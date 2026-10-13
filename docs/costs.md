@@ -64,7 +64,9 @@ shared infrastructure is not arbitrarily charged to individual teammates.
 The total is a **recorded subtotal** when a provider has missing days or an LLM
 request has no final cost. Coverage does not certify that every company expense
 has been connected. Calls through separate credential-proxy keys remain outside
-the inference ledger.
+the inference ledger; they appear only as content-free usage logs and trace
+spans, and `PROVIDER_KEY_PROXY_ENABLED=false` disables them
+([secure access](credentials.md#secure-access-requests)).
 
 - **Modal:** enable `MODAL_BILLING_ENABLED=true` with a Team/Enterprise plan and
   billing-authorized `MODAL_TOKEN_ID` / `MODAL_TOKEN_SECRET`. The reader resolves

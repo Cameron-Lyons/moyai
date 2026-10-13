@@ -159,6 +159,10 @@ class Settings(BaseSettings):
     litellm_api_base: str = ""
     litellm_api_key: str = ""
     litellm_spend_recovery_enabled: bool = True
+    # False disables Moyai's direct provider-key proxy and stops accepting
+    # provider-typed keys. Sandbox egress, and keys supplied as generic
+    # credentials or from 1Password, need separate controls.
+    provider_key_proxy_enabled: bool = True
     model_context_limits: dict[str, ModelContextLimits] = Field(default_factory=dict)
     session_titles_enabled: bool = True
     session_title_model: str = Field(default="openai/gpt-4.1-nano", min_length=1, max_length=200)

@@ -1,4 +1,6 @@
+import asyncio
 import json
+import logging
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
@@ -6,16 +8,21 @@ import httpx
 import pytest
 from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
+from opentelemetry.exporter.otlp.proto.common.trace_encoder import encode_spans
 from pydantic import SecretStr
 
-from app.credentials import CredentialRequest, Credentials, Invoke, Materialize, ReportFailure, Resolve, SaveSecret
+from app.config import Settings
+from app.credentials import (GATEWAY_ONLY, PROVIDER_KEYS_DISABLED, PROVIDER_KEYS_DISABLED_INSTRUCTIONS, CredentialRequest,
+                             Credentials, Invoke, Materialize, ReportFailure, Resolve, ResolveExternal, SaveSecret)
 from app.db import Store, now
 from app.security import Security
 from app.session_lifecycle import SessionLifecycle
 from app.temporal_runtime import TemporalRunManager
+from app.tracing import AgentTracing
 from agent.continuation import AgentWait
 from test_durable import Cloud, durable, drive
 from test_spend import active, sign_in
+from test_tracing import Processor
 from test_workspace import workspace
 
 KEY = 'test-provider-secret-438912'
@@ -200,6 +207,271 @@ def test_fixed_provider_proxy_auth_redaction_routes_no_redirects_and_revocation(
     reopened=requested(app,run)
     assert reopened['status']=='pending' and reopened['request_id']==request['request_id']
     assert not app.state.store.rows('SELECT * FROM model_requests')  # Not Moyai gateway spend.
+
+
+USAGE_LOG = 'uvicorn.error.moyai.credentials'
+
+
+def mock_provider(monkeypatch, handler):
+    actual = httpx.AsyncClient
+    monkeypatch.setattr('app.credentials.httpx.AsyncClient',
+                        lambda **kw: actual(transport=httpx.MockTransport(handler), **kw))
+
+
+def usage_records(caplog):
+    return [json.loads(r.getMessage()) for r in caplog.records
+            if r.name == USAGE_LOG and 'provider_key_request_finished' in r.getMessage()]
+
+
+def traced(app):
+    settings = Settings(_env_file=None, litellm_trace_endpoint='https://traces.example/v1/traces',
+                        litellm_trace_api_key='trace-secret')
+    processor = Processor()
+    app.state.store.tracing = AgentTracing(app.state.store, settings, processor)
+    return processor
+
+
+async def test_disabled_provider_key_proxy_refuses_keys_and_calls_but_keeps_generic_access(workspace, monkeypatch):
+    app, client = workspace
+    sign_in(app, client)
+    secret = save(client).json()['id']
+    vault, run = app.state.credentials, active(app)
+    provided = requested(app, run)
+    other = active(app)
+    pending = vault.request(other, CredentialRequest(provider='groq', reason='Compare providers', request_key='groq'))
+    assert provided['status'] == 'provided' and pending['status'] == 'pending'
+    groq = save(client, provider='groq', suffix='groq').json()['id']
+    closed_run = active(app)
+    closed = vault.request(closed_run, CredentialRequest(provider='together', reason='Compare providers', request_key='together'))
+    closed = vault.resolve_external(closed_run, ResolveExternal(request_id=closed['request_id'], generation=0, source='existing_credentials'))
+    assert closed['status'] == 'satisfied'
+    calls = []
+    mock_provider(monkeypatch, lambda req: calls.append(req) or httpx.Response(200, json={}))
+    monkeypatch.setattr(app.state.settings, 'provider_key_proxy_enabled', False)
+    monkeypatch.setattr(app.state.settings, 'temporal_enabled', True)
+    request_count = len(app.state.store.rows('SELECT * FROM credential_requests'))
+
+    # Neither the SDK relay route nor the agent tool reaches a provider.
+    args = {'request_id': provided['request_id'], 'path': '/chat/completions', 'body': {'model': 'test-model', 'messages': []}}
+    sdk = client.post('/broker/' + run['id'] + '/credentials/invoke', json=args, headers={'Authorization': 'Bearer capability'})
+    assert sdk.status_code == 403 and sdk.json()['error']['type'] == 'provider_keys_disabled'
+    tool = await vault.call(run, 'credentials_http_request', args)
+    assert tool['status_code'] == 403 and tool['response']['error']['message'] == PROVIDER_KEYS_DISABLED_INSTRUCTIONS
+    assert not calls
+
+    # The agent is not offered the proxy and cannot open a provider-key form.
+    names = {tool['name'] for tool in vault.tools(run)}
+    assert 'credentials_http_request' not in names and {'credentials_request', 'credentials_run'} <= names
+    descriptions = ' '.join(tool['description'] for tool in vault.tools(run))
+    assert 'provider key' not in descriptions and descriptions.count(GATEWAY_ONLY) == 2
+    refused = vault.request(run, CredentialRequest(provider='openai', reason='Call the model directly', request_key='direct'))
+    assert refused == {'status': 'unavailable', 'provider': 'openai', 'instructions': PROVIDER_KEYS_DISABLED_INSTRUCTIONS}
+    external = vault.resolve_external(app.state.store.run(other['id']), ResolveExternal(
+        request_id=pending['request_id'], generation=0, source='existing_credentials'))
+    assert external['status'] == 'unavailable' and vault.row(pending['request_id'])['status'] == 'pending'
+    assert len(app.state.store.rows('SELECT * FROM credential_requests')) == request_count
+
+    # Saved handles keep their status and the key is never marked invalid.
+    row = vault.row(provided['request_id'])
+    handle = vault.ready(row)
+    assert handle['status'] == 'provided' and handle['instructions'] == PROVIDER_KEYS_DISABLED_INSTRUCTIONS
+    resumed = vault.ready(vault.row(closed['request_id']))
+    assert resumed['status'] == 'satisfied' and resumed['instructions'] == PROVIDER_KEYS_DISABLED_INSTRUCTIONS
+    report = vault.report_failure(run, ReportFailure(request_id=row['id'], revision=row['revision'], failure='invalid'))
+    assert report['status'] == 'unavailable' and vault.row(row['id'])['status'] == 'provided'
+    assert app.state.store.rows('SELECT invalid_reason FROM provider_secrets WHERE id=?', (secret,))[0]['invalid_reason'] == ''
+
+    # No new provider keys are collected; generic access is unchanged.
+    rejected = save(client, provider='openai', suffix='disabled')
+    assert rejected.status_code == 403 and rejected.json()['detail'] == PROVIDER_KEYS_DISABLED
+    assert client.post('/api/credentials/secrets', json={
+        'provider': 'generic', 'name': 'service', 'format': 'env', 'label': 'Service', 'scope': 'personal',
+        'lifetime': 'persistent', 'value': json.dumps({'SERVICE_TOKEN': KEY}), 'client_id': 'save-test-generic'}).status_code == 201
+    listing = client.get('/api/credentials').json()
+    assert [provider['id'] for provider in listing['providers']] == ['generic']
+    saved = next(item for item in listing['secrets'] if item['id'] == secret)
+    path = '/api/credentials/secrets/' + secret
+    assert client.patch(path, json={'revision': saved['revision'], 'value': KEY + '-new'}).status_code == 403
+    renamed = client.patch(path, json={'revision': saved['revision'], 'label': 'Old benchmark key'})
+    assert renamed.status_code == 200 and renamed.json()['label'] == 'Old benchmark key'
+
+    # A form opened before the switch can only be declined; revoking still works.
+    monkeypatch.setattr(app.state.manager, 'submit', lambda run: None)
+    form = '/api/credentials/requests/' + pending['request_id']
+    assert client.post(form, json={'scope': 'personal', 'value': KEY}).status_code == 403
+    assert client.post(form, json={'secret_id': groq}).status_code == 403
+    assert client.post(form, json={'decision': 'decline'}).status_code == 200
+    assert client.delete(path).status_code == 200
+    assert not calls and not app.state.store.rows('SELECT * FROM model_requests')
+
+
+def test_disabled_provider_key_proxy_vault_lookup_points_model_calls_to_gateway(workspace, monkeypatch):
+    app, client = workspace
+    sign_in(app, client)
+    assert client.post('/api/credentials/secrets', json={
+        'provider': 'generic', 'name': '1password-shared', 'format': 'env', 'label': '1Password Shared',
+        'scope': 'organization', 'lifetime': 'persistent', 'value': json.dumps({'OP_SERVICE_ACCOUNT_TOKEN': KEY}),
+        'client_id': 'save-test-onepassword'}).status_code == 201
+    monkeypatch.setattr(app.state.settings, 'provider_key_proxy_enabled', False)
+    lookup = app.state.credentials.request(active(app), CredentialRequest(
+        provider='generic', name='service', reason='Read service logs', request_key='lookup'))
+    assert lookup['status'] == 'lookup_required'
+    assert 'never call a model provider directly' in lookup['instructions'] and 'provider calls' not in lookup['instructions']
+
+
+def test_disabled_provider_key_proxy_keeps_generic_round_trip(workspace, monkeypatch):
+    app, client = workspace
+    sign_in(app, client)
+    vault, run = app.state.credentials, active(app)
+    monkeypatch.setattr(app.state.settings, 'provider_key_proxy_enabled', False)
+    monkeypatch.setattr(app.state.settings, 'temporal_enabled', True)
+    monkeypatch.setattr(app.state.manager, 'submit', lambda run: None)
+    fields = [{'name': 'SERVICE_TOKEN', 'label': 'Access token', 'secret': True, 'required': True}]
+    request = vault.request(run, CredentialRequest(provider='generic', name='service', reason='Read service logs',
+                                                   request_key='token', input_fields=fields))
+    assert request['status'] == 'pending'
+    form = client.post('/api/credentials/requests/' + request['request_id'], json={
+        'decision': 'provide', 'generation': 0, 'scope': 'personal', 'lifetime': 'persistent',
+        'value': json.dumps({'SERVICE_TOKEN': KEY})})
+    assert form.status_code == 200
+    assert vault.materialize(run, Materialize(request_ids=[request['request_id']]))['status'] == 'ready'
+    row = vault.row(request['request_id'])
+    report = vault.report_failure(run, ReportFailure(request_id=row['id'], revision=row['revision'], failure='permission'))
+    assert report['status'] == 'pending'  # Normal recovery, not 'unavailable'.
+    secret = app.state.store.rows("SELECT * FROM provider_secrets WHERE provider='generic'")[0]
+    rotated = client.patch('/api/credentials/secrets/' + secret['id'], json={
+        'revision': secret['revision'], 'value': json.dumps({'SERVICE_TOKEN': KEY + '-new'})})
+    assert rotated.status_code == 200
+
+
+@pytest.mark.parametrize('provider,path,usage,expected', [
+    ('fireworks', '/chat/completions',
+     {'prompt_tokens': 11, 'completion_tokens': 7, 'total_tokens': 18, 'prompt_tokens_details': {'cached_tokens': 3}},
+     {'input_tokens': 11, 'output_tokens': 7, 'total_tokens': 18, 'cache_read.input_tokens': 3}),
+    ('anthropic', '/messages',
+     {'input_tokens': 10, 'output_tokens': 5, 'cache_read_input_tokens': 2, 'cache_creation_input_tokens': 3},
+     {'input_tokens': 15, 'output_tokens': 5, 'total_tokens': 20, 'cache_read.input_tokens': 2, 'cache_write.input_tokens': 3}),
+])
+def test_provider_key_calls_record_usage_without_content(workspace, monkeypatch, caplog, provider, path, usage, expected):
+    app, client = workspace
+    sign_in(app, client)
+    save(client, provider=provider)
+    run = active(app)
+    request = app.state.credentials.request(run, CredentialRequest(provider=provider, reason='Benchmark models', request_key='usage'))
+    processor = traced(app)
+    status = 200
+
+    def upstream(req):
+        if status is None:
+            raise httpx.ConnectError('provider unreachable')
+        if status == 'oversize':  # Answered and possibly billed, but unreadable.
+            return httpx.Response(200, content=b'x' * (8 * 1024 * 1024 + 1))
+        return httpx.Response(status, json={'id': 'response-1', 'model': 'served-model', 'usage': usage,
+                                            'choices': [{'message': {'content': 'PRIVATE COMPLETION'}}]})
+
+    mock_provider(monkeypatch, upstream)
+    caplog.set_level(logging.INFO, logger=USAGE_LOG)
+    args = {'request_id': request['request_id'], 'path': path,
+            'body': {'model': 'test-model', 'messages': [{'role': 'user', 'content': 'PRIVATE PROMPT'}]}}
+    endpoint, headers = '/broker/' + run['id'] + '/credentials/invoke', {'Authorization': 'Bearer capability'}
+    assert client.post(endpoint, json=args, headers=headers).status_code == 200
+    status = 429
+    assert client.post(endpoint, json=args, headers=headers).status_code == 429
+    status = None
+    assert client.post(endpoint, json=args, headers=headers).status_code == 502
+    status = 'oversize'
+    assert client.post(endpoint, json=args, headers=headers).status_code == 502
+    status = 200
+    listing = client.post(endpoint, json={'request_id': request['request_id'], 'method': 'GET', 'path': '/models'}, headers=headers)
+    assert listing.status_code == 200
+
+    completed, failed, unknown, oversized = processor.spans  # Model listing sends no prompt and is logged only.
+    attributes = dict(completed.attributes)
+    assert completed.name == 'chat test-model' and completed.status.is_ok
+    assert {key: attributes['gen_ai.usage.' + key] for key in expected} == expected
+    assert attributes['gen_ai.provider.name'] == provider and attributes['moyai.inference_route'] == 'provider_key'
+    assert attributes['gen_ai.request.model'] == 'test-model' and attributes['gen_ai.response.model'] == 'served-model'
+    assert attributes['http.response.status_code'] == 200 and attributes['moyai.credential.scope'] == 'personal'
+    assert failed.attributes['moyai.status'] == 'failed' and failed.attributes['http.response.status_code'] == 429
+    assert not failed.status.is_ok and failed.attributes['error.type'] == 'provider_error'
+    assert unknown.attributes['moyai.status'] == 'unknown' and 'http.response.status_code' not in unknown.attributes
+    assert oversized.attributes['moyai.status'] == 'unknown' and oversized.attributes['http.response.status_code'] == 200
+    assert not any(key.startswith('gen_ai.usage.') for span in (failed, unknown, oversized) for key in span.attributes)
+    payload = encode_spans(processor.spans).SerializeToString()
+    assert b'PRIVATE' not in payload and KEY.encode() not in payload
+
+    records = usage_records(caplog)
+    assert [(r['status'], r['http_status'], r['path']) for r in records] == [
+        ('completed', 200, path), ('failed', 429, path), ('unknown', None, path), ('unknown', 200, path),
+        ('completed', 200, '/models')]
+    assert records[0]['provider'] == provider and records[0]['model'] == 'test-model'
+    assert records[0]['prompt_tokens'] == expected['input_tokens'] and records[0]['total_tokens'] == expected['total_tokens']
+    assert [span.attributes['moyai.provider_key.call_id'] for span in processor.spans] == [r['call_id'] for r in records[:4]]
+    assert len({r['call_id'] for r in records}) == 5 and 'PRIVATE' not in caplog.text and KEY not in caplog.text
+    assert not app.state.store.rows('SELECT * FROM model_requests')  # Still outside gateway spend.
+
+
+def test_provider_key_usage_redacts_secret_like_model_names(workspace, monkeypatch, caplog):
+    app, client = workspace
+    sign_in(app, client)
+    save(client)
+    run = active(app)
+    request = requested(app, run)
+    processor = traced(app)
+    mock_provider(monkeypatch, lambda req: httpx.Response(404, json={'error': {'message': 'model not found'}}))
+    caplog.set_level(logging.INFO, logger=USAGE_LOG)
+    leaked = 'sk-proj-ABCDEFGHIJKLMNOPQRSTUV0123456789'
+    args = {'request_id': request['request_id'], 'path': '/chat/completions', 'body': {'model': leaked, 'messages': []}}
+    response = client.post('/broker/' + run['id'] + '/credentials/invoke', json=args, headers={'Authorization': 'Bearer capability'})
+    assert response.status_code == 404
+    record, = usage_records(caplog)
+    assert record['status'] == 'failed' and 'redacted' in record['model'] and leaked not in caplog.text
+    assert leaked.encode() not in encode_spans(processor.spans).SerializeToString()
+
+
+def test_provider_key_usage_log_is_enabled_by_uvicorn_default_logging():
+    import copy
+    import logging.config
+    from uvicorn.config import LOGGING_CONFIG
+    from app.credentials import log
+    loggers = [logging.getLogger(name) for name in ('uvicorn', 'uvicorn.error', 'uvicorn.access')]
+    saved = [(logger, logger.handlers[:], logger.level, logger.propagate) for logger in loggers]
+    try:
+        # Every launcher uses uvicorn's default config, which leaves app.* loggers at WARNING.
+        logging.config.dictConfig(copy.deepcopy(LOGGING_CONFIG))
+        assert log.name == USAGE_LOG and log.isEnabledFor(logging.INFO)
+    finally:
+        for logger, handlers, level, propagate in saved:
+            logger.handlers[:] = handlers
+            logger.setLevel(level)
+            logger.propagate = propagate
+
+
+async def test_interrupted_provider_key_call_is_recorded_as_interrupted(workspace, monkeypatch, caplog):
+    app, client = workspace
+    sign_in(app, client)
+    save(client)
+    vault, run = app.state.credentials, active(app)
+    request = requested(app, run)
+    processor = traced(app)
+    entered = asyncio.Event()
+
+    async def upstream(req):
+        entered.set()
+        await asyncio.sleep(30)
+
+    mock_provider(monkeypatch, upstream)
+    caplog.set_level(logging.INFO, logger=USAGE_LOG)
+    task = asyncio.create_task(vault.invoke(run, Invoke(request_id=request['request_id'], path='/chat/completions',
+                                                        body={'model': 'test-model', 'messages': []})))
+    await asyncio.wait_for(entered.wait(), 5)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    span, = processor.spans
+    assert span.attributes['moyai.status'] == 'interrupted' and not span.status.is_ok
+    record, = usage_records(caplog)
+    assert record['status'] == 'interrupted' and record['http_status'] is None
 
 
 def test_accounting_links_cannot_grant_personal_credentials(workspace):

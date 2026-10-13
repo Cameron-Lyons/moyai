@@ -154,11 +154,14 @@ text is omitted as a whole before redaction. Model text is sanitized with that
 larger limit, and each serialized message representation is capped at 2 MiB of
 UTF-8 JSON. Text that exceeds the serialized budget is shortened after redaction
 with an explicit `[truncated]` marker. Tool arguments and results remain in their
-separate tool spans. Internal context-compaction calls export usage and status only. Capture
-uses the existing inference connection and does not add a network hop.
+separate tool spans. Internal context-compaction calls export usage and status only. Direct
+[provider-key calls](credentials.md#secure-access-requests) that bypass the gateway add an LLM span
+with usage and status only. Capture uses the existing inference connection and does not add a network hop.
 
-System prompts, loaded skills, private reasoning, images and credential-tool
-payloads are excluded. Known credentials and common secret fields are redacted;
+System prompts, loaded skills, private reasoning and images are excluded. Credential,
+skill, memory and connector tool payloads, including `credentials_http_request` requests
+and responses, are omitted only when the turn author turns on **Settings → Preferences →
+Hide private tool content in traces** (off by default). Known credentials and common secret fields are redacted;
 ordinary task/tool text is sent to the configured gateway. Agent and tool text
 retains its 16,000-character per-field limit. Moyai writes encoded spans to a SQLite
 outbox on Render's persistent disk before export. A background worker retries delivery after

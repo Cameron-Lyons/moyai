@@ -364,8 +364,38 @@ class AgentTracing:
                       'gen_ai.input.messages': input_messages,
                       'gen_ai.output.messages': output_messages,
                       'input.mime_type': 'application/json', 'output.mime_type': 'application/json'})
+        if isinstance(gateway_id, str) and gateway_id:
+            attrs['litellm.call_id'] = self.content(gateway_id)[:200]
+        self.response_attributes(attrs, response, provider)
+        # Let Langfuse map GenAI usage to its canonical input/output pricing
+        # keys; overriding usage_details with *_tokens breaks inferred costs.
+        self.emit(run, run.get('active_message_id'), 'chat ' + attrs['gen_ai.request.model'],
+                  request_id, start, time.time_ns(), attrs, failed=status != 'completed')
+
+    @best_effort
+    def provider_key(self, run, call_id, start, *, provider, scope, operation, model, response, status, http_status=None):
+        """Content-free span for a call made with a provider key outside the gateway."""
+        model = self.content(model)[:200]
+        attrs = {'gen_ai.operation.name': operation, 'openinference.span.kind': 'LLM',
+                 'gen_ai.request.model': model, 'llm.model_name': model,
+                 'gen_ai.system': provider, 'gen_ai.provider.name': provider,
+                 'moyai.inference_route': 'provider_key', 'moyai.credential.scope': scope, 'moyai.status': status,
+                 'moyai.provider_key.call_id': call_id}
+        if type(http_status) is int:
+            attrs['http.response.status_code'] = http_status
+        if status != 'completed':
+            attrs['error.type'] = 'provider_error' if status == 'failed' else status
+            attrs['error.message'] = (f'{provider} returned HTTP {http_status}.' if status == 'failed' else
+                                      'The provider call was interrupted.' if status == 'interrupted' else
+                                      'The provider outcome could not be confirmed.')
+        self.response_attributes(attrs, response, provider)
+        self.emit(run, run.get('active_message_id'), (operation + ' ' + model).strip(), 'provider-key:' + call_id,
+                  start, time.time_ns(), attrs, failed=status != 'completed')
+
+    def response_attributes(self, attrs, response, provider):
+        """Add response identity and token usage; never message content."""
         for source, value in [('gen_ai.response.id', response.get('id')),
-                              ('gen_ai.response.model', response.get('model')), ('litellm.call_id', gateway_id)]:
+                              ('gen_ai.response.model', response.get('model'))]:
             if isinstance(value, str) and value:
                 attrs[source] = self.content(value)[:200]
         usage = response.get('usage')
@@ -393,10 +423,6 @@ class AgentTracing:
                     attrs['anthropic.usage.cache_creation.' + key] = value
         if all('gen_ai.usage.' + key in attrs for key in ('input_tokens', 'output_tokens')):
             attrs['gen_ai.usage.total_tokens'] = attrs['gen_ai.usage.input_tokens'] + attrs['gen_ai.usage.output_tokens']
-        # Let Langfuse map GenAI usage to its canonical input/output pricing
-        # keys; overriding usage_details with *_tokens breaks inferred costs.
-        self.emit(run, run.get('active_message_id'), 'chat ' + attrs['gen_ai.request.model'],
-                  request_id, start, time.time_ns(), attrs, failed=status != 'completed')
 
     @staticmethod
     def error_attributes(error):

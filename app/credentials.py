@@ -3,7 +3,9 @@ from . import slack_secrets
 import asyncio
 import hmac
 import json
+import logging
 import re
+import time
 from datetime import datetime, timezone
 from typing import Literal
 from uuid import uuid4
@@ -15,6 +17,11 @@ from pydantic import BaseModel, ConfigDict, Field, HttpUrl, SecretStr, model_val
 from .database import Connection, DatabaseRow
 from .db import now
 from .identities import PROFILE_MAX_AGE_SECONDS
+from .spend import UsageCapture
+from agent.trace_content import trace_content
+
+# Uvicorn's default logging emits INFO under uvicorn.error; app.* loggers stay at WARNING.
+log = logging.getLogger('uvicorn.error.moyai.credentials')
 
 
 # Inference keys retain fixed origins/routes and never enter the sandbox.
@@ -31,6 +38,16 @@ PROVIDERS = {
              'setup': 'https://console.groq.com/keys'},
     'generic': {'name': 'Other service', 'setup': ''},
 }
+# PROVIDER_KEY_PROXY_ENABLED=false removes Moyai's direct provider-key path.
+PROVIDER_KEYS_DISABLED = ('Direct provider API keys are disabled by your administrator; '
+                          'model calls use the workspace model gateway.')
+GATEWAY_ONLY = ('Choose an approved gateway model with model_list or model_switch, and never call a model provider '
+                'directly with an API key from 1Password, a generic credential or any other source.')
+PROVIDER_KEYS_DISABLED_INSTRUCTIONS = PROVIDER_KEYS_DISABLED + ' No provider call was made. ' + GATEWAY_ONLY
+PROVIDER_OPERATIONS = {'/chat/completions': 'chat', '/messages': 'chat', '/completions': 'text_completion',
+                       '/embeddings': 'embeddings'}
+USAGE_FIELDS = ('prompt_tokens', 'completion_tokens', 'total_tokens', 'cache_read_input_tokens',
+                'cache_creation_input_tokens', 'reasoning_tokens')
 Provider = Literal['fireworks', 'openai', 'anthropic', 'together', 'groq', 'generic']
 Scope = Literal['session', 'personal', 'organization']
 Lifetime = Literal['session', 'persistent']
@@ -238,8 +255,16 @@ class UpdateSecret(Arguments):
 
 
 # Loaded with credentials_run instead of occupying every task's system prompt.
+# Provider-key sentences are swapped out when the direct provider-key path is disabled.
+ONEPASSWORD_PROVIDER_LEAD = 'Before asking for a provider key, '
+ONEPASSWORD_PROVIDER_USE = (
+    'To use a provider key, set only a nonsecret op://Shared/<item>/credential reference in the command environment '
+    'and use op run -- <process>, keeping its output masking enabled. Never use --no-masking. For other reads, ')
+ONEPASSWORD_SECRET_USE = (
+    'To pass a vault secret to a process, set only a nonsecret op://Shared/<item>/<field> reference in the command '
+    'environment and use op run -- <process>, keeping its output masking enabled. Never use --no-masking. For other reads, ')
 ONEPASSWORD_GUIDANCE = (
-    'Before asking for a provider key, inspect credential_sources from credentials_list for saved generic '
+    ONEPASSWORD_PROVIDER_LEAD + 'inspect credential_sources from credentials_list for saved generic '
     '1password-shared access, even when the provider-specific credentials list is empty. If authorized Shared access '
     'exists, request it with provider=generic, name=1password-shared, format=env and input_fields=[{name: '
     'OP_SERVICE_ACCOUNT_TOKEN, label: Service account token}]. Use credentials_run for all op commands; the token is '
@@ -248,9 +273,8 @@ ONEPASSWORD_GUIDANCE = (
     'checked the vault. Verify op whoami and op vault list first, then op item list --vault Shared. Scope all item '
     'operations and secret references to Shared. Account permissions are enforced by 1Password, not by the vault name in '
     'these instructions. Prefer a dedicated service account with Shared read_items/write_items only and no '
-    'vault-creation permission. Keep vault values out of all tool output and chat. To use a provider key, set only a '
-    'nonsecret op://Shared/<item>/credential reference in the command environment and use op run -- <process>, keeping '
-    'its output masking enabled. Never use --no-masking. For other reads, capture op read directly in memory inside the '
+    'vault-creation permission. Keep vault values out of all tool output and chat. ' + ONEPASSWORD_PROVIDER_USE +
+    'capture op read directly in memory inside the '
     'same credentials_run command and pass it straight to the intended process; never print it. The generic executor '
     'redacts the service-account token but cannot automatically redact newly read vault values. Before adding a key, '
     'search Shared for an existing matching item and edit it; if matches are ambiguous, clarify the intended item. Only '
@@ -268,6 +292,14 @@ TOOLS = {
     'credentials_run': (RunCredential, 'Run a foreground sandbox command with approved generic access. Use request_ids from credentials_request; environment values and credential files exist only for this command. Output is bounded and redacted. Never print credentials or copy them to ordinary files. A failed command is not replayed automatically. If authentication fails, report the returned credential revision through credentials_report_failure; distinguish missing permissions from invalid or expired authentication. ' + ONEPASSWORD_GUIDANCE),
     'credentials_report_failure': (ReportFailure, 'Report an observed access failure with the request ID and revision returned by credentials_run. Expired or invalid authentication tries alternative saved access, then requires checking available credential_sources before opening a replacement form. No failed operation is replayed. Missing permissions reopen only this request so the user can grant access; they do not invalidate the shared credential. Never guess expiry from a generic command error and never repeat potentially completed writes automatically.'),
     'credentials_http_request': (Invoke, 'Use an authorized inference-key request for a non-streaming inference or model-list API call. The server supplies authentication to fixed provider origins and paths. Responses contain no key. Provider usage is billed to that separate key, outside Moyai gateway spend.'),
+}
+ONEPASSWORD_GATEWAY_ONLY = (ONEPASSWORD_GUIDANCE.replace(ONEPASSWORD_PROVIDER_LEAD, 'Before asking for new access, ')
+                            .replace(ONEPASSWORD_PROVIDER_USE, ONEPASSWORD_SECRET_USE)
+                            + PROVIDER_KEYS_DISABLED + ' ' + GATEWAY_ONLY)
+GATEWAY_ONLY_DESCRIPTIONS = {
+    'credentials_list': TOOLS['credentials_list'][1].replace(
+        ' Inspect an available Shared vault before asking for another provider key.', ' ' + PROVIDER_KEYS_DISABLED + ' ' + GATEWAY_ONLY),
+    'credentials_run': TOOLS['credentials_run'][1].replace(ONEPASSWORD_GUIDANCE, ONEPASSWORD_GATEWAY_ONLY),
 }
 
 
@@ -382,7 +414,12 @@ class Credentials:
                     raise HTTPException(422, 'Use a JSON object of credential environment names and nonempty string values, without runtime settings.') from None
         return value
 
+    def proxy_disabled(self, provider):
+        return provider != 'generic' and not self.settings.provider_key_proxy_enabled
+
     def insert_secret(self, conn, body, user_id, admin, root_id=''):
+        if self.proxy_disabled(body.provider):
+            raise HTTPException(403, PROVIDER_KEYS_DISABLED)
         if body.scope == 'organization' and not admin:
             raise HTTPException(403, 'Only an administrator can save organization credentials.')
         if body.scope != 'organization' and not user_id.startswith(('google:', 'cloudflare:')) and not self.security.local_preview():
@@ -411,10 +448,13 @@ class Credentials:
     def tools(self, run):
         if not self.settings.temporal_enabled or not run['chat_enabled']:
             return []
-        return [{'name': name, 'description': description, 'inputSchema': schema.model_json_schema(),
+        enabled = self.settings.provider_key_proxy_enabled
+        return [{'name': name, 'description': description if enabled else GATEWAY_ONLY_DESCRIPTIONS.get(name, description),
+                 'inputSchema': schema.model_json_schema(),
                  'annotations': {'readOnlyHint': name == 'credentials_list', 'idempotentHint': name == 'credentials_list'}}
                 for name, (schema, description) in TOOLS.items()
-                if name not in slack_secrets.TOOLS or slack_secrets.enabled(self, run)]
+                if (name not in slack_secrets.TOOLS or slack_secrets.enabled(self, run))
+                and (enabled or name != 'credentials_http_request')]
 
     def setup(self, row):
         return {'setup_url': PROVIDERS[row['provider']]['setup'] or row['setup_url'],
@@ -432,7 +472,7 @@ class Credentials:
         if request['status'] == 'satisfied':
             return {'status': 'satisfied', 'request_id': request['id'], 'generation': request['generation'],
                     'provider': request['provider'],
-                    'instructions': 'This request was closed after access was verified through another path. No credential was stored or granted. Continue using that access, rechecking it when needed. If it is no longer usable, create a new request with a new request_key.'}
+                    'instructions': PROVIDER_KEYS_DISABLED_INSTRUCTIONS if self.proxy_disabled(request['provider']) else 'This request was closed after access was verified through another path. No credential was stored or granted. Continue using that access, rechecking it when needed. If it is no longer usable, create a new request with a new request_key.'}
         if request['status'] == 'declined':
             return {'status': 'declined', 'request_id': request['id'], 'provider': request['provider'],
                     'instructions': 'The user declined this access request. Continue without it, explain any limitation, and do not request it again unless the user asks.'}
@@ -440,6 +480,9 @@ class Credentials:
         if request['provider'] == 'generic':
             return {**result, 'name': request['name'], 'format': request['format'], 'env_var': request['env_var'],
                     'instructions': 'Use credentials_run with this request_id to verify access and continue the task. Credential values are supplied only to that command. Report confirmed authentication failures with the returned revision; never replay potentially completed writes automatically.'}
+        if self.proxy_disabled(request['provider']):
+            # Keep the status: durable resume and receipts depend on it.
+            return {**result, 'instructions': PROVIDER_KEYS_DISABLED_INSTRUCTIONS}
         suffix = '' if request['provider'] == 'anthropic' else '/v1'
         return {**result, 'instructions': 'Use credentials_http_request with this request_id. For Python SDKs, base_url=os.environ["MOYAI_CREDENTIAL_PROXY_URL"] + "/' + request['id'] + suffix + '", api_key=os.environ["WORKSPACE_RUN_TOKEN"]. Set max_retries=0 and stream=False. The endpoint is rebuilt each turn; do not hard-code it. No raw provider key is available. Provider charges are separate from Moyai gateway spend.'}
 
@@ -547,12 +590,14 @@ class Credentials:
         remaining = [source for source in sources if (source['id'], source['revision']) not in checked]
         if not remaining:
             return None
+        handling = ('use op run with masking for provider calls' if self.settings.provider_key_proxy_enabled
+                    else 'use op run with masking and never call a model provider directly')
         return {'status': 'lookup_required', 'credential_sources': remaining,
                 'request_arguments': args.model_dump(exclude={'secret_id'}),
                 'instructions': 'No new credential form was opened. Check these authorized 1Password sources first. '
                     'Request provider=generic, name=1password-shared, format=env with the source secret_id, '
                     'then use credentials_run to inspect Shared and verify task-relevant access. '
-                    'Keep vault values out of output; use op run with masking for provider calls. '
+                    'Keep vault values out of output; ' + handling + '. '
                     'If access works, continue with it and close any earlier pending request with credentials_resolve. '
                     'Only if lookup or verification fails, retry request_arguments, preserving earlier source_checks and adding '
                     'each source secret_id, revision and observed outcome (not_found, invalid, expired, permission, unavailable). '
@@ -573,6 +618,9 @@ class Credentials:
             slack_secrets.private_context(self, run)
         else:
             deny_export(self.store, run['id'])
+        if self.proxy_disabled(args.provider):
+            # No form, checkpoint, saved-key reuse or vault lookup for a disabled path.
+            return {'status': 'unavailable', 'provider': args.provider, 'instructions': PROVIDER_KEYS_DISABLED_INSTRUCTIONS}
         with self.store.connect() as conn:
             conn.begin_write()
             if private_slack:
@@ -733,6 +781,10 @@ class Credentials:
                                         (current['active_message_id'], current['id'])).fetchone()):
                 raise HTTPException(409, 'This agent turn is no longer active.')
             row, _ = self.authorized_request(conn, current, args.request_id)
+            if self.proxy_disabled(row['provider']):
+                # A provider-key form opened before the switch can only be declined.
+                return {'status': 'unavailable', 'request_id': row['id'], 'provider': row['provider'],
+                        'instructions': PROVIDER_KEYS_DISABLED_INSTRUCTIONS}
             if row['generation'] != args.generation:
                 raise HTTPException(409, 'This access request changed. Check credentials_list again.')
             if row['status'] == 'pending':
@@ -767,6 +819,8 @@ class Credentials:
                 raise HTTPException(409, 'This session is no longer waiting for that access.')
             secret_id = ''
             if body.decision == 'provide':
+                if self.proxy_disabled(row['provider']):
+                    raise HTTPException(403, PROVIDER_KEYS_DISABLED)  # Declining stays available.
                 if body.secret_id:
                     secret = conn.execute('SELECT * FROM provider_secrets WHERE id=?', (body.secret_id,)).fetchone()
                     if (not secret or not self.matching(secret, row) or self.status(secret) != 'active'
@@ -832,7 +886,8 @@ class Credentials:
                 if row['provider'] == 'generic' and row['name'] == 'slack-personal':
                     raise HTTPException(403, 'Use the server-side personal Slack tools; this token cannot be exported to a command.')
                 if row['provider'] != 'generic':
-                    raise HTTPException(422, 'Use the inference proxy for provider keys.')
+                    raise HTTPException(422, PROVIDER_KEYS_DISABLED if self.proxy_disabled(row['provider'])
+                                        else 'Use the inference proxy for provider keys.')
                 if row['status'] == 'pending':
                     return self.ready(self.reopen_in(conn, row, row['failure'], run))
                 if row['status'] != 'provided':
@@ -858,6 +913,10 @@ class Credentials:
         with self.store.connect() as conn:
             conn.begin_write()
             row, secret = self.authorized_request(conn, run, args.request_id)
+            if self.proxy_disabled(row['provider']):
+                # Never mark the key invalid or reopen a form for a disabled path.
+                return {'status': 'unavailable', 'request_id': row['id'], 'provider': row['provider'],
+                        'instructions': PROVIDER_KEYS_DISABLED_INSTRUCTIONS}
             if (row['status'] != 'provided' or not secret or row['revision'] != args.revision
                     or row['secret_revision'] != secret['revision']):
                 return {'status': 'stale', 'message': 'Access changed since this command. Check the current connection before continuing.'}
@@ -905,6 +964,10 @@ class Credentials:
                 **({'moyai_wait_credential': result['moyai_wait_credential']} if result.get('moyai_wait_credential') else {})}
 
     async def invoke(self, run, args):
+        if not self.settings.provider_key_proxy_enabled:
+            # Refuse before any lookup, failure report or provider call. A
+            # result rather than an exception keeps the tool outcome definite.
+            return 403, {'error': {'message': PROVIDER_KEYS_DISABLED_INSTRUCTIONS, 'type': 'provider_keys_disabled'}}
         with self.store.connect() as conn:
             conn.begin_write()
             request, secret = self.authorized_request(conn, run, args.request_id)
@@ -930,29 +993,76 @@ class Credentials:
             self.acknowledge(run['id'], run['active_message_id'], request['id'], request['generation'])
             value = self.security.decrypt(secret['encrypted'])
             headers = {'x-api-key': value, 'anthropic-version': '2023-06-01'} if secret['provider'] == 'anthropic' else {'Authorization': 'Bearer ' + value}
+            # These tokens bypass the gateway ledger; record content-free usage
+            # for every outcome. Unconfirmed calls remain 'unknown' (possibly billed).
+            started, status, outcome, result = time.time_ns(), None, 'unknown', None
             try:
-                async with httpx.AsyncClient(timeout=httpx.Timeout(300, connect=30), follow_redirects=False) as client:
-                    async with client.stream(args.method, provider['base'] + args.path, headers=headers,
-                                             json=args.body if args.method == 'POST' else None) as response:
-                        raw = bytearray()
-                        async for chunk in response.aiter_bytes():
-                            raw.extend(chunk)
-                            if len(raw) > 8 * 1024 * 1024:
-                                raise HTTPException(502, 'Provider response exceeded the size limit.')
-                        status = response.status_code
-            except httpx.HTTPError:
-                raise HTTPException(502, 'Provider request could not be confirmed. Do not retry a billed request automatically.') from None
-            if not 200 <= status < 300:
-                recovery = {}
-                if status in (401, 403):
-                    recovery = self.report_failure(run, ReportFailure(request_id=args.request_id, revision=request['revision'], failure='invalid' if status == 401 else 'permission'))
-                return status if 400 <= status < 600 else 502, {'error': {'message': f'{provider["name"]} rejected the request ({status}). ' + ('Follow the returned access recovery instructions.' if status == 401 else 'Check permissions, quota, model and request.'), 'type': 'invalid_credentials' if status == 401 else 'permission' if status == 403 else 'provider_error'}, **recovery}
-            try:
-                decoded = json.loads(bytes(raw))
-                result = json.loads(json.dumps(decoded).replace(value, '[credential redacted]'))
-            except (ValueError, UnicodeDecodeError):
-                raise HTTPException(502, 'Provider returned an invalid JSON response.') from None
-            return status, result
+                try:
+                    async with httpx.AsyncClient(timeout=httpx.Timeout(300, connect=30), follow_redirects=False) as client:
+                        async with client.stream(args.method, provider['base'] + args.path, headers=headers,
+                                                 json=args.body if args.method == 'POST' else None) as response:
+                            status = response.status_code  # Answered, even if the body read fails.
+                            raw = bytearray()
+                            async for chunk in response.aiter_bytes():
+                                raw.extend(chunk)
+                                if len(raw) > 8 * 1024 * 1024:
+                                    raise HTTPException(502, 'Provider response exceeded the size limit.')
+                except httpx.HTTPError:
+                    raise HTTPException(502, 'Provider request could not be confirmed. Do not retry a billed request automatically.') from None
+                if not 200 <= status < 300:
+                    outcome = 'failed'
+                    recovery = {}
+                    if status in (401, 403):
+                        recovery = self.report_failure(run, ReportFailure(request_id=args.request_id, revision=request['revision'], failure='invalid' if status == 401 else 'permission'))
+                    return status if 400 <= status < 600 else 502, {'error': {'message': f'{provider["name"]} rejected the request ({status}). ' + ('Follow the returned access recovery instructions.' if status == 401 else 'Check permissions, quota, model and request.'), 'type': 'invalid_credentials' if status == 401 else 'permission' if status == 403 else 'provider_error'}, **recovery}
+                try:
+                    decoded = json.loads(bytes(raw))
+                    result = json.loads(json.dumps(decoded).replace(value, '[credential redacted]'))
+                except (ValueError, UnicodeDecodeError):
+                    raise HTTPException(502, 'Provider returned an invalid JSON response.') from None
+                outcome = 'completed'
+                return status, result
+            except asyncio.CancelledError:
+                outcome = 'interrupted'
+                raise
+            finally:
+                self.observe(run, request, secret, args, started, outcome, status, result)
+
+    def observe(self, run, request, secret, args, started, outcome, status, result):
+        """Log and trace provider-key usage without prompts, completions or keys."""
+        try:
+            tracing = getattr(self.store, 'tracing', None)
+            provider, model = secret['provider'], args.body.get('model')
+            model = re.sub(r'[\x00-\x1f\x7f]', '', model)[:200] if isinstance(model, str) else ''
+            # Agent-supplied: apply the trace redaction before logging it too.
+            model = str(tracing.content(model) if tracing is not None else trace_content(model))[:200]
+            observed = {}
+            if outcome == 'completed' and isinstance(result, dict):
+                if provider == 'anthropic':
+                    from .harness_gateway import NativeUsageCapture
+                    capture = NativeUsageCapture(False, route='/v1/messages')
+                else:
+                    capture = UsageCapture(False)
+                capture.consume(result)
+                observed = capture.response
+            usage = observed.get('usage') or {}
+            counts = {key: usage[key] for key in USAGE_FIELDS if type(usage.get(key)) is int and usage[key] >= 0}
+            if 'total_tokens' not in counts and {'prompt_tokens', 'completion_tokens'} <= counts.keys():
+                counts['total_tokens'] = counts['prompt_tokens'] + counts['completion_tokens']
+            call_id = uuid4().hex
+            log.info(json.dumps({
+                'event': 'provider_key_request_finished', 'version': 1, 'run_id': run['id'],
+                'turn_id': run['active_message_id'], 'call_id': call_id, 'credential_request_id': request['id'],
+                'provider': provider, 'credential_scope': secret['scope'], 'method': args.method, 'path': args.path,
+                'model': model, 'status': outcome, 'http_status': status,
+                'duration_ms': round((time.time_ns() - started) / 1_000_000), **counts}))
+            if tracing is not None and args.method == 'POST':  # Model listing sends no prompt; logged only.
+                tracing.provider_key(run, call_id, started, provider=provider, scope=secret['scope'],
+                                     operation=PROVIDER_OPERATIONS[args.path], model=model,
+                                     response={**observed, 'usage': {**usage, **counts}},
+                                     status=outcome, http_status=status)
+        except Exception as exc:
+            log.warning('Provider-key usage capture failed (%s)', type(exc).__name__)
 
     def update_secret(self, secret_id, body, user_id, admin):
         with self.store.connect() as conn:
@@ -962,6 +1072,8 @@ class Credentials:
                 raise HTTPException(404, 'Credentials not found.')
             if row['revision'] != body.revision:
                 raise HTTPException(409, 'These credentials changed. Refresh before saving.')
+            if body.value is not None and self.proxy_disabled(row['provider']):
+                raise HTTPException(403, PROVIDER_KEYS_DISABLED)  # Revoking stays available.
             values = dict(row)
             for key in body.model_fields_set - {'revision', 'value'}:
                 values[key] = getattr(body, key)
@@ -1006,7 +1118,8 @@ class Credentials:
             if run and run['deleted_at']:
                 raise HTTPException(404, 'Session not found.')
             root_id = self.root(run) if run else ''
-            return {'providers': [{'id': key, 'name': value['name'], 'setup_url': value['setup']} for key, value in PROVIDERS.items()],
+            return {'providers': [{'id': key, 'name': value['name'], 'setup_url': value['setup']} for key, value in PROVIDERS.items()
+                                  if not self.proxy_disabled(key)],
                     'root_id': root_id, 'secrets': self.list_secrets(user, admin, root_id)}
 
         @router.post('/api/credentials/secrets', status_code=201)

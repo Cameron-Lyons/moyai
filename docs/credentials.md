@@ -124,6 +124,34 @@ Use `credentials_http_request` or the returned SDK proxy instructions with
 `max_retries=0` and `stream=False`. Those inference keys stay out of the sandbox,
 and their provider charges remain separate from Moyai gateway spend.
 
+These calls go straight to the provider, not through `LITELLM_API_BASE`, so the
+gateway's logs, model allowlist and provider agreements do not apply to them.
+Each call writes a `provider_key_request_finished` INFO line on the
+`uvicorn.error.moyai.credentials` logger with the provider, requested model,
+status, HTTP status and token usage. When a trace destination is configured,
+inference calls also emit an LLM span with the same fields; model-list calls are
+logged only, and private sessions are never traced. Neither record contains
+prompts, completions or keys. The `credentials_http_request` tool span still
+carries the request and response unless **Settings → Preferences → Hide private
+tool content in traces** is on. The calls are not added to the Spend ledger.
+
+Set `PROVIDER_KEY_PROXY_ENABLED=false` on every role to disable this proxy. The
+agent is no longer offered `credentials_http_request`, and its credential
+guidance points it to gateway models instead of provider keys. Provider-key
+requests return `unavailable` without opening a form, and the Secrets page and
+API stop accepting Fireworks, OpenAI, Anthropic, Together AI and Groq keys.
+Handles saved earlier get a refusal without contacting the provider. Saved
+provider keys stay encrypted until revoked, and a provider-key form that was
+already open can only be declined.
+
+The switch is not egress control. Generic credentials, 1Password and
+`credentials_run` work as before, so a sandbox command can still reach a model
+provider with a key saved as a generic credential or read from 1Password,
+without the gateway, a log line or a span. To keep all model traffic on the
+gateway, also restrict sandbox egress with `SUBSTRATE_EGRESS_HOSTS`, a Lambda
+egress connector or network policy. Moyai sets no egress limit on Modal
+sandboxes.
+
 Access is checked against the active message's server-owned identity, including
 follow-ups by another teammate. Slack personal access requires a recent eligible
 profile matching verified SSO; spend attribution links grant no access. Personal
