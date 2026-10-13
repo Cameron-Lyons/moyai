@@ -84,8 +84,9 @@ def test_gateway_pins_active_model_despite_future_switch_or_sandbox_override(wor
         return httpx.Response(200, json={'choices':[{'message':{'content':'Done'}}]})
     actual = httpx.AsyncClient
     monkeypatch.setattr('app.main.httpx.AsyncClient', lambda **kwargs: actual(transport=httpx.MockTransport(upstream), **kwargs))
+    actor = app.state.store.identity({'method': 'local', 'role': 'admin'})
     for selected, future in [(ASTRA, OPUS), (OPUS, ASTRA), (GLM, ASTRA), (ASTRA, GLM), (SOL, ASTRA), (ASTRA, SOL)]:
-        run = app.state.store.create_run('Pinned turn', '', 'modal', [], chat_enabled=True, model=selected)
+        run = app.state.store.create_run('Pinned turn', '', 'modal', [], chat_enabled=True, model=selected, user_id=actor)
         app.state.store.claim_message(run['id'])
         app.state.store.update_run(run['id'], status='running', token_hash=digest('capability'))
         app.state.store.enqueue_message(run['id'], 'Future turn', 'future-turn', future)

@@ -1,30 +1,37 @@
 const settingsGroups = [
   {id:'workflows', title:'Workflows', items:[
-    ...(typeof renderAutomations === 'function' ? [{view:'automations', title:'Automations', description:'Schedule recurring work and review past runs.'}] : []),
-    {view:'skills', title:'Skills', description:'Save instructions for yourself or your team.'},
-    {view:'memory', title:'Memory', description:'Review what Moyai remembers for your future sessions.'},
+    ...(typeof renderAutomations === 'function' ? [{view:'automations', title:'Automations', description:'Schedule recurring work and review past runs.', permission:'automations.read'}] : []),
+    {view:'skills', title:'Skills', description:'Save instructions for yourself or your team.', permission:'skills.read'},
+    {view:'memory', title:'Memory', description:'Review what Moyai remembers for your future sessions.', permission:'memory.read'},
   ]},
   {id:'integrations', title:'Integrations', items:[
-    {view:'connections', title:'Connections', description:'Connect GitHub, Slack, Linear, and Notion.'},
-    {view:'personal-slack', title:'Personal Slack', description:'Connect your own Slack account for private web chats.'},
-    {view:'secrets', title:'Secrets', description:'Manage personal and shared service access.'},
+    {view:'connections', title:'Connections', description:'Connect GitHub, Slack, Linear, and Notion.', permission:'connections.read'},
+    {view:'personal-slack', title:'Personal Slack', description:'Connect your own Slack account for private web chats.', permission:'credentials.read'},
+    {view:'secrets', title:'Secrets', description:'Manage personal and shared service access.', permission:'credentials.read'},
   ]},
   {id:'workspace', title:'Workspace', items:[
-    {view:'spend', title:'Spend', description:'See your own LLM usage and costs.', memberOnly:true},
-    {view:'runtime', title:'Runtime', description:'Check cloud setup and session limits.'},
-    {view:'environments', title:'Environments', description:'Prepare repositories and workspace tools.', admin:true},
+    {view:'spend', title:'Spend', description:'See your own LLM usage and costs.', memberOnly:true, permission:'spend.personal'},
+    {view:'runtime', title:'Runtime', description:'Check cloud setup and session limits.', permission:'workspace.read'},
+    {view:'environments', title:'Environments', description:'Prepare repositories and workspace tools.', admin:true, permission:'environments.manage'},
   ]},
   {id:'administration', title:'Administration', admin:true, items:[
-    {view:'users', title:'Users', description:'Manage workspace members and roles.', admin:true},
-    {view:'performance', title:'Performance', description:'Measure startup and Send now latency.', admin:true},
-    {view:'spend', title:'Spend & usage', description:'Review team costs, model usage, and human activity.', admin:true},
+    {view:'users', title:'Users', description:'Manage workspace members and roles.', admin:true, permission:'users.read'},
+    {view:'governance', title:'Governance', description:'Configure roles, provisioning, and session security policies.', admin:true, permissions:['roles.manage','scim.manage','security.manage','audit.read']},
+    {view:'performance', title:'Performance', description:'Measure startup and Send now latency.', admin:true, permission:'runtime.manage'},
+    {view:'spend', title:'Spend & usage', description:'Review team costs, model usage, and human activity.', admin:true, permission:'spend.read'},
   ]},
 ];
 // Keep old Usage analytics bookmarks routable without adding a second navigation entry.
 const settingsViews = new Set(['settings', 'adoption', ...settingsGroups.flatMap(group => group.items.map(item => item.view))]);
 
 function settingsItemVisible(item, role) {
-  return (!item.admin || role === 'admin') && (!item.memberOnly || role !== 'admin');
+  const allowed=permission=>role==='admin'||Array.isArray(state.permissions)&&state.permissions.includes(permission);
+  const delegated=item.permission?allowed(item.permission):item.permissions?.some(allowed);
+  return (!(Array.isArray(state.permissions)&&item.permission)||allowed(item.permission)) && (!item.admin || role === 'admin' || delegated) && (!item.memberOnly || role !== 'admin' && !(item.view==='spend'&&allowed('spend.read')));
+}
+
+function settingsGroupVisible(group, role) {
+  return (!group.admin || role === 'admin' || group.items.some(item=>settingsItemVisible(item,role))) && group.items.some(item=>settingsItemVisible(item,role));
 }
 
 // The same destinations drive the overview and the persistent settings rail.
@@ -32,7 +39,7 @@ function settingsNavigation(view, role) {
   const link = (target, title, icon) => `<a href="#${target}"${view === target ? ' aria-current="page"' : ''}>${icon ? settingsIcon(target) : '<span class="settings-overview-icon" aria-hidden="true">⊞</span>'}<span>${title}</span></a>`;
   return `<a class="settings-back" href="#tasks"><span aria-hidden="true">←</span> Back to workspace</a>
     <div class="settings-nav-title">Settings</div>${link('settings', 'Overview')}
-    ${settingsGroups.filter(group => !group.admin || role === 'admin').map(group => `<div class="settings-nav-group"><h2>${group.title}</h2>${group.items.filter(item => settingsItemVisible(item, role)).map(item => link(item.view, item.title, true)).join('')}</div>`).join('')}`;
+    ${settingsGroups.filter(group => settingsGroupVisible(group,role)).map(group => `<div class="settings-nav-group"><h2>${group.title}</h2>${group.items.filter(item => settingsItemVisible(item, role)).map(item => link(item.view, item.title, true)).join('')}</div>`).join('')}`;
 }
 
 function updateSettingsNavigation() {
@@ -101,6 +108,7 @@ function bindSettingsFilter({input, select, rows, count, empty}) {
 
 function settingsIcon(view) {
   const paths = {
+    governance:'<path d="m12 3 8 3v6c0 5-8 9-8 9s-8-4-8-9V6l8-3Z"/><path d="m8 12 3 3 5-6"/>',
     automations:'<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>',
     skills:'<path d="m12 3 2.5 6.5L21 12l-6.5 2.5L12 21l-2.5-6.5L3 12l6.5-2.5Z"/>',
     memory:'<path d="M8 3h10v18H8a3 3 0 0 1-3-3V6a3 3 0 0 1 3-3Zm0 0v18M11 8h4m-4 4h4m-4 4h2"/>',
@@ -127,7 +135,7 @@ async function renderSettings(recent=false) {
   const admin = state.role === 'admin';
   MoyaiUI.render($('#content'), `<section class="settings-page">
     <div class="page-heading"><div><h1>Settings</h1><p class="subtext">Make Moyai work the way your team does.</p></div></div>
-    <div class="settings-grid">${settingsGroups.filter(group => !group.admin || admin).map(group => `
+    <div class="settings-grid">${settingsGroups.filter(group => settingsGroupVisible(group,state.role)).map(group => `
       <section class="settings-group" aria-labelledby="settings-${group.id}">
         <h2 id="settings-${group.id}">${group.title}${group.admin ? '<span>Admin</span>' : ''}</h2>
         <div class="settings-links">${group.items.filter(item => settingsItemVisible(item, state.role)).map(item => `

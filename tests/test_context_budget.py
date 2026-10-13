@@ -8,6 +8,7 @@ from fastapi import HTTPException
 from app.config import Settings
 from app.context_budget import ContextBudget, ContextPressure, ModelContextLimits, counting_input
 from app.security import digest
+from test_spend import registered_actor
 from test_workspace import workspace
 
 
@@ -239,7 +240,8 @@ def test_tool_image_reaches_inference_with_original_tool_identity(workspace, mon
         return httpx.Response(200, json={'status': 'completed', 'output': [], 'usage': {'input_tokens': 100, 'output_tokens': 1}})
     actual = httpx.AsyncClient
     monkeypatch.setattr('app.context_budget.httpx.AsyncClient', lambda **kw: actual(transport=httpx.MockTransport(upstream), **kw))
-    run = app.state.store.create_run('inspect image', '', 'modal', [])
+    run = app.state.store.create_run('inspect image', '', 'modal', [],
+                                     user_id=registered_actor(app, 'shared:local:admin'))
     app.state.store.update_run(run['id'], status='running', token_hash=digest('cap'))
     response = client.post(f"/broker/{run['id']}/v1/responses", headers={'Authorization': 'Bearer cap'},
                            json={'input': [output]})
@@ -277,7 +279,8 @@ def test_all_routes_check_injected_input_before_admission(workspace, monkeypatch
     monkeypatch.setattr('app.memory.Memory.context', lambda *a: 'injected-private-memory')
     monkeypatch.setattr('app.skills.Skills.context', lambda *a: 'injected-private-skills')
     monkeypatch.setattr('app.context_budget.httpx.AsyncClient', lambda **kw: pytest.fail('Inference admitted'))
-    run = app.state.store.create_run('context check', '', 'modal', [], model='openai/gpt-6-astra')
+    run = app.state.store.create_run('context check', '', 'modal', [], model='openai/gpt-6-astra',
+                                     user_id=registered_actor(app, 'shared:local:admin'))
     app.state.store.update_run(run['id'], status='running', token_hash=digest('cap'))
     response = client.post(f"/broker/{run['id']}/v1/{route}", headers={'Authorization': 'Bearer cap'},
                            json={field: [{'role': 'user', 'content': 'small request'}],
@@ -305,7 +308,8 @@ def test_compaction_splits_to_fit_and_advances_only_returned_prefix(workspace, m
     actual = httpx.AsyncClient
     monkeypatch.setattr('app.harness_gateway.httpx.AsyncClient', lambda **kw: actual(transport=httpx.MockTransport(upstream), **kw))
     app.state.settings.litellm_api_base = 'https://gateway.example/v1'
-    run = app.state.store.create_run('compact', '', 'modal', [])
+    run = app.state.store.create_run('compact', '', 'modal', [],
+                                     user_id=registered_actor(app, 'shared:local:admin'))
     app.state.store.update_run(run['id'], status='running', token_hash=digest('cap'))
     store = ContextStore(tmp_path / 'context.db', run['id'])
     store.initialize([{'role': 'assistant', 'content': 'receipt-' + str(i) + 'x' * 1500} for i in range(40)])
@@ -324,7 +328,8 @@ def test_compaction_splits_to_fit_and_advances_only_returned_prefix(workspace, m
 
 def test_revocation_during_count_cannot_admit_model(workspace, monkeypatch):
     app, client = workspace
-    run = app.state.store.create_run('count', '', 'modal', [])
+    run = app.state.store.create_run('count', '', 'modal', [],
+                                     user_id=registered_actor(app, 'shared:local:admin'))
     app.state.store.update_run(run['id'], status='running', token_hash=digest('cap'))
     async def count(payload, **kwargs):
         app.state.store.update_run(run['id'], status='cancelled', token_hash='')
@@ -346,7 +351,8 @@ def test_only_confirmed_provider_context_rejection_can_request_recovery(workspac
         return httpx.Response(400, json={'error': {'code': code, 'message': 'PRIVATE provider detail'}})
     actual = httpx.AsyncClient
     monkeypatch.setattr('app.context_budget.httpx.AsyncClient', lambda **kw: actual(transport=httpx.MockTransport(upstream), **kw))
-    run = app.state.store.create_run('count', '', 'modal', [])
+    run = app.state.store.create_run('count', '', 'modal', [],
+                                     user_id=registered_actor(app, 'shared:local:admin'))
     app.state.store.update_run(run['id'], status='running', token_hash=digest('cap'))
     response = client.post(f"/broker/{run['id']}/v1/{route}", headers={'Authorization': 'Bearer cap'},
                            json={field: [{'role': 'user', 'content': 'small request'}]})
@@ -378,7 +384,8 @@ def test_compaction_provider_rejection_reduces_only_unprocessed_prefix(workspace
         return httpx.Response(200, json={'choices': [{'finish_reason': 'stop', 'message': {'content': 'Saved receipt.'}}]})
     actual = httpx.AsyncClient
     monkeypatch.setattr('app.harness_gateway.httpx.AsyncClient', lambda **kw: actual(transport=httpx.MockTransport(upstream), **kw))
-    run = app.state.store.create_run('compact', '', 'modal', [])
+    run = app.state.store.create_run('compact', '', 'modal', [],
+                                     user_id=registered_actor(app, 'shared:local:admin'))
     app.state.store.update_run(run['id'], status='running', token_hash=digest('cap'))
     entries = [{'seq': i, 'excerpt': f'receipt {i}'} for i in range(1, 9)]
     response = client.post(f"/broker/{run['id']}/context/compact", headers={'Authorization': 'Bearer cap'},
@@ -392,7 +399,8 @@ def test_legacy_compactor_cannot_skip_records_during_rolling_deployment(workspac
     app, client = workspace
     async def small_limits(model): return limits(5000, 1000)
     monkeypatch.setattr(app.state.context_budget, 'limits', small_limits)
-    run = app.state.store.create_run('compact', '', 'modal', [])
+    run = app.state.store.create_run('compact', '', 'modal', [],
+                                     user_id=registered_actor(app, 'shared:local:admin'))
     app.state.store.update_run(run['id'], status='running', token_hash=digest('cap'))
     response = client.post(f"/broker/{run['id']}/context/compact", headers={'Authorization': 'Bearer cap'},
         json={'summary': '', 'entries': [{'seq': i, 'excerpt': 'large receipt ' * 80} for i in range(1, 9)]})
@@ -483,7 +491,8 @@ def test_native_window_is_authenticated_and_reserves_injected_context(workspace,
     monkeypatch.setattr(app.state.context_budget, 'limits', small_limits)
     monkeypatch.setattr(app.state.memory, 'context', lambda run: 'private-marker' * 100)
     monkeypatch.setattr(app.state.skills, 'context', lambda run: '')
-    run = app.state.store.create_run('native window', '', 'modal', [], model='openai/gpt-6-astra')
+    run = app.state.store.create_run('native window', '', 'modal', [], model='openai/gpt-6-astra',
+                                     user_id=registered_actor(app, 'shared:local:admin'))
     app.state.store.update_run(run['id'], status='running', token_hash=digest('cap'))
     path = f"/broker/{run['id']}/context/window"
     assert client.get(path).status_code == 401

@@ -115,6 +115,9 @@ class SlackSessions:
         allowed_users = {x.strip() for x in self.settings.slack_session_users.split(",")}
         if payload.get("team_id") != bot.get("team_id"):
             return {"ok": True}
+        if (event.get('user') and not (event.get('bot_id') or event.get('bot_profile'))
+                and not await self.provisioning_sender_allowed(bot['team_id'], event['user'])):
+            return {'ok': True}
         event_id = payload.get('event_id', '')
         if not isinstance(event_id, str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,100}', event_id):
             raise HTTPException(400, 'Invalid Slack event identifier.')
@@ -181,8 +184,39 @@ class SlackSessions:
             direct_message=direct_message, missing_cloud=missing_cloud, file_ids=file_ids, reference=reference)
         return {'ok': True}
 
+    async def provisioning_sender_allowed(self, team, user):
+        """Resolve a human sender before admitting work in a provisioned workspace.
+
+        Unknown Slack identities must not bypass an inactive SCIM account merely
+        because profile linking normally runs after their first message.
+        """
+        from .scim import active_for_actor_in
+        with self.store.connect() as conn:
+            if 'scim_users' not in conn.table_names() or not conn.execute('SELECT 1 FROM scim_users LIMIT 1').fetchone():
+                return True
+            if not isinstance(user, str) or not re.fullmatch(r'[UW][A-Z0-9]{7,30}', user):
+                return False
+            actor = f'slack:{team}:{user}'
+            row = conn.execute('SELECT * FROM users WHERE id=?', (actor,)).fetchone()
+            if row and (row['email'] or row['linked_user_id']):
+                return active_for_actor_in(conn, actor)
+        # Provisioning requires a verified provider profile for an otherwise
+        # unknown Slack sender. Missing scopes or provider failures fail closed.
+        if not self.identities or not self.identities.status()['ready']:
+            return False
+        with self.store.connect() as conn:
+            conn.begin_write()
+            self.store.slack_identity_in(conn, team, user)
+            row = conn.execute('SELECT * FROM users WHERE id=?', (actor,)).fetchone()
+        await self.identities.resolve(row, team)
+        with self.store.connect() as conn:
+            row = conn.execute('SELECT * FROM users WHERE id=?', (actor,)).fetchone()
+            return bool(row and row['profile_eligible'] and row['email'] and active_for_actor_in(conn, actor))
+
     async def accept_message(self, *, team, event_id, channel, ts, root, user, prompt,
                              mentioned, direct_message, missing_cloud, file_ids=(), reference=''):
+        if not await self.provisioning_sender_allowed(team, user):
+            return
         if self.settings.slack_thread_chat_enabled:
             try:
                 run = self.chat.accept(team=team, event_id=event_id, channel=channel, ts=ts,

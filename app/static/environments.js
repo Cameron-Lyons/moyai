@@ -21,7 +21,7 @@ async function renderEnvironments(background = false,recent=false) {
   }
   const explanationOpen = document.querySelector('.environments-page .settings-hint')?.open;
   const version=state.pageVersion;
-  if(state.role!=='admin') {MoyaiUI.render($('#content'), '<div class="page-heading"><h1>Project environments</h1><p>Ask an administrator to configure your project environments.</p></div>');return;}
+  if(!(globalThis.MoyaiPermissions?.has('environments.manage')??state.role==='admin')) {MoyaiUI.render($('#content'), '<div class="page-heading"><h1>Project environments</h1><p>Ask an administrator to configure your project environments.</p></div>');return;}
   const data=await api('/api/admin/environments',{recent});
   if(version!==state.pageVersion||state.view!=='environments')return;
   if (background && settingsInteractionActive()) {

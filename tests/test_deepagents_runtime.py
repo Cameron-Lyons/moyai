@@ -328,13 +328,13 @@ async def test_background_compaction_keeps_working_preserves_tail_and_replays(du
     monkeypatch.setattr('app.harness_gateway.httpx', SimpleNamespace(**{**vars(httpx), 'AsyncClient': ProviderClient}))
 
     run = store.create_run('Original task: preserve receipts.', '', 'modal', [], chat_enabled=True,
-        harness=manager.settings.default_harness(), model='test-model', user_id='owner')
+        harness=manager.settings.default_harness(), model='test-model', user_id='google:owner')
     assert run['harness'] == 'deepagents-temporal'
     manager.submit(run)
     message = store.claim_message(run['id'])
     manager.save(run['id'], {'message_id': message['id'], 'segment': 0, 'turn_started': time.time()})
     store.update_run(run['id'], status='running', token_hash=digest(manager.token(run['id'], message['id'])))
-    scope = TurnScope(run['id'], message['id'], actor_id='owner')
+    scope = TurnScope(run['id'], message['id'], actor_id='google:owner')
     @activity.defn(name='deepagents_prepare_v1')
     async def prepare(scope: TurnScope) -> TurnInput:
         history = [HumanMessage(content='Original task: preserve receipts.')]
@@ -395,10 +395,14 @@ def durable_app(tmp_path):
     from app.main import create_app
     settings = Settings(_env_file=None, data_dir=tmp_path, temporal_enabled=True,
         session_secret='test-session-secret', encryption_key=Fernet.generate_key().decode(),
+        google_allowed_domains='berri.ai,example.com',
         agent_model='test-model', session_titles_enabled=False, memory_review_enabled=False,
         model_context_limits={'test-model': {'context_window': 100000, 'max_input_tokens': 90000,
                                              'max_output_tokens': 10000}})
     app = create_app(settings)
+    for subject in ('owner', 'collaborator'):
+        app.state.store.identity({'method': 'google', 'identity': {
+            'sub': subject, 'email': subject + '@berri.ai', 'name': subject.title()}})
     app.state.manager.deepagents_runtime.broker_transport = httpx.ASGITransport(app=app)
     yield app
     app.state.store.close()
@@ -610,7 +614,7 @@ async def test_default_engine_uses_real_broker_skills_and_settles_answer_without
             'arguments_json': json.dumps({'name': skill['name'], 'revision': skill['revision']})}, 'id': 'skill-1'}])
     manager.deepagents_runtime.model_request = model
     run = store.create_run('Load the relevant skill.', '', 'modal', [], chat_enabled=True,
-        harness=manager.settings.default_harness(), model='test-model', user_id='owner')
+        harness=manager.settings.default_harness(), model='test-model', user_id='google:owner')
     manager.submit(run)
     async with await WorkflowEnvironment.start_local(dev_server_log_level='error') as env:
         manager.temporal = configured_client(env.client, DataConverter(
@@ -636,7 +640,7 @@ async def test_discovered_tools_acquire_one_computer_and_preserve_file_receipts(
     manager, store = durable_app.state.manager, durable_app.state.store
     manager.settings.sandbox_idle_seconds = 0
     run = store.create_run('Discover tools, write the requested file, and verify it.', '', 'modal', [],
-        chat_enabled=True, harness='deepagents-temporal', model='test-model', user_id='owner', sandbox_provider=provider_name)
+        chat_enabled=True, harness='deepagents-temporal', model='test-model', user_id='google:owner', sandbox_provider=provider_name)
     cloud = Cloud(monkeypatch, store, run['id'])
     cloud.attach(manager)
     selected = []
@@ -729,7 +733,7 @@ async def test_discovered_tools_acquire_one_computer_and_preserve_file_receipts(
     assert receipts == [{'name': name, 'status': 'completed'} for name in executions]
 
 
-@pytest.mark.parametrize('actor,model_name', [('owner', 'test-model'), ('collaborator', 'anthropic/claude-opus-5-5')])
+@pytest.mark.parametrize('actor,model_name', [('google:owner', 'test-model'), ('google:collaborator', 'anthropic/claude-opus-5-5')])
 async def test_queued_followup_keeps_history_and_rotates_capability(durable_app, actor, model_name):
     manager, store = durable_app.state.manager, durable_app.state.store
     manager.settings.model_context_limits[model_name] = manager.settings.model_context_limits['test-model']
@@ -748,7 +752,7 @@ async def test_queued_followup_keeps_history_and_rotates_capability(durable_app,
 
     manager.deepagents_runtime.model_request = model
     run = store.create_run('Answer the first request.', '', 'modal', [], chat_enabled=True,
-        harness='deepagents-temporal', model='test-model', user_id='owner')
+        harness='deepagents-temporal', model='test-model', user_id='google:owner')
     manager.submit(run)
     async with await WorkflowEnvironment.start_local(dev_server_log_level='error') as env:
         manager.temporal = configured_client(env.client, DataConverter(payload_codec=PrivatePayloadCodec(manager.payloads)))
@@ -791,7 +795,7 @@ async def test_credential_wait_resumes_saved_turn_and_acknowledges_resolution(du
             'arguments_json': json.dumps({'provider': 'openai', 'reason': 'Run evaluation', 'request_key': 'test'})}, 'id': 'request-access'}])
     manager.deepagents_runtime.model_request = model
     run = store.create_run('Run the evaluation.', '', 'modal', [], chat_enabled=True,
-        harness='deepagents-temporal', model='test-model', user_id='owner')
+        harness='deepagents-temporal', model='test-model', user_id='google:owner')
     manager.submit(run)
     async with await WorkflowEnvironment.start_local(dev_server_log_level='error') as env:
         manager.temporal = configured_client(env.client, DataConverter(payload_codec=PrivatePayloadCodec(manager.payloads)))
@@ -799,7 +803,7 @@ async def test_credential_wait_resumes_saved_turn_and_acknowledges_resolution(du
             state = await drive_session(manager, run['id'], lambda s: s.get('phase') == 'waiting_credential')
             request_id, message_id = state['wait_credential'], state['message_id']
             assert state.get('deepagents_checkpoint') and not state.get('computer')
-            manager.credentials.resolve(request_id, Resolve(decision='decline'), 'owner', False)
+            manager.credentials.resolve(request_id, Resolve(decision='decline'), 'google:owner', False)
             await drive_session(manager, run['id'])
         assert store.run(run['id'])['summary'] == 'Access declined; no external work attempted.'
         assert manager.credentials.row(request_id)['resolution_pending'] == 0
@@ -826,7 +830,7 @@ async def test_child_wait_resumes_parent_once_with_saved_results(durable_app):
 
     manager.deepagents_runtime.model_request = model
     run = store.create_run('Delegate verification and integrate the result.', '', 'modal', [], chat_enabled=True,
-        harness='deepagents-temporal', model='test-model', user_id='owner')
+        harness='deepagents-temporal', model='test-model', user_id='google:owner')
     manager.submit(run)
     async with await WorkflowEnvironment.start_local(dev_server_log_level='error') as env:
         manager.temporal = configured_client(env.client, DataConverter(payload_codec=PrivatePayloadCodec(manager.payloads)))
@@ -852,17 +856,17 @@ async def test_private_checkpoint_is_rebuilt_from_public_journal(durable_app):
     # Start without private skill-index context, then explicitly taint the turn.
     store.execute("UPDATE skills SET archived=1 WHERE owner_id=?", ('system:bundled-coding-skills',))
     run = store.create_run('Continue the public task.', '', 'modal', [], chat_enabled=True,
-        harness='deepagents-temporal', model='test-model', user_id='owner')
+        harness='deepagents-temporal', model='test-model', user_id='google:owner')
     manager.submit(run)
     manager.begin_turn(run['id'], store.run(run['id']))
     state = manager.state(run['id'])
     state['segment'] = 1
-    checkpoint = {'scope': [run['id'], state['message_id'], 'owner', 'test-model'], 'applied': [],
+    checkpoint = {'scope': [run['id'], state['message_id'], 'google:owner', 'test-model'], 'applied': [],
         'messages': messages_to_dict([HumanMessage(content='private-secret-context')])}
     state['deepagents_checkpoint'] = manager.payloads.put(json.dumps(checkpoint).encode())
     manager.save(run['id'], state)
     store.update_run(run['id'], status='running', token_hash=digest(manager.token(run['id'], state['message_id'])))
-    scope = TurnScope(run['id'], state['message_id'], segment=1, actor_id='owner')
+    scope = TurnScope(run['id'], state['message_id'], segment=1, actor_id='google:owner')
     prepared = await manager.deepagents_runtime.prepare(scope)
     assert 'private-secret-context' in str(prepared.messages)
     mark_private_context(store, store.run(run['id']))
@@ -883,7 +887,7 @@ async def test_prepare_preserves_original_input_when_slack_reference_changes(dur
         store.objects = MemoryObjects()
     store.execute("UPDATE skills SET archived=1 WHERE owner_id=?", ('system:bundled-coding-skills',))
     run = store.create_run('Keep the original request.', '', 'modal', [], chat_enabled=True,
-        harness='deepagents-temporal', model='test-model', user_id='owner')
+        harness='deepagents-temporal', model='test-model', user_id='google:owner')
     store.execute("""INSERT INTO slack_events(event_id,run_id,channel,thread_ts,user_id,created_at,context_json)
         VALUES(?,?,?,?,?,?,?)""", ('input-reference', run['id'], 'C12345678', '1.0', 'U12345678', '2026-10-13',
         json.dumps({'messages': [{'text': 'Initial source'}], 'coverage': {'status': 'events_only'}})))
@@ -891,14 +895,14 @@ async def test_prepare_preserves_original_input_when_slack_reference_changes(dur
     manager.begin_turn(run['id'], store.run(run['id']))
     state = manager.state(run['id'])
     store.update_run(run['id'], status='running', token_hash=digest(manager.token(run['id'], state['message_id'])))
-    scope = TurnScope(run['id'], state['message_id'], actor_id='owner')
+    scope = TurnScope(run['id'], state['message_id'], actor_id='google:owner')
     await manager.deepagents_runtime.prepare(scope)
     original = store.rows('SELECT * FROM session_items WHERE run_id=? AND item_id=?',
                           (run['id'], f'user:{scope.message_id}'))
 
     if resume != 'retry':
         state.update(segment=1, deepagents_checkpoint=manager.payloads.put(json.dumps({
-            'scope': [run['id'], scope.message_id, 'owner', 'test-model'], 'applied': [],
+            'scope': [run['id'], scope.message_id, 'google:owner', 'test-model'], 'applied': [],
             'messages': messages_to_dict([HumanMessage(content='checkpoint-private-sentinel')])}).encode()))
         manager.save(run['id'], state)
         scope = replace(scope, segment=1)
@@ -932,12 +936,12 @@ async def test_default_activity_scope_rejects_stop_and_changed_ownership(durable
     from app.security import digest
     app = durable_app
     manager, store = app.state.manager, app.state.store
-    run = store.create_run('Task', '', 'modal', [], chat_enabled=True, harness='deepagents-temporal', user_id='owner')
+    run = store.create_run('Task', '', 'modal', [], chat_enabled=True, harness='deepagents-temporal', user_id='google:owner')
     manager.submit(run)
     manager.begin_turn(run['id'], store.run(run['id']))
     state = manager.state(run['id'])
     store.update_run(run['id'], status='running', token_hash=digest(manager.token(run['id'], state['message_id'])))
-    scope = TurnScope(run['id'], state['message_id'], actor_id='owner')
+    scope = TurnScope(run['id'], state['message_id'], actor_id='google:owner')
     assert manager.deepagents_runtime.current(scope)['id'] == run['id']
     store.execute('UPDATE runs SET ' + field + '=? WHERE id=?', (value, run['id']))
     with pytest.raises(ApplicationError, match='no longer active'):
@@ -957,7 +961,7 @@ async def test_stop_cancels_inflight_deepagents_workflow(durable_app):
             raise
     manager.deepagents_runtime.model_request = model
     run = store.create_run('Wait for a response.', '', 'modal', [], chat_enabled=True,
-        harness='deepagents-temporal', model='test-model', user_id='owner')
+        harness='deepagents-temporal', model='test-model', user_id='google:owner')
     manager.submit(run)
     async with await WorkflowEnvironment.start_local(dev_server_log_level='error') as env:
         manager.temporal = configured_client(env.client, DataConverter(payload_codec=PrivatePayloadCodec(manager.payloads)))
@@ -1102,7 +1106,7 @@ async def test_fifty_step_checkpoint_resumes_with_changed_slack_reference(durabl
     manager, store = durable_app.state.manager, durable_app.state.store
     segments = []
     run = store.create_run('Continue until the saved work is complete.', '', 'modal', [], chat_enabled=True,
-        harness='deepagents-temporal', model='test-model', user_id='owner')
+        harness='deepagents-temporal', model='test-model', user_id='google:owner')
     store.execute("""INSERT INTO slack_events(event_id,run_id,channel,thread_ts,user_id,created_at,context_json)
         VALUES(?,?,?,?,?,?,?)""", ('checkpoint-reference', run['id'], 'C12345678', '1.0', 'U12345678', '2026-10-13',
         json.dumps({'messages': [{'text': 'Initial source'}]})))

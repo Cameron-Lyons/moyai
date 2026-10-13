@@ -39,7 +39,7 @@ def body(scope, *, name='notion_append', identity='a' * 32):
 
 def correction(manager, store, scope, *, accept=True):
     message, _ = store.enqueue_message(scope.run_id, 'Cancel the obsolete write.', 'correction',
-                                      user_id='owner', send_immediately=True)
+                                      user_id=scope.actor_id, send_immediately=True)
     if accept:
         manager.message_queue.live_control(scope.run_id, scope.message_id, [])
         manager.message_queue.acknowledge(scope.run_id, scope.message_id, [message['id']])

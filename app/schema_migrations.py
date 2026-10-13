@@ -11,13 +11,13 @@ import json
 
 from .database import DatabaseError, identifier
 
-SCHEMA_REVISION = 19
+SCHEMA_REVISION = 20
 # Physical additive expansions can keep this contract after a reviewed online
 # manifest step. Incompatible changes advance it and require maintenance.
-SCHEMA_COMPATIBILITY_REVISION = 19
+SCHEMA_COMPATIBILITY_REVISION = 20
 # Dependency order; optional features are prepared even when disabled at runtime.
 COMPONENTS = (
-    'session_privacy', 'personal_slack', 'user_roles', 'sandbox_settings', 'github_repositories', 'github_write_access',
+    'organization_scope', 'session_privacy', 'personal_slack', 'enterprise_roles', 'user_roles', 'scim', 'governance_audit', 'sandbox_settings', 'github_repositories', 'github_write_access',
     'github', 'repository_context', 'session_pull_requests', 'durable_runner', 'prepared_sandboxes',
     'user_preferences', 'environments', 'infrastructure_costs', 'spend', 'agents',
     'tracing', 'credentials', 'skills', 'memory', 'memory_review', 'skill_learning', 'lens_feedback',
@@ -26,7 +26,7 @@ COMPONENTS = (
     'coordinator_handoff',
     'broker_ownership', 'performance',
     'session_journal', 'goals', 'slack_sources', 'published_artifacts', 'computer_operations', 'broker_payloads',
-    'session_events', 'slack_notifications',
+    'session_events', 'slack_notifications', 'security_profiles',
 )
 
 
@@ -65,6 +65,9 @@ def initialize_components(store):
 def initialize_defaults(store, settings):
     from cryptography.fernet import Fernet
     from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    from .organization_scope import OrganizationScope
+
+    OrganizationScope(store, settings)
 
     store.execute('INSERT INTO organization(id,name) VALUES(1,?) ON CONFLICT DO NOTHING', (settings.organization_name,))
     if not store.rows('SELECT 1 FROM sandbox_settings WHERE id=1'):

@@ -56,13 +56,15 @@ def background_gateway(tmp_path, monkeypatch, broker_workspace, harness, on_upst
     @contextmanager
     def running():
         app, client = broker_workspace
+        from test_spend import sign_in
+        actor = sign_in(app, client, 'background-fixture', 'background-fixture@berri.ai')
         model = 'anthropic/claude-opus-5-5' if harness == 'claude-agent-sdk' else 'openai/gpt-6-astra'
         capability = 'background-fixture-capability'
         app.state.settings.agent_model = model
         app.state.settings.litellm_api_base = 'http://background-provider.test'
         app.state.settings.max_agent_iterations = 100
         run = app.state.store.create_run('Continue each tool once.', '', 'modal', [],
-            harness=harness, model=model, chat_enabled=True, user_id='google:background-fixture')
+            harness=harness, model=model, chat_enabled=True, user_id=actor)
         app.state.store.claim_message(run['id'])
         app.state.store.update_run(run['id'], status='running', token_hash=digest(capability))
         async def limits(model):
@@ -1017,6 +1019,7 @@ def native_yield_case(tmp_path, monkeypatch, yield_ms, outcome='complete', *,
         except ContextUnavailable as exc:
             result = {'completed': False, 'interrupted': False, 'failed': True,
                       'messages': agent.journal.messages, 'final_response': str(exc)}
+        assert requests, {'result': result, 'native_errors': native_errors, 'transport_errors': diagnostics}
         assert calls == ([] if settlement else [{'name': tool_name, 'arguments': {}}])
         receipts = [m for m in result['messages'] if m['role'] == 'tool']
         assert all('slow-tool-complete' in receipt['content'] or

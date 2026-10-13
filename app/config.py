@@ -30,6 +30,8 @@ class Settings(BaseSettings):
         # unrelated global gateway key. Containers do not contain the .env file.
         return init_settings, dotenv_settings, env_settings, file_secret_settings
     data_dir: Path = Path(".data")
+    moyai_organization_id: str = Field(default='', max_length=32,
+        pattern=r'^(?:[a-z][a-z0-9]*(?:-[a-z0-9]+)*)?$')
     moyai_database_url: str = Field(default='', repr=False)
     moyai_database_initialize: bool = False
     moyai_schema_mode: Literal['auto', 'verify'] = 'auto'
@@ -259,6 +261,11 @@ class Settings(BaseSettings):
     temporal_tls: bool = True
     temporal_task_queue: str = "moyai-sessions-v1"
     temporal_checkpoint_seconds: int = Field(default=600, ge=30, le=3600)
+
+    @model_validator(mode='after')
+    def organization_namespaces(self):
+        from .organization_scope import scope_settings
+        return scope_settings(self)
     startup_recovery_seconds: int = Field(default=600, ge=30, le=3600)
     transport_recovery_seconds: int = Field(default=600, ge=30, le=3600)
     demo_step_seconds: float = Field(default=0.8, ge=0, le=10)

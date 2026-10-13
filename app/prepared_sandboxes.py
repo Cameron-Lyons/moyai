@@ -40,6 +40,9 @@ class PreparedSandboxes:
             self.settings.modal_vm_runtime, revision.hexdigest())).encode()).hexdigest()
 
     def eligible(self, run):
+        profiles = getattr(self.store, 'security_profiles', None)
+        if profiles and profiles.effective(run)['network_domains'] is not None:
+            return False
         basic = bool(self.settings.sandbox_prepared_pool_size and run
             and run['mode'] == 'modal' and run.get('sandbox_provider', 'modal') == 'modal'
             and not run.get('snapshot_id') and not run.get('repo_url')

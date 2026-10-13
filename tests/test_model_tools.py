@@ -37,6 +37,10 @@ def gateway(app, monkeypatch):
 @pytest.mark.parametrize('user', ['google:alice', 'slack:T12345678:U12345678'])
 def test_tools_switch_next_inference_preserving_history_files_and_admission_receipts(workspace, monkeypatch, user):
     app, client = workspace
+    if user.startswith('slack:'):
+        _, team, slack_user = user.split(':')
+        with app.state.store.connect() as conn:
+            app.state.store.slack_identity_in(conn, team, slack_user)
     run = active(app, user)
     captured = gateway(app, monkeypatch)
     headers = {'Authorization': 'Bearer capability'}
@@ -130,6 +134,8 @@ def test_tools_hidden_and_denied_outside_direct_active_chat(workspace, changes):
     app, client = workspace
     run = active(app)
     field, value = next(iter(changes.items()))
+    if field == 'parent_run_id':
+        value = app.state.store.create_run('Parent session', '', 'modal', [], user_id=run['owner_id'])['id']
     app.state.store.execute(f'UPDATE runs SET {field}=? WHERE id=?', (value, run['id']))
     assert not app.state.model_tools.tools(run)
     assert call(client, run).status_code in {401, 403}

@@ -16,6 +16,7 @@ from urllib.parse import quote
 
 import httpx
 import jwt
+from fastapi import HTTPException
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator, model_serializer
 
 from agent.github_paths import publishable_path
@@ -364,6 +365,10 @@ class GitHub(GitHubCoding, GitHubCI, GitHubWriteAccess, GitHubRepositories):
                 'url': repo['html_url'], 'private': repo['private']}
 
     async def call(self, run, name, arguments):
+        profiles = getattr(self.store, 'security_profiles', None)
+        if profiles:
+            tool = TOOLS.get(name)
+            profiles.require_tool(run, name, 'github', tool[1] if tool else False)
         if name in CODING_TOOLS:
             return await self.coding_call(run, name, arguments)
         if name in CONTEXT_TOOLS:
@@ -572,8 +577,16 @@ class GitHub(GitHubCoding, GitHubCI, GitHubWriteAccess, GitHubRepositories):
                 or current['active_message_id'] != run['active_message_id'] or not current['token_hash']
                 or current['token_hash'] != run['token_hash'] or 'github' not in current['plugins']
                 or connection_version != self.connection_version()
-                or not self.connectors.allowed(tool)):
+                or not self.connectors.allowed(tool, current)):
             raise ConnectorError('The session or GitHub connection changed. Publication has stopped; inspect the destination before retrying.')
+        roles = getattr(self.store, 'user_roles', None)
+        if roles:
+            try:
+                roles.require_actor(current['active_user_id'] or current['owner_id'], 'connections.write')
+            except HTTPException as error:
+                # This publication may already have created Git objects or a
+                # branch. Keep its existing uncertain-write receipt semantics.
+                raise ConnectorError(error.detail, code='access_denied') from None
 
         scope = run.get('_pr_write_scope')
         if scope:

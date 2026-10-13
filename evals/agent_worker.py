@@ -20,6 +20,15 @@ from sandbox.broker_relay import BrokerRelay
 from .agent import AgentRunError, source_revision
 
 
+class EvalSettings(Settings):
+    @classmethod
+    def settings_customise_sources(cls, settings_cls, init_settings, env_settings,
+                                   dotenv_settings, file_secret_settings):
+        # This disposable loopback broker receives all configuration through
+        # the private payload, including its local-only authentication context.
+        return (init_settings,)
+
+
 class SpanReceipts:
     def __init__(self):
         self.spans = {}
@@ -39,7 +48,7 @@ def execute(payload):
     listener = socket.socket()
     listener.bind(('127.0.0.1', 0))
     broker_url = f'http://127.0.0.1:{listener.getsockname()[1]}'
-    settings = Settings(
+    settings = EvalSettings(
         _env_file=None, data_dir=state / 'broker', public_url=broker_url,
         litellm_api_base=payload['model_base_url'], litellm_api_key=payload['model_api_key'],
         agent_model=payload['model'], agent_harness=payload['harness'], temporal_enabled=False,
@@ -67,8 +76,9 @@ def execute(payload):
         token = secrets.token_hex(24)
         os.environ['WORKSPACE_RUN_TOKEN'] = token
         store, tracing = app.state.store, app.state.tracing
+        actor = store.identity({'method': 'local', 'role': 'member'})
         run = store.create_run(payload['input'], '', 'modal', [], model=payload['model'],
-                               harness=payload['harness'], user_id='fixture:lens-eval', chat_enabled=True)
+                               harness=payload['harness'], user_id=actor, chat_enabled=True)
         message = store.claim_message(run['id'])
         if message is None:
             raise AgentRunError('Moyai could not claim the evaluation input.')

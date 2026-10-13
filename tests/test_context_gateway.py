@@ -9,6 +9,7 @@ from app.security import digest
 from app.model_selection import ASTRA_ULTRAFAST, gateway_model
 from sandbox.broker_transport import seal, CONTENT_TYPE
 from test_workspace import workspace
+from test_spend import registered_actor
 
 
 @pytest.mark.parametrize('model', ['openai/gpt-6-astra', ASTRA_ULTRAFAST, 'fireworks_ai/glm-5p3', 'anthropic/claude-opus-5-5'])
@@ -43,7 +44,8 @@ def test_summary_route_pins_model_excludes_injections_and_accounts(workspace, mo
         monkeypatch.setattr(self.store.attachments, 'with_images', lambda *a, **k: pytest.fail('Attachments injected'))
         return await original(self, *args)
     monkeypatch.setattr(HarnessGateway, 'forward', forward)
-    run = app.state.store.create_run('compact context', '', 'modal', [], model='anthropic/claude-opus-5-5')
+    run = app.state.store.create_run('compact context', '', 'modal', [], model='anthropic/claude-opus-5-5',
+                                     user_id=registered_actor(app, 'shared:local:admin'))
     app.state.store.execute('UPDATE runs SET active_model=? WHERE id=?', (model, run['id']))
     app.state.store.update_run(run['id'], status='running', token_hash=digest('cap'))
     route = '/context/compact'
@@ -93,7 +95,7 @@ def test_summary_uses_run_admission_limit_before_inference(workspace, monkeypatc
     app, client = workspace
     app.state.settings.max_agent_iterations = 1
     monkeypatch.setattr('app.harness_gateway.httpx.AsyncClient', lambda **kw: pytest.fail('Limit bypassed'))
-    run = app.state.store.create_run('compact', '', 'modal', [])
+    run = app.state.store.create_run('compact', '', 'modal', [], user_id=registered_actor(app, 'shared:local:admin'))
     app.state.store.update_run(run['id'], status='running', token_hash=digest('cap'))
     app.state.store.execute('UPDATE runs SET model_calls=3 WHERE id=?', (run['id'],))
     response = client.post(f"/broker/{run['id']}/context/compact", headers={'Authorization': 'Bearer cap'},
@@ -173,7 +175,8 @@ def test_live_complete_large_summary_recovers_pressure_without_losing_tail(
     monkeypatch.setattr('app.harness_gateway.httpx.AsyncClient', lambda **kwargs: actual(
         transport=httpx.MockTransport(upstream), **kwargs))
     store = app.state.store
-    run = store.create_run('task', '', 'modal', [], model='openai/gpt-6-astra', harness=harness)
+    run = store.create_run('task', '', 'modal', [], model='openai/gpt-6-astra', harness=harness,
+                            user_id=registered_actor(app, 'shared:local:admin'))
     store.update_run(run['id'], status='running', token_hash=digest('cap'))
     url = f"/broker/{run['id']}/v1/responses"
     headers = {'Authorization': 'Bearer cap', 'Content-Type': CONTENT_TYPE}
@@ -228,7 +231,10 @@ def test_live_http_pressure_wait_survives_idle_sweep_and_preserves_new_tail(work
         return proof.clock
     monkeypatch.setattr(live_context, 'time', SimpleNamespace(monotonic=clock))
     async def limits(model):
-        return ModelContextLimits(context_window=25000, max_input_tokens=25000,
+        # Include authenticated workspace context in the fixture geometry:
+        # the original prefix is soft pressure, its new tail is hard pressure,
+        # and one adopted summary brings the result below the soft watermark.
+        return ModelContextLimits(context_window=28700, max_input_tokens=28700,
                                   max_output_tokens=8192, default_output_tokens=4096)
     monkeypatch.setattr(app.state.context_budget, 'limits', limits)
     original_forward, original_measure = HarnessGateway.forward, app.state.context_budget.measure
@@ -237,9 +243,13 @@ def test_live_http_pressure_wait_survives_idle_sweep_and_preserves_new_tail(work
         return await original_forward(self, *args)
     async def measure(payload, **kwargs):
         budget = await original_measure(payload, **kwargs)
+        if payload.get('input') == items:
+            assert live_context.START_FRACTION * budget.input_budget < budget.input_tokens <= budget.input_budget
         if payload.get('input') == items + tail:
             assert budget.input_tokens > budget.input_budget
             pressured.set()
+        elif payload.get('input') and 'private-aged-summary' in json.dumps(payload['input']):
+            assert budget.input_tokens < live_context.START_FRACTION * budget.input_budget
         return budget
     monkeypatch.setattr(HarnessGateway, 'forward', forward)
     monkeypatch.setattr(app.state.context_budget, 'measure', measure)
@@ -268,7 +278,8 @@ def test_live_http_pressure_wait_survives_idle_sweep_and_preserves_new_tail(work
     monkeypatch.setattr('app.harness_gateway.httpx.AsyncClient', lambda **kw: actual(
         transport=httpx.MockTransport(upstream), **kw))
     db = app.state.store
-    run = db.create_run('task', '', 'modal', [], model='openai/gpt-6-astra', chat_enabled=True, harness=harness)
+    run = db.create_run('task', '', 'modal', [], model='openai/gpt-6-astra', chat_enabled=True, harness=harness,
+                         user_id=registered_actor(app, 'shared:local:admin'))
     message = db.claim_message(run['id'])
     db.update_run(run['id'], status='running', token_hash=digest('cap'))
     route = '/v1/responses'
@@ -362,7 +373,7 @@ def test_private_summary_waits_unbilled_behind_foreground_and_cancels_cleanly(wo
     monkeypatch.setattr('app.harness_gateway.httpx.AsyncClient', lambda **kw: actual(
         transport=httpx.MockTransport(upstream), **kw))
     db = app.state.store
-    run = db.create_run('task', '', 'modal', [])
+    run = db.create_run('task', '', 'modal', [], user_id=registered_actor(app, 'shared:local:admin'))
     db.update_run(run['id'], status='running', token_hash=digest('cap'))
     url, headers = f"/broker/{run['id']}", {'Authorization': 'Bearer cap'}
     with ThreadPoolExecutor(max_workers=2) as pool:
@@ -412,7 +423,8 @@ def test_private_summary_is_complete_scoped_tool_free_and_accounted(workspace, m
     monkeypatch.setattr(app.state.tracing, 'model', lambda *a, **k: traces.append((a[3:6], k)))
     history = ['private-native-prefix-marker', 'Do not deploy; completed action receipt-123']
     summary = 'private-summary-marker: receipt-123 is complete; do not deploy'
-    run = app.state.store.create_run('task', '', 'modal', [], model='openai/gpt-6-astra')
+    run = app.state.store.create_run('task', '', 'modal', [], model='openai/gpt-6-astra',
+                                     user_id=registered_actor(app, 'shared:local:admin'))
     app.state.store.update_run(run['id'], status='running', token_hash=digest('cap'))
     if outcome == 'limit':
         app.state.settings.max_agent_iterations = 1
@@ -505,13 +517,15 @@ def test_inference_rechecks_origin_after_await(workspace, monkeypatch, change, b
     private = route == 'context/compact'
     if private:
         private_summary_route(monkeypatch)
-    run = app.state.store.create_run('task', '', 'modal', [], model='openai/gpt-6-astra')
+    run = app.state.store.create_run('task', '', 'modal', [], model='openai/gpt-6-astra',
+                                     user_id=registered_actor(app, 'shared:local:admin'))
     app.state.store.update_run(run['id'], status='running', token_hash=digest('cap'))
     if change == 'model':
         app.state.store.execute("UPDATE runs SET active_model='' WHERE id=?", (run['id'],))
+    replacement_actor = registered_actor(app, 'google:bob')
     def retire_scope():
         value = (digest('new-cap') if change == 'token_hash' else 999 if change == 'active_message_id'
-                 else 'another-actor' if change == 'active_user_id' else 'fireworks_ai/glm-5p3')
+                 else replacement_actor if change == 'active_user_id' else 'fireworks_ai/glm-5p3')
         app.state.store.execute(f'UPDATE runs SET {change}=? WHERE id=?', (value, run['id']))
     if boundary == 'budget':
         method = 'check' if private else 'measure'
@@ -546,7 +560,8 @@ def test_summary_recovers_without_cutting_output_or_replaying_actions(workspace,
     from agent.context_store import ContextStore
     app, client = workspace
     app.state.settings.litellm_api_base = 'https://gateway.example/v1'
-    run = app.state.store.create_run('recover summary', '', 'modal', [], model='openai/gpt-6-astra')
+    run = app.state.store.create_run('recover summary', '', 'modal', [], model='openai/gpt-6-astra',
+                                     user_id=registered_actor(app, 'shared:local:admin'))
     app.state.store.update_run(run['id'], status='running', token_hash=digest('cap'))
     journal = ContextStore(tmp_path / 'journal.sqlite3', run['id'])
     journal.input_budget = 48_000
@@ -599,7 +614,7 @@ def test_repeated_rejection_keeps_checkpoint_and_reports_reason(workspace, monke
     from agent.context_store import ContextStore, ContextUnavailable
     app, client = workspace
     app.state.settings.litellm_api_base = 'https://gateway.example/v1'
-    run = app.state.store.create_run('recover summary', '', 'modal', [])
+    run = app.state.store.create_run('recover summary', '', 'modal', [], user_id=registered_actor(app, 'shared:local:admin'))
     app.state.store.update_run(run['id'], status='running', token_hash=digest('cap'))
     journal = ContextStore(tmp_path / 'journal.sqlite3', run['id'])
     journal.input_budget = 48_000
@@ -632,7 +647,7 @@ def test_repeated_rejection_keeps_checkpoint_and_reports_reason(workspace, monke
 def test_compaction_recovery_reauthorizes_before_resubmitting(workspace, monkeypatch):
     app, client = workspace
     app.state.settings.litellm_api_base = 'https://gateway.example/v1'
-    run = app.state.store.create_run('cancel summary', '', 'modal', [])
+    run = app.state.store.create_run('cancel summary', '', 'modal', [], user_id=registered_actor(app, 'shared:local:admin'))
     app.state.store.update_run(run['id'], status='running', token_hash=digest('cap'))
     seen = []
     def upstream(request):
@@ -650,7 +665,7 @@ def test_compaction_recovery_reauthorizes_before_resubmitting(workspace, monkeyp
 def test_refusal_is_not_retried(workspace, monkeypatch):
     app, client = workspace
     app.state.settings.litellm_api_base = 'https://gateway.example/v1'
-    run = app.state.store.create_run('summary', '', 'modal', [])
+    run = app.state.store.create_run('summary', '', 'modal', [], user_id=registered_actor(app, 'shared:local:admin'))
     app.state.store.update_run(run['id'], status='running', token_hash=digest('cap'))
     seen = []
     def upstream(request):
@@ -668,7 +683,7 @@ def test_recovery_does_not_reopen_expired_transport_envelope(workspace, monkeypa
     from app.harness_gateway import HarnessGateway
     app, client = workspace
     app.state.settings.litellm_api_base = 'https://gateway.example/v1'
-    run = app.state.store.create_run('summary', '', 'modal', [])
+    run = app.state.store.create_run('summary', '', 'modal', [], user_id=registered_actor(app, 'shared:local:admin'))
     app.state.store.update_run(run['id'], status='running', token_hash=digest('cap'))
     reads, calls = [], []
     original = HarnessGateway.forward
@@ -712,7 +727,8 @@ def test_background_summary_survives_answer_and_cold_restore_without_losing_tail
     actual = httpx.AsyncClient
     monkeypatch.setattr('app.harness_gateway.httpx.AsyncClient', lambda **kw: actual(transport=httpx.MockTransport(upstream), **kw))
     db = app.state.store
-    run = db.create_run('task', '', 'modal', [], model='openai/gpt-6-astra', chat_enabled=True)
+    run = db.create_run('task', '', 'modal', [], model='openai/gpt-6-astra', chat_enabled=True,
+                         user_id=registered_actor(app, 'shared:local:admin'))
     message = db.claim_message(run['id'])
     db.update_run(run['id'], status='running', token_hash=digest('cap'))
     store = ContextStore(tmp_path / 'public.sqlite3', run['id'])
@@ -783,7 +799,7 @@ def test_foreground_preempts_background_gateway_and_interrupted_job_retries(work
             self.fixture_slots = True
         return await original(self, *args, **kwargs)
     monkeypatch.setattr(HarnessGateway, '_forward_once', forward)
-    run = app.state.store.create_run('task', '', 'modal', [])
+    run = app.state.store.create_run('task', '', 'modal', [], user_id=registered_actor(app, 'shared:local:admin'))
     app.state.store.update_run(run['id'], status='running', token_hash=digest('cap'))
     store = ContextStore(tmp_path / 'context.sqlite3', run['id'])
     store.initialize([{'role': 'assistant', 'content': 'log' * 1000} for _ in range(60)])
@@ -809,7 +825,8 @@ def test_late_maintenance_admission_cannot_charge_a_new_turn(workspace, monkeypa
     from test_workspace import wait_for
     app, client = workspace
     db = app.state.store
-    run = db.create_run('task', '', 'modal', [], chat_enabled=True)
+    run = db.create_run('task', '', 'modal', [], chat_enabled=True,
+                         user_id=registered_actor(app, 'shared:local:admin'))
     original = db.claim_message(run['id'])
     db.update_run(run['id'], status='running', token_hash=digest('cap'))
     next_message, _ = db.enqueue_message(run['id'], 'Next question', 'next', send_now=False)
@@ -909,6 +926,7 @@ def native_exchange(client, run_id, action, lease='a' * 32, *, token='capability
 
 
 def native_followup(app, run, *, user=None, model=None, before_finish=False):
+    registered_actor(app, user or run['active_user_id'])
     db = app.state.store
     def enqueue():
         db.enqueue_message(run['id'], 'Follow-up', 'follow-up-' + str(run['active_message_id']),
@@ -1152,7 +1170,8 @@ def test_goal_review_and_report_use_accounted_tool_free_gateway(workspace, monke
         return httpx.Response(503, text='final provider unavailable')
     actual = httpx.AsyncClient
     monkeypatch.setattr('app.harness_gateway.httpx.AsyncClient', lambda **kw: actual(transport=httpx.MockTransport(upstream), **kw))
-    run = store.create_run('Keep working until the artifact is verified', '', 'modal', [], chat_enabled=True, user_id='owner')
+    run = store.create_run('Keep working until the artifact is verified', '', 'modal', [], chat_enabled=True,
+                            user_id=registered_actor(app, 'shared:local:admin'))
     source = store.claim_message(run['id'])
     store.update_run(run['id'], status='running', token_hash=digest('cap'))
     caller = store.run(run['id'])

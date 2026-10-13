@@ -15,6 +15,7 @@ if(process.argv.includes('--production-csp')){
  if(!productionCsp)throw new Error('Cannot find the production Content-Security-Policy in app/main.py');
 }
 const computerHandoff=require('./computer_handoff_preview.cjs').create(arg('--computer-frame',null));
+const governanceFixture=require('./governance_ui_fixture.cjs');
 const stamp='2026-10-07T15:00:00Z';
 const agentSession=(number,prompt,status='idle',children=[])=>({id:number.toString(16).padStart(32,'0'),prompt,status,children,updated_at:stamp,created_at:stamp});
 const agentSessions=[
@@ -173,6 +174,7 @@ const server=http.createServer(async(req,res)=>{
  if((fixture==='computer-handoff'||p==='/demo/sign-in')&&await computerHandoff.route(req,res,url))return;
  if(delayMs&&req.method==='GET'&&p.startsWith('/api/'))await new Promise(resolve=>setTimeout(resolve,delayMs));
  let body={};if(req.method!=='GET'){const chunks=[];for await(const chunk of req)chunks.push(chunk);try{body=JSON.parse(Buffer.concat(chunks).toString()||'{}');}catch{return json(res,400,{detail:'Invalid JSON'});}}
+ if(governanceFixture(req,res,url,body,role,fixture))return;
  const swarmPreview=fixture.startsWith('swarm');
  const supportedWrite = (p.startsWith('/api/connections/slack/personal')&&['POST','DELETE'].includes(req.method)) || (fixture.startsWith('personal-')&&p==='/api/runs'&&req.method==='POST') || (swarmPreview&&req.method==='PATCH'&&/^\/api\/runs\/[a-f0-9]{32}\/swarm\/time$/.test(p)) || (swarmPreview&&req.method==='POST'&&(p==='/api/runs'||/^\/api\/runs\/[a-f0-9]{32}\/(messages|cancel|swarm\/(pause|resume))$/.test(p))) || (req.method==='PUT' && ['/api/settings/preferences','/api/settings/sandboxes','/api/settings/session-titles','/api/memory/preferences','/api/admin/users/role'].includes(p)) ||
   (req.method==='POST' && p==='/api/memory') ||

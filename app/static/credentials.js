@@ -145,7 +145,7 @@ async function openCredentialDialog(request=null,secret=null,preset=null){
   if(secret){secret=data.secrets.find(s=>s.id===secret.id);if(!secret?.can_manage)throw new Error('This credential is no longer available to edit.');}
   const rootId=request?(data.root_id||request.root_id||state.selected):(secret?.root_id||'');
   const saved=request?data.secrets.filter(s=>credentialMatches(s,request,rootId)):[];
-  const canPersonal=request?request.can_personal:true,admin=state.role==='admin';
+  const canPersonal=request?request.can_personal:true,admin=globalThis.MoyaiPermissions?.has('credentials.publish')??state.role==='admin';
   const canOrganization=request?!!request.can_organization:admin;
   const providerList=data.providers.some(p=>p.id==='generic')?data.providers:[...data.providers,{id:'generic',name:'Other service',setup_url:''}];
   if(!preset&&secret?.provider==='generic'&&secret.name==='1password-shared'&&secret.format==='env')preset=onePasswordAccess;

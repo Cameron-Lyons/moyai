@@ -257,7 +257,8 @@ class PublishedArtifacts:
         target = self.target(admitted, body.run_id)
         if name == 'artifacts_list':
             items = self.listing(target, revisions=body.revisions)
-            selected, cursor = page(items, body.cursor, body.page_size, [target, items])
+            selected, cursor = page(items, body.cursor, body.page_size, [target, items],
+                                    organization_id=getattr(self.store, 'organization_id', ''))
             return {'artifacts': selected, **cursor}
         manifest = self.manifest(target, body.path, body.revision)
         raw = b''.join(self.chunks(manifest, body.offset, body.length))

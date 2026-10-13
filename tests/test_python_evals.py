@@ -169,9 +169,18 @@ def test_should_export_linked_agent_model_and_tool_spans_before_returning(worker
     assert all(span.parent_span_id == root.span_id for span in exported if span != root)
 
 
-def test_should_use_production_instructions_with_isolated_session_storage(worker):
+def test_should_use_production_instructions_with_isolated_session_storage(worker, monkeypatch):
     payload, state, _ = worker
+    monkeypatch.setenv('WORKSPACE_PASSWORD', 'unrelated-administrator-password')
+    monkeypatch.setenv('GOOGLE_CLIENT_ID', 'unrelated-client')
+    monkeypatch.setenv('GOOGLE_CLIENT_SECRET', 'unrelated-secret')
     agent_worker.execute(payload)
+    app = state['app']
+    assert app.state.security.local_preview()
+    run = app.state.store.rows('SELECT * FROM runs')[0]
+    assert run['owner_id'] == 'shared:local:member'
+    assert app.state.security.has_actor_permission(run['owner_id'], 'sessions.create')
+    assert not app.state.security.has_actor_permission(run['owner_id'], 'security.manage')
     conversation = state['conversations'][0]
     assert conversation['prompt'] == payload['input']
     assert conversation['conversation_history'] == []

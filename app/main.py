@@ -34,6 +34,11 @@ from .security import Security, Throttle, digest
 from .cloudflare_access import CloudflareAccess, CloudflareAccessMiddleware
 from .google_sso import GoogleSignIn
 from .user_roles import UserRoles
+from .scim import Scim
+from .security_profiles import SecurityProfiles
+from .permissions import PERMISSIONS, tool_permission
+from .governance_audit import GovernanceAudit
+from .organization_scope import OrganizationScope
 from .user_preferences import UserPreferences
 from .model_preferences import preferred_model, save_model
 from .model_selection import ASTRA_ULTRAFAST, gateway_model
@@ -94,6 +99,7 @@ class NewRun(BaseModel):
     mode: Literal["demo", "modal"] = "demo"
     plugins: list[Provider] = Field(default_factory=list, max_length=4)
     environment_id: str = Field(default="auto", pattern=r"^(auto|none|[0-9a-f]{32})$")
+    security_profile_id: str = Field(default='', pattern=r'^([0-9a-f]{32})?$')
     private_session: bool = Field(default=False, strict=True)
     chat_enabled: bool = True
     model: str | None = Field(default=None, max_length=120)
@@ -197,6 +203,7 @@ def create_app(settings: Settings | None = None):
                   database_pool_size=settings.moyai_database_pool_size, runtime_role=settings.moyai_runtime_role,
                   runtime_settings=settings, schema_mode=settings.moyai_schema_mode)
     try:
+        OrganizationScope(store, settings)
         if settings.moyai_runtime_role != 'standalone':
             from .runtime_coordination import require_shared_artifacts
             require_shared_artifacts(store)
@@ -217,6 +224,10 @@ def create_app(settings: Settings | None = None):
 def _create_app(settings, store):
     user_roles = UserRoles(store, settings)
     security = Security(settings, user_roles)
+    security_profiles = SecurityProfiles(store, settings, security)
+    scim = Scim(store, security, governance=user_roles)
+    governance_audit = GovernanceAudit(store, security)
+    store.user_roles = user_roles
     privacy = SessionPrivacy(store, security)
     store.session_privacy = security.session_privacy = privacy
     from .sandbox_settings import SandboxSettings
@@ -499,7 +510,16 @@ def _create_app(settings, store):
     app.include_router(session_titles.routes(security))
     app.include_router(google.routes())
     app.include_router(user_roles.routes(security))
+    app.include_router(user_roles.enterprise.routes(security))
+    app.include_router(scim.routes())
+    app.include_router(scim.admin_routes())
+    app.include_router(security_profiles.routes())
+    app.include_router(governance_audit.routes())
+    app.state.scim = scim
+    app.state.security_profiles = security_profiles
+    app.state.governance_audit = governance_audit
     app.state.user_roles = user_roles
+    app.state.organization_scope = store.organization_scope
     app.include_router(user_preferences.routes())
     app.state.user_preferences = user_preferences
     app.include_router(spend.routes())
@@ -641,6 +661,7 @@ def _create_app(settings, store):
         if info:
             user_id = actor if actor is not None else store.identity(info)
         response.body = json.dumps({"authenticated": bool(sid), "csrf": security.csrf(sid) if sid else "", "local": security.local, "role": role,
+                                   "permissions": sorted(security.permissions_for_info(info)) if info else (sorted(PERMISSIONS) if sid else []),
                                    "identity": info.get("identity"), "user_id": user_id, "preferences": user_preferences.get(user_id), "google_enabled": settings.google_enabled(),
                                    "google_domains": sorted(settings.google_domains()) if settings.google_enabled() else [],
                                    "password_enabled": settings.password_login_enabled and bool(settings.workspace_password or settings.workspace_member_password)}).encode()
@@ -767,6 +788,8 @@ def _create_app(settings, store):
     async def organization(request: Request):
         security.require(request)
         return {"name": store.rows("SELECT name FROM organization WHERE id=1")[0]["name"],
+                "id": settings.moyai_organization_id,
+                "deployment": store.organization_scope.metadata(),
                 "role": security.role(request), "member_access_configured": bool(settings.workspace_member_password) or settings.person_login_enabled(),
                 "google_signin": settings.google_enabled(),
                 "slack_sessions": slack.status(),
@@ -854,6 +877,16 @@ def _create_app(settings, store):
             model = settings.harness_model(harness, requested_model)
         except ValueError as exc:
             raise HTTPException(422, str(exc))
+        security_fields = await database(security_profiles.binding, body.security_profile_id,
+                                         provider=settings.sandbox_provider,
+                                         parent_run_id=body.side_chat_of)
+        selected_policy = json.loads(security_fields['security_policy'])
+        if selected_policy['connected_apps'] is not None and not set(body.plugins) <= set(selected_policy['connected_apps']):
+            raise HTTPException(422, 'The selected security policy does not allow all selected apps.')
+        if (body.repo_url or body.github_repository_id) and (
+                selected_policy['git_access'] == 'none' or
+                selected_policy['connected_apps'] is not None and 'github' not in selected_policy['connected_apps']):
+            raise HTTPException(422, 'The selected security policy does not allow managed repository access.')
         if body.mode == "modal" and not metadata_request:
             if missing_cloud():
                 raise HTTPException(503, "Cloud setup is incomplete. See Runtime for the missing settings.")
@@ -873,13 +906,16 @@ def _create_app(settings, store):
         if body.mode == "modal" and not metadata_request:
             await database(environments.choose, body.environment_id, body.repo_url, body.github_repository_id)
         session = await database(security.session_info, request)
+        if not session:
+            raise HTTPException(401, 'Sign in to the workspace.')
         user_id = await database(store.identity, session)
         try:
             run = await database(store.create_run, body.prompt, body.repo_url, body.mode, sorted(set(body.plugins)), chat_enabled=body.chat_enabled or settings.temporal_enabled, model=model, user_id=user_id,
                                    attachment_ids=body.attachment_ids, client_id=body.client_id, environment_id=body.environment_id, side_chat_of=body.side_chat_of, harness=harness, github_repository_id=body.github_repository_id, metadata_request=metadata_request,
                                    swarm_budget_seconds=body.swarm.budget_seconds if body.swarm else None,
                                    durable_submit=manager.submit_in if body.swarm else None,
-                                   swarm_bootstrap=manager.swarms.bootstrap_in if body.swarm else None, received_at=received_at, private_owner_id=private_owner_id)
+                                   swarm_bootstrap=manager.swarms.bootstrap_in if body.swarm else None, received_at=received_at, private_owner_id=private_owner_id,
+                                   security_fields=security_fields)
         except ValueError as exc:
             raise HTTPException(429 if 'queue' in str(exc) else 409, str(exc))
         await checkpoints.flush()
@@ -918,10 +954,13 @@ def _create_app(settings, store):
         # The route dependency authenticates and checks live-session access.
         # Recheck ownership below against the same snapshot as the content.
         from .activity_history import projection
+        info = security.session_info(request)
+        if not info:
+            raise HTTPException(401, 'Sign in to the workspace.')
         actor = getattr(request.state, 'access_actor', None) if settings.cloudflare_access_login else None
         if actor is None:
-            actor = store.identity(security.session_info(request))
-        admin = security.role(request) == 'admin'
+            actor = store.identity(info)
+        admin = info['role'] == 'admin'
         # Keep message status and the activity cursor in one read snapshot. A
         # response completing during this request must be included or replayed
         # by SSE, never skipped between independent database reads.
@@ -1330,6 +1369,8 @@ def _create_app(settings, store):
             raise HTTPException(401, "Run capability expired or invalid.")
         if privacy.is_private(run) and run['active_user_id'] != run['private_owner_id']:
             raise HTTPException(403, 'Private session requester changed.')
+        if enforce_swarm_time:
+            user_roles.require_actor(run['active_user_id'] or run['owner_id'], 'sessions.create')
         if enforce_swarm_time and (run.get('swarm') or run['parent_run_id']):
             # Admission reads current root policy even if its execution worker
             # is offline. An extension keeps the same authenticated capability;
@@ -1369,8 +1410,14 @@ def _create_app(settings, store):
             body = json.loads(raw)
         except (ValueError, UnicodeDecodeError):
             raise HTTPException(422, 'Invalid broker request JSON.')
+        # Uploading a body can overlap revocation or a turn change. Only saved
+        # native checkpoints and receipt acknowledgements retain state-only access.
+        receipt_only = (route in {'/context/native', '/context/journal'} or
+                        route == '/control' and isinstance(body, dict) and body.get('receipt_only') is True or
+                        route == '/payloads' and isinstance(body, dict) and body.get('route') == '/context/native')
+        admission = require_run_state if receipt_only else require_run
+        await asyncio.to_thread(admission, request.path_params['run_id'], request)
         if isinstance(body, dict) and 'moyai_payload' in body:
-            admission = require_run_state if route == '/context/native' else require_run
             caller = await asyncio.to_thread(admission, request.path_params['run_id'], request)
             return await asyncio.to_thread(broker_payloads.resolve, caller, route, body)
         return body
@@ -1388,7 +1435,11 @@ def _create_app(settings, store):
         return result
 
     from .github_git import routes as git_routes
-    app.include_router(git_routes(connectors.github, require_run))
+    def require_git_run(run_id, request):
+        run = require_run(run_id, request)
+        user_roles.require_actor(run['active_user_id'] or run['owner_id'], 'connections.read')
+        return run
+    app.include_router(git_routes(connectors.github, require_git_run))
 
     @app.post('/broker/{run_id}/control')
     async def session_control(run_id: str, request: Request):
@@ -1424,7 +1475,15 @@ def _create_app(settings, store):
         from .session_journal import READ_TOOL
         listed = [DIAGNOSTIC_TOOL, READ_TOOL, GOAL_TOOL, COMPUTER_HANDOFF] + ([COMPUTER_OPERATION_READ] if computer_operations else []) + ARTIFACT_TOOLS + ([SLACK_CONTEXT_TOOL, SLACK_PARTICIPATION_TOOL] if store.rows('SELECT 1 FROM slack_threads WHERE run_id=?', (run['id'],)) else []) + media_shares.tools() + session_lifecycle.tools(run) + model_tools.tools(run) + automation_tools.tools(run) + automations.tools(run) + memory.tools(run) + skills.tools(run) + credentials.tools(run) + coordinator.tools(run) + [{"name": name, "description": spec[3], "inputSchema": tool_schema(spec[2]), "annotations": {"readOnlyHint": not spec[1], "idempotentHint": name in RETRY_SAFE_READS}}
                 for name, spec in TOOLS.items() if spec[0] in run["plugins"] and connectors.allowed(name, run)]
-        return [tool for tool in listed if privacy.allow_tool(run, tool["name"], TOOLS.get(tool["name"], (None, False))[1])]
+        with store.connect() as conn:
+            conn.begin_read()
+            permissions = user_roles.permissions_for_actor_in(conn, run['active_user_id'] or run['owner_id'])
+        return [tool for tool in listed
+                if privacy.allow_tool(run, tool["name"], TOOLS.get(tool["name"], (None, False))[1])
+                and (tool_permission(tool['name']) is None or tool_permission(tool['name']) in permissions)
+                and security_profiles.allowed_tool(run, tool['name'],
+                                                  TOOLS.get(tool['name'], (None, False))[0],
+                                                  TOOLS.get(tool['name'], (None, False))[1])]
 
     @app.get("/broker/{run_id}/tools")
     def tool_list(run_id: str, request: Request):
@@ -1443,8 +1502,12 @@ def _create_app(settings, store):
     @app.post('/broker/{run_id}/artifacts/transfer')
     async def artifact_transfer(run_id: str, request: Request):
         run = require_run(run_id, request)
+        await database(user_roles.require_actor, run['active_user_id'] or run['owner_id'], 'sessions.manage')
+        security_profiles.require_tool(run, 'artifact_publish')
         try:
-            result = await asyncio.to_thread(published_artifacts.transfer, run, await broker_body(request, '/artifacts/transfer'))
+            body = await broker_body(request, '/artifacts/transfer')
+            await database(user_roles.require_actor, run['active_user_id'] or run['owner_id'], 'sessions.manage')
+            result = await asyncio.to_thread(published_artifacts.transfer, run, body)
         except ValidationError:
             raise HTTPException(422, 'Invalid artifact transfer arguments.') from None
         await checkpoints.flush()
@@ -1478,6 +1541,12 @@ def _create_app(settings, store):
         return result
 
     async def execute_tool(run_id, request, run, body, dispatch):
+        permission = tool_permission(body.name)
+        if permission:
+            await database(user_roles.require_actor, run['active_user_id'] or run['owner_id'], permission)
+        tool_spec = TOOLS.get(body.name)
+        security_profiles.require_tool(run, body.name, tool_spec[0] if tool_spec else None,
+                                       tool_spec[1] if tool_spec else False)
         def rejected_result(error, **fields):
             return {'error': error, **fields, **({'outcome': 'rejected', 'dispatched': False} if dispatch else {})}
 
@@ -1761,7 +1830,10 @@ def _create_app(settings, store):
     @app.post('/broker/{run_id}/goal')
     async def goal_clock(run_id: str, request: Request):
         caller = require_run(run_id, request)
+        await database(user_roles.require_actor, caller['active_user_id'] or caller['owner_id'], 'sessions.manage')
+        security_profiles.require_tool(caller, 'goal')
         body = await broker_body(request, '/goal')
+        await database(user_roles.require_actor, caller['active_user_id'] or caller['owner_id'], 'sessions.manage')
         result = await asyncio.to_thread(goals.exchange, caller, body, internal=True)
         if body.get('action') == 'review' and (result.get('goal') or {}).get('status') == 'active':
             result = await goals.review(caller, GoalArgs(action='progress', note=body.get('note', '')),

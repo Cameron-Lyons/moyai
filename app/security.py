@@ -13,6 +13,7 @@ from starlette.requests import HTTPConnection
 from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 
 from .config import Settings
+from .permissions import BUILTIN_PERMISSIONS, MEMBER_PERMISSIONS, PERMISSIONS, route_permission, shared_actor_role
 
 
 def digest(value: str) -> str:
@@ -74,6 +75,12 @@ class Security:
         self.settings = settings
         self.user_roles = user_roles
         self.secret = settings.session_secret or local_secret(settings.data_dir / "session.key", lambda: secrets.token_urlsafe(48))
+        organization_id = getattr(settings, 'moyai_organization_id', '')
+        if organization_id:
+            # Scope the signing key itself, so explicit cursor/OAuth salts and
+            # CSRF also remain isolated if operators reuse a raw session secret.
+            self.secret = hmac.new(self.secret.encode(),
+                ('moyai-organization-session-v1:' + organization_id).encode(), hashlib.sha256).hexdigest()
         key = settings.encryption_key or local_secret(settings.data_dir / "encryption.key", lambda: Fernet.generate_key().decode())
         self.fernet = Fernet(key.encode())
         self.signer = URLSafeTimedSerializer(self.secret, salt="workspace-session-v1")
@@ -103,7 +110,9 @@ class Security:
             # assertion. Cookies alone, including legacy admin cookies, cannot
             # authenticate or override the currently signed-in Access identity.
             info = getattr(request.state, 'access_session', None)
-            return {**info, 'role': self.google_role(info['identity']['email'])} if info else None
+            if not info or not self.identity_active(info['identity']['email']):
+                return None
+            return {**info, 'role': self.google_role(info['identity']['email'])}
         try:
             info = self.signer.loads(request.cookies.get("workspace_session", ""), max_age=43200)
             # Sessions from the original single-password deployment belong to
@@ -117,7 +126,8 @@ class Security:
                 email, domain = identity.get("email", ""), identity.get("domain", "")
                 if (not self.settings.google_enabled() or domain not in self.settings.google_domains()
                         or email.rpartition("@")[2] != domain or not identity.get("sub")
-                        or info.get("client_id") != self.settings.google_client_id):
+                        or info.get("client_id") != self.settings.google_client_id
+                        or not self.identity_active(email)):
                     return None
                 role = self.google_role(email)
             elif method == "local":
@@ -166,6 +176,33 @@ class Security:
             return self.user_roles.role(email)
         return 'admin' if email in self.settings.google_admins() else 'member'
 
+    def identity_active(self, email: str) -> bool:
+        if self.user_roles is None:
+            return True
+        with self.user_roles.store.connect() as conn:
+            return self.user_roles.active_email_in(conn, email.strip().lower())
+
+    def permissions_for_info(self, info):
+        if not info:
+            return frozenset()
+        if info.get('method') in {'google', 'cloudflare'} and self.user_roles is not None:
+            return self.user_roles.permissions(info['identity']['email'])
+        return BUILTIN_PERMISSIONS.get(info.get('role'), frozenset())
+
+    def permissions(self, request: Request):
+        return self.permissions_for_info(self.session_info(request))
+
+    def has_permission(self, request: Request, permission: str) -> bool:
+        return permission in self.permissions(request)
+
+    def has_actor_permission(self, actor_id, permission, *, connection=None):
+        if self.user_roles is None:
+            return permission in BUILTIN_PERMISSIONS.get(shared_actor_role(actor_id, self.settings), frozenset())
+        if connection is not None:
+            return permission in self.user_roles.permissions_for_actor_in(connection, actor_id)
+        with self.user_roles.store.connect() as conn:
+            return permission in self.user_roles.permissions_for_actor_in(conn, actor_id)
+
     def local_preview(self) -> bool:
         return self.local and not self.settings.workspace_password and not self.settings.person_login_enabled()
 
@@ -190,11 +227,20 @@ class Security:
     def csrf(self, sid: str) -> str:
         return hmac.new(self.secret.encode(), f"csrf:{sid}".encode(), hashlib.sha256).hexdigest()
 
-    def require(self, request: Request, *, mutation: bool = False, admin: bool = False) -> str:
-        sid = self.session(request)
+    def require(self, request: Request, *, mutation: bool = False, admin: bool = False,
+                permission: str | None = None) -> str:
+        info = self.session_info(request)
+        sid = info['sid'] if info else None
         if not sid:
             raise HTTPException(401, "Sign in to the workspace.")
-        if admin and self.role(request) != "admin":
+        required = permission or route_permission(request)
+        if required is not None and required not in PERMISSIONS:
+            raise ValueError('Unknown workspace permission.')
+        if required and required not in self.permissions_for_info(info):
+            raise HTTPException(403, 'Your workspace role does not permit this action.')
+        # Existing admin endpoints receive delegated access only when their
+        # concrete route has an audited permission mapping or explicit permission.
+        if admin and permission is None and (required is None or required in MEMBER_PERMISSIONS) and info['role'] != "admin":
             raise HTTPException(403, "An organization administrator must perform this action.")
         if mutation:
             self.check_origin(request)
@@ -202,7 +248,9 @@ class Security:
                 raise HTTPException(403, "Refresh the page and try again.")
         privacy = getattr(self, 'session_privacy', None)
         if privacy:
-            privacy.guard_request(request)
+            # Reuse this synchronous admission's validated identity; subsequent
+            # admissions still resolve live roles and provisioning state.
+            privacy.guard_request(request, info=info)
         return sid
 
     def check_origin(self, request: Request):

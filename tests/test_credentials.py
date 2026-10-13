@@ -15,10 +15,18 @@ from app.session_lifecycle import SessionLifecycle
 from app.temporal_runtime import TemporalRunManager
 from agent.continuation import AgentWait
 from test_durable import Cloud, durable, drive
-from test_spend import active, sign_in
+from test_spend import active as active_run, sign_in
 from test_workspace import workspace
 
 KEY = 'test-provider-secret-438912'
+
+
+def active(app, user='google:alice', model='openai/gpt-6-astra'):
+    if user.startswith('google:') and user != 'google:unknown':
+        subject = user.removeprefix('google:')
+        app.state.store.identity({'method': 'google', 'identity': {
+            'sub': subject, 'email': subject + '@berri.ai', 'name': subject.title()}})
+    return active_run(app, user, model)
 
 
 def test_labeled_token_request_round_trip(workspace, monkeypatch):
@@ -723,6 +731,10 @@ def test_permission_recovery_pauses_only_this_request_and_keeps_shared_credentia
 
 def access_followup(app, run, actor='google:bob', model=None):
     store=app.state.store
+    if actor.startswith('google:') and actor != 'google:unknown':
+        subject = actor.removeprefix('google:')
+        store.identity({'method': 'google', 'identity': {
+            'sub': subject, 'email': subject + '@berri.ai', 'name': subject.title()}})
     store.finish_message(run['id'],run['active_message_id'],'','steered')
     store.enqueue_message(run['id'],'Continue investigating','access-followup',model=model,user_id=actor)
     store.claim_message(run['id'])

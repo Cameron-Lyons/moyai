@@ -10,8 +10,9 @@ def encode(value):
     return json.dumps(value, ensure_ascii=False, separators=(',', ':'))
 
 
-def page(items, cursor, size, identity):
-    version = hashlib.sha256(encode(identity).encode()).hexdigest()
+def page(items, cursor, size, identity, *, organization_id=''):
+    scoped_identity = [organization_id, identity] if organization_id else identity
+    version = hashlib.sha256(encode(scoped_identity).encode()).hexdigest()
     offset = 0
     if cursor:
         try:

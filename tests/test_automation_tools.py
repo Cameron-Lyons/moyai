@@ -124,7 +124,8 @@ def test_automation_and_delegated_runs_cannot_create_recursive_schedules(workspa
     app, client = workspace
     sign_in(app, client)
     run = active(app)
-    app.state.store.execute('UPDATE runs SET parent_run_id=? WHERE id=?', (run['id'], run['id']))
+    parent = active(app)
+    app.state.store.execute('UPDATE runs SET parent_run_id=? WHERE id=?', (parent['id'], run['id']))
     assert call(client, run, 'automation_list').status_code == 403
     assert not app.state.automation_tools.tools(run)
     app.state.store.execute("UPDATE runs SET parent_run_id='' WHERE id=?", (run['id'],))
@@ -236,7 +237,8 @@ def test_environment_discovery_exposes_reusable_build_not_setup_scripts(workspac
     saved = create(client, run, environment_id=item['id'])
     assert saved['definition']['environment_id'] == item['id']
     assert saved['definition']['repo_url'] == '' and saved['definition']['metadata'] == {}
-    app.state.store.execute('UPDATE runs SET parent_run_id=? WHERE id=?', (run['id'], run['id']))
+    parent = active(app)
+    app.state.store.execute('UPDATE runs SET parent_run_id=? WHERE id=?', (parent['id'], run['id']))
     assert call(client, run, 'automation_environments').status_code == 403
 
 

@@ -39,6 +39,13 @@ def ref(atespace, name):
     return {'atespace': atespace, 'name': name}
 
 
+def egress_host_allowed(host, pattern):
+    # Native wildcard syntax matches exactly one leftmost DNS label. Shell
+    # fnmatch would also admit nested names and loosen the configured ceiling.
+    return (pattern == '*' or host == pattern or (pattern.startswith('*.')
+            and host.endswith(pattern[1:]) and host.count('.') == pattern.count('.')))
+
+
 def tls_context(settings):
     context = ssl.create_default_context()
     if settings.substrate_ca_cert:
@@ -96,13 +103,24 @@ class SubstrateProvider:
     async def initialize(self, sandbox, *, timeout, apt_packages):
         # Safe to repeat after the control plane accepted CreateActor but the
         # provisioner lost its response. Finding an actor for cleanup is read-only.
+        configured = [host.strip() for host in self.settings.substrate_egress_hosts.split(',')]
+        restricted = getattr(self, 'security_egress_hosts', None)
+        hosts = configured if restricted is None else [host for host in restricted
+            if any(egress_host_allowed(host, pattern) for pattern in configured)]
+        policy = {'metadata': ref(sandbox.ref['atespace'], 'default'), 'rules': [
+            {'http': {'hostnames': hosts, 'ports': {'numbers': [80]}}},
+            {'tls_passthrough': {'hostnames': hosts, 'ports': {'all': {}}}}]} if hosts else {
+                'metadata': ref(sandbox.ref['atespace'], 'default'), 'rules': []}
         try:
             await self.rpc('CreateActorEgressPolicy', {
-                'actor': sandbox.ref, 'egress_policy': {'metadata': ref(sandbox.ref['atespace'], 'default'), 'rules': [
-                    {'http': {'hostnames': self.settings.substrate_egress_hosts.split(','), 'ports': {'numbers': [80]}}},
-                    {'tls_passthrough': {'hostnames': self.settings.substrate_egress_hosts.split(','), 'ports': {'all': {}}}}]}})
+                'actor': sandbox.ref, 'egress_policy': policy})
         except AlreadyExistsError:
-            pass
+            # A restored/named VM may already have a broader policy. Replace
+            # it before ResumeActor or guest activation, using CAS metadata.
+            # Never swallow an update error and resume with wildcard egress.
+            existing = await self.rpc('GetActorEgressPolicy', {'actor': sandbox.ref})
+            policy['metadata'].update(uid=existing.metadata.uid, version=existing.metadata.version)
+            await self.rpc('UpdateActorEgressPolicy', {'actor': sandbox.ref, 'egress_policy': policy})
         await self.rpc('ResumeActor', {'actor': sandbox.ref})
         await sandbox.request('/activate', {'expires_at': time.time() + timeout})
         if apt_packages:

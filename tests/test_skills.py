@@ -6,12 +6,20 @@ from fastapi import HTTPException
 
 from app.db import now
 from app.skills import requested_skills
-from test_spend import active, sign_in
+from test_spend import active as active_run, sign_in
 from test_workspace import workspace
 
 
 INSTRUCTIONS = '# Benchmark review\n\nUse the marker basalt-skill-42. Count every case and report failures.'
 MARKER = 'basalt-skill-42'
+
+
+def active(app, user='google:alice', model='openai/gpt-6-astra'):
+    # These tests steer work between two verified coworkers. Register the
+    # teammate's identity rather than fabricating a requester with no account.
+    app.state.store.identity({'method': 'google', 'identity': {
+        'sub': 'ishaan', 'email': 'ishaan@berri.ai', 'name': 'Ishaan'}})
+    return active_run(app, user, model)
 
 
 @pytest.mark.parametrize('content,expected', [

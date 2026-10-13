@@ -58,6 +58,7 @@ def test_opt_in_survives_new_login_and_restart_and_can_be_reversed(workspace, mo
 @pytest.mark.parametrize('stream', [False, True])
 def test_gateway_freezes_tier_per_turn_and_ignores_sandbox_overrides(workspace, monkeypatch, selected, tier, stream):
     app, client = workspace
+    actor = sign_in(app, client)
     app.state.settings.litellm_api_base = 'https://gateway.example/v1'
     seen = []
     result = {'id': 'tier-receipt', 'status': 'completed', 'service_tier': tier,
@@ -74,11 +75,11 @@ def test_gateway_freezes_tier_per_turn_and_ignores_sandbox_overrides(workspace, 
 
     actual = httpx.AsyncClient
     monkeypatch.setattr('app.harness_gateway.httpx.AsyncClient', lambda **kw: actual(transport=httpx.MockTransport(upstream), **kw))
-    run = app.state.store.create_run('First turn', '', 'modal', [], model=selected, harness='codex', chat_enabled=True)
+    run = app.state.store.create_run('First turn', '', 'modal', [], model=selected, harness='codex', chat_enabled=True, user_id=actor)
     first = app.state.store.claim_message(run['id'])
     app.state.store.update_run(run['id'], status='running', token_hash=digest('capability'))
     future = ASTRA if selected == ASTRA_ULTRAFAST else ASTRA_ULTRAFAST
-    app.state.store.enqueue_message(run['id'], 'Next turn in the other mode', 'future-tier', future)
+    app.state.store.enqueue_message(run['id'], 'Next turn in the other mode', 'future-tier', future, user_id=actor)
     headers = {'Authorization': 'Bearer capability'}
     assert client.get(f"/broker/{run['id']}/v1/models", headers=headers).json()['data'][0]['id'] == ASTRA
     response = client.post(f"/broker/{run['id']}/v1/responses", headers=headers,
@@ -95,6 +96,7 @@ def test_gateway_freezes_tier_per_turn_and_ignores_sandbox_overrides(workspace, 
 
 def test_incompatible_harness_and_protocol_cannot_silently_disable_opt_in(workspace, monkeypatch):
     app, client = workspace
+    actor = sign_in(app, client)
     monkeypatch.setattr(app.state.manager, 'submit', lambda run: None)
     response = client.post('/api/runs', json={'prompt': 'Task', 'model': ASTRA_ULTRAFAST, 'harness': 'hermes'})
     assert response.status_code == 422 and 'requires the Responses API' in response.text
@@ -106,7 +108,8 @@ def test_incompatible_harness_and_protocol_cannot_silently_disable_opt_in(worksp
         'content': 'Switch', 'client_id': 'incompatible-tier', 'model': ASTRA_ULTRAFAST}).status_code == 422
     app.state.store.execute("UPDATE runs SET mode='modal' WHERE id=?", (run['id'],))
     assert call(client, app.state.store.run(run['id']), model=ASTRA_ULTRAFAST).status_code == 422
-    run = app.state.store.create_run('Codex task', '', 'modal', [], model=ASTRA_ULTRAFAST, harness='codex')
+    run = app.state.store.create_run('Codex task', '', 'modal', [], model=ASTRA_ULTRAFAST, harness='codex', chat_enabled=True, user_id=actor)
+    app.state.store.claim_message(run['id'])
     app.state.store.update_run(run['id'], status='running', token_hash=digest('capability'))
     for route in ('messages', 'chat/completions'):
         response = client.post(f"/broker/{run['id']}/v1/{route}", headers={'Authorization': 'Bearer capability'},

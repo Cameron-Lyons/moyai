@@ -45,10 +45,12 @@ def wait_for(predicate, timeout=3):
     raise AssertionError("Timed out waiting for condition")
 
 
-def cloud_capability(app, plugins):
+def cloud_capability(app, plugins, *, role='admin'):
     for provider in plugins:
         app.state.connectors.save(provider, {"access_token": "provider-test-token", "kind": "personal"}, "Test team")
-    run = app.state.store.create_run("A controlled test task", "", "modal", plugins, model=app.state.settings.agent_model)
+    owner = app.state.store.identity({'method': 'password' if app.state.settings.workspace_password else 'local', 'role': role})
+    run = app.state.store.create_run("A controlled test task", "", "modal", plugins,
+                                     model=app.state.settings.agent_model, user_id=owner)
     token = "run-capability-only"
     app.state.store.update_run(run["id"], status="running", token_hash=digest(token))
     return run["id"], {"Authorization": f"Bearer {token}"}
@@ -87,7 +89,8 @@ def test_every_broker_tool_has_an_audited_replay_classification(workspace, recov
     response = client.get(f"/broker/{run['id']}/tools", headers={'Authorization': 'Bearer capability'})
     assert response.status_code == 200
     catalogs = [recovery_catalog, response.json()]
-    app.state.store.execute('UPDATE runs SET parent_run_id=? WHERE id=?', (run['id'], run['id']))
+    parent = app.state.store.create_run('Catalog parent session', '', 'demo', [], user_id=run['owner_id'])
+    app.state.store.execute('UPDATE runs SET parent_run_id=? WHERE id=?', (parent['id'], run['id']))
     response = client.get(f"/broker/{run['id']}/tools", headers={'Authorization': 'Bearer capability'})
     assert response.status_code == 200
     catalogs.append(response.json())
@@ -219,12 +222,12 @@ def test_tokens_are_validated_encrypted_and_never_returned(workspace, monkeypatc
 ])
 def test_writes_execute_without_approval(workspace, monkeypatch, role, provider, name, arguments):
     app, client = workspace
-    run_id, headers = cloud_capability(app, [provider])
     if role == 'member':
         app.state.settings.workspace_password = 'admin-password'
         app.state.settings.workspace_member_password = 'member-password'
         assert client.post('/api/login', json={'password': 'member-password'}).json()['role'] == 'member'
         client.headers['X-CSRF-Token'] = client.get('/api/session').json()['csrf']
+    run_id, headers = cloud_capability(app, [provider], role=role)
     calls = []
     async def call(name, arguments, **kwargs):
         assert app.state.store.run(run_id)['status'] == 'running'

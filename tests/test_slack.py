@@ -104,6 +104,9 @@ def test_uncertain_working_status_does_not_replay_the_agent(slack_app, monkeypat
     monkeypatch.setattr(app.state.connectors, "request", uncertain)
     client.post("/hooks/slack/events", **signed(event()))
     wait_for(lambda: bool(app.state.store.rows("SELECT 1 FROM slack_activity WHERE retry_at>0")))
+    # The durable receipt is written before dispatch; wait for that first
+    # provider attempt before checking that redelivery/recovery cannot repeat it.
+    wait_for(lambda: len(attempts) == 1)
     client.post("/hooks/slack/events", **signed(event()))
     app.state.slack.recover()
     assert len(runs) == 1 and len(attempts) == 1

@@ -31,7 +31,7 @@ async function openSkillEditor(id='',suggestion=null){
   const saved=id?await api('/api/skills/'+id):null;
   if(version!==state.pageVersion||user!==state.userId)return;
   if(suggestion&&saved&&saved.revision!==suggestion.target_revision)throw new Error('This skill changed. Review the current skill before updating it.');
-  const skill=suggestion?{...saved,...suggestion,id:saved?.id||'',scope:saved?.scope||'',revision:suggestion.target_revision,can_manage:true}:saved,canEdit=!skill||skill.can_manage,admin=state.role==='admin';
+  const skill=suggestion?{...saved,...suggestion,id:saved?.id||'',scope:saved?.scope||'',revision:suggestion.target_revision,can_manage:true}:saved,canEdit=!skill||skill.can_manage,admin=globalThis.MoyaiPermissions?.has('skills.publish')??state.role==='admin';
   const dialog=$('#skill-dialog');
   dialog.dataset.dialogScope='settings';
   const references=skill?.files?.length?`<div class="field"><label>Supporting files</label><ul>${skill.files.map(file=>`<li><a href="/api/skills/${encodeURIComponent(skill.id)}/files/${file.path.split('/').map(encodeURIComponent).join('/')}" download>${esc(file.path)}</a> <small>${Math.ceil(file.size/1024)} KB</small></li>`).join('')}</ul><small>These files are preserved when you edit the instructions. Ask Moyai in chat to update or remove a supporting file.</small></div>`:'';

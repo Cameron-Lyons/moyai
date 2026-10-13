@@ -162,7 +162,8 @@ def test_current_image_is_multimodal_but_future_and_other_session_files_are_inac
     later = upload(client, 'later.png', png()).json()
     client.post(f'/api/runs/{run_id}/messages', json={'content': 'Future files', 'client_id': 'future-image', 'attachment_ids': [later['id']]})
     store.execute("UPDATE runs SET mode='modal' WHERE id=?", (run_id,))
-    other = store.create_run('Other session', '', 'modal', [], chat_enabled=True)
+    other = store.create_run('Other session', '', 'modal', [], chat_enabled=True,
+                             user_id=store.run(run_id)['owner_id'])
     store.claim_message(other['id'])
     store.update_run(other['id'], status='running', token_hash=digest('other'))
     headers = {'Authorization': 'Bearer capability'}

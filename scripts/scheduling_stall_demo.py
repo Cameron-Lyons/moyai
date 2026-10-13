@@ -54,11 +54,12 @@ async def probe(directory: Path, *, steering: bool, hold_seconds: float = 1,
     if contention not in {'writer', 'pool'} or (contention == 'pool' and not store.database):
         store.close()
         raise ValueError('Pool contention requires PostgreSQL; otherwise use writer contention.')
-    run = store.create_run('Local scheduling probe', '', 'modal', [], chat_enabled=True)
+    actor = store.identity({'method': 'local', 'role': 'admin'})
+    run = store.create_run('Local scheduling probe', '', 'modal', [], chat_enabled=True, user_id=actor)
     store.claim_message(run['id'])
     store.update_run(run['id'], status='running', token_hash=digest('local-probe'))
     if steering:
-        store.enqueue_message(run['id'], 'Local correction', 'correction', send_now=True)
+        store.enqueue_message(run['id'], 'Local correction', 'correction', send_now=True, user_id=actor)
     locked = threading.Event()
     errors = []
 

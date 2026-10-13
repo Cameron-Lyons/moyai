@@ -328,6 +328,8 @@ class Credentials:
     def permitted(self, secret, run, actor_id):
         if not actor_id or secret['revoked_at']:
             return False
+        if self.security.user_roles and not self.security.has_actor_permission(actor_id, 'credentials.read'):
+            return False
         # Lifetime bounds every source of reachability, including shared access.
         if secret['lifetime'] == 'session' and secret['root_id'] != self.root(run):
             return False
@@ -408,6 +410,9 @@ class Credentials:
         return value
 
     def insert_secret(self, conn, body, user_id, admin, root_id=''):
+        if self.security.user_roles:
+            self.security.user_roles.require_actor(user_id, 'credentials.manage', connection=conn)
+            admin = self.security.has_actor_permission(user_id, 'credentials.publish', connection=conn)
         if body.scope == 'organization' and not admin:
             raise HTTPException(403, 'Only an administrator can save organization credentials.')
         if body.scope != 'organization' and not user_id.startswith(('google:', 'cloudflare:')) and not self.security.local_preview():
@@ -435,6 +440,8 @@ class Credentials:
 
     def tools(self, run):
         if not self.settings.temporal_enabled or not run['chat_enabled']:
+            return []
+        if self.security.user_roles and not self.security.has_actor_permission(run['active_user_id'], 'credentials.read'):
             return []
         return [{'name': name, 'description': description, 'inputSchema': schema.model_json_schema(),
                  'annotations': {'readOnlyHint': name == 'credentials_list', 'idempotentHint': name == 'credentials_list'}}
@@ -849,6 +856,11 @@ class Credentials:
         return dict(row), dict(secret) if secret else None
 
     def materialize(self, run, args):
+        if self.security.user_roles:
+            self.security.user_roles.require_actor(run['active_user_id'], 'credentials.read')
+        profiles = getattr(self.store, 'security_profiles', None)
+        if profiles:
+            profiles.require_tool(run, 'credentials_run')
         with self.store.connect() as conn:
             conn.begin_write()
             accepted = []
@@ -912,6 +924,8 @@ class Credentials:
         return result
 
     async def call(self, run, name, arguments):
+        if self.security.user_roles:
+            self.security.user_roles.require_actor(run['active_user_id'], 'credentials.read')
         args = TOOLS[name][0].model_validate(arguments)
         if name in slack_secrets.TOOLS:
             return await slack_secrets.call(self, run, name, args)
@@ -930,6 +944,11 @@ class Credentials:
                 **({'moyai_wait_credential': result['moyai_wait_credential']} if result.get('moyai_wait_credential') else {})}
 
     async def invoke(self, run, args):
+        if self.security.user_roles:
+            self.security.user_roles.require_actor(run['active_user_id'], 'credentials.read')
+        profiles = getattr(self.store, 'security_profiles', None)
+        if profiles:
+            profiles.require_tool(run, 'credentials_http_request')
         with self.store.connect() as conn:
             conn.begin_write()
             request, secret = self.authorized_request(conn, run, args.request_id)
@@ -952,6 +971,13 @@ class Credentials:
         if await self.slots.is_full():
             raise HTTPException(429, 'Provider request capacity is busy. No provider call was made.')
         async with self.slots:
+            # Admission can wait behind another provider call. Recheck live
+            # authorization and destination policy at actual dispatch.
+            if self.security.user_roles:
+                self.security.user_roles.require_actor(run['active_user_id'], 'credentials.read')
+            if profiles:
+                profiles.require_tool(run, 'credentials_http_request', write=args.method == 'POST')
+                profiles.require_url(run, provider['base'] + args.path)
             self.acknowledge(run['id'], run['active_message_id'], request['id'], request['generation'])
             value = self.security.decrypt(secret['encrypted'])
             headers = {'x-api-key': value, 'anthropic-version': '2023-06-01'} if secret['provider'] == 'anthropic' else {'Authorization': 'Bearer ' + value}
@@ -982,6 +1008,9 @@ class Credentials:
     def update_secret(self, secret_id, body, user_id, admin):
         with self.store.connect() as conn:
             conn.begin_write()
+            if self.security.user_roles:
+                self.security.user_roles.require_actor(user_id, 'credentials.manage', connection=conn)
+                admin = self.security.has_actor_permission(user_id, 'credentials.publish', connection=conn)
             row = conn.execute('SELECT * FROM provider_secrets WHERE id=? AND revoked_at=\'\'', (secret_id,)).fetchone()
             if not row or (row['scope'] == 'organization' and not admin) or (row['scope'] != 'organization' and row['owner_id'] != user_id):
                 raise HTTPException(404, 'Credentials not found.')
@@ -1022,7 +1051,7 @@ class Credentials:
 
         def actor(request, mutation=False):
             self.security.require(request, mutation=mutation)
-            return self.store.identity(self.security.session_info(request)), self.security.role(request) == 'admin'
+            return self.store.identity(self.security.session_info(request)), self.security.has_permission(request, 'credentials.publish')
 
         @router.get('/api/credentials')
         async def list_keys(request: Request, run_id: str = ''):
@@ -1058,6 +1087,9 @@ class Credentials:
             user, admin = actor(request, True)
             with self.store.connect() as conn:
                 conn.begin_write()
+                if self.security.user_roles:
+                    self.security.user_roles.require_actor(user, 'credentials.manage', connection=conn)
+                    admin = self.security.has_actor_permission(user, 'credentials.publish', connection=conn)
                 row = conn.execute('SELECT * FROM provider_secrets WHERE id=?', (secret_id,)).fetchone()
                 if not row or not (row['owner_id'] == user or (row['scope'] == 'organization' and admin)):
                     raise HTTPException(404, 'Credentials not found.')

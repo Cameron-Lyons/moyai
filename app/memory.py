@@ -147,7 +147,9 @@ class Memory:
         return [{'id': entry['id'], 'url': Note.repository('https://github.com/' + entry['full_name'])}
                 for entry in self.github.repository_options()]
 
-    def owner(self, actor, conn=None):
+    def owner(self, actor, conn=None, *, permission='memory.read'):
+        if self.security.user_roles:
+            self.security.user_roles.require_actor(actor, permission, connection=conn)
         if self.security.local_preview() and actor == 'shared:local:admin':
             return actor
         if not actor or not self.security.settings.person_login_enabled():
@@ -223,6 +225,8 @@ class Memory:
 
     def save_in(self, conn, owner, body, *, source=None, run=None, note_id=''):
         """Shared storage checks; caller owns the transaction and authorization."""
+        if self.security.user_roles:
+            self.security.user_roles.require_actor(owner, 'memory.manage', connection=conn)
         if run:
             deny_export(self.store, run['id'], conn)
         if source and source.get('run_id'):
@@ -282,6 +286,8 @@ class Memory:
     def forget(self, owner, note_id, revision):
         with self.store.connect() as conn:
             conn.begin_write()
+            if self.security.user_roles:
+                self.security.user_roles.require_actor(owner, 'memory.manage', connection=conn)
             row = self.get(conn, owner, note_id)
             if row['revision'] != revision:
                 raise HTTPException(409, 'This memory changed. Review it before deleting.')
@@ -307,7 +313,8 @@ class Memory:
                 ranked.append((score, note['updated_at'], note['id'], note))
         matches = [item[-1] for item in sorted(ranked, key=lambda item: item[:-1], reverse=True)]
         selected, paging = page(matches, cursor, page_size,
-            [owner, query, repo_url, [(n['id'], n['revision']) for n in matches]])
+            [owner, query, repo_url, [(n['id'], n['revision']) for n in matches]],
+            organization_id=getattr(self.store, 'organization_id', ''))
         with self.store.connect() as conn:
             conn.begin_write()
             conn.execute('DELETE FROM memory_selections WHERE run_id=?', (run['id'],))

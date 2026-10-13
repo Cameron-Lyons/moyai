@@ -68,10 +68,12 @@ class IndependentRuntime:
 
     async def provision(self, run_id, state):
         r = self.runner
+        await database(r.enforce_session_security, await database(r.store.run, run_id))
         name = f"moyai-runtime-{run_id}-{state['message_id']}-{state['segment']}"
         state.update(sandbox_name=name, runtime_scope=self.scope(await database(r.store.run, run_id)))
         await database(r.save, run_id, state)
         backend = self.provider()
+        await database(r.enforce_session_security, await database(r.store.run, run_id), backend)
         try:
             runtime = await backend.find(name)
         except modal.exception.NotFoundError:

@@ -14,7 +14,7 @@ from app.db import Store
 from app.media_shares import MediaShares, TOOLS, validated_mime
 from app.security import digest
 from storage_fixture import MemoryObjects
-from test_spend import active
+from test_spend import active, sign_in
 import asyncio
 import json
 import time
@@ -557,6 +557,7 @@ def share(client, run, source, key='fixture-share'):
 def rig(workspace):
     app, client = workspace
     app.state.store.objects = MemoryObjects()
+    sign_in(app, client)
     run = active(app)
     return app, client, run
 
@@ -564,7 +565,8 @@ def rig(workspace):
 @pytest.mark.parametrize('harness', ['hermes', 'claude-agent-sdk', 'codex', 'opencode', 'deepagents', 'tool-loop'])
 def test_default_broker_discovery_and_resume_are_harness_independent(rig, harness):
     app, client, run = rig
-    run = app.state.store.create_run('Harness media fixture', '', 'modal', [], harness=harness)
+    run = app.state.store.create_run('Harness media fixture', '', 'modal', [], harness=harness,
+                                     user_id=run['owner_id'])
     app.state.store.update_run(run['id'], status='running', token_hash=digest('capability'))
     for resumed in (False, True):
         if resumed:
@@ -683,6 +685,9 @@ def test_publication_rechecks_authority_after_upload(rig, monkeypatch, change, e
     app, client, run = rig
     source = attach(app, run, png())
     store = app.state.store
+    if change == 'requester':
+        sign_in(app, client, 'bob', 'bob@berri.ai')
+        sign_in(app, client)
     put = store.objects.put
     def changed_during_upload(raw):
         reference = put(raw)

@@ -70,7 +70,7 @@ function performanceResults(data) {
 
 async function renderPerformance() {
   const version=state.pageVersion, owner=state.userId;
-  if(state.role!=='admin') {
+  if(!(globalThis.MoyaiPermissions?.has('runtime.manage')??state.role==='admin')) {
     MoyaiUI.render($('#content'),'<section class="card"><h1>Performance</h1><p role="alert">Only administrators can view workspace performance.</p></section>');
     return;
   }
@@ -81,7 +81,7 @@ async function renderPerformance() {
       <label>Model<select id="performance-model"><option value="">All models</option>${performanceView.models.map(model=>`<option value="${esc(model)}" ${performanceView.model===model?'selected':''}>${esc(model)}</option>`).join('')}</select></label>
       <label>Send now<select id="performance-send-kind">${[['all','Explicit + automatic'],['explicit','Explicit Send now'],['automatic','Automatic immediate']].map(([value,label])=>`<option value="${value}" ${performanceView.sendKind===value?'selected':''}>${label}</option>`).join('')}</select></label></div>
     <p id="performance-status" class="subtext" role="status"></p><div id="performance-results"></div></section>`);
-  const active=()=>version===state.pageVersion&&state.view==='performance'&&state.userId===owner&&state.role==='admin';
+  const active=()=>version===state.pageVersion&&state.view==='performance'&&state.userId===owner&&(globalThis.MoyaiPermissions?.has('runtime.manage')??state.role==='admin');
   async function load(){
     const request=++performanceView.request;
     const expanded=[...document.querySelectorAll('#performance-results details[open]')].map(el=>el.querySelector('summary')?.textContent);

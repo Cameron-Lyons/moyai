@@ -104,6 +104,9 @@ def writing_actor(skills, run):
     user = matches[0]
     if user['email'].rpartition('@')[2] not in settings.google_domains():
         raise HTTPException(403, 'This account is no longer eligible to manage skills.')
+    if skills.security.user_roles:
+        skills.security.user_roles.require_actor(user['id'], 'skills.manage')
+        return user['id'], skills.security.has_actor_permission(user['id'], 'skills.publish')
     return user['id'], skills.security.google_role(user['email']) == 'admin'
 
 

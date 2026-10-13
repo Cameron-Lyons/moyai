@@ -48,8 +48,8 @@ def test_person_isolation_linked_slack_and_removed_model(workspace):
 
 def test_switch_uses_active_author_and_retry_does_not_overwrite(workspace):
     app, client = workspace
-    app.state.store.identity({'method': 'google', 'identity': {'sub': 'alice', 'email': 'alice@example.com'}})
-    bob = app.state.store.identity({'method': 'google', 'identity': {'sub': 'bob', 'email': 'bob@example.com'}})
+    app.state.store.identity({'method': 'google', 'identity': {'sub': 'alice', 'email': 'alice@berri.ai'}})
+    bob = app.state.store.identity({'method': 'google', 'identity': {'sub': 'bob', 'email': 'bob@berri.ai'}})
     run = active(app, 'google:alice')
     app.state.store.execute('UPDATE runs SET owner_id=? WHERE id=?', (bob, run['id']))
     assert call(client, run).status_code == 200

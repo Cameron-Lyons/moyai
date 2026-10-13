@@ -128,7 +128,10 @@ class DurableRunner(RunManager):
         secret = self.settings.encryption_key or self.settings.session_secret
         if not secret:
             raise ValueError('Durable execution requires a stable encryption/session key')
-        return hmac.new(secret.encode(), f'moyai-turn-v1:{run_id}:{message_id}'.encode(), hashlib.sha256).hexdigest()
+        organization_id = getattr(self.settings, 'moyai_organization_id', '')
+        context = (f'moyai-organization-turn-v1:{organization_id}:{run_id}:{message_id}' if organization_id
+                   else f'moyai-turn-v1:{run_id}:{message_id}')
+        return hmac.new(secret.encode(), context.encode(), hashlib.sha256).hexdigest()
 
     def computer_wake_state(self, row, state, pending):
         """One lifecycle policy for presentation, retries, and atomic admission."""
@@ -393,6 +396,7 @@ class DurableRunner(RunManager):
                 return True
 
     def begin_turn(self, run_id, row, warm=None):
+        row = self.enforce_session_security(row)
         if stop_requested(row) or row['status'] in {'cancelled', 'interrupted'}:
             return False
         messages = self.store.rows("SELECT * FROM messages WHERE run_id=? AND status='running'", (run_id,))
@@ -447,6 +451,9 @@ class DurableRunner(RunManager):
         return self.settings.sandbox_idle_seconds or (300 if state.get('computer_only') else 0)
 
     def can_keep_warm(self, run, state):
+        profiles = getattr(self.store, 'security_profiles', None)
+        if profiles and profiles.network_hosts(run) != state.get('security_network'):
+            return False
         return (bool(self.computer_idle_seconds(state)) and not run['parent_run_id']
                 and bool(state.get('sandbox_id'))
                 and time.time() < state['machine_started'] + self.rotation_seconds(state)
@@ -466,6 +473,13 @@ class DurableRunner(RunManager):
 
     async def warm(self, run_id, state):
         row = await database(self.store.run, run_id)
+        profiles = getattr(self.store, 'security_profiles', None)
+        if profiles:
+            row = await database(profiles.bind_session, row)
+            if await database(profiles.network_hosts, row) != state.get('security_network'):
+                state['idle_reason'] = 'session network policy changed'
+                await self.release_warm(run_id, state, state['idle_reason'])
+                return await database(self.store.has_queued_messages, run_id)
         if (getattr(self, 'computer', None) and state.get('phase') == 'warm'
                 and not state.get('independent_runtime')):
             touched = self.computer.touched(run_id)
@@ -601,6 +615,7 @@ class DurableRunner(RunManager):
     async def provision(self, run_id, state, *, save=None, provisioned=None):
         save = save or self.save
         provisioned = provisioned or self.save_provisioned
+        await database(self.enforce_session_security, await database(self.store.run, run_id))
         project = await self.environments.prepare(run_id) if self.environments else {}
         if stop_requested((await database(self.store.run, run_id))):
             return True
@@ -613,6 +628,7 @@ class DurableRunner(RunManager):
                 state['phase'] = 'provision'
                 await database(save, run_id, state)
         backend = self.provider((await database(self.store.run, run_id)))
+        await database(self.enforce_session_security, await database(self.store.run, run_id), backend)
         name = self.provision_name(run_id, state)
         state['sandbox_name'] = name
         await database(save, run_id, state)  # Keep create identity even if its ACK is lost.
@@ -642,7 +658,8 @@ class DurableRunner(RunManager):
                 await database(self.store.event, run_id, 'status', 'Startup VM stopped. Retrying from the saved workspace.',
                                  {'phase': 'provision', 'attempt': attempt + 1})
             return True
-        state.update(sandbox_id=sandbox.object_id, machine_started=getattr(sandbox, 'started_at', time.time()), phase='install')
+        state.update(sandbox_id=sandbox.object_id, machine_started=getattr(sandbox, 'started_at', time.time()), phase='install',
+                     security_network=getattr(backend, 'security_egress_hosts', None))
         await database(provisioned, run_id, state)
         return sandbox
 

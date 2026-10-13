@@ -656,6 +656,7 @@ def test_agent_wait_interrupts_only_after_trusted_delegation_and_complete_tools(
 
 def test_broker_hides_delegation_without_temporal_and_keeps_run_scope(workspace):
     app, client = workspace
+    sign_in(app, client)
     root = active(app)
     headers = {'Authorization':'Bearer capability'}
     assert not any(t['name'].startswith('agents_') for t in client.get(f"/broker/{root['id']}/tools", headers=headers).json())

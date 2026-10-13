@@ -78,6 +78,12 @@ def safe_error_detail(exc, secrets_to_hide=()):
 class RunManager:
     """Single-process durable admission; interrupted work is never silently replayed."""
     def __init__(self, store, settings):
+        if getattr(settings, 'moyai_organization_id', ''):
+            if not all(getattr(store, name, None) for name in ('organization_scope', 'user_roles', 'security_profiles')):
+                from .database import DatabaseError
+                raise DatabaseError('Construct organization-scoped runtimes through create_app so organization, roles and security policies are verified before workers start.')
+            from .organization_scope import OrganizationScope
+            OrganizationScope(store, settings)
         self.store, self.settings = store, settings
         store.sandbox_provider = lambda: settings.sandbox_provider
         self.jobs = {}
@@ -92,6 +98,23 @@ class RunManager:
         self.credentials = None
         self.message_queue = MessageQueue(store)
         self.modal_clients = ModalClients()
+
+    def enforce_session_security(self, run, backend=None):
+        """Bind before provider I/O and enforce identities at each launch."""
+        profiles = getattr(self.store, 'security_profiles', None)
+        if profiles:
+            run = profiles.bind_session(run)
+            hosts = profiles.network_hosts(run)
+            if backend is not None:
+                backend.security_egress_hosts = hosts
+        from .scim import active_for_actor_in
+        with self.store.connect() as conn:
+            if not active_for_actor_in(conn, run.get('active_user_id') or run.get('owner_id') or ''):
+                raise HTTPException(403, 'The session owner has been deactivated.')
+        roles = getattr(self.store, 'user_roles', None)
+        if roles:
+            roles.require_actor(run.get('active_user_id') or run.get('owner_id') or '', 'sessions.create')
+        return run
 
     async def persist(self):
         """Replaced by the cloud checkpoint callback when hosted on Modal."""
@@ -489,6 +512,7 @@ class RunManager:
         if run.get('harness') == 'deepagents-temporal':
             raise ValueError('Deep Agents requires Temporal. Configure TEMPORAL_ENABLED=true and a reachable Temporal server.')
         run_id = run["id"]
+        run = self.enforce_session_security(run)
         self.store.update_run(run_id, status="provisioning")
         self.store.event(run_id, "status", "Provisioning an isolated sandbox")
         waiting = ''
@@ -507,6 +531,7 @@ class RunManager:
         fresh = self.store.run(run_id)
         run = {**run, 'repo_url': fresh['repo_url'], 'environment_build_id': fresh['environment_build_id']}
         backend = self.provider(run)
+        run = self.enforce_session_security(run, backend)
         if self.stopped(run_id):
             return
         token = secrets.token_urlsafe(48)

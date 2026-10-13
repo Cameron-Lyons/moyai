@@ -34,7 +34,29 @@ def sign_in(app, client, sub='alice', email='alice@berri.ai'):
     return 'google:' + sub
 
 
+def registered_actor(app, user):
+    """Register the authenticated fixture assertion, preserving existing profiles.
+
+    Runtime capabilities belong to a real account, even when a test does not
+    need a browser login. Negative-account sentinels deliberately remain absent;
+    this helper never changes role grants, SCIM state, or configured eligibility.
+    """
+    if app.state.store.rows('SELECT id FROM users WHERE id=?', (user,)):
+        return user
+    if user.startswith('google:'):
+        subject = user.removeprefix('google:')
+        if subject not in {'unknown', 'missing', 'nonexistent'}:
+            app.state.store.identity({'method': 'google', 'identity': {
+                'sub': subject, 'email': subject + '@berri.ai', 'name': subject.title()}})
+    elif user.startswith('shared:'):
+        _, method, role = user.split(':', 2)
+        if method in {'local', 'password'} and role in {'admin', 'member'}:
+            app.state.store.identity({'method': method, 'role': role})
+    return user
+
+
 def active(app, user='google:alice', model='openai/gpt-6-astra'):
+    registered_actor(app, user)
     run = app.state.store.create_run('Spend test', '', 'modal', [], chat_enabled=True, user_id=user, model=model)
     app.state.store.claim_message(run['id'])
     app.state.store.update_run(run['id'], status='running', token_hash=digest('capability'))

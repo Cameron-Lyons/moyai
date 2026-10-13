@@ -17,6 +17,23 @@ class AccessUnavailable(Exception):
     pass
 
 
+def scim_provisioning_route(path, method):
+    """Only installed provisioning operations use their own bearer controller.
+
+    This is an application-layer exemption, not a Cloudflare edge-policy change.
+    Admin credential management and every browser/broker route retain Access.
+    """
+    if path in {'/scim/v2/Users', '/scim/v2/Groups'}:
+        return method in {'GET', 'POST'}
+    if re.fullmatch(r'/scim/v2/(?:Users|Groups)/[0-9a-f]{32}', path):
+        return method in {'GET', 'PUT', 'PATCH', 'DELETE'}
+    if method != 'GET':
+        return False
+    return bool(path in {'/scim/v2/ServiceProviderConfig', '/scim/v2/ResourceTypes', '/scim/v2/Schemas'}
+                or re.fullmatch(r'/scim/v2/ResourceTypes/(?:User|Group)', path)
+                or re.fullmatch(r'/scim/v2/Schemas/urn:ietf:params:scim:schemas:core:2\.0:(?:User|Group)', path))
+
+
 class CloudflareAccess:
     def __init__(self, settings: Settings):
         self.settings = settings
@@ -84,6 +101,8 @@ class CloudflareAccess:
         # their provider before accepting work; no general /hooks/* exemption.
         if (path == '/health' and method in {'GET', 'HEAD'}) or (path in self.webhooks and method == 'POST'):
             return
+        if scim_provisioning_route(path, method):
+            return  # Every matching controller requires its own provisioning credential.
         if not token or len(token) > 16384:
             raise jwt.InvalidTokenError()
         header = jwt.get_unverified_header(token)

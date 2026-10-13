@@ -19,15 +19,17 @@ class SessionPrivacy:
             raise HTTPException(404, 'Session not found.')
         return run
 
-    def individual_owner(self, request):
-        info = self.security.session_info(request)
+    def individual_owner(self, request, *, info=None):
+        if info is None:
+            info = self.security.session_info(request)
         if not info or info.get('method') not in {'google', 'cloudflare'}:
             raise HTTPException(403, 'Private sessions require individual Google or Cloudflare sign-in.')
         actor = getattr(request.state, 'access_actor', None) if info['method'] == 'cloudflare' else None
         return actor if actor is not None else self.store.identity(info)
 
-    def require_request(self, request, run_or_id):
-        info = self.security.session_info(request)
+    def require_request(self, request, run_or_id, *, info=None):
+        if info is None:
+            info = self.security.session_info(request)
         if not info:
             raise HTTPException(401, 'Sign in to the workspace.')
         if isinstance(run_or_id, str):
@@ -35,7 +37,7 @@ class SessionPrivacy:
             run = rows[0] if rows else None
         else:
             run = run_or_id
-        actor = self.individual_owner(request) if self.is_private(run) and info.get('method') in {'google', 'cloudflare'} else ''
+        actor = self.individual_owner(request, info=info) if self.is_private(run) and info.get('method') in {'google', 'cloudflare'} else ''
         return self.require_owner(run, actor)
 
     @staticmethod
@@ -51,7 +53,7 @@ class SessionPrivacy:
                     or name in {'media_share', 'media_revoke', 'skills_save', 'memory_save', 'memory_forget'}
                     or (name.startswith('credentials_') and name not in {'credentials_list', 'credentials_request', 'credentials_http_request'}))
 
-    def guard_request(self, request):
+    def guard_request(self, request, *, info=None):
         """Resolve indirect resource routes before their handlers can read content."""
         if not getattr(request, 'scope', {}).get('path', '').startswith('/api/'):
             return
@@ -65,7 +67,7 @@ class SessionPrivacy:
             rows = self.store.rows('SELECT run_id FROM approvals WHERE id=?', (params['approval_id'],))
             run_id = rows[0]['run_id'] if rows else None
         if run_id:
-            self.require_request(request, run_id)
+            self.require_request(request, run_id, info=info)
 
 
 def initialize_schema(store):

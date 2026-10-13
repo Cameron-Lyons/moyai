@@ -74,7 +74,7 @@ def test_turn_discovery_respects_session_lifetime_and_disabled_credential_tools(
     assert app.state.credentials.discovery_context(first)['shared_vault_sources'] == 1
     assert app.state.credentials.discovery_context(other)['shared_vault_sources'] == 0
     assert source not in json.dumps(app.state.credentials.discovery_context(first))
-    assert app.state.credentials.discovery_context({**first, 'active_user_id': ''})['shared_vault_sources'] == 0
+    assert app.state.credentials.discovery_context({**first, 'active_user_id': ''}) is None
     assert app.state.credentials.discovery_context({**first, 'chat_enabled': False}) is None
     app.state.settings.temporal_enabled = False
     assert app.state.credentials.discovery_context(first) is None

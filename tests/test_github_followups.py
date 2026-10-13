@@ -99,7 +99,9 @@ def test_uncertain_comment_is_found_beyond_one_hundred_pages(published, monkeypa
 
 
 def another_session(app):
-    run = app.state.store.create_run('Continue an existing PR', '', 'modal', ['github'])
+    assert app.state.security.local_preview()
+    actor = app.state.store.identity({'method': 'local', 'role': 'admin'})
+    run = app.state.store.create_run('Continue an existing PR', '', 'modal', ['github'], user_id=actor)
     token = 'another-run-capability'
     app.state.store.update_run(run['id'], status='running', token_hash=digest(token))
     return app.state.store.run(run['id']), {'Authorization': 'Bearer ' + token}

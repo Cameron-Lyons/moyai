@@ -1,6 +1,15 @@
 const userDirectoryState = {query:'', filter:'all'};
 const userRoleLabel = role => role === 'admin' ? 'Admin' : 'Internal user';
 
+function hasWorkspacePermission(permission, role=state.role) {
+  if (role === 'admin') return true;
+  if (!Array.isArray(state.permissions)) return ['workspace.read','sessions.read','sessions.create','sessions.manage',
+    'connections.read','connections.write','automations.read','automations.manage','environments.read',
+    'skills.read','skills.manage','memory.read','memory.manage','credentials.read','credentials.manage','spend.personal'].includes(permission);
+  return Array.isArray(state.permissions) && state.permissions.includes(permission);
+}
+globalThis.MoyaiPermissions = {has:hasWorkspacePermission};
+
 function userRows(users, query, filter) {
   const needle = query.trim().toLowerCase();
   return users.filter(user => (filter === 'all' || user.role === filter) &&
@@ -11,15 +20,17 @@ function userTable(users, query, filter) {
   const rows = userRows(users, query, filter);
   return rows.length ? `<table class="users-table"><thead><tr><th scope="col">User</th><th scope="col">Role</th><th scope="col">Workspace access</th><th scope="col"><span class="sr-only">Actions</span></th></tr></thead><tbody>${rows.map(user => `<tr>
     <td><div class="user-person"><span class="user-avatar" aria-hidden="true">${esc((user.name || user.email).slice(0,1).toUpperCase())}</span><div><strong>${esc(user.name || user.email.split('@')[0])}${user.email === state.identity?.email ? ' <span class="user-you">You</span>' : ''}</strong><span>${esc(user.email)}</span></div></div></td>
-    <td><span class="user-role ${user.role === 'admin' ? 'is-admin' : ''}">${userRoleLabel(user.role)}</span></td>
+    <td><span class="user-role ${user.role === 'admin' ? 'is-admin' : ''}">${esc(user.access_role_id&&!['admin','member'].includes(user.access_role_id)?user.access_role_id:userRoleLabel(user.role))}</span></td>
     <td><span class="user-access">${user.has_signed_in ? 'Signed in with Google' : 'Awaiting first sign-in'}</span></td>
-    <td><button class="quiet small" data-edit-user="${esc(user.email)}" aria-label="Change role for ${esc(user.email)}">Change role</button></td>
+    <td>${hasWorkspacePermission('users.manage')?`<button class="quiet small" data-edit-user="${esc(user.email)}" aria-label="Change role for ${esc(user.email)}">Change role</button>`:''}</td>
   </tr>`).join('')}</tbody></table>` : '<div class="users-empty">No users match your search.</div>';
 }
 
 function applyUserSession(session) {
-  const changed=state.role!==(session.role||'member')||state.userId!==session.user_id||state.authenticated!==session.authenticated;
+  const permissions=Array.isArray(session.permissions)?session.permissions:null;
+  const changed=state.role!==(session.role||'member')||state.userId!==session.user_id||state.authenticated!==session.authenticated||JSON.stringify(state.permissions)!==JSON.stringify(permissions);
   state.role = session.role || 'member'; state.identity = session.identity; state.csrf = session.csrf;
+  state.permissions = permissions;
   state.authenticated = session.authenticated; state.userId = session.user_id;
   state.preferences = {send_immediately: session.preferences?.send_immediately === true,
     omit_private_tool_payloads: session.preferences?.omit_private_tool_payloads === true,
@@ -33,11 +44,11 @@ async function renderUsers(recent=false) {
   const version = state.pageVersion;
   const actor=state.userId;
   // The server authorizes the directory independently; overlap known-admin reads.
-  const directory=state.role==='admin'?api('/api/admin/users',{recent}).then(data=>({data}),error=>({error})):null;
+  const directory=hasWorkspacePermission('users.read')?api('/api/admin/users',{recent}).then(data=>({data}),error=>({error})):null;
   const [session,result] = await Promise.all([api('/api/session',{recent}),directory]);
   if (version !== state.pageVersion) return;
   applyUserSession(session);
-  if (state.role !== 'admin') {
+  if (!hasWorkspacePermission('users.read')) {
     MoyaiUI.render($('#content'), '<div class="page-heading"><div><h1>Users</h1><p class="subtext">Only administrators can manage workspace roles.</p></div></div>');
     return;
   }
@@ -46,7 +57,7 @@ async function renderUsers(recent=false) {
   if (version !== state.pageVersion) return;
   const admins = data.users.filter(user => user.role === 'admin').length;
   MoyaiUI.render($('#content'), `<section class="users-page">
-    <div class="page-heading"><div><h1>Users</h1><p class="subtext">Manage workspace members and their access.</p></div><button class="primary" id="add-user">Add user</button></div>
+    <div class="page-heading"><div><h1>Users</h1><p class="subtext">Manage workspace members and their access.</p></div>${hasWorkspacePermission('users.manage')?'<button class="primary" id="add-user">Add user</button>':''}</div>
     <div class="users-overview"><span><strong>${data.users.length}</strong> users</span><span><strong>${admins}</strong> admins</span><span><strong>${data.users.length - admins}</strong> internal users</span></div>
     <div class="users-panel"><div class="users-toolbar"><label class="users-search"><span class="sr-only">Search users</span><input id="user-search" type="search" placeholder="Search by name or email" autocomplete="off"></label><label><span class="sr-only">Filter by role</span><select id="user-role-filter"><option value="all">All roles</option><option value="admin">Admins</option><option value="member">Internal users</option></select></label></div><div id="user-table" class="users-table-scroll" role="region" aria-label="Workspace users" tabindex="0"></div><p class="users-domain">Sign-in is restricted to ${data.domains.map(domain => '@' + esc(domain)).join(', ')} Google accounts. New teammates join as internal users by default.</p></div>
     <div class="user-role-guide"><div><h2>Admin</h2><p>Manage users, shared connections and organization settings. View team spend and manage allowed actions.</p></div><div><h2>Internal user</h2><p>Start sessions, chat with agents and use shared tools and skills. Create Linear tickets and GitHub PRs directly. Access follows each connection’s permissions.</p></div></div>
@@ -61,7 +72,7 @@ async function renderUsers(recent=false) {
   };
   $('#user-search').oninput = event => {userDirectoryState.query = event.target.value; redraw();};
   $('#user-role-filter').onchange = event => {userDirectoryState.filter = event.target.value; redraw();};
-  $('#add-user').onclick = () => editUserRole(data);
+  if($('#add-user'))$('#add-user').onclick = () => editUserRole(data);
   redraw();
 }
 

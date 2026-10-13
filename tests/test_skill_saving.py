@@ -244,7 +244,9 @@ def test_nonchat_and_unknown_identities_cannot_write_skills(workspace):
     app,client=workspace
     sign_in(app,client)
     unknown=active(app,'google:unknown')
-    assert_rejected(call(client,unknown,**form()), 403)
+    # An unidentified requester now fails broker authorization before tool
+    # dispatch, so the invalid capability does not produce a tool receipt.
+    assert call(client,unknown,**form()).status_code == 403
     run=active(app)
     app.state.store.execute('UPDATE runs SET chat_enabled=0 WHERE id=?',(run['id'],))
     assert_rejected(call(client,run,**form()), 403)

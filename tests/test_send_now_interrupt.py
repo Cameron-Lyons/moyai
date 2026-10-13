@@ -80,7 +80,7 @@ def test_leaving_generation_window_prevents_late_interrupts():
 
 def test_disconnected_model_client_still_records_original_turn_cost(workspace, monkeypatch):
     import asyncio
-    app, _ = workspace
+    app, workspace_client = workspace
     run = active(app)
     app.state.settings.litellm_api_base = 'https://gateway.example/v1'
     app.state.settings.litellm_api_key = 'server-key'
@@ -98,8 +98,11 @@ def test_disconnected_model_client_still_records_original_turn_cost(workspace, m
     listener.bind(('127.0.0.1', 0))
     port = listener.getsockname()[1]
     server = uvicorn.Server(uvicorn.Config(app, log_level='error', lifespan='off'))
-    thread = threading.Thread(target=lambda: server.run(sockets=[listener]), daemon=True)
-    thread.start()
+    async def serve():
+        await server.serve(sockets=[listener])
+    # The app already has a lifespan owner in TestClient. Serve the raw socket
+    # on that same loop so its live-context watcher has one lifecycle owner.
+    serving = workspace_client.portal.start_task_soon(serve)
     client = None
     try:
         deadline = time.monotonic() + 5
@@ -129,5 +132,5 @@ def test_disconnected_model_client_still_records_original_turn_cost(workspace, m
         if client:
             client.close()
         server.should_exit = True
-        thread.join(timeout=5)
+        serving.result(timeout=5)
         listener.close()

@@ -104,11 +104,15 @@ class Skills:
             return json.loads(row['manifest']) if row else []
 
     def tools(self, run):
+        if self.security.user_roles and not self.security.has_actor_permission(run['active_user_id'], 'skills.read'):
+            return [BUNDLED_TOOL]
         return TOOLS if run['chat_enabled'] and run['active_user_id'] and run['active_message_id'] else [BUNDLED_TOOL]
 
     def call(self, run, name, arguments):
         if name == 'bundled_skill_read':
             return read_bundled(arguments)
+        if self.security.user_roles:
+            self.security.user_roles.require_actor(run['active_user_id'], 'skills.manage' if name == 'skills_save' else 'skills.read')
         if name == 'skills_search':
             return self.search(run,SearchSkills.model_validate(arguments))
         if name == 'skills_save':
@@ -119,6 +123,8 @@ class Skills:
 
     def rows_for(self, actor, *, archived=False):
         if not actor:
+            return []
+        if self.security.user_roles and not self.security.has_actor_permission(actor, 'skills.read'):
             return []
         return [row for row in self.store.rows('SELECT * FROM skills ORDER BY scope,name')
                 if (archived or not row['archived']) and self.visible(row,actor)]
@@ -163,6 +169,11 @@ class Skills:
             with (self.store.connect() if own_transaction else nullcontext(conn)) as conn:
                 if own_transaction:
                     conn.begin_write()
+                if self.security.user_roles:
+                    self.security.user_roles.require_actor(actor, 'skills.manage', connection=conn)
+                    admin = self.security.has_actor_permission(actor, 'skills.publish', connection=conn)
+                    if body.scope == 'organization' and not admin:
+                        raise HTTPException(403, 'Your workspace role cannot publish organization skills.')
                 if skill_id:
                     old = conn.execute('SELECT * FROM skills WHERE id=?',(skill_id,)).fetchone()
                     if not old or not self.manageable(old,actor,admin):
@@ -212,7 +223,8 @@ class Skills:
                     ranked.append((-int(exact),-score,skill['scope']!='personal',skill['name'],skill['id'],metadata))
             all_matches = [item[-1] for item in sorted(ranked)]
             selected, paging = page(all_matches, body.cursor, body.page_size,
-                [body.query, current['active_user_id'], [(s['id'], s['revision']) for s in all_matches]])
+                [body.query, current['active_user_id'], [(s['id'], s['revision']) for s in all_matches]],
+                organization_id=getattr(self.store, 'organization_id', ''))
             # IDs only: descriptions stay out of sandbox history and are resolved
             # privately with current authorization on each model call.
             conn.execute('DELETE FROM skill_searches WHERE run_id=?',(run['id'],))
@@ -328,7 +340,7 @@ class Skills:
         router = APIRouter()
         def actor(request, mutation=False):
             self.security.require(request,mutation=mutation)
-            return self.store.identity(self.security.session_info(request)),self.security.role(request)=='admin'
+            return self.store.identity(self.security.session_info(request)),self.security.has_permission(request, 'skills.publish')
 
         @router.get('/api/skills')
         async def listing(request: Request, archived: bool=False):
@@ -369,6 +381,9 @@ class Skills:
             user,admin = actor(request,True)
             with self.store.connect() as conn:
                 conn.begin_write()
+                if self.security.user_roles:
+                    self.security.user_roles.require_actor(user, 'skills.manage', connection=conn)
+                    admin = self.security.has_actor_permission(user, 'skills.publish', connection=conn)
                 row = conn.execute('SELECT * FROM skills WHERE id=?',(skill_id,)).fetchone()
                 if not row or not self.manageable(row,user,admin):
                     raise HTTPException(404,'Skill not found.')

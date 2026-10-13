@@ -15,13 +15,14 @@ from test_deepagents_runtime import durable_app  # noqa: F401
 @pytest.fixture
 def active(durable_app):
     manager, store = durable_app.state.manager, durable_app.state.store
+    actor = store.identity({'method': 'local', 'role': 'admin'})
     run = store.create_run('Keep working for one hour.', '', 'modal', [], chat_enabled=True,
-                           harness='deepagents-temporal', model='test-model', user_id='owner')
+                           harness='deepagents-temporal', model='test-model', user_id=actor)
     manager.submit(run)
     message = store.claim_message(run['id'])
     manager.save(run['id'], {'message_id': message['id'], 'segment': 0, 'turn_started': time.time()})
     store.update_run(run['id'], status='running', token_hash=digest(manager.token(run['id'], message['id'])))
-    scope = TurnScope(run['id'], message['id'], actor_id='owner')
+    scope = TurnScope(run['id'], message['id'], actor_id=actor)
     manager.deepagents_runtime.journal.exchange(store.run(run['id']), {'action': 'import',
         'manifest': {'id': 'empty', 'count': 0}, 'entries': [], 'complete': True})
     return manager, store, scope
@@ -36,7 +37,7 @@ def publications(store, scope):
 async def test_late_publication_and_stream_are_fenced(active, transition):
     manager, store, scope = active
     if transition in {'pending', 'accepted'}:
-        message, _ = store.enqueue_message(scope.run_id, 'Correction', 'correction', user_id='owner', send_immediately=True)
+        message, _ = store.enqueue_message(scope.run_id, 'Correction', 'correction', user_id=scope.actor_id, send_immediately=True)
         if transition == 'accepted':
             control = manager.message_queue.live_control(scope.run_id, scope.message_id, [])
             assert control['input']['id'] == message['id']
@@ -59,7 +60,7 @@ async def test_late_publication_and_stream_are_fenced(active, transition):
 
 async def test_ordinary_queued_followup_allows_current_answer_and_retry_is_idempotent(active):
     manager, store, scope = active
-    store.enqueue_message(scope.run_id, 'Next question', 'next', user_id='owner')
+    store.enqueue_message(scope.run_id, 'Next question', 'next', user_id=scope.actor_id)
     observed = []
     def delivery(conn, run_id):
         # The outbox sees both records inside the publication transaction.
@@ -122,13 +123,13 @@ async def test_prepare_restores_current_goal_initial_followup_and_checkpoint(act
                                       'remaining': 'Verify recovery.', 'evidence': []})
     for phase in ('initial', 'checkpoint', 'followup'):
         if phase == 'checkpoint':
-            checkpoint = manager.payloads.put(json.dumps({'scope': [scope.run_id, scope.message_id, 'owner', 'test-model'],
+            checkpoint = manager.payloads.put(json.dumps({'scope': [scope.run_id, scope.message_id, scope.actor_id, 'test-model'],
                                                           'messages': [], 'applied': []}).encode())
             scope = replace(scope, segment=1)
             manager.save(scope.run_id, {**manager.state(scope.run_id), 'segment': 1, 'deepagents_checkpoint': checkpoint})
         elif phase == 'followup':
             store.finish_message(scope.run_id, scope.message_id, 'Progress saved.')
-            store.enqueue_message(scope.run_id, 'Continue the existing goal.', 'followup', user_id='owner')
+            store.enqueue_message(scope.run_id, 'Continue the existing goal.', 'followup', user_id=scope.actor_id)
             message = store.claim_message(scope.run_id)
             scope = replace(scope, message_id=message['id'], segment=0)
             manager.save(scope.run_id, {'message_id': scope.message_id, 'segment': 0, 'turn_started': time.time()})

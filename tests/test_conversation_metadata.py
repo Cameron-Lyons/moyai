@@ -67,12 +67,14 @@ def test_conversation_metadata_read_budget(login, monkeypatch):
     assert detail['can_delete'] is True and detail['archived'] is False
     assert {'goal', 'approvals', 'agents', 'pr_write_access', 'credential_requests',
             'slack_mirroring', 'has_captures', 'has_artifact', 'has_published_artifacts'} <= detail.keys()
-    # The previous path needed 35 data reads and 29 checkouts for the same six
-    # messages. Two narrow privacy admission reads now fit alongside the
-    # metadata. PostgreSQL retains its original budget by sharing checkouts;
-    # it also checks its schema owner on every checkout.
+    # The previous path needed 35 data reads and 29 checkouts for six messages.
+    # Live SCIM authorization adds six fixed reads (table presence and active
+    # state at each of three admission checks), giving 34 total on SQLite.
+    # PostgreSQL also validates its schema owner on each of the 14 checkouts,
+    # giving 48. These authorization checks must not scale with message count.
     reads = [sql for sql in queries if sql.lstrip().upper().startswith(('SELECT', 'WITH'))]
-    assert 0 < len(reads) <= (40 if store.database else 28), queries
+    assert 0 < len(reads) <= (48 if store.database else 34), (
+        f'{len(reads)} reads/{len(checkouts)} checkouts:\n' + '\n'.join(reads))
     assert len(checkouts) <= 14
 
 

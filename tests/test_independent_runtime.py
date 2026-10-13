@@ -43,7 +43,8 @@ def test_broker_computer_admission_uses_the_durable_controller(tmp_path):
     try:
         # Deliberately omit lifespan: no Temporal or cloud service is started.
         client = TestClient(app, base_url=app.state.settings.public_url, client=('127.0.0.1', 50000))
-        caller = active(app)
+        actor = app.state.store.identity({'method': 'local', 'role': 'admin'})
+        caller = active(app, user=actor)
         app.state.store.execute('INSERT INTO durable_sessions(run_id,state) VALUES(?,?)',
             (caller['id'], json.dumps({'independent_runtime': True, 'phase': 'monitor'})))
         body = request(name='computer_write_file', arguments={'path': 'receipt', 'text': 'result'})
@@ -299,15 +300,18 @@ def test_remote_commands_activate_project_without_restarting_services(tmp_path, 
     monkeypatch.setenv('MOYAI_CREDENTIAL_PROXY_URL', '')
     monkeypatch.setenv('MOYAI_WORKSPACE', '')
     monkeypatch.chdir(tmp_path)
+    observed = {}
     def execute(params, _, *, relay):
-        assert relay.url == 'http://relay'
-        assert os.getcwd() == str(root.parent)
-        assert str(root/'.venv/bin') in os.environ['PATH'].split(os.pathsep)
-        assert os.environ['MOYAI_CREDENTIAL_PROXY_URL'] == 'http://relay/credentials'
+        observed.update(relay=relay.url, cwd=os.getcwd(), path=os.environ['PATH'].split(os.pathsep),
+                        credential_proxy=os.environ['MOYAI_CREDENTIAL_PROXY_URL'])
         return {'content': [], 'isError': False}
     monkeypatch.setattr(remote_tool, 'call_tool', execute)
     assert remote_tool.run({**project_spec(startup='must not run'), 'workspace': str(root),
                            'name': 'computer_terminal', 'arguments': {}}) == 0
+    assert observed['relay'] == 'http://relay'
+    assert observed['cwd'] == str(root.parent)
+    assert str(root/'.venv/bin') in observed['path']
+    assert observed['credential_proxy'] == 'http://relay/credentials'
     assert len(probes) == 2
 
 

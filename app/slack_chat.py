@@ -238,6 +238,9 @@ class SlackChat:
                             (event_id, channel, ts)).fetchone():
                 return None
             actor_id = self.store.slack_identity_in(conn, team, user)
+            from .scim import active_for_actor_in
+            if not active_for_actor_in(conn, actor_id):
+                return None
             if direct_message and root == ts:
                 # Keep the DM participant guard without adopting an older session.
                 existing = conn.execute('SELECT e.user_id FROM slack_threads t JOIN slack_events e ON e.run_id=t.run_id WHERE t.team_id=? AND t.channel=? AND t.thread_ts=t.started_ts ORDER BY t.started_ts LIMIT 1', (team, channel)).fetchone()

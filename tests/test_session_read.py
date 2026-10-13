@@ -16,6 +16,8 @@ def read(client, caller, **arguments):
 
 def setup(users_app):
     app, client = users_app
+    app.state.store.identity({'method': 'google', 'identity': {
+        'sub': 'other', 'email': 'other@berri.ai'}})
     actor = sign_as(app, client, 'maya@berri.ai')['user_id']
     caller = active(app, actor)
     target = app.state.store.create_run('Shared investigation', '', 'demo', [],

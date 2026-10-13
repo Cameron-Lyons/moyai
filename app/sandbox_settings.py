@@ -108,7 +108,7 @@ class SandboxSettings:
         @router.get('/api/settings/sandboxes')
         async def get(request: Request):
             self.security.require(request)
-            return self.view(self.security.role(request) == 'admin')
+            return self.view(self.security.has_permission(request, 'runtime.manage'))
 
         @router.put('/api/settings/sandboxes')
         async def connect(body: Connection, request: Request):

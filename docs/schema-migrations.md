@@ -36,7 +36,7 @@ is insufficient.
    python -m app.schema_migrations --apply
    ```
 
-   It prints `{"schema_revision": 19, "status": "ready"}` on success. An empty
+   It prints `{"schema_revision": 20, "status": "ready"}` on success. An empty
    schema must already exist, and requires `MOYAI_DATABASE_INITIALIZE=true`.
    Existing schemas do not need that flag. No credentials are printed.
 4. Set `MOYAI_SCHEMA_MODE=verify` on every role, including the dedicated API.

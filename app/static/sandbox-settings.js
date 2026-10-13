@@ -7,7 +7,7 @@ async function renderSandboxConnection(version) {
     let saved = await api('/api/settings/sandboxes');
     if (version !== state.pageVersion) return;
     const names = {modal: 'Modal', substrate: 'Substrate', lambda: 'AWS Lambda MicroVMs'};
-    const admin = state.role === 'admin';
+    const admin = globalThis.MoyaiPermissions?.has('runtime.manage')??state.role === 'admin';
     if (!admin) {
       MoyaiUI.render(host, `<h2>Sandbox provider</h2><p>${names[saved.provider]} supplies new sandboxes. An administrator manages this connection.</p>`);
       return;

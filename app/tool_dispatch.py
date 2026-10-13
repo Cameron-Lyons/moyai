@@ -51,6 +51,25 @@ class ToolDispatch:
                     or MessageQueue.pending_input(conn, caller['id'], caller['active_message_id'])):
                 return {'isError': True, 'outcome': 'cancelled', 'dispatched': False,
                         'error': 'Cancelled before dispatch because the request or execution changed.'}
+            from .scim import active_for_actor_in
+            if run and not active_for_actor_in(conn, run['active_user_id']):
+                raise ToolRejected(403, 'The executing user has been deactivated.')
+            roles = getattr(self.store, 'user_roles', None)
+            if run and roles:
+                try:
+                    roles.require_actor(run['active_user_id'] or run['owner_id'], 'sessions.create', connection=conn)
+                    from .permissions import tool_permission
+                    permission = tool_permission(body.name)
+                    if permission and permission != 'sessions.create':
+                        roles.require_actor(run['active_user_id'] or run['owner_id'], permission, connection=conn)
+                except HTTPException as exc:
+                    raise ToolRejected(exc.status_code, exc.detail) from None
+            profiles = getattr(self.store, 'security_profiles', None)
+            if run and profiles:
+                from .connectors import TOOLS
+                spec = TOOLS.get(body.name)
+                if not profiles.allowed_tool(dict(run), body.name, spec[0] if spec else None, spec[1] if spec else False):
+                    raise ToolRejected(403, 'This operation is disabled by the session security profile.')
             self.metadata = {'request_id': body.request_id, 'signature': signature,
                              'turn_id': caller['active_message_id'], 'input_id': body.input_id,
                              'tool': body.name, 'outcome': 'unknown', 'dispatched': True}

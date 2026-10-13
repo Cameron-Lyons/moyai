@@ -15,6 +15,13 @@ from test_workspace import workspace
 from test_tracing import Processor
 
 
+def owned_run(app, *args, **kwargs):
+    """A local broker fixture needs the same valid owner as its preview login."""
+    assert app.state.security.local_preview()
+    kwargs.setdefault('user_id', app.state.store.identity({'method': 'local', 'role': 'admin'}))
+    return app.state.store.create_run(*args, **kwargs)
+
+
 @pytest.mark.parametrize('route', ['messages', 'responses'])
 async def test_streaming_pool_wait_keeps_event_loop_responsive(workspace, monkeypatch, route):
     """Hold real PostgreSQL connections only after admission/stream startup."""
@@ -24,7 +31,7 @@ async def test_streaming_pool_wait_keeps_event_loop_responsive(workspace, monkey
     if store.database is None:
         pytest.skip('Pool contention requires --postgres-backend.')
     app.state.settings.litellm_api_base = 'https://gateway.example/v1'
-    run = store.create_run('Stream while another request uses the pool.', '', 'modal', [])
+    run = owned_run(app, 'Stream while another request uses the pool.', '', 'modal', [])
     store.update_run(run['id'], status='running', token_hash=digest('cap'))
     held = threading.Event()
     holding = None
@@ -57,6 +64,7 @@ async def test_streaming_pool_wait_keeps_event_loop_responsive(workspace, monkey
     monkeypatch.setattr('app.harness_gateway.httpx.AsyncClient', lambda **kw: actual(
         transport=httpx.MockTransport(lambda _: httpx.Response(200, stream=Streaming())), **kw))
     scope = {'type': 'http', 'asgi': {'version': '3.0', 'spec_version': '2.4'}, 'method': 'POST',
+             'path_params': {'run_id': run['id']},
              'path': f"/broker/{run['id']}/v1/{route}", 'query_string': b'',
              'headers': [(b'authorization', b'Bearer cap'), (b'content-type', b'application/json'),
                          (b'host', b'127.0.0.1')]}
@@ -115,7 +123,7 @@ def test_deepagents_single_oversized_input_is_rejected_before_inference(workspac
     actual = httpx.AsyncClient
     monkeypatch.setattr('app.harness_gateway.httpx.AsyncClient', lambda **kw: actual(
         transport=httpx.MockTransport(upstream), **kw))
-    run = app.state.store.create_run('Context test', '', 'modal', [], harness='deepagents-temporal', model=model)
+    run = owned_run(app, 'Context test', '', 'modal', [], harness='deepagents-temporal', model=model)
     app.state.store.update_run(run['id'], status='running', token_hash=digest('cap'))
     def post(content):
         return client.post(f"/broker/{run['id']}/v1/responses", headers={'Authorization': 'Bearer cap'},
@@ -140,7 +148,7 @@ def test_gateway_failure_keeps_status_ledger_and_request_correlation(workspace, 
         transport=httpx.MockTransport(lambda req: httpx.Response(upstream_status,
             headers={'x-request-id': 'provider-123', 'x-litellm-call-id': 'gateway-456', 'x-private': 'private-header'},
             json={'error': {'code': 'cyber_policy', 'message': 'private-provider-body'}})), **kw))
-    run = app.state.store.create_run('private-prompt', '', 'modal', [])
+    run = owned_run(app, 'private-prompt', '', 'modal', [])
     app.state.store.update_run(run['id'], status='running', token_hash=digest('private-capability'))
     correlation = '1' * 32
     caplog.set_level('INFO', logger='uvicorn.error.moyai.broker')
@@ -211,7 +219,7 @@ def test_policy_rejection_reaches_relay_without_false_transport_recovery(workspa
     actual = httpx.AsyncClient
     monkeypatch.setattr('app.harness_gateway.httpx.AsyncClient', lambda **kw: actual(
         transport=httpx.MockTransport(upstream), **kw))
-    run = app.state.store.create_run('Copy a skill', '', 'modal', [])
+    run = owned_run(app, 'Copy a skill', '', 'modal', [])
     app.state.store.update_run(run['id'], status='running', token_hash=digest('private-capability'))
     class Edge(BaseHTTPRequestHandler):
         def log_message(self, *args): pass
@@ -246,7 +254,7 @@ def test_gateway_network_failure_keeps_exception_type_without_exception_text(wor
         raise httpx.ReadTimeout('private-url-and-token', request=request)
     monkeypatch.setattr('app.harness_gateway.httpx.AsyncClient', lambda **kw: actual(
         transport=httpx.MockTransport(unavailable), **kw))
-    run = app.state.store.create_run('network test', '', 'modal', [])
+    run = owned_run(app, 'network test', '', 'modal', [])
     app.state.store.update_run(run['id'], status='running', token_hash=digest('cap'))
     caplog.set_level('INFO', logger='uvicorn.error.moyai.broker')
     response = client.post(f"/broker/{run['id']}/v1/{route}", headers={'Authorization': 'Bearer cap'},
@@ -293,7 +301,7 @@ async def test_broker_diagnostics_capture_partial_stream_failure(caplog):
 async def test_model_cancellation_keeps_safe_cause(workspace, monkeypatch, route, phase):
     from app.broker_diagnostics import BrokerDiagnosticsMiddleware
     from starlette.requests import Request
-    app, _ = workspace
+    app, client = workspace
     app.state.settings.litellm_api_base = 'https://gateway.example/v1'
     processor = app.state.tracing.processor = Processor()
     app.state.tracing.enabled = True
@@ -318,7 +326,7 @@ async def test_model_cancellation_keeps_safe_cause(workspace, monkeypatch, route
 
     monkeypatch.setattr('app.harness_gateway.httpx.AsyncClient', lambda **kw: actual(
         transport=httpx.MockTransport(upstream), **kw))
-    run = app.state.store.create_run('cancelled request', '', 'modal', [])
+    run = owned_run(app, 'cancelled request', '', 'modal', [])
     app.state.store.update_run(run['id'], status='running', token_hash=digest('cap'))
     async def receive():
         return {'type': 'http.request', 'body': json.dumps({'messages': [], 'input': [],
@@ -327,17 +335,21 @@ async def test_model_cancellation_keeps_safe_cause(workspace, monkeypatch, route
     async def send(message):
         replies.append(message)
     scope = {'type': 'http', 'asgi': {'version': '3.0', 'spec_version': '2.4'}, 'method': 'POST',
+             'path_params': {'run_id': run['id']},
              'path': '/broker/' + run['id'] + '/v1/' + route, 'query_string': b'',
              'headers': [(b'authorization', b'Bearer cap'), (b'content-type', b'application/json'), (b'host', b'127.0.0.1')]}
     endpoint = next(r.endpoint for r in app.routes if getattr(r, 'path', '') == '/broker/{run_id}/v1/' + route)
     async def forward(scope, receive, send):
         response = await endpoint(run['id'], Request(scope, receive=receive))
         await response(scope, receive, send)
-    cancelled = False
-    try:
-        await BrokerDiagnosticsMiddleware(forward, app.state.store, app.state.tracing)(scope, receive, send)
-    except asyncio.CancelledError:
-        cancelled = True
+    async def exchange():
+        try:
+            await BrokerDiagnosticsMiddleware(forward, app.state.store, app.state.tracing)(scope, receive, send)
+        except asyncio.CancelledError:
+            return True
+        return False
+    # The application owns exporter/maintenance tasks on its TestClient loop.
+    cancelled = await asyncio.to_thread(client.portal.call, exchange)
     assert processor.spans, replies
     assert cancelled is (phase != 'incomplete')
     span, = processor.spans
@@ -373,7 +385,7 @@ def test_native_gateway_preserves_discovered_tool_references(workspace, monkeypa
     actual = httpx.AsyncClient
     monkeypatch.setattr('app.harness_gateway.httpx.AsyncClient', lambda **kw: actual(
         transport=httpx.MockTransport(upstream), **kw))
-    run = app.state.store.create_run('tool search', '', 'modal', [], harness='claude-agent-sdk')
+    run = owned_run(app, 'tool search', '', 'modal', [], harness='claude-agent-sdk')
     app.state.store.update_run(run['id'], status='running', token_hash=digest('cap'))
     response = client.post(f"/broker/{run['id']}/v1/messages",
         headers={'Authorization': 'Bearer cap', 'anthropic-beta': beta},
@@ -414,7 +426,7 @@ def test_native_gateway_preserves_protocol_stream_and_pins_access(workspace, mon
         return httpx.Response(200, content=wire, headers={'Content-Type': 'text/event-stream'})
     actual = httpx.AsyncClient
     monkeypatch.setattr('app.harness_gateway.httpx.AsyncClient', lambda **kw: actual(transport=httpx.MockTransport(upstream), **kw))
-    run = app.state.store.create_run('native gateway', '', 'modal', [], model=model)
+    run = owned_run(app, 'native gateway', '', 'modal', [], model=model)
     app.state.store.update_run(run['id'], status='running', token_hash=digest('cap'))
     url = f"/broker/{run['id']}/v1/{route}"
     payload = {**body, 'stream': True, 'model': 'override', 'api_key': 'override', 'api_base': 'https://evil.example'}
@@ -457,7 +469,7 @@ def test_native_nonstream_response_bytes_unchanged(workspace, monkeypatch, route
     actual = httpx.AsyncClient
     monkeypatch.setattr('app.harness_gateway.httpx.AsyncClient', lambda **kw: actual(
         transport=httpx.MockTransport(lambda req: httpx.Response(200, content=wire)), **kw))
-    run = app.state.store.create_run('test native', '', 'modal', [])
+    run = owned_run(app, 'test native', '', 'modal', [])
     app.state.store.update_run(run['id'], status='running', token_hash=digest('cap'))
     response = client.post(f"/broker/{run['id']}/v1/{route}", headers={'Authorization': 'Bearer cap'},
                            json={'messages': [], 'input': [], 'stream': False})
@@ -489,7 +501,7 @@ def test_prompt_cache_policy_and_usage_survive_gateway(workspace, monkeypatch):
         return httpx.Response(200, content=wire, headers={'Content-Type': 'text/event-stream'})
     actual = httpx.AsyncClient
     monkeypatch.setattr('app.harness_gateway.httpx.AsyncClient', lambda **kw: actual(transport=httpx.MockTransport(upstream), **kw))
-    run = app.state.store.create_run('cache test', '', 'modal', [], model='anthropic/claude-opus-5-5', harness='claude-agent-sdk')
+    run = owned_run(app, 'cache test', '', 'modal', [], model='anthropic/claude-opus-5-5', harness='claude-agent-sdk')
     app.state.store.update_run(run['id'], status='running', token_hash=digest('cap'))
     response = client.post(f"/broker/{run['id']}/v1/messages", headers={'Authorization': 'Bearer cap'},
                            json={'messages': [{'role': 'user', 'content': 'Hello'}], 'system': system,
@@ -662,7 +674,7 @@ def test_native_nonstream_service_tier_policy(workspace, monkeypatch, route, mod
     actual = httpx.AsyncClient
     monkeypatch.setattr('app.harness_gateway.httpx.AsyncClient', lambda **kw: actual(
         transport=httpx.MockTransport(upstream), **kw))
-    run = app.state.store.create_run('test native', '', 'modal', [], model=model)
+    run = owned_run(app, 'test native', '', 'modal', [], model=model)
     app.state.store.update_run(run['id'], status='running', token_hash=digest('cap'))
     response = client.post(f"/broker/{run['id']}/v1/{route}", headers={'Authorization': 'Bearer cap'},
                            json={'messages': [], 'input': [], 'stream': False})
@@ -675,7 +687,7 @@ def test_pre_admission_diagnostics_do_not_charge_or_bypass_auth(workspace, monke
     app, client = workspace
     processor = app.state.tracing.processor = Processor()
     app.state.tracing.enabled = True
-    run = app.state.store.create_run('diagnostic boundary', '', 'modal', [], chat_enabled=True)
+    run = owned_run(app, 'diagnostic boundary', '', 'modal', [], chat_enabled=True)
     message = app.state.store.claim_message(run['id'])
     app.state.store.update_run(run['id'], status='running', token_hash=digest('cap'))
     if boundary == 'admission':
@@ -724,7 +736,7 @@ def test_native_stream_failure_keeps_safe_code(route, value):
 def test_delayed_failure_keeps_original_turn(workspace, monkeypatch, route):
     from fastapi import HTTPException
     app, client = workspace
-    run = app.state.store.create_run('original', '', 'modal', [], chat_enabled=True)
+    run = owned_run(app, 'original', '', 'modal', [], chat_enabled=True)
     original = app.state.store.claim_message(run['id'])
     app.state.store.update_run(run['id'], status='running', token_hash=digest('cap'))
     async def delayed(self, *args, **kwargs):

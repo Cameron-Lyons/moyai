@@ -9,6 +9,7 @@ from typing import Annotated
 from urllib.parse import urlencode
 
 import httpx
+from fastapi import HTTPException
 from pydantic import BaseModel, ConfigDict, Field
 
 from .db import Store, database, now
@@ -167,7 +168,7 @@ class Connectors:
         self.slack_identities = None
         self.personal_slack = PersonalSlack(store, security, settings, self)
 
-    def check_execution(self, run):
+    def check_execution(self, run, tool=None):
         if not run:
             return
         fresh = self.store.run(run['id'])
@@ -176,6 +177,14 @@ class Connectors:
                 or any(fresh[key] != run[key] for key in ('token_hash', 'active_user_id', 'active_message_id'))):
             raise ConnectorError('The executing session changed. No further action was sent.',
                                  code='execution_changed', dispatched=False)
+        roles = getattr(self.store, 'user_roles', None)
+        if roles:
+            try:
+                from .permissions import tool_permission
+                roles.require_actor(fresh['active_user_id'] or fresh['owner_id'],
+                                    tool_permission(tool) if tool else 'connections.read')
+            except HTTPException as error:
+                raise ConnectorError(error.detail, code='access_denied', dispatched=False) from None
 
     def configured_oauth(self, provider):
         if provider == 'github':
@@ -209,6 +218,9 @@ class Connectors:
 
     def allowed(self, name, run=None, *, as_bot=False):
         provider, write, _, _ = TOOLS[name]
+        profiles = getattr(self.store, 'security_profiles', None)
+        if run is not None and profiles and not profiles.allowed_tool(run, name, provider, write):
+            return False
         policy = self.policy(provider)
         if run is not None and not as_bot and name in {'slack_search', 'slack_thread', 'slack_channel'}:
             try:
@@ -347,6 +359,7 @@ class Connectors:
         if not self.allowed('linear_my_issues'):
             raise ConnectorError('The Linear connection is disabled.', dispatched=False)
         headers = self.headers('linear', await self.credentials('linear'))
+        self.check_execution(run, 'linear_my_issues')
         query = """query($email:String!,$first:Int!,$after:String){issues(first:$first,after:$after,filter:{assignee:{email:{eq:$email}},
             state:{type:{nin:["completed","canceled"]}}}){
             nodes{id identifier title description url priority updatedAt state{name type} team{key name}}
@@ -372,7 +385,7 @@ class Connectors:
         selection = None
         if name in {'slack_search', 'slack_thread', 'slack_channel'} and not args.get('as_bot'):
             selection = await self.personal_slack.select(run, name)
-        if not self.allowed(name, run=run if selection else None):
+        if not self.allowed(name, run=run):
             raise ConnectorError("This operation is disabled by your organization's connection policy.", dispatched=False)
         if name == 'slack_send':
             return await self.slack_send(args, run)
@@ -384,8 +397,9 @@ class Connectors:
                 raise ConnectorError('Reconnect Slack with the Moyai bot im:history permission to read its DMs.', dispatched=False)
         else:
             headers = self.headers(provider, selection.credentials if selection else await self.credentials(provider))
-        if not self.allowed(name, run=run if selection else None):
+        if not self.allowed(name, run=run):
             raise ConnectorError("This operation is disabled by your organization's connection policy.", dispatched=False)
+        self.check_execution(run, name)
         if provider == "linear":
             if name == "linear_teams":
                 query = "query($first:Int!,$after:String){teams(first:$first,after:$after){nodes{id name key} pageInfo{hasNextPage endCursor}}}"
@@ -420,7 +434,7 @@ class Connectors:
             # policy in case the connection changed while those were in flight.
             if not self.allowed(name):
                 raise ConnectorError("This operation is disabled by your organization's connection policy.", dispatched=False)
-            self.check_execution(run)
+            self.check_execution(run, name)
             result = await self.request("POST", "https://api.linear.app/graphql", headers=headers, json={"query": query, "variables": variables})
             data = result["data"]
             if name == "linear_comment" and not data.get("commentCreate", {}).get("success"):
@@ -484,7 +498,7 @@ class Connectors:
         # the full requested text remains represented across acknowledged parts.
         results, rich_text, completed = [], [], 0
         async def append_batch(batch):
-            self.check_execution(run)
+            self.check_execution(run, name)
             if not self.allowed(name):
                 raise ConnectorError('The organization connection changed.', code='access_changed', dispatched=False)
             return await self.request('PATCH', url, headers=headers, json={'children': batch})
@@ -503,7 +517,10 @@ class Connectors:
             try:
                 result = await append_batch(children)
             except ConnectorError as exc:
-                return {**exc.receipt(write=True), 'acknowledged_results': results, 'completed_characters': completed,
+                receipt = exc.receipt(write=True)
+                if completed and receipt['dispatched'] is False:
+                    receipt.update(dispatched=True, outcome='failed', outcome_uncertain=False, retryable=False)
+                return {**receipt, 'acknowledged_results': results, 'completed_characters': completed,
                         'instruction': 'Earlier parts are acknowledged. Verify the failed part at the destination before continuing; do not append the entire original text again.'}
             results.extend(result.get('results', []))
             completed += sum(len(item['text']['content']) for item in rich_text)
@@ -536,7 +553,7 @@ class Connectors:
             self.slack_identities.check_requester(run, installation)
         if 'chat:write' not in scopes:
             raise ConnectorError('Reconnect Slack with the Moyai bot chat:write permission to send messages.', dispatched=False)
-        if not self.allowed('slack_send'):
+        if not self.allowed('slack_send', run):
             raise ConnectorError("This operation is disabled by your organization's connection policy.", dispatched=False)
         if channel.startswith(('U', 'W')):
             if 'im:write' not in scopes:
@@ -551,7 +568,7 @@ class Connectors:
             if await self.slack_identities.requester(run) != identity:
                 raise ConnectorError('Your Slack recipient changed. Resolve your identity again before sending.', dispatched=False)
             self.slack_identities.check_requester(run, installation)
-        if not self.allowed('slack_send'):
+        if not self.allowed('slack_send', run):
             raise ConnectorError("This operation is disabled by your organization's connection policy.", dispatched=False)
         parts = []
         for offset in range(0, len(text), 40000):  # Slack's text field limit.
@@ -561,8 +578,8 @@ class Connectors:
             if parts:
                 payload['thread_ts'] = parts[0]['ts']
             try:
-                self.check_execution(run)
-                if not self.allowed('slack_send'):
+                self.check_execution(run, 'slack_send')
+                if not self.allowed('slack_send', run):
                     raise ConnectorError('The organization connection changed.', code='access_changed', dispatched=False)
                 if identity:
                     self.slack_identities.check_requester(run, installation)
@@ -570,7 +587,10 @@ class Connectors:
                 if not result.get('ts'):
                     raise ConnectorError('Slack did not return the message receipt.', code='missing_receipt', dispatched=True)
             except ConnectorError as exc:
-                return {**exc.receipt(write=True), 'acknowledged_messages': parts, 'completed_formatted_characters': offset,
+                receipt = exc.receipt(write=True)
+                if parts and receipt['dispatched'] is False:
+                    receipt.update(dispatched=True, outcome='failed', outcome_uncertain=False, retryable=False)
+                return {**receipt, 'acknowledged_messages': parts, 'completed_formatted_characters': offset,
                         'instruction': 'Earlier parts are acknowledged. Read the destination to verify the failed part before continuing; do not resend the full message.'}
             parts.append({'channel': result.get('channel', channel), 'ts': result['ts']})
         return {**result, 'channel': parts[0]['channel'], 'ts': parts[0]['ts'], 'parts': parts, 'complete': True}

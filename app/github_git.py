@@ -18,7 +18,7 @@ def routes(github, require_run):
     async def git(run_id: str, operation: str, request: Request, owner: str = '', repository: str = '', repository_id: int | None = None):
         def authorize():
             run = require_run(run_id, request)
-            if 'github' not in run['plugins'] or not github.connectors.allowed('github_checkout'):
+            if 'github' not in run['plugins'] or not github.connectors.allowed('github_checkout', run):
                 raise HTTPException(403, 'GitHub is not enabled for this session.')
             return run
         run = authorize()

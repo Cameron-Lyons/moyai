@@ -55,11 +55,11 @@ def sender(workspace, monkeypatch):
     return app, client, run_id, headers, requests
 
 
-def invoke(sender, name='slack_send', arguments=None):
+def invoke(sender, name='slack_send', arguments=None, *, status=200):
     _, client, run_id, headers, _ = sender
     response = client.post(f'/broker/{run_id}/tools/call', headers=headers,
                            json={'name': name, 'arguments': arguments if arguments is not None else {'channel': 'C12345678', 'text': 'Requested message'}})
-    assert response.status_code == 200
+    assert response.status_code == status, response.text
     return response.json()
 
 
@@ -104,7 +104,10 @@ def test_unknown_sender_never_uses_session_owner(sender, actor):
     app, _, run_id, _, requests = sender
     app.state.store.execute('UPDATE runs SET chat_enabled=1,owner_id=?,active_user_id=? WHERE id=?',
                             ('google:alice', actor, run_id))
-    assert 'identified requester' in invoke(sender)['error']
+    if actor == 'google:missing':
+        assert 'role' in invoke(sender, status=403)['detail']
+    else:
+        assert 'identified requester' in invoke(sender)['error']
     assert not requests
 
 
@@ -384,7 +387,9 @@ def test_dm_me_rejects_untrusted_or_ambiguous_identity(linked_sender, problem):
                 store.slack_identity_in(conn, 'T87654321', 'U12345678')
         store.execute('UPDATE runs SET chat_enabled=1,owner_id=?,active_user_id=? WHERE id=?',
                       ('google:alice', actor, run_id))
-    assert 'error' in invoke(linked_sender, arguments={'channel': 'me', 'text': 'Private issue'})
+    result = invoke(linked_sender, arguments={'channel': 'me', 'text': 'Private issue'},
+                    status=403 if problem == 'disallowed_email' else 200)
+    assert ('detail' if problem == 'disallowed_email' else 'error') in result
     assert not requests
 
 

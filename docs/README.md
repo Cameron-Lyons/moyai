@@ -27,6 +27,7 @@ Follow the [installation walkthrough](getting-started.md) to deploy Moyai on Mod
 | [Independent agent runtime](independent-runtime.md) | Opt-in responses before computer acquisition, qualification and recovery |
 | [AWS Lambda MicroVMs](aws-lambda-microvms.md) | AWS sandbox setup, durable S3 checkpoints, rotation, and conformance tests |
 | [Sign-in and user roles](authentication.md) | Google Workspace SSO and administrators |
+| [Enterprise governance](enterprise-governance.md) | Custom roles, SCIM lifecycle, session policies, audit history, and dedicated organization deployments |
 | [App connections](integrations.md) | Linear, Slack, Notion, GitHub, and repository rulesets |
 | [Secure access and 1Password](credentials.md) | Credential requests, ownership, and vault access |
 | [Project environments](environments.md) | Repository setup, build recipes, and snapshots |

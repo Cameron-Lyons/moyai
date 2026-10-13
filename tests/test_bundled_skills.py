@@ -17,7 +17,8 @@ def test_default_startup_installs_pack_without_starting_services(tmp_path):
     values.update(data_dir=tmp_path, litellm_api_key='', litellm_api_base='')
     app = create_app(Settings(_env_file=None, **values))
     try:
-        assert len(app.state.skills.rows_for('google:alice')) == 3
+        actor = app.state.store.identity({'method': 'local', 'role': 'admin'})
+        assert len(app.state.skills.rows_for(actor)) == 3
         assert app.state.store.rows('SELECT * FROM runs') == []
         assert app.state.store.rows('SELECT * FROM model_requests') == []
         assert len(app.state.store.rows('SELECT * FROM skill_bundles')) == 3

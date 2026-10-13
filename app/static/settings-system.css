@@ -624,6 +624,34 @@
 /* Admin performance dashboard: shared Settings surfaces and controls. */
 .settings-view .performance-view {display:grid;gap:24px;min-width:0}
 .settings-view .performance-view .page-heading {margin-bottom:0}
+
+/* Governance uses the shared Settings controls and tables. */
+.settings-view .governance-tabs { margin-bottom: 32px; flex-wrap: wrap; }
+.settings-view .governance-section { margin-block: 32px; min-width: 0; }
+.settings-view .governance-section > .section-header { display: flex; align-items: start; justify-content: space-between; gap: 24px; margin-bottom: 20px; }
+.settings-view .governance-section :is(h2,h3) { margin-block: 0 8px; }
+.settings-view .governance-section h3 { font-size: var(--settings-body); }
+.settings-view .governance-search { display: grid; gap: 8px; margin-block: 20px; }
+.settings-view .governance-row { display: flex; align-items: start; justify-content: space-between; gap: 24px; border-bottom: 1px solid var(--settings-line); padding-block: 20px; overflow-wrap: anywhere; }
+.settings-view .governance-row > div:first-child { min-width: 0; }
+.settings-view .governance-actions { display: flex; flex-wrap: wrap; gap: 8px; flex-shrink: 0; }
+.settings-view .governance-form-grid { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 24px; }
+.settings-view .governance-activity { padding: 0; list-style: none; }
+.settings-view .governance-activity li { display: flex; flex-wrap: wrap; gap: 8px 16px; border-bottom: 1px solid var(--settings-line); padding-block: 12px; overflow-wrap: anywhere; }
+.settings-view .governance-activity time { color: var(--settings-muted); margin-inline-start: auto; }
+[data-slot="dialog-content"] .governance-permissions { display: grid; gap: 20px; margin-block: 20px; }
+[data-slot="dialog-content"] .governance-permissions fieldset { min-width: 0; border: 1px solid var(--settings-line); border-radius: 8px; padding: 16px; }
+[data-slot="dialog-content"] .governance-permissions legend { padding-inline: 8px; font-weight: 500; }
+[data-slot="dialog-content"] .governance-check { display: flex; align-items: start; gap: 12px; margin-block: 12px; overflow-wrap: anywhere; }
+[data-slot="dialog-content"] .governance-check > span { min-width: 0; }
+[data-slot="dialog-content"] .governance-check small { display: block; color: var(--settings-muted); margin-top: 4px; }
+[data-slot="dialog-content"] .governance-apps { display: flex; flex-wrap: wrap; gap: 8px 24px; }
+@media (max-width: 640px) {
+  .settings-view .governance-section > .section-header { flex-wrap: wrap; gap: 16px; }
+  .settings-view .governance-row { flex-wrap: wrap; gap: 16px; }
+  .settings-view .governance-form-grid { grid-template-columns: minmax(0,1fr); gap: 16px; }
+  .settings-view .governance-activity time { margin-inline-start: 0; }
+}
 .settings-view .performance-filters {display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:16px}
 .settings-view .performance-filters label {display:grid;gap:8px;min-width:0}
 .settings-view #performance-results {display:grid;gap:24px;min-width:0}

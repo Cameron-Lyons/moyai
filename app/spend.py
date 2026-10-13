@@ -327,9 +327,10 @@ class Spend:
 
         @router.get('/api/spend')
         async def accessible_report(request: Request, start: date | None = None, end: date | None = None):
-            self.security.require(request)
+            organization = self.security.has_permission(request, 'spend.read')
+            self.security.require(request, permission='spend.read' if organization else 'spend.personal')
             info = self.security.session_info(request)
-            if info['role'] == 'admin':
+            if organization:
                 return self.report(start, end)
             if info['method'] not in {'google', 'cloudflare'}:
                 raise HTTPException(403, 'Sign in with your Google account to view your personal LLM spend. Shared passwords do not identify an individual.')

@@ -486,7 +486,8 @@ def test_session_search_is_advertised_and_callable_only_for_live_direct_chat(
                       (actor, now(), now()))
         store.execute("INSERT INTO automation_runs VALUES('search-tick','search-auto',1,?,'started','',?)", (caller['id'], now()))
     else:
-        field, value = {'child': ('parent_run_id', 'parent'), 'anonymous': ('active_user_id', ''),
+        parent_id = store.create_run('Parent session', '', 'demo', [], user_id=actor)['id'] if change == 'child' else ''
+        field, value = {'child': ('parent_run_id', parent_id), 'anonymous': ('active_user_id', ''),
                         'no_turn': ('active_message_id', None), 'legacy': ('chat_enabled', 0), 'inactive': ('status', 'idle'),
                         'deleted': ('deleted_at', now()), 'token': ('token_hash', '')}[change]
         store.execute(f'UPDATE runs SET {field}=? WHERE id=?', (value, caller['id']))
@@ -502,6 +503,8 @@ def test_session_search_rechecks_requester_after_reading_broker_body(
 ) -> None:
     app, client = users_app
     caller = active(app, sign_as(app, client, 'maya@berri.ai')['user_id'])
+    app.state.store.identity({'method': 'google', 'identity': {
+        'sub': 'other', 'email': 'other@berri.ai'}})
     original = Request.body
     async def changed_body(request: Request) -> bytes:
         body = await original(request)

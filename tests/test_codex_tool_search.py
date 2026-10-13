@@ -60,7 +60,9 @@ def search_case(tmp_path, monkeypatch, broker_workspace, progress=print, *, agen
         elif sequence == 4:
             result = next(item for item in body['input']
                 if item.get('type') == 'tool_search_output' and item.get('call_id') == 'restricted_call')
-            assert 'github_repositories' not in json.dumps(result['tools'])
+            returned_names = {tool.get('name') for group in result['tools']
+                              for tool in group.get('tools', [group])}
+            assert 'github_repositories' not in returned_names
             proof['unselected_connection_hidden'] = True
             progress('Search cannot reveal GitHub tools outside this session’s connection scope.')
             output = {'type': 'message', 'id': 'final', 'role': 'assistant', 'phase': 'final_answer',

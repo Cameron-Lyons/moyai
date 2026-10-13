@@ -321,7 +321,8 @@ def test_access_login_requires_complete_policy_configuration():
 def test_broker_cannot_bootstrap_employee_session_when_login_enabled(login, access_key):
     from app.security import digest
     app, client = login
-    run = app.state.store.create_run('Broker boundary', '', 'modal', [], model='test-model')
+    run = app.state.store.create_run('Broker boundary', '', 'modal', [], model='test-model',
+                                     user_id='google:original-google-tin')
     app.state.store.update_run(run['id'], status='running', token_hash=digest('test-run-token'))
     path = '/broker/' + run['id'] + '/v1/models'
     client.headers['Cf-Access-Jwt-Assertion'] = assertion(access_key[0], 'broker-audience', sub='', common_name='test-service')

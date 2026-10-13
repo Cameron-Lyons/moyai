@@ -7,9 +7,14 @@ from pathlib import Path
 
 import modal
 
+from app.config import Settings
+from app.organization_scope import scoped_name
+
 ROOT = Path(__file__).parent
-APP_NAME = "moyai"
-VOLUME_NAME = "hermes-workspace-state"
+ORGANIZATION_ID = Settings().moyai_organization_id
+APP_NAME = scoped_name('moyai', ORGANIZATION_ID, 64) if ORGANIZATION_ID else 'moyai'
+VOLUME_NAME = scoped_name('hermes-workspace-state', ORGANIZATION_ID, 64) if ORGANIZATION_ID else 'hermes-workspace-state'
+CONFIG_SECRET_NAME = scoped_name('hermes-workspace-config', ORGANIZATION_ID, 64) if ORGANIZATION_ID else 'hermes-workspace-config'
 
 app = modal.App(APP_NAME)
 volume = modal.Volume.from_name(VOLUME_NAME, create_if_missing=True)
@@ -27,10 +32,18 @@ image = (
 
 # A named Secret is created by main(), before the app is deployed. No .env or
 # local task data is part of the image or uploaded source tree.
-config_secret = modal.Secret.from_name("hermes-workspace-config", required_keys=[
+config_secret = modal.Secret.from_name(CONFIG_SECRET_NAME, required_keys=[
     "WORKSPACE_PASSWORD", "SESSION_SECRET", "ENCRYPTION_KEY",
     "MODAL_TOKEN_ID", "MODAL_TOKEN_SECRET",
 ])
+
+
+def deployment_config(settings):
+    return {
+        name.upper(): str(value).lower() if isinstance(value, bool) else str(value)
+        for name, value in settings.model_dump().items()
+        if value is not None and name not in {'public_url', 'data_dir', 'checkpoint_dir', 'modal_volume_name'}
+    }
 
 
 @app.server(
@@ -92,6 +105,8 @@ def main():
     if Path.cwd() != ROOT:
         raise SystemExit("Run this command from the project root directory.")
     settings = Settings()
+    if settings.moyai_organization_id != ORGANIZATION_ID:
+        raise SystemExit('MOYAI_ORGANIZATION_ID changed while preparing deployment. Restart the deployment command.')
     if not settings.modal_token_id or not settings.modal_token_secret:
         raise SystemExit("Configure Modal credentials in .env first.")
     private_env = ROOT / ".env"
@@ -107,19 +122,15 @@ def main():
     # Validate before publishing; this is also enforced by the app at boot.
     if len(settings.workspace_password) < 16:
         raise SystemExit("WORKSPACE_PASSWORD must be at least 16 characters.")
-    values = {
-        name.upper(): str(value).lower() if isinstance(value, bool) else str(value)
-        for name, value in settings.model_dump().items()
-        if value is not None and name not in {"public_url", "data_dir", "checkpoint_dir", "modal_volume_name"}
-    }
+    values = deployment_config(settings)
 
     async def deploy():
         client = await modal.Client.from_credentials.aio(settings.modal_token_id, settings.modal_token_secret)
         # Pin CLI discovery to the same explicit account used for deployment.
         os.environ["MODAL_TOKEN_ID"] = settings.modal_token_id
         os.environ["MODAL_TOKEN_SECRET"] = settings.modal_token_secret
-        await modal.Secret.objects.create.aio("hermes-workspace-config", values, allow_existing=True, client=client)
-        await modal.Secret.from_name("hermes-workspace-config", client=client).update.aio(values)
+        await modal.Secret.objects.create.aio(CONFIG_SECRET_NAME, values, allow_existing=True, client=client)
+        await modal.Secret.from_name(CONFIG_SECRET_NAME, client=client).update.aio(values)
         await app.deploy.aio(client=client, strategy="recreate")
         url = await modal.Server.from_name(APP_NAME, "Web", client=client).get_url.aio()
         print(f"Workspace URL: {url}")

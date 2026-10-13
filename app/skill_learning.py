@@ -138,7 +138,7 @@ class SkillLearning:
                         (source['run_id'], source['user_id'])).fetchone():
             return False
         try:
-            if self.memory.owner(source['user_id'], conn) != owner:
+            if self.memory.owner(source['user_id'], conn, permission='skills.read') != owner:
                 return False
         except HTTPException:
             return False
@@ -153,7 +153,7 @@ class SkillLearning:
         if not source:
             return
         try:
-            owner = self.memory.owner(source['user_id'], conn)
+            owner = self.memory.owner(source['user_id'], conn, permission='skills.read')
         except HTTPException:
             return
         prefs = self.preferences_in(conn, owner)
@@ -513,7 +513,7 @@ class SkillLearning:
         async def actor(request, mutation=False):
             self.security.require(request, mutation=mutation)
             user = await database(self.store.identity, self.security.session_info(request))
-            return await database(self.memory.owner, user)
+            return await database(self.memory.owner, user, permission='skills.read')
 
         @router.get('')
         async def listing(request: Request):

@@ -141,7 +141,8 @@ async def test_broker_listener_grace_preserves_admitted_model_stream_and_owner(v
         app.state.settings.litellm_api_base = 'https://synthetic.invalid/v1'
         app.state.settings.model_context_limits = {app.state.settings.resolve_model(): ModelContextLimits(
             context_window=65536, max_input_tokens=65536, max_output_tokens=8192)}
-        run = app.state.store.create_run('shutdown fixture', '', 'modal', [])
+        actor = app.state.store.identity({'method': 'local', 'role': 'member'})
+        run = app.state.store.create_run('shutdown fixture', '', 'modal', [], user_id=actor)
         app.state.store.update_run(run['id'], status='running', token_hash=digest('cap'))
         return f"/broker/{run['id']}/v1/responses"
 

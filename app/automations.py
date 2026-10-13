@@ -115,6 +115,7 @@ class Definition(BaseModel):
     github_repository_id: int | None = Field(default=None, gt=0, strict=True)
     environment_id: str = Field(default='auto', pattern=r'^(auto|none|[0-9a-f]{32})$',
                                 description='Reusable project environment id from automation_environments. Each run pins its active validated build. auto matches the repository, or the workspace default when no repository is set; none uses base tools.')
+    security_profile_id: str = Field(default='', pattern=r'^([0-9a-f]{32})?$')
     plugins: list[Literal['linear', 'github', 'slack', 'notion']] = Field(default_factory=list, max_length=4)
     model: str = Field(default='', max_length=120)
     # Missing on old saved definitions: preserve their original runtime.
@@ -218,13 +219,27 @@ class Automations:
         return rows[0]
 
     def actor(self, request):
-        return self.store.identity(self.security.session_info(request))
+        info = self.security.session_info(request)
+        if not info:
+            raise HTTPException(401, 'Sign in to the workspace.')
+        return self.store.identity(info)
 
     def require_owner(self, row, request, *, pausing=False):
         if row['owner_id'] != self.actor(request) and not (pausing and self.security.role(request) == 'admin'):
             raise HTTPException(403, 'Only the owner can edit or run this automation. Administrators can pause it.')
 
     def validate_execution(self, definition, owner_id):
+        if self.security.user_roles:
+            self.security.user_roles.require_actor(owner_id, 'sessions.create')
+        profiles = getattr(self.store, 'security_profiles', None)
+        if profiles:
+            policy = json.loads(profiles.binding(definition.security_profile_id, provider=self.settings.sandbox_provider)['security_policy'])
+            if policy['connected_apps'] is not None and not set(definition.plugins) <= set(policy['connected_apps']):
+                raise HTTPException(422, 'The security policy does not allow all selected apps.')
+            if (definition.repo_url or definition.github_repository_id) and (
+                    policy['git_access'] == 'none' or
+                    policy['connected_apps'] is not None and 'github' not in policy['connected_apps']):
+                raise HTTPException(422, 'The security policy does not allow managed repository access.')
         # Re-evaluate access at every launch; saved workflows confer no new rights.
         if 'slack' in definition.plugins and self.connectors.personal_slack.configured(owner_id):
             raise HTTPException(409, 'Personal Slack is not supported in automations. Use a private web chat, or disconnect personal Slack in Connections.')
@@ -307,6 +322,8 @@ class Automations:
         with self.store.connect() if connection is None else nullcontext(connection) as conn:
             if connection is None:
                 conn.begin_write()
+            if self.security.user_roles:
+                self.security.user_roles.require_actor(owner_id, 'automations.manage', connection=conn)
             if automation_id:
                 row = conn.execute('SELECT * FROM automations WHERE id=?', (automation_id,)).fetchone()
                 if not row or row['owner_id'] != owner_id:
@@ -327,6 +344,8 @@ class Automations:
                 automation_id = uuid4().hex
                 conn.execute('INSERT INTO automations(id,owner_id,definition,created_at,updated_at) VALUES(?,?,?,?,?)',
                              (automation_id, owner_id, definition.model_dump_json(), stamp, stamp))
+            conn.execute('UPDATE automations SET security_profile_id=? WHERE id=?',
+                         (definition.security_profile_id, automation_id))
             result = dict(conn.execute('SELECT * FROM automations WHERE id=?', (automation_id,)).fetchone())
         self.next_sync = 0
         return result
@@ -336,6 +355,9 @@ class Automations:
         with self.store.connect() if connection is None else nullcontext(connection) as conn:
             if connection is None:
                 conn.begin_write()
+            if self.security.user_roles:
+                self.security.user_roles.require_actor(owner_id, 'automations.manage', connection=conn)
+                admin_pause = admin_pause and self.security.user_roles.is_admin_actor_in(conn, owner_id)
             row = conn.execute('SELECT * FROM automations WHERE id=?', (automation_id,)).fetchone()
             if not row:
                 raise HTTPException(404, 'Automation not found.')
@@ -368,6 +390,7 @@ class Automations:
         error = ''
         environment_blocker = ''
         try:
+            self.validate_execution(definition, row['owner_id'])
             await self.identify_repositories(definition)
             self.validate_execution(definition, row['owner_id'])
             environment_blocker = self.environment_blocker(definition)
@@ -375,6 +398,11 @@ class Automations:
             error = exc.detail if isinstance(exc, HTTPException) else str(exc)
         with self.store.connect() as conn:
             conn.begin_write()
+            if self.security.user_roles:
+                try:
+                    self.security.user_roles.require_actor(row['owner_id'], 'sessions.create', connection=conn)
+                except HTTPException as exc:
+                    error = exc.detail
             previous = conn.execute('SELECT * FROM automation_runs WHERE occurrence=?', (occurrence,)).fetchone()
             if previous:
                 result = {'run_id': previous['run_id'] or '', 'outcome': previous['outcome']}
@@ -436,6 +464,10 @@ class Automations:
                                      'instructions': definition.prompt})))
                     conn.execute("INSERT INTO events(run_id,kind,message,data,created_at) VALUES(?,'status',?,'{}',?)", (run_id, 'Started by event automation' if event else 'Started by automation', stamp))
                     conn.execute('UPDATE runs SET sandbox_provider=? WHERE id=?', (self.settings.sandbox_provider, run_id))
+                    profiles = getattr(self.store, 'security_profiles', None)
+                    if profiles:
+                        profiles.bind_session(dict(conn.execute('SELECT * FROM runs WHERE id=?', (run_id,)).fetchone()),
+                                              definition.security_profile_id, automation_id, conn=conn)
                     conn.execute('INSERT INTO automation_runs VALUES(?,?,?,?,?,?,?)', (occurrence, automation_id, revision, run_id, 'started', '', stamp))
                     if self.settings.temporal_enabled:
                         conn.execute('INSERT INTO durable_sessions(run_id,revision) VALUES(?,1)', (run_id,))
@@ -609,6 +641,8 @@ def initialize_schema(store):
         conn.begin_write()
         if 'synced_schedule_version' not in conn.column_names('automations'):
             conn.execute('ALTER TABLE automations ADD COLUMN synced_schedule_version INTEGER NOT NULL DEFAULT 0')
+        if 'security_profile_id' not in conn.column_names('automations'):
+            conn.execute("ALTER TABLE automations ADD COLUMN security_profile_id TEXT NOT NULL DEFAULT ''")
     # Remember already-synced single-trigger schedules for later removal.
     for row in store.rows('SELECT * FROM automations WHERE synced_revision>0'):
         if 'triggers' not in json.loads(row['definition']) and not json.loads(row['definition']).get('event'):

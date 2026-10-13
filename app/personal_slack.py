@@ -209,7 +209,8 @@ class PersonalSlack:
                 await checkpoints.flush()
 
         def actor(request, mutation=False, required=True):
-            sid = self.security.require(request, mutation=mutation)
+            sid = self.security.require(request, mutation=mutation,
+                permission='credentials.manage' if mutation else 'credentials.read')
             try:
                 owner = self.owner(self.store.identity(self.security.session_info(request)))
             except ConnectorError:

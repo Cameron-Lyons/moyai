@@ -399,9 +399,10 @@ async def test_real_temporal_workers_finish_after_one_worker_restarts(cluster):
                 return await original_step(run_id, state)
 
             apps[1].state.manager.step = pause_first_activity
+            actor = control.state.store.identity({'method': 'local', 'role': 'member'})
             runs = []
             for i in range(8):
-                run = control.state.store.create_run('Demo ' + str(i), '', 'demo', [], chat_enabled=True)
+                run = control.state.store.create_run('Demo ' + str(i), '', 'demo', [], chat_enabled=True, user_id=actor)
                 control.state.manager.submit(run)
                 runs.append(run)
             await asyncio.wait_for(first_started.wait(), 15)

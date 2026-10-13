@@ -89,7 +89,8 @@ def test_forged_and_unsigned_assertions_are_rejected(guarded, access_key):
 
 def test_machine_assertion_and_run_capability_are_both_required(guarded, access_key):
     app, client, _ = guarded
-    run = app.state.store.create_run('Synthetic task', '', 'modal', [], model='test-model')
+    actor = app.state.store.identity({'method': 'password', 'role': 'admin'})
+    run = app.state.store.create_run('Synthetic task', '', 'modal', [], model='test-model', user_id=actor)
     app.state.store.update_run(run['id'], status='running', token_hash=digest('test-run-token'))
     path = '/broker/' + run['id'] + '/v1/models'
     employee = assertion(access_key[0])
@@ -115,6 +116,44 @@ def test_only_exact_webhook_methods_bypass_access_and_still_require_signatures(g
         assert client.post(path + '/').json()['detail'] == 'Cloudflare Access authentication required.'
     assert client.post('/hooks/unknown').status_code == 401
     assert upstream['calls'] == 0
+
+
+def test_scim_exemption_is_exact_and_keeps_provisioning_bearer_auth(guarded, access_key):
+    app, client, upstream = guarded
+    from app.scim import API, CORE
+    for path in ('/scim/v2/ServiceProviderConfig', '/scim/v2/Users', '/scim/v2/Groups',
+                 '/scim/v2/ResourceTypes', '/scim/v2/ResourceTypes/User', '/scim/v2/Schemas',
+                 '/scim/v2/Schemas/' + CORE + 'User'):
+        response = client.get(path)
+        assert response.status_code == 401 and response.json()['schemas'] == [API + 'Error']
+        assert response.headers['www-authenticate'] == 'Bearer'
+    for path, method in [('/scim/v2/Users/', 'GET'), ('/scim/v2/Unknown', 'GET'),
+                         ('/scim/v2/Users/not-an-id', 'DELETE'), ('/scim/v2/Users', 'DELETE'),
+                         ('/scim/v2/ServiceProviderConfig', 'POST'), ('/api/admin/scim', 'GET')]:
+        response = client.request(method, path)
+        assert response.status_code == 401 and 'Cloudflare' in response.json()['detail']
+    assert upstream['calls'] == 0
+    # Existing protected sign-in creates the provisioning credential. That
+    # credential then works without creating an employee login or Access JWT.
+    client.headers['Cf-Access-Jwt-Assertion'] = assertion(access_key[0])
+    assert client.post('/api/login', json={'password': 'test-workspace-password'}).status_code == 200
+    session = client.get('/api/session').json()
+    client.headers['X-CSRF-Token'] = session['csrf']
+    issued = client.post('/api/admin/scim/tokens', json={'label': 'IdP'})
+    assert issued.status_code == 200
+    client.headers['Authorization'] = 'Bearer ' + issued.json()['token']
+    del client.headers['Cf-Access-Jwt-Assertion']
+    client.cookies.clear()
+    created = client.post('/scim/v2/Users', json={'userName': 'scim@example.com'})
+    assert created.status_code == 201
+    identity = created.json()['id']
+    assert client.get('/scim/v2/Users/' + identity).status_code == 200
+    assert client.patch('/scim/v2/Users/' + identity,
+                        json={'schemas': [API + 'PatchOp'], 'Operations': [{'op': 'replace', 'path': 'active', 'value': False}]}).status_code == 200
+    assert client.get('/api/session').status_code == 401
+    assert client.get('/api/admin/scim').status_code == 401
+    assert client.delete('/scim/v2/Users/' + identity).status_code == 204
+    assert upstream['calls'] == 1
 
 
 def test_key_fetch_failure_fails_closed(guarded, access_key):
