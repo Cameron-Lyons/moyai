@@ -149,7 +149,7 @@ async function openCredentialDialog(request=null,secret=null,preset=null){
   const canOrganization=request?!!request.can_organization:admin;
   const providerList=data.providers.some(p=>p.id==='generic')?data.providers:[...data.providers,{id:'generic',name:'Other service',setup_url:''}];
   if(!preset&&secret?.provider==='generic'&&secret.name==='1password-shared'&&secret.format==='env')preset=onePasswordAccess;
-  const fixed=request||secret||preset,providers=fixed?providerList.filter(p=>p.id===fixed.provider):providerList;
+  const fixed=request||secret||preset,providers=fixed?providerList.filter(p=>p.id===fixed.provider):providerList.filter(p=>!p.disabled);
   const existingScope=secret?(secret.scope==='session'?'personal':secret.scope):'';
   const existingLifetime=secret?credentialLifetime(secret):'';
   const inputFields=credentialInputFields(request||preset);

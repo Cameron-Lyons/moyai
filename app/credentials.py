@@ -1118,8 +1118,9 @@ class Credentials:
             if run and run['deleted_at']:
                 raise HTTPException(404, 'Session not found.')
             root_id = self.root(run) if run else ''
-            return {'providers': [{'id': key, 'name': value['name'], 'setup_url': value['setup']} for key, value in PROVIDERS.items()
-                                  if not self.proxy_disabled(key)],
+            # Disabled providers stay listed so saved keys keep their names.
+            return {'providers': [{'id': key, 'name': value['name'], 'setup_url': value['setup'],
+                                   'disabled': self.proxy_disabled(key)} for key, value in PROVIDERS.items()],
                     'root_id': root_id, 'secrets': self.list_secrets(user, admin, root_id)}
 
         @router.post('/api/credentials/secrets', status_code=201)

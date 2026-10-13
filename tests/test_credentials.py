@@ -288,7 +288,8 @@ async def test_disabled_provider_key_proxy_refuses_keys_and_calls_but_keeps_gene
         'provider': 'generic', 'name': 'service', 'format': 'env', 'label': 'Service', 'scope': 'personal',
         'lifetime': 'persistent', 'value': json.dumps({'SERVICE_TOKEN': KEY}), 'client_id': 'save-test-generic'}).status_code == 201
     listing = client.get('/api/credentials').json()
-    assert [provider['id'] for provider in listing['providers']] == ['generic']
+    assert [provider['id'] for provider in listing['providers'] if not provider['disabled']] == ['generic']
+    assert {provider['id']: provider['name'] for provider in listing['providers']}['openai'] == 'OpenAI'
     saved = next(item for item in listing['secrets'] if item['id'] == secret)
     path = '/api/credentials/secrets/' + secret
     assert client.patch(path, json={'revision': saved['revision'], 'value': KEY + '-new'}).status_code == 403
