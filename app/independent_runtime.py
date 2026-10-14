@@ -82,7 +82,8 @@ class IndependentRuntime:
             except modal.exception.AlreadyExistsError:
                 runtime = await backend.find(name)
         # runs.sandbox_id is exclusively the user's computer, never this guest.
-        state.update(sandbox_id=runtime.object_id, machine_started=time.time(), phase='install')
+        state.update(sandbox_id=runtime.object_id, machine_started=time.time(), phase='install',
+                     security_network=getattr(backend, 'security_egress_hosts', None))
         await database(r.save, run_id, state)
         return True
 

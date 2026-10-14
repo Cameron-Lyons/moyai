@@ -37,6 +37,12 @@ def change(client, email, role, revision=0):
     return client.put('/api/admin/users/role', json={'email': email, 'role': role, 'revision': revision})
 
 
+def directory_write(app, kind, body, identity=None):
+    with app.state.store.connect() as conn:
+        conn.begin_write()
+        return app.state.scim.write_in(conn, kind, body, identity)
+
+
 def test_current_admins_preserved_and_role_changes_apply_to_existing_sessions(users_app):
     app, client = users_app
     sign_as(app, client, 'tin@berri.ai')
@@ -120,6 +126,72 @@ def test_concurrent_demotions_keep_one_admin(users_app):
         outcomes = list(pool.map(demote, ['tin@berri.ai', 'ishaan@berri.ai']))
     assert sorted(outcomes) == [200, 409]
     assert len([row for row in app.state.user_roles.directory()['users'] if row['role'] == 'admin']) == 1
+
+
+@pytest.mark.parametrize('route', ['users', 'assignments'])
+def test_deactivated_admin_can_be_demoted_while_another_admin_is_active(users_app, route):
+    app, client = users_app
+    sign_as(app, client, 'tin@berri.ai')
+    person = directory_write(app, 'User', {'userName': 'ishaan@berri.ai'})
+    directory_write(app, 'User', {'userName': 'ishaan@berri.ai', 'active': False}, person['id'])
+    response = change(client, 'ishaan@berri.ai', 'member') if route == 'users' else client.put(
+        '/api/admin/role-assignments', json={'email': 'ishaan@berri.ai', 'role_id': 'member', 'revision': 0})
+    assert response.status_code == 200, response.text
+    # The last active administrator stays protected.
+    assert change(client, 'tin@berri.ai', 'member').status_code == 409
+    directory_write(app, 'User', {'userName': 'ishaan@berri.ai', 'active': True}, person['id'])
+    assert app.state.user_roles.role('ishaan@berri.ai') == 'member'
+
+
+def test_directory_guard_keeps_promoted_admins_without_configured_admins(tmp_path):
+    from app.scim import Scim
+    from app.security import Security
+    settings = Settings(_env_file=None, data_dir=tmp_path, public_url='http://localhost:8787', google_allowed_domains='berri.ai')
+    store = Store(settings.data_dir)
+    roles = UserRoles(store, settings)
+    directory = Scim(store, Security(settings, roles), roles)
+
+    def write(body, identity=None):
+        with store.connect() as conn:
+            conn.begin_write()
+            return directory.write_in(conn, 'User', body, identity)
+
+    # A local deployment that never had administrators provisions freely.
+    maya = write({'userName': 'maya@berri.ai'})
+    assert write({'userName': 'maya@berri.ai', 'active': False}, maya['id'])['active'] is False
+    local = {'method': 'local', 'role': 'admin'}
+    roles.change(RoleChange(email='tin@berri.ai', role='admin', revision=0), local)
+    tin = write({'userName': 'tin@berri.ai'})
+    with pytest.raises(HTTPException) as error:
+        write({'userName': 'tin@berri.ai', 'active': False}, tin['id'])
+    assert error.value.status_code == 409
+    roles.change(RoleChange(email='ishaan@berri.ai', role='admin', revision=0), local)
+    assert write({'userName': 'tin@berri.ai', 'active': False}, tin['id'])['active'] is False
+
+
+def test_require_actor_resolves_activity_and_group_tables_once(users_app, monkeypatch):
+    app, client = users_app
+    sign_as(app, client, 'maya@berri.ai')
+    roles = app.state.user_roles
+    checked = []
+    active_actor_in = roles.active_actor_in
+    monkeypatch.setattr(roles, 'active_actor_in', lambda conn, actor: checked.append(actor) or active_actor_in(conn, actor))
+    with roles.store.connect() as conn:
+        listed = []
+        table_names = conn.table_names
+        conn.table_names = lambda: listed.append(1) or table_names()
+        roles.enterprise.group_permissions_in(conn, 'maya@berri.ai')
+        roles.enterprise.group_permissions_in(conn, 'maya@berri.ai')
+        assert len(listed) <= 1  # Once per connection; PostgreSQL caches it per schema.
+        roles.require_actor('google:maya', 'sessions.create', connection=conn)
+        assert checked == ['google:maya']
+        with pytest.raises(HTTPException) as error:
+            roles.require_actor('google:maya', 'roles.manage', connection=conn)
+        assert error.value.detail == 'Your workspace role does not permit this action.'
+    person = directory_write(app, 'User', {'userName': 'maya@berri.ai', 'active': False})
+    with pytest.raises(HTTPException) as error:
+        roles.require_actor('google:maya', 'sessions.create')
+    assert error.value.detail == 'This workspace account has been deactivated.' and not person['active']
 
 
 def test_concurrent_actor_revocation_is_checked_inside_transaction(users_app):

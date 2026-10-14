@@ -122,12 +122,15 @@ class SecurityProfiles:
     def _network_change(self, before, after, conn):
         if before.get('network_domains') == after.get('network_domains'):
             return
+        # Non-durable runs keep sandbox_id after their machine is terminated;
+        # only a non-terminal run can still hold one.
         live = conn.execute("""SELECT 1 FROM runs WHERE deleted_at='' AND
-            (sandbox_id<>'' OR (mode='modal' AND status IN ('running','reconnecting','provisioning','awaiting_approval')))
+            ((sandbox_id<>'' AND status NOT IN ('completed','failed','cancelled','interrupted','idle'))
+             OR (mode='modal' AND status IN ('running','reconnecting','provisioning','awaiting_approval')))
             LIMIT 1""").fetchone()
         if not live and 'durable_sessions' in conn.table_names():
-            # Independent control guests have a durable machine identity even
-            # while runs.sandbox_id (the user's computer) is empty.
+            # Warm idle durable machines and independent control guests keep a
+            # durable machine identity whatever the run status or sandbox_id.
             live = conn.execute("SELECT 1 FROM durable_sessions WHERE COALESCE(json_text(state,'sandbox_id'),'')<>'' LIMIT 1").fetchone()
         if live:
             raise HTTPException(409, 'Release session sandboxes before changing the mandatory network policy.')
@@ -188,19 +191,25 @@ class SecurityProfiles:
 
     def effective(self, run, conn=None):
         """Use authoritative persisted snapshots, including all ancestors."""
+        if conn is None:
+            # One snapshot and one pooled connection for the floor and lineage.
+            with self.store.connect() as conn:
+                conn.begin_read()
+                return self.effective(run, conn)
         if not run:
             return intersect(self.floor(conn))
-        policies, seen, current = [self.floor(conn)], set(), run
+        policies, seen, current, persisted = [self.floor(conn)], set(), run, False
         while current:
             identity = current.get('id')
             if identity in seen:
                 raise HTTPException(409, 'Security profile lineage is cyclic.')
             if identity:
                 seen.add(identity)
-                rows = self._rows('SELECT * FROM runs WHERE id=?', (identity,), conn)
-                if not rows:
-                    raise HTTPException(409, 'Security profile session lineage is missing.')
-                current = rows[0]
+                if not persisted:
+                    rows = self._rows('SELECT * FROM runs WHERE id=?', (identity,), conn)
+                    if not rows:
+                        raise HTTPException(409, 'Security profile session lineage is missing.')
+                    current = rows[0]
             try:
                 policies.append(json.loads(current.get('security_policy') or '{}'))
             except (TypeError, ValueError):
@@ -211,7 +220,7 @@ class SecurityProfiles:
             rows = self._rows('SELECT * FROM runs WHERE id=?', (parent,), conn)
             if not rows:
                 raise HTTPException(409, 'Security profile parent session is missing.')
-            current = rows[0]
+            current, persisted = rows[0], True
         try:
             return intersect(*policies)
         except ValidationError:
@@ -244,8 +253,21 @@ class SecurityProfiles:
         if run.get('security_policy') not in (None, '', '{}'):
             self.require_provider(self.effective(run, conn), run.get('sandbox_provider', 'modal'))
             return run
-        fields = self.binding(profile_id or run.get('security_profile_id', ''), provider=run.get('sandbox_provider', 'modal'),
-                              parent_run_id=run.get('parent_run_id', ''), automation_id=automation_id, conn=conn)
+        profile_id = profile_id or run.get('security_profile_id', '')
+        if run.get('parent_run_id') and not profile_id and not automation_id:
+            # Delegated agents and swarm workers keep their parent's selection.
+            # The organization default applies only to new user selections.
+            rows = self._rows('SELECT * FROM runs WHERE id=?', (run['parent_run_id'],), conn)
+            if not rows:
+                raise HTTPException(409, 'Security profile parent session is missing.')
+            policy = self.effective(rows[0], conn)  # Includes the current floor.
+            self.require_provider(policy, run.get('sandbox_provider', 'modal'))
+            fields = {'security_profile_id': rows[0]['security_profile_id'],
+                      'security_profile_revision': rows[0]['security_profile_revision'],
+                      'security_policy': json.dumps(policy, sort_keys=True)}
+        else:
+            fields = self.binding(profile_id, provider=run.get('sandbox_provider', 'modal'),
+                                  parent_run_id=run.get('parent_run_id', ''), automation_id=automation_id, conn=conn)
         sql = 'UPDATE runs SET security_profile_id=?,security_profile_revision=?,security_policy=? WHERE id=?'
         values = (fields['security_profile_id'], fields['security_profile_revision'], fields['security_policy'], run['id'])
         if conn:
@@ -259,8 +281,8 @@ class SecurityProfiles:
         if policy.get('network_domains') is not None and provider != 'substrate':
             raise HTTPException(409, 'Domain network policies require Substrate. This provider cannot enforce the selected security profile.')
 
-    def network_hosts(self, run):
-        policy = self.effective(run)
+    def network_hosts(self, run, *, conn=None):
+        policy = self.effective(run, conn)
         self.require_provider(policy, run.get('sandbox_provider', 'modal'))
         domains = policy['network_domains']
         if domains is None:
@@ -276,8 +298,9 @@ class SecurityProfiles:
             raise HTTPException(409, 'Allow the broker hostname in Substrate egress settings before starting this network-restricted session.')
         return sorted(set(domains) | {broker.lower()})
 
-    def allowed_tool(self, run, name, provider=None, write=False):
-        policy = self.effective(run)
+    @staticmethod
+    def permits(policy, name, provider=None, write=False):
+        """Evaluate one tool against an already resolved effective policy."""
         if policy['tools'] is not None and name not in policy['tools']:
             return False
         if provider and policy['connected_apps'] is not None and provider not in policy['connected_apps']:
@@ -287,12 +310,15 @@ class SecurityProfiles:
                 return False
         return True
 
-    def require_tool(self, run, name, provider=None, write=False):
-        if not self.allowed_tool(run, name, provider, write):
+    def allowed_tool(self, run, name, provider=None, write=False, *, conn=None, policy=None):
+        return self.permits(self.effective(run, conn) if policy is None else policy, name, provider, write)
+
+    def require_tool(self, run, name, provider=None, write=False, *, conn=None, policy=None):
+        if not self.allowed_tool(run, name, provider, write, conn=conn, policy=policy):
             raise HTTPException(403, 'This operation is disabled by the session security profile.')
 
-    def require_url(self, run, url):
-        domains = self.effective(run)['network_domains']
+    def require_url(self, run, url, *, conn=None, policy=None):
+        domains = (self.effective(run, conn) if policy is None else policy)['network_domains']
         if domains is not None and urlsplit(url).hostname not in domains:
             raise HTTPException(403, 'This destination is disabled by the session security profile.')
 

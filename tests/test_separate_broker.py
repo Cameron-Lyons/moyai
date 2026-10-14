@@ -58,7 +58,9 @@ def test_api_restart_preserves_broker_requests_compaction_and_tools(split_settin
             broker_client = TestClient(broker, base_url=split_settings.public_url, client=('127.0.0.1', 50000))
             broker_client = broker_lifetime.enter_context(broker_client)
             store = broker.state.store
-            run = store.create_run('Synthetic live inference', '', 'modal', [], chat_enabled=True)
+            # Broker admission checks the run's requester; use the local preview owner.
+            run = store.create_run('Synthetic live inference', '', 'modal', [], chat_enabled=True,
+                                   user_id=store.identity({'method': 'local', 'role': 'admin'}))
             broker.state.manager.submit(run)
             store.update_run(run['id'], status='running', token_hash=digest('synthetic-capability'))
             request_id = broker.state.spend.begin(store.run(run['id']), 'synthetic-model')
@@ -171,7 +173,9 @@ def test_split_broker_preserves_machine_audience_and_run_capability(split_settin
     with TestClient(create_app(settings), base_url=settings.public_url) as api:
         broker = create_app(settings.model_copy(update={'moyai_runtime_role': 'broker'}))
         with TestClient(broker, base_url=settings.public_url) as client:
-            run = broker.state.store.create_run('Synthetic access check', '', 'modal', [])
+            # Access with a shared password: the password administrator is a valid requester.
+            run = broker.state.store.create_run('Synthetic access check', '', 'modal', [],
+                                                user_id=broker.state.store.identity({'method': 'password', 'role': 'admin'}))
             broker.state.store.update_run(run['id'], status='running', token_hash=digest('synthetic-capability'))
             route = f"/broker/{run['id']}/v1/models"
             machine = {'Cf-Access-Jwt-Assertion': assertion(access_key[0], 'broker-audience', sub='', common_name='test-service')}

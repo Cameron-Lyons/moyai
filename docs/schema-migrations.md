@@ -1,8 +1,8 @@
 # Explicit PostgreSQL schema migrations
 
 Explicit schema verification is the database prerequisite for
-[compatible rolling releases](rolling-deploy.md). This bridge release requires
-revision **19**. Verified roles can overlap under their reviewed protocols and
+[compatible rolling releases](rolling-deploy.md). This release requires
+revision **20**. Verified roles can overlap under their reviewed protocols and
 shared settings. After every role runs the bridge, future explicitly reviewed
 additive revisions can use the rolling action; initial activation and breaking
 changes still require maintenance. Production is not opted in by merging code.
@@ -51,8 +51,17 @@ transition before enabling them. A normal pre-deploy hook that runs while the ol
 app is live will be rejected. Once this activation is complete, deploy the bridge
 at the same schema revision to all four roles before using online expansions.
 An installation still on an earlier revision, such as revision 14, first needs
-the one-time maintenance adoption of revision 19; the empty online registry
-does not provide a migration path for it.
+the one-time maintenance adoption of the current revision (20); the empty online
+registry does not provide a migration path for it.
+
+## Enterprise governance upgrade
+
+Revision 20 adds workspace roles, SCIM provisioning, session security profiles,
+the governance audit feed and the organization pin, and advances the
+compatibility baseline to 20. Use the coordinated maintenance steps above; the
+rolling and API release actions reject it. See
+[Enterprise governance](enterprise-governance.md#operator-rollout-and-verification)
+for the verification checklist.
 
 ## Private-session upgrade
 
@@ -60,11 +69,12 @@ Revision 19 adds immutable private ownership and personal Slack grants. It also
 advances the compatibility baseline to 19: older application code treats all
 sessions as shared and cannot safely overlap once private sessions exist.
 
-Use the coordinated maintenance steps above for an existing revision-18 deployment:
+Use the coordinated maintenance steps above for an existing revision-18 deployment
+(this release migrates it directly to revision 20):
 back up the database, drain work, stop **all four roles** (including the dedicated
 API), run `python -m app.schema_migrations --apply` from the target release, and
 start every role at that release with `MOYAI_SCHEMA_MODE=verify`. Confirm the
-migration prints revision 19, health checks pass, and an ordinary saved session
+migration prints this release's revision (20), health checks pass, and an ordinary saved session
 opens before reopening ingress. Verify that a private test session returns 404
 for a second individual account.
 
@@ -83,8 +93,8 @@ entire plan and records it while making no database or service writes.
 `app/online_schema_migrations.json` is the explicit reviewed registry. Each step
 names its source and target revision, their digests from `schema_versions.json`,
 the unchanged compatibility revision, and a list of declarative operations.
-Steps must be contiguous. The bridge initially has an empty registry and retains
-compatibility revision 19, preserving the existing role fingerprints.
+Steps must be contiguous. The registry is empty and the compatibility revision
+is 20; online steps keep that revision and the existing role fingerprints.
 
 Protocol 1 accepts only:
 

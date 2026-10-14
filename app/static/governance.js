@@ -15,7 +15,13 @@ globalThis.MoyaiSecurityProfiles = {
 
 async function renderGovernance() {
   const version=state.pageVersion;
-  MoyaiUI.render($('#content'), '<p class="subtext" role="status">Loading governance…</p>');
+  // Tab switches and Refresh update in place: keep the activated control focused
+  // and expanded details open instead of replacing the page with a loading state.
+  const page=document.querySelector('.governance-page');
+  const focused=document.activeElement?.closest?.('[data-governance-tab],#governance-refresh');
+  const focusTarget=focused?.id==='governance-refresh'?'#governance-refresh':focused?'[data-governance-tab="'+governanceState.tab+'"]':'';
+  const opened=new Set([...document.querySelectorAll('.governance-page details[open][data-details-key]')].map(item=>item.dataset.detailsKey));
+  if(!page)MoyaiUI.render($('#content'), '<p class="subtext" role="status">Loading governance…</p>');
   const session=await api('/api/session');
   if(version!==state.pageVersion)return;
   applyUserSession(session);
@@ -39,6 +45,8 @@ async function renderGovernance() {
     governanceState.tab=button.dataset.governanceTab;
     renderGovernance().catch(error=>settingsLoadError('Governance',error,()=>renderGovernance()));
   });
+  document.querySelectorAll('.governance-page details[data-details-key]').forEach(item=>{if(opened.has(item.dataset.detailsKey))item.open=true;});
+  if(focusTarget)document.querySelector(focusTarget)?.focus();
   if(tab==='roles')bindGovernanceRoles(data,version);
   else if(tab==='provisioning')bindGovernanceProvisioning(data,version);
   else if(tab==='audit')bindGovernanceAudit(data,version);
@@ -77,15 +85,17 @@ function governanceRoles(data) {
   const roles=data.roles.filter(role=>!role.archived);
   return `<section class="governance-section"><div class="section-header"><div><h2>Workspace roles</h2><p class="subtext">Custom roles replace internal user permissions. Group memberships can add permissions.</p></div><button id="governance-new-role" class="primary">Create role</button></div>
     <label class="governance-search">Search roles<input id="governance-role-search" type="search" value="${esc(governanceState.query)}" placeholder="Name, description, or permission"></label>
-    <div id="governance-role-list">${roles.map(role=>`<article class="governance-row" data-governance-role="${esc(role.id)}" data-search="${esc([role.name,role.description,...role.permissions].join(' ').toLowerCase())}"><div><h3>${esc(role.name)} ${role.builtin?'<span class="badge">Built-in</span>':''}</h3><p class="subtext">${esc(role.description||'Custom workspace permissions')}</p><details><summary>${role.permissions.length} permissions</summary><ul>${role.permissions.map(permission=>`<li><code>${esc(permission)}</code></li>`).join('')}</ul></details></div>${role.builtin?'':`<div class="governance-actions"><button class="quiet" data-role-edit="${esc(role.id)}">Edit</button><button class="quiet danger" data-role-delete="${esc(role.id)}">Archive</button></div>`}</article>`).join('')}</div>
+    <div id="governance-role-list">${roles.map(role=>`<article class="governance-row" data-governance-role="${esc(role.id)}" data-search="${esc([role.name,role.description,...role.permissions].join(' ').toLowerCase())}"><div><h3>${esc(role.name)} ${role.builtin?'<span class="badge">Built-in</span>':''}</h3><p class="subtext">${esc(role.description||'Custom workspace permissions')}</p><details data-details-key="role:${esc(role.id)}"><summary>${role.permissions.length} permissions</summary><ul>${role.permissions.map(permission=>`<li><code>${esc(permission)}</code></li>`).join('')}</ul></details></div>${role.builtin?'':`<div class="governance-actions"><button class="quiet" data-role-edit="${esc(role.id)}">Edit</button><button class="quiet danger" data-role-delete="${esc(role.id)}">Archive</button></div>`}</article>`).join('')}</div>
     <div id="governance-role-empty" hidden><p>No roles match your search.</p><button class="quiet" id="governance-clear-search">Clear search</button></div>
   </section><section class="governance-section"><div class="section-header"><div><h2>User assignments</h2><p class="subtext">Assign a role to an eligible work email. Changes apply on the next request.</p></div><button id="governance-assign-role" class="quiet">Assign role</button></div>
     ${governanceTable('Explicit user role assignments',['Work email','Role',''],(data.assignments||[]).map(row=>`<tr><td>${esc(row.email)}</td><td>${esc(roles.find(role=>role.id===row.role_id)?.name||row.role_id)}</td><td><button class="quiet" data-role-assign="${esc(row.email)}">Change role</button></td></tr>`),'No custom assignments yet. Existing administrator and internal user roles still apply.')}
-  </section><details class="governance-section"><summary>Recent role activity</summary>${governanceActivity(data.activity)}</details>`;
+  </section><section class="governance-section"><div class="section-header"><div><h2>Directory group grants</h2><p class="subtext">A group role adds permissions to each active member of a provisioned group.</p></div></div>
+    ${governanceTable('Directory group grants',['Group','Members','Additional role',''],(data.groups||[]).map(group=>{const grant=(data.group_roles||[]).find(row=>row.group_id===group.id&&row.role_id);return `<tr><td>${esc(group.display_name)}</td><td>${Number(group.members)||0}</td><td>${grant?esc(roles.find(role=>role.id===grant.role_id)?.name||grant.role_id):'None'}</td><td><button class="quiet" data-group-grant="${esc(group.id)}">Change</button></td></tr>`;}),'No directory groups have been provisioned yet.')}
+  </section><details class="governance-section" data-details-key="activity:roles"><summary>Recent role activity</summary>${governanceActivity(data.activity)}</details>`;
 }
 
 function governanceActivity(rows=[]) {
-  return rows.length?`<ul class="governance-activity">${rows.map(row=>`<li><strong>${esc(row.action||row.resource_type||'Updated')}</strong><span>${esc(row.actor||'')} ${esc(row.email||row.resource_id||row.role_id||'')}</span><time>${esc(new Date(row.created_at).toLocaleString())}</time></li>`).join('')}</ul>`:'<p class="subtext">Changes will appear here after they are saved.</p>';
+  return rows.length?`<ul class="governance-activity">${rows.map(row=>`<li><strong>${esc(row.action||row.resource_type||'Updated')}</strong><span>${esc(row.actor||'')} ${esc(row.subject||row.email||row.resource_id||row.role_id||'')}</span><time>${esc(new Date(row.created_at).toLocaleString())}</time></li>`).join('')}</ul>`:'<p class="subtext">Changes will appear here after they are saved.</p>';
 }
 
 function governanceDialog(title,html) {
@@ -147,31 +157,51 @@ function bindGovernanceRoles(data,version) {
   };
   $('#governance-assign-role').onclick=()=>assign();
   document.querySelectorAll('[data-role-assign]').forEach(button=>button.onclick=()=>assign(data.assignments.find(row=>row.email===button.dataset.roleAssign)));
+  document.querySelectorAll('[data-group-grant]').forEach(button=>button.onclick=()=>governanceGroupGrant(data,(data.groups||[]).map(group=>({id:group.id,name:group.display_name})),version,button.dataset.groupGrant));
+}
+
+function governanceGroupGrant(roles,groups,version,selected='') {
+  const dialog=governanceDialog('Assign group role',`<div class="field"><label for="governance-group">Directory group</label><select id="governance-group" required>${groups.map(group=>`<option value="${esc(group.id)}" ${group.id===selected?'selected':''}>${esc(group.name)}</option>`).join('')}</select></div><div class="field"><label for="governance-group-role-id">Additional role</label><select id="governance-group-role-id"><option value="">No additional permissions</option>${roles.roles.filter(role=>!role.archived&&role.id!=='admin').map(role=>`<option value="${esc(role.id)}">${esc(role.name)}</option>`).join('')}</select></div>`);
+  const synchronize=()=>{const mapping=roles.group_roles.find(row=>row.group_id===dialog.querySelector('#governance-group').value);dialog.querySelector('#governance-group-role-id').value=mapping?.role_id||'';};
+  dialog.querySelector('#governance-group').onchange=synchronize;synchronize();
+  governanceSave(dialog,version,()=>{const group=dialog.querySelector('#governance-group').value,mapping=roles.group_roles.find(row=>row.group_id===group);return api('/api/admin/group-roles/'+encodeURIComponent(group),{method:'PUT',body:JSON.stringify({role_id:dialog.querySelector('#governance-group-role-id').value||null,revision:mapping?.revision||0})});});
 }
 
 function governanceProvisioning(data) {
-  return `<section class="governance-section"><div class="section-header"><div><h2>Directory provisioning</h2><p class="subtext">Connect your identity provider to create users, manage groups, and deactivate access.</p></div><button class="primary" id="governance-new-token">Create token</button></div><div class="field"><label for="governance-scim-url">SCIM base URL</label><input id="governance-scim-url" readonly value="${esc(data.base_url)}"></div>
+  return `<section class="governance-section"><div class="section-header"><div><h2>Directory provisioning</h2><p class="subtext">Connect your identity provider to create users, manage groups, and deactivate access.${state.role==='admin'?'':' A built-in administrator creates provisioning tokens.'}</p></div>${state.role==='admin'?'<button class="primary" id="governance-new-token">Create token</button>':''}</div><div class="field"><label for="governance-scim-url">SCIM base URL</label><input id="governance-scim-url" readonly value="${esc(data.base_url)}"></div>
     ${governanceTable('SCIM tokens',['Token','Created','Status',''],data.tokens.map(token=>`<tr><td><strong>${esc(token.label)}</strong><small>${esc(token.prefix)}</small></td><td>${esc(new Date(token.created_at).toLocaleDateString())}</td><td>${token.revoked_at?'Revoked':'Active'}</td><td>${token.revoked_at?'':`<button class="quiet danger" data-scim-revoke="${esc(token.id)}">Revoke</button>`}</td></tr>`),'Create a provisioning token to connect your directory.')}
   </section><section class="governance-section"><h2>Provisioned users</h2>${governanceTable('Provisioned users',['User','Work email','Status'],data.users.map(user=>`<tr><td>${esc(user.displayName||user.userName)}</td><td>${esc(user.userName)}</td><td><span class="badge">${user.active?'Active':'Deactivated'}</span></td></tr>`),'No users have been provisioned yet.')}</section>
     <section class="governance-section"><div class="section-header"><div><h2>Directory groups</h2><p class="subtext">Group roles add permissions to each active member.</p></div>${hasWorkspacePermission('roles.manage')?'<button id="governance-group-role" class="quiet">Assign group role</button>':''}</div>${governanceTable('Provisioned groups',['Group','Members'],data.groups.map(group=>`<tr><td>${esc(group.displayName)}</td><td>${group.members?.length||0}</td></tr>`),'No groups have been provisioned yet.')}</section>
-    <details class="governance-section"><summary>Recent provisioning activity</summary>${governanceActivity(data.activity)}</details>`;
+    <details class="governance-section" data-details-key="activity:provisioning"><summary>Recent provisioning activity</summary>${governanceActivity(data.activity)}</details>`;
 }
 
 function bindGovernanceProvisioning(data,version) {
-  $('#governance-new-token').onclick=()=>{
+  // The secret is shown once: only Done closes its view, and every close refreshes
+  // the credential list so the new active token is visible.
+  const showToken=(dialog,saved)=>{
+    dialog.oncancel=event=>event.preventDefault();
+    MoyaiUI.render(dialog,`<h2>Provisioning token created</h2><p>Copy this token into your identity provider. It is shown only once.</p><div class="field"><label for="governance-token-secret">Bearer token</label><input id="governance-token-secret" type="text" readonly autocomplete="off" spellcheck="false" value="${esc(saved.token)}"></div><div class="credential-actions"><button type="button" id="governance-token-copy" class="primary">Copy token</button><button type="button" id="governance-token-done" class="quiet">Done</button></div><p id="governance-token-status" role="status"></p>`);
+    dialog.querySelector('#governance-token-copy').onclick=async()=>{
+      try{await navigator.clipboard.writeText(saved.token);dialog.querySelector('#governance-token-status').textContent='Copied';}catch{dialog.querySelector('#governance-token-status').textContent='Clipboard unavailable. Select the token field and copy it.';dialog.querySelector('#governance-token-secret').select();}
+    };
+    dialog.querySelector('#governance-token-done').onclick=()=>{dialog.oncancel=null;dialog.close();};
+    dialog.addEventListener('close',()=>{if(version===state.pageVersion&&state.view==='governance')renderGovernance().catch(error=>toast(error.message));},{once:true});
+  };
+  if($('#governance-new-token'))$('#governance-new-token').onclick=()=>{
     const dialog=governanceDialog('Create provisioning token','<div class="field"><label for="governance-token-label">Token label</label><input id="governance-token-label" required maxlength="80" placeholder="Identity provider"></div>');
     dialog.querySelector('[type="submit"]').textContent='Create token';
     dialog.querySelector('form').onsubmit=async event=>{
       event.preventDefault();const button=dialog.querySelector('[type="submit"]');button.disabled=true;
+      dialog.oncancel=cancel=>cancel.preventDefault();
+      dialog.querySelectorAll('[data-governance-cancel]').forEach(control=>control.disabled=true);
       try{
         const saved=await api('/api/admin/scim/tokens',{method:'POST',body:JSON.stringify({label:dialog.querySelector('#governance-token-label').value})});
-        if(!dialog.isConnected)return;
-        MoyaiUI.render(dialog,`<h2>Provisioning token created</h2><p>Copy this token into your identity provider. It is shown only once.</p><div class="field"><label for="governance-token-secret">Bearer token</label><input id="governance-token-secret" type="password" readonly autocomplete="off" value="${esc(saved.token)}"></div><div class="credential-actions"><button id="governance-token-copy" class="primary">Copy token</button><button id="governance-token-done" class="quiet">Done</button></div><p id="governance-token-status" role="status"></p>`);
-        dialog.querySelector('#governance-token-copy').onclick=async()=>{
-          try{await navigator.clipboard.writeText(saved.token);dialog.querySelector('#governance-token-status').textContent='Copied';}catch{dialog.querySelector('#governance-token-status').textContent='Clipboard unavailable. Select and copy the token field.';dialog.querySelector('#governance-token-secret').select();}
-        };
-        dialog.querySelector('#governance-token-done').onclick=()=>{dialog.close();if(version===state.pageVersion)renderGovernance().catch(error=>toast(error.message));};
-      }catch(error){if(dialog.isConnected){dialog.querySelector('#governance-error').textContent=error.message;button.disabled=false;}}
+        // A dismissed form must not drop a credential that now exists.
+        showToken(dialog.isConnected?dialog:governanceDialog('Provisioning token created',''),saved);
+      }catch(error){
+        dialog.oncancel=null;dialog.querySelectorAll('[data-governance-cancel]').forEach(control=>control.disabled=false);
+        if(dialog.isConnected){dialog.querySelector('#governance-error').textContent=error.message;button.disabled=false;}
+      }
     };
   };
   document.querySelectorAll('[data-scim-revoke]').forEach(button=>button.onclick=async()=>{
@@ -182,10 +212,7 @@ function bindGovernanceProvisioning(data,version) {
     try{
       const roles=await api('/api/admin/roles');
       if(version!==state.pageVersion||governanceState.tab!=='provisioning')return;
-      const dialog=governanceDialog('Assign group role',`<div class="field"><label for="governance-group">Directory group</label><select id="governance-group" required>${data.groups.map(group=>`<option value="${esc(group.id)}">${esc(group.displayName)}</option>`).join('')}</select></div><div class="field"><label for="governance-group-role-id">Additional role</label><select id="governance-group-role-id"><option value="">No additional permissions</option>${roles.roles.filter(role=>!role.archived&&role.id!=='admin').map(role=>`<option value="${esc(role.id)}">${esc(role.name)}</option>`).join('')}</select></div>`);
-      const synchronize=()=>{const mapping=roles.group_roles.find(row=>row.group_id===dialog.querySelector('#governance-group').value);dialog.querySelector('#governance-group-role-id').value=mapping?.role_id||'';};
-      dialog.querySelector('#governance-group').onchange=synchronize;synchronize();
-      governanceSave(dialog,version,()=>{const group=dialog.querySelector('#governance-group').value,mapping=roles.group_roles.find(row=>row.group_id===group);return api('/api/admin/group-roles/'+encodeURIComponent(group),{method:'PUT',body:JSON.stringify({role_id:dialog.querySelector('#governance-group-role-id').value||null,revision:mapping?.revision||0})});});
+      governanceGroupGrant(roles,data.groups.map(group=>({id:group.id,name:group.displayName})),version);
     }catch(error){toast(error.message);}
   };
 }
@@ -201,7 +228,7 @@ function bindGovernancePolicies(data,version) {
   const edit=profile=>{
     const policy=profile?.policy||{network_domains:null,connected_apps:null,tools:null,git_access:'write'};
     const dialog=governanceDialog(profile?'Edit security policy':'Create security policy',`<div class="field"><label for="governance-policy-name">Policy name</label><input id="governance-policy-name" required maxlength="80" value="${esc(profile?.name||'')}"></div><label class="governance-check"><input id="governance-policy-enabled" type="checkbox" ${profile?.enabled!==false?'checked':''}><span>Available for new sessions</span></label><div class="field"><label for="governance-git-access">Managed Git access</label><select id="governance-git-access">${[['write','Read and write'],['read','Read only'],['none','No managed Git access']].map(([id,label])=>`<option value="${id}" ${policy.git_access===id?'selected':''}>${label}</option>`).join('')}</select></div><label class="governance-check"><input id="governance-restrict-network" type="checkbox" ${policy.network_domains!==null?'checked':''}><span>Restrict network destinations</span></label><div class="field"><label for="governance-network-domains">Allowed domains</label><textarea id="governance-network-domains" rows="3" placeholder="registry.npmjs.org&#10;github.com">${esc((policy.network_domains||[]).join('\n'))}</textarea><small>Exact hostnames, one per line. An empty restricted list blocks outbound traffic except Moyai’s broker. Requires Substrate.</small></div><label class="governance-check"><input id="governance-restrict-apps" type="checkbox" ${policy.connected_apps!==null?'checked':''}><span>Restrict connected apps</span></label><div class="governance-apps">${['github','linear','slack','notion'].map(id=>`<label class="governance-check"><input name="policy-app" type="checkbox" value="${id}" ${policy.connected_apps===null||policy.connected_apps.includes(id)?'checked':''}><span>${id[0].toUpperCase()+id.slice(1)}</span></label>`).join('')}</div><label class="governance-check"><input id="governance-restrict-tools" type="checkbox" ${policy.tools!==null?'checked':''}><span>Restrict agent tools</span></label><div class="field"><label for="governance-allowed-tools">Allowed broker tool names</label><textarea id="governance-allowed-tools" rows="3">${esc((policy.tools||[]).join('\n'))}</textarea><small>An empty restricted list disables all broker tools. Native shell operations follow the machine's network policy.</small></div>`);
-    const toggle=()=>{dialog.querySelector('#governance-network-domains').disabled=!dialog.querySelector('#governance-restrict-network').checked;dialog.querySelector('#governance-allowed-tools').disabled=!dialog.querySelector('#governance-restrict-tools').checked;dialog.querySelectorAll('[name="policy-app"]').forEach(input=>input.disabled=!dialog.querySelector('#governance-restrict-apps').checked);};
+    const toggle=()=>{dialog.querySelector('#governance-network-domains').disabled=!dialog.querySelector('#governance-restrict-network').checked;dialog.querySelector('#governance-allowed-tools').disabled=!dialog.querySelector('#governance-restrict-tools').checked;const restrictApps=dialog.querySelector('#governance-restrict-apps').checked;dialog.querySelectorAll('[name="policy-app"],.governance-apps [role="checkbox"]').forEach(input=>input.disabled=!restrictApps);};
     dialog.querySelectorAll('[id^="governance-restrict-"]').forEach(input=>input.onchange=toggle);toggle();
     const list=id=>dialog.querySelector(id).value.split(/[\s,]+/).filter(Boolean);
     governanceSave(dialog,version,()=>api(profile?'/api/admin/security-profiles/'+profile.id:'/api/admin/security-profiles',{method:profile?'PUT':'POST',body:JSON.stringify({name:dialog.querySelector('#governance-policy-name').value,revision:profile?.revision||0,enabled:dialog.querySelector('#governance-policy-enabled').checked,policy:{git_access:dialog.querySelector('#governance-git-access').value,network_domains:dialog.querySelector('#governance-restrict-network').checked?list('#governance-network-domains'):null,connected_apps:dialog.querySelector('#governance-restrict-apps').checked?[...dialog.querySelectorAll('[name="policy-app"]:checked')].map(input=>input.value):null,tools:dialog.querySelector('#governance-restrict-tools').checked?list('#governance-allowed-tools'):null}})}));

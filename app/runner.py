@@ -107,13 +107,18 @@ class RunManager:
             hosts = profiles.network_hosts(run)
             if backend is not None:
                 backend.security_egress_hosts = hosts
+        # claim_message makes each input's sender the active requester.
+        actor = run.get('active_user_id') or run.get('owner_id') or ''
         from .scim import active_for_actor_in
         with self.store.connect() as conn:
-            if not active_for_actor_in(conn, run.get('active_user_id') or run.get('owner_id') or ''):
-                raise HTTPException(403, 'The session owner has been deactivated.')
+            if not active_for_actor_in(conn, actor):
+                raise HTTPException(403, 'The workspace account that requested this response has been deactivated.')
         roles = getattr(self.store, 'user_roles', None)
         if roles:
-            roles.require_actor(run.get('active_user_id') or run.get('owner_id') or '', 'sessions.create')
+            if not actor:
+                # Inputs saved before session ownership have no sender to authorize.
+                raise HTTPException(403, 'This message has no signed-in sender to authorize. Send a new message to continue.')
+            roles.require_actor(actor, 'sessions.create')
         return run
 
     async def persist(self):

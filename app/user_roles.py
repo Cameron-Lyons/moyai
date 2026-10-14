@@ -1,4 +1,5 @@
 """Administrator-managed Google Workspace roles, separate from spend identities."""
+import json
 import re
 from typing import Literal
 
@@ -6,7 +7,8 @@ from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from .db import now
-from .permissions import BUILTIN_PERMISSIONS, MEMBER_PERMISSIONS, shared_actor_role
+from .enterprise_roles import ADMIN_ONLY, SCIM_GROUP_TABLES
+from .permissions import BUILTIN_PERMISSIONS, MEMBER_PERMISSIONS, PERMISSIONS, shared_actor_role
 
 
 class RoleChange(BaseModel):
@@ -51,11 +53,11 @@ class UserRoles:
         from .scim import active_for_actor_in
         return active_for_actor_in(conn, actor_id)
 
-    def permissions_in(self, conn, email):
+    def permissions_in(self, conn, email, *, active=None, role=None):
         email = email.strip().lower()
-        if not self.eligible(email) or not self.active_email_in(conn, email):
+        if not self.eligible(email) or not (self.active_email_in(conn, email) if active is None else active):
             return frozenset()
-        if self.role_in(conn, email) == 'admin':
+        if (self.role_in(conn, email) if role is None else role) == 'admin':
             return BUILTIN_PERMISSIONS['admin']
         direct = self.enterprise.direct_permissions_in(conn, email)
         return (MEMBER_PERMISSIONS if direct is None else direct) | self.enterprise.group_permissions_in(conn, email)
@@ -72,8 +74,9 @@ class UserRoles:
         user = conn.execute('SELECT * FROM users WHERE id=?', (actor_id,)).fetchone()
         if not user:
             return frozenset()
+        # The actor check above already covered this account's own email.
         if user['kind'] in {'google', 'cloudflare'}:
-            return self.permissions_in(conn, user['email'])
+            return self.permissions_in(conn, user['email'], active=True)
         if user['kind'] == 'slack':
             # The event sender is authenticated by Slack. Only a current verified
             # company profile can inherit email-based roles; accounting links do
@@ -85,7 +88,7 @@ class UserRoles:
             except (ValueError, TypeError):
                 age = PROFILE_MAX_AGE_SECONDS
             if user['profile_eligible'] and not user['profile_conflict'] and 0 <= age < PROFILE_MAX_AGE_SECONDS:
-                permissions = self.permissions_in(conn, user['email'])
+                permissions = self.permissions_in(conn, user['email'], active=True)
                 verified = conn.execute("SELECT id FROM users WHERE email=? AND kind IN ('google','cloudflare')",
                                         (user['email'],)).fetchall()
                 # A Slack profile or accounting link alone cannot turn a
@@ -117,23 +120,30 @@ class UserRoles:
         if connection is None:
             with self.store.connect() as conn:
                 return self.require_actor(actor_id, permission, connection=conn)
-        if not self.active_actor_in(connection, actor_id):
-            raise HTTPException(403, 'This workspace account has been deactivated.')
+        # Inactive actors resolve to no permissions; only a denial needs the
+        # second activity check to explain itself.
         if permission not in self.permissions_for_actor_in(connection, actor_id):
+            if not self.active_actor_in(connection, actor_id):
+                raise HTTPException(403, 'This workspace account has been deactivated.')
             raise HTTPException(403, 'Your workspace role does not permit this action.')
 
-    def admins_in(self, conn):
+    def admin_holders_in(self, conn):
+        """Built-in administrator role holders, before eligibility and directory status."""
         admins = set(self.settings.google_admins())
         for row in conn.execute('SELECT email,role FROM user_roles'):
             if row['role'] == 'admin':
                 admins.add(row['email'])
             else:
                 admins.discard(row['email'])
-        return {email for email in admins if self.eligible(email) and self.active_email_in(conn, email)}
+        return admins
+
+    def admins_in(self, conn):
+        return {email for email in self.admin_holders_in(conn) if self.eligible(email) and self.active_email_in(conn, email)}
 
     def directory(self):
         with self.store.connect() as conn:
             conn.begin_read()
+            tables = set(conn.table_names())
             assignments = {row['email']: dict(row) for row in conn.execute('SELECT * FROM user_roles')}
             people = {email: {'email': email, 'name': '', 'has_signed_in': False, 'last_seen': None}
                       for email in set(self.settings.google_admins()) | assignments.keys() if self.eligible(email)}
@@ -147,13 +157,39 @@ class UserRoles:
                     person.update(name=row['name'], has_signed_in=True, last_seen=row['updated_at'])
                 elif not person['name']:
                     person['name'] = row['name']
+            # Bulk reads mirror role_in, active_email_in and permissions_in so the
+            # page costs a fixed number of statements, not several per person.
+            custom = {row['email']: row for row in conn.execute('SELECT email,role_id,revision FROM enterprise_role_assignments')}
+            granted = {**{row['id']: frozenset(json.loads(row['permissions'])) & PERMISSIONS.keys()
+                          for row in conn.execute('SELECT id,permissions FROM enterprise_roles WHERE archived=0')},
+                       **BUILTIN_PERMISSIONS}
+            # A live row wins over tombstones, then the latest update; unmanaged people stay active.
+            active = {row['user_name']: bool(row['active'] and not row['deleted_at']) for row in conn.execute(
+                "SELECT user_name,active,deleted_at FROM scim_users ORDER BY (deleted_at=''),updated_at")} if 'scim_users' in tables else {}
+            groups = {}
+            if SCIM_GROUP_TABLES <= tables:
+                for row in conn.execute('''SELECT DISTINCT u.user_name,r.role_id FROM enterprise_group_roles r
+                    JOIN scim_groups g ON g.id=r.group_id
+                    JOIN scim_group_members m ON m.group_id=g.id
+                    JOIN scim_users u ON u.id=m.user_id
+                    WHERE u.active=1 AND u.deleted_at='' AND g.deleted_at='' AND r.role_id IS NOT NULL'''):
+                    groups.setdefault(row['user_name'], set()).add(row['role_id'])
+            admins = self.settings.google_admins()
             for email, person in people.items():
-                assignment = assignments.get(email, {})
-                custom = conn.execute('SELECT role_id,revision FROM enterprise_role_assignments WHERE email=?', (email,)).fetchone()
-                person.update(role=self.role_in(conn, email), revision=assignment.get('revision', 0),
-                              access_role_id=custom['role_id'] if custom else self.role_in(conn, email),
-                              access_revision=custom['revision'] if custom else 0,
-                              active=self.active_email_in(conn, email), permissions=sorted(self.permissions_in(conn, email)))
+                assignment, access = assignments.get(email), custom.get(email)
+                role = assignment['role'] if assignment else 'admin' if email in admins else 'member'
+                live = active.get(email, True)
+                if not live:
+                    permissions = frozenset()
+                elif role == 'admin':
+                    permissions = BUILTIN_PERMISSIONS['admin']
+                else:
+                    direct = granted.get(access['role_id'], frozenset()) if access else MEMBER_PERMISSIONS
+                    permissions = direct.union(*(granted.get(role_id, frozenset()) for role_id in groups.get(email, ())))
+                person.update(role=role, revision=assignment['revision'] if assignment else 0,
+                              access_role_id=access['role_id'] if access else role,
+                              access_revision=access['revision'] if access else 0,
+                              active=live, permissions=sorted(permissions))
             audit = [dict(row) for row in conn.execute('SELECT email,previous_role,role,actor,created_at FROM user_role_audit ORDER BY id DESC LIMIT 30')]
         return {'users': sorted(people.values(), key=lambda row: (row['role'] != 'admin', row['email'])),
                 'activity': audit, 'domains': sorted(self.settings.google_domains())}
@@ -176,13 +212,22 @@ class UserRoles:
         if body.revision != revision:
             raise HTTPException(409, 'This role changed since you opened it. Refresh and try again.')
         old_role = self.role_in(conn, body.email)
-        if old_role == 'admin' and body.role != 'admin' and len(self.admins_in(conn)) <= 1:
+        held = self.enterprise.held_in(conn, actor)
+        if held is not None and 'admin' in {old_role, body.role}:
+            raise HTTPException(403, ADMIN_ONLY)
+        # Only the last active administrator is protected; a deactivated one can
+        # still be demoted so reprovisioning cannot restore a latent admin role.
+        if old_role == 'admin' and body.role != 'admin' and self.admins_in(conn) == {body.email}:
             raise HTTPException(409, 'Keep at least one administrator. Promote another user first.')
         if body.role == 'admin' and not self.active_email_in(conn, body.email):
             raise HTTPException(409, 'Activate this directory account before assigning administrator access.')
         if clear_custom:
+            # assign() checks the role it grants; this editor grants a built-in set.
+            self.enterprise.require_grantable(held, BUILTIN_PERMISSIONS[body.role])
             custom = conn.execute('SELECT * FROM enterprise_role_assignments WHERE email=?', (body.email,)).fetchone()
             if custom and custom['role_id'] != body.role:
+                if custom['role_id'] not in BUILTIN_PERMISSIONS and held is not None and 'roles.manage' not in held:
+                    raise HTTPException(403, 'This person has a custom workspace role. Change it under Governance → Roles.')
                 conn.execute('UPDATE enterprise_role_assignments SET role_id=?,revision=revision+1,updated_by=?,updated_at=? WHERE email=?',
                              (body.role, actor_label, now(), body.email))
                 self.enterprise.audit_in(conn, 'assignment.updated', actor_label, body.email,

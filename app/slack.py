@@ -24,6 +24,8 @@ from .slack_origin import is_self
 # Literal examples are context, not recipients. Preserve them in the prompt.
 # re.M anchors quote prefixes; \Z keeps fences open across line endings.
 QUOTED_TEXT = re.compile(r'```[\s\S]*?(?:```|\Z)|`[^`\n]*(?:`|$)|^[ \t]*>>>[\s\S]*|^[ \t]*>[^\n]*', re.M)
+# A request waits through one or two profile lookup backoffs, then fails closed.
+PROVISIONING_RETRY_SECONDS = 600
 
 
 def routing_text(text: str, mention: str) -> tuple[str, str]:
@@ -115,9 +117,8 @@ class SlackSessions:
         allowed_users = {x.strip() for x in self.settings.slack_session_users.split(",")}
         if payload.get("team_id") != bot.get("team_id"):
             return {"ok": True}
-        if (event.get('user') and not (event.get('bot_id') or event.get('bot_profile'))
-                and not await self.provisioning_sender_allowed(bot['team_id'], event['user'])):
-            return {'ok': True}
+        # Sender provisioning gates work admission (accept_message, SlackChat.accept),
+        # not attributed observations or Slack event automations.
         event_id = payload.get('event_id', '')
         if not isinstance(event_id, str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,100}', event_id):
             raise HTTPException(400, 'Invalid Slack event identifier.')
@@ -188,7 +189,8 @@ class SlackSessions:
         """Resolve a human sender before admitting work in a provisioned workspace.
 
         Unknown Slack identities must not bypass an inactive SCIM account merely
-        because profile linking normally runs after their first message.
+        because profile linking normally runs after their first message. None
+        means a transient lookup failure: the caller decides whether to retry.
         """
         from .scim import active_for_actor_in
         with self.store.connect() as conn:
@@ -204,6 +206,9 @@ class SlackSessions:
         # unknown Slack sender. Missing scopes or provider failures fail closed.
         if not self.identities or not self.identities.status()['ready']:
             return False
+        if row and row['profile_next_check'] > time.time() and row['link_status'] in {'ineligible', 'unavailable'}:
+            # Honor the lookup backoff instead of calling users.info per event.
+            return None if row['link_status'] == 'unavailable' else False
         with self.store.connect() as conn:
             conn.begin_write()
             self.store.slack_identity_in(conn, team, user)
@@ -211,11 +216,19 @@ class SlackSessions:
         await self.identities.resolve(row, team)
         with self.store.connect() as conn:
             row = conn.execute('SELECT * FROM users WHERE id=?', (actor,)).fetchone()
-            return bool(row and row['profile_eligible'] and row['email'] and active_for_actor_in(conn, actor))
+            if row and row['profile_eligible'] and row['email']:
+                return active_for_actor_in(conn, actor)
+            return None if row and row['link_status'] == 'unavailable' else False
 
     async def accept_message(self, *, team, event_id, channel, ts, root, user, prompt,
                              mentioned, direct_message, missing_cloud, file_ids=(), reference=''):
-        if not await self.provisioning_sender_allowed(team, user):
+        allowed = await self.provisioning_sender_allowed(team, user)
+        if allowed is None and time.time() - float(ts) < PROVISIONING_RETRY_SECONDS:
+            # Nothing was admitted. The durable inbox retries a 5xx (Slack retries a
+            # direct one up to three times); observation and automation intake are
+            # idempotent per event. An older request fails closed.
+            raise HTTPException(503, 'Slack profile verification is temporarily unavailable. Retry later.')
+        if not allowed:
             return
         if self.settings.slack_thread_chat_enabled:
             try:

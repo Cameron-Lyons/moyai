@@ -82,12 +82,23 @@ function editUserRole(data, user) {
   MoyaiUI.render(dialog, `<form id="user-role-form"><button class="dialog-close" type="button" aria-label="Close">×</button><div class="eyebrow">WORKSPACE ACCESS</div><h2>${user ? 'Change role' : 'Add a user'}</h2><p class="subtext">${user ? 'Changes apply on their next request. No sign-out or redeploy needed.' : 'Set a role before their first sign-in. They will still need a verified work Google account; no invitation email is sent.'}</p>
     <div class="field"><label for="role-email">Work email</label><input id="role-email" type="email" maxlength="254" required autocomplete="off" ${user ? 'readonly' : ''} placeholder="name@${esc(data.domains[0] || 'company.com')}" value="${esc(user?.email || '')}"></div>
     <div class="field"><label for="role-choice">Role</label><select id="role-choice"><option value="member" ${lastAdmin ? 'disabled' : ''}>Internal user</option><option value="admin">Admin</option></select></div>
-    <p id="role-description" class="role-description"></p>${lastAdmin ? '<p class="role-notice">This is the last admin. Promote another user before changing this role.</p>' : ''}<p id="role-error" class="signin-error" role="alert"></p><div class="role-actions"><button type="button" id="role-cancel">Cancel</button><button type="submit" class="primary">${user ? 'Save role' : 'Add user'}</button></div></form>`);
+    <p id="role-description" class="role-description"></p>${lastAdmin ? '<p class="role-notice">This is the last admin. Promote another user before changing this role.</p>' : ''}<div id="role-custom" hidden><p class="role-notice" id="role-custom-notice"></p><label class="governance-check"><input type="checkbox" id="role-replace-custom"><span>Replace the custom role with this built-in role</span></label></div><p id="role-error" class="signin-error" role="alert"></p><div class="role-actions"><button type="button" id="role-cancel">Cancel</button><button type="submit" class="primary">${user ? 'Save role' : 'Add user'}</button></div></form>`);
   $('#role-choice').value = user?.role || 'member';
   const describe = () => {$('#role-description').textContent = $('#role-choice').value === 'admin' ?
     'Can manage workspace users and shared connections, view team spend, and manage allowed actions.' :
     'Can use the workspace and shared tools. Cannot manage workspace users or shared connection settings.';};
-  $('#role-choice').onchange = describe; describe();
+  // Saving here assigns a built-in role. A custom role is a deliberate restriction,
+  // so replacing it needs an explicit choice, and an unchanged save is never sent.
+  const target = () => data.users.find(row => row.email === $('#role-email').value.trim().toLowerCase());
+  const customRole = row => row?.access_role_id && !['admin', 'member'].includes(row.access_role_id) ? row.access_role_id : '';
+  const sync = () => {
+    describe();
+    const row = target(), custom = customRole(row);
+    $('#role-custom').hidden = !custom;
+    if (custom) $('#role-custom-notice').textContent = `Assigned custom role: ${custom}. Saving replaces it with the built-in role selected above.`;
+    dialog.querySelector('[type="submit"]').disabled = custom ? !$('#role-replace-custom').checked : Boolean(row && row.role === $('#role-choice').value);
+  };
+  $('#role-choice').onchange = sync; $('#role-email').oninput = sync; $('#role-replace-custom').onchange = sync; sync();
   dialog.querySelector('.dialog-close').onclick = () => dialog.close();
   $('#role-cancel').onclick = () => dialog.close();
   $('#user-role-form').onsubmit = async event => {
@@ -98,12 +109,12 @@ function editUserRole(data, user) {
     try {
       await api('/api/admin/users/role', {method:'PUT', body:JSON.stringify({email, role:$('#role-choice').value, revision:existing?.revision || 0})});
     } catch (error) {
-      $('#role-error').textContent = error.message; button.disabled = false; return;
+      $('#role-error').textContent = error.message; sync(); return;
     }
     dialog.close();
     try {
       applyUserSession(await api('/api/session'));
-      if (state.role !== 'admin') await navigate('tasks'); else await renderUsers();
+      if (!hasWorkspacePermission('users.read')) await navigate('tasks'); else await renderUsers();
       toast('Workspace role saved.');
     } catch (error) {toast('Role saved. Refresh the page to see the updated user list.');}
   };

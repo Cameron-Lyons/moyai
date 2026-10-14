@@ -1,14 +1,16 @@
 """Custom roles must affect existing sessions and survive every access path."""
 from concurrent.futures import ThreadPoolExecutor
-from threading import Barrier
+from threading import Barrier, get_ident
 
 import pytest
 from fastapi import HTTPException
 from starlette.requests import Request
 
-from app.enterprise_roles import RoleAssignment, RoleDefinition
+from app.enterprise_roles import ADMIN_ONLY, RoleAssignment, RoleDefinition
 from app.permissions import BUILTIN_PERMISSIONS, MEMBER_PERMISSIONS
-from test_user_roles import sign_as, users_app
+from test_user_roles import directory_write, sign_as, users_app
+
+AMPLIFY = 'You can only grant permissions you hold.'
 
 
 def create_role(client, identity='reader', permissions=None):
@@ -262,6 +264,156 @@ def test_custom_all_permissions_do_not_grant_builtin_ownership_override(users_ap
         assert not app.state.user_roles.is_admin_actor_in(conn, 'shared:invented:admin')
 
 
+def test_delegates_cannot_grant_administrator_or_permissions_they_lack(users_app):
+    app, client = users_app
+    for email in ('maya@berri.ai', 'ops@berri.ai'):
+        sign_as(app, client, email)
+    sign_as(app, client, 'tin@berri.ai')
+    create_role(client)
+    create_role(client, 'user-admin', ['workspace.read', 'users.read', 'users.manage'])
+    create_role(client, 'role-manager', sorted(MEMBER_PERMISSIONS | {'roles.manage'}))
+    assert assign(client, role_id='user-admin').status_code == 200
+    assert assign(client, email='ops@berri.ai', role_id='role-manager').status_code == 200
+    sign_as(app, client, 'maya@berri.ai')
+    for email, role, revision in [('maya@berri.ai', 'admin', 1), ('ishaan@berri.ai', 'member', 0)]:
+        denied = client.put('/api/admin/users/role', json={'email': email, 'role': role, 'revision': revision})
+        assert denied.status_code == 403 and denied.json()['detail'] == ADMIN_ONLY
+    denied = client.put('/api/admin/users/role', json={'email': 'new@berri.ai', 'role': 'member', 'revision': 0})
+    assert denied.status_code == 403 and denied.json()['detail'] == AMPLIFY
+    sign_as(app, client, 'ops@berri.ai')
+    for email, role_id, revision in [('ops@berri.ai', 'admin', 1), ('tin@berri.ai', 'reader', 0)]:
+        denied = assign(client, email=email, role_id=role_id, revision=revision)
+        assert denied.status_code == 403 and denied.json()['detail'] == ADMIN_ONLY
+    denied = client.post('/api/admin/roles', json={'id': 'auditor', 'name': 'Auditor', 'permissions': ['audit.read']})
+    assert denied.status_code == 403 and denied.json()['detail'] == AMPLIFY
+    own = next(row for row in client.get('/api/admin/roles').json()['roles'] if row['id'] == 'role-manager')
+    widened = {key: own[key] for key in ('id', 'name', 'description', 'revision')} | {'permissions': own['permissions'] + ['spend.read']}
+    assert client.put('/api/admin/roles/role-manager', json=widened).json()['detail'] == AMPLIFY
+    assert assign(client, email='new@berri.ai', role_id='user-admin').json()['detail'] == AMPLIFY
+    assert assign(client, email='new@berri.ai').status_code == 200
+    assert assign(client, email='new@berri.ai', role_id='member', revision=1).status_code == 200
+    assert {app.state.user_roles.role(email) for email in ('maya@berri.ai', 'ops@berri.ai', 'new@berri.ai')} == {'member'}
+    assert app.state.user_roles.role('tin@berri.ai') == app.state.user_roles.role('ishaan@berri.ai') == 'admin'
+    with app.state.store.connect() as conn:
+        assert not app.state.user_roles.is_admin_actor_in(conn, 'google:maya')
+        assert not app.state.user_roles.is_admin_actor_in(conn, 'google:ops')
+
+
+def test_group_granted_governance_cannot_become_administrator(users_app):
+    app, client = users_app
+    sign_as(app, client, 'tin@berri.ai')
+    create_role(client, 'finance-reader', ['workspace.read', 'spend.read'])
+    create_role(client, 'governance-ops', ['workspace.read', 'users.read', 'users.manage', 'roles.manage'])
+    person = directory_write(app, 'User', {'userName': 'maya@berri.ai'})
+    group = directory_write(app, 'Group', {'displayName': 'IT', 'members': [{'value': person['id']}]})
+    assert client.put('/api/admin/group-roles/' + group['id'], json={'role_id': 'governance-ops', 'revision': 0}).status_code == 200
+    sign_as(app, client, 'maya@berri.ai')
+    assert {'users.manage', 'roles.manage'} <= set(client.get('/api/permissions').json()['permissions'])
+    denied = client.put('/api/admin/users/role', json={'email': 'maya@berri.ai', 'role': 'admin', 'revision': 0})
+    assert denied.status_code == 403 and denied.json()['detail'] == ADMIN_ONLY
+    denied = assign(client, role_id='admin')
+    assert denied.status_code == 403 and denied.json()['detail'] == ADMIN_ONLY
+    # A group grant cannot be widened beyond what the granting delegate holds.
+    denied = client.put('/api/admin/group-roles/' + group['id'], json={'role_id': 'finance-reader', 'revision': 1})
+    assert denied.status_code == 403 and denied.json()['detail'] == AMPLIFY
+    assert client.get('/api/session').json()['role'] == 'member'
+    assert app.state.store.rows('SELECT role_id FROM enterprise_group_roles')[0]['role_id'] == 'governance-ops'
+
+
+def test_role_listing_exposes_live_groups_to_role_managers(users_app):
+    app, client = users_app
+    sign_as(app, client, 'tin@berri.ai')
+    assert client.get('/api/admin/roles').json()['groups'] == []
+    create_role(client)
+    create_role(client, 'role-manager', ['workspace.read', 'sessions.read', 'roles.manage'])
+    assert assign(client, role_id='role-manager').status_code == 200
+    people = [directory_write(app, 'User', {'userName': name + '@berri.ai'}) for name in ('ava', 'ben')]
+    engineering = directory_write(app, 'Group', {'displayName': 'Engineering', 'members': [{'value': row['id']} for row in people]})
+    alumni = directory_write(app, 'Group', {'displayName': 'alumni'})
+    removed = directory_write(app, 'Group', {'displayName': 'Removed', 'members': [{'value': people[0]['id']}]})
+    app.state.store.execute('UPDATE scim_groups SET deleted_at=? WHERE id=?', ('2026-01-01T00:00:00Z', removed['id']))
+    sign_as(app, client, 'maya@berri.ai')
+    listing = client.get('/api/admin/roles')
+    assert listing.status_code == 200
+    assert listing.json()['groups'] == [{'id': alumni['id'], 'display_name': 'alumni', 'members': 0},
+                                        {'id': engineering['id'], 'display_name': 'Engineering', 'members': 2}]
+    assert client.get('/api/admin/scim').status_code == 403
+    granted = client.put('/api/admin/group-roles/' + engineering['id'], json={'role_id': 'reader', 'revision': 0})
+    assert granted.status_code == 200, granted.text
+    assert client.get('/api/admin/roles').json()['group_roles'] == [
+        {'group_id': engineering['id'], 'role_id': 'reader', 'revision': 1}]
+
+
+def test_users_editor_keeps_custom_roles_unless_actor_manages_roles(users_app):
+    app, client = users_app
+    sign_as(app, client, 'tin@berri.ai')
+    create_role(client)
+    create_role(client, 'user-admin', sorted(MEMBER_PERMISSIONS | {'users.read', 'users.manage'}))
+    create_role(client, 'access-admin', sorted(MEMBER_PERMISSIONS | {'users.read', 'users.manage', 'roles.manage'}))
+    assert assign(client).status_code == 200
+    assert assign(client, email='ops@berri.ai', role_id='user-admin').status_code == 200
+    assert assign(client, email='lead@berri.ai', role_id='access-admin').status_code == 200
+    unchanged = {'email': 'maya@berri.ai', 'role': 'member', 'revision': 1}
+    sign_as(app, client, 'ops@berri.ai')
+    denied = client.put('/api/admin/users/role', json=unchanged)
+    assert denied.status_code == 403
+    assert denied.json()['detail'] == 'This person has a custom workspace role. Change it under Governance → Roles.'
+    assert app.state.user_roles.permissions('maya@berri.ai') == {'workspace.read', 'sessions.read'}
+    assert client.put('/api/admin/users/role', json={'email': 'new@berri.ai', 'role': 'member', 'revision': 0}).status_code == 200
+    sign_as(app, client, 'lead@berri.ai')
+    assert client.put('/api/admin/users/role', json=unchanged).status_code == 200
+    assert app.state.user_roles.permissions('maya@berri.ai') == MEMBER_PERMISSIONS
+
+
+def test_directory_matches_live_permission_resolution_in_bulk(users_app, monkeypatch):
+    from app import db
+    app, client = users_app
+    roles = app.state.user_roles
+    for email in ('maya@berri.ai', 'mo@berri.ai', 'old@berri.ai', 'grace@berri.ai', 'dan@berri.ai'):
+        sign_as(app, client, email)
+    sign_as(app, client, 'tin@berri.ai')
+    create_role(client)
+    create_role(client, 'retired', ['workspace.read', 'spend.read'])
+    create_role(client, 'connection-manager', ['connections.read', 'connections.manage'])
+    assert assign(client).status_code == 200
+    assert assign(client, email='old@berri.ai', role_id='retired').status_code == 200
+    assert client.delete('/api/admin/roles/retired?revision=1').status_code == 200
+    grace, dan, ishaan = (directory_write(app, 'User', {'userName': name + '@berri.ai'}) for name in ('grace', 'dan', 'ishaan'))
+    group = directory_write(app, 'Group', {'displayName': 'Connectors', 'members': [{'value': grace['id']}, {'value': dan['id']}]})
+    assert client.put('/api/admin/group-roles/' + group['id'], json={'role_id': 'connection-manager', 'revision': 0}).status_code == 200
+    for person in (dan, ishaan):
+        directory_write(app, 'User', {'userName': person['userName'], 'active': False}, person['id'])
+    rows = {row['email']: row for row in roles.directory()['users']}
+    with app.state.store.connect() as conn:
+        for email, row in rows.items():
+            assert set(row['permissions']) == roles.permissions_in(conn, email), email
+            assert (row['role'], row['active']) == (roles.role_in(conn, email), roles.active_email_in(conn, email)), email
+    assert set(rows['grace@berri.ai']['permissions']) == MEMBER_PERMISSIONS | {'connections.manage'}
+    assert rows['ishaan@berri.ai']['role'] == 'admin' and not rows['ishaan@berri.ai']['permissions']
+    assert rows['old@berri.ai']['access_role_id'] == 'retired' and not rows['old@berri.ai']['permissions']
+    assert not rows['dan@berri.ai']['active'] and set(rows['tin@berri.ai']['permissions']) == BUILTIN_PERMISSIONS['admin']
+    statements, caller, connect = [], get_ident(), db.sqlite_connection
+
+    def traced(path):
+        conn = connect(path)
+        # Background workers share the store; count only this thread's directory reads.
+        if get_ident() == caller:
+            conn.set_trace_callback(statements.append)
+        return conn
+
+    monkeypatch.setattr(db, 'sqlite_connection', traced)
+
+    def cost():
+        statements.clear()
+        roles.directory()
+        return len(statements)
+
+    baseline = cost()
+    for index in range(20):
+        app.state.store.execute('INSERT INTO user_roles VALUES(?,?,?,?,?)', (f'p{index}@berri.ai', 'member', 1, 'test', 'now'))
+    assert cost() == baseline
+
+
 def test_every_current_broker_tool_has_an_explicit_permission():
     from app.agents import TOOLS as AGENTS
     from app.automation_tools import SPECS as AUTOMATIONS
@@ -361,6 +513,8 @@ def test_raw_broker_routes_obey_the_same_role_permissions(users_app, monkeypatch
     for suffix in ('/artifacts/transfer', '/goal'):
         response = client.post(base + suffix, headers=headers, json={})
         assert response.status_code == 403, (suffix, response.text)
+    # The Deep Agents runtime reads goal state every turn; that is not steering.
+    assert client.post(base + '/goal', headers=headers, json={'action': 'get'}).status_code == 200
     response = client.get(base + '/github.git/info/refs?service=git-upload-pack', headers=headers)
     assert response.status_code == 403, response.text
 

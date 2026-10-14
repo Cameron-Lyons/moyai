@@ -6,6 +6,7 @@ survive web-worker restarts. Only validated snapshots are published to sessions.
 import asyncio
 import json
 import time
+from contextlib import nullcontext
 from datetime import datetime
 from typing import Literal
 from uuid import NAMESPACE_URL, uuid4, uuid5
@@ -143,6 +144,8 @@ class Environments:
             if run.get('repo_url') or run.get('environment_id') not in {'auto', 'none', ''}:
                 await self.sync_repositories()
             selected = self.choose(run.get('environment_id', 'auto'), run['repo_url'], run.get('github_repository_id'))
+            if selected and self.access_denial(run, selected):
+                return self.bind(run_id)  # Rejects an explicit choice; auto starts without it.
             if selected:
                 recipe = json.loads(self.build(selected['active_build'])['recipe'] if selected['active_build'] else selected['recipe'])
                 if recipe.get('clone_access') == 'github':
@@ -237,8 +240,8 @@ class Environments:
             conn.execute('UPDATE environment_builds SET sandbox_provider=? WHERE id=?', (provider, identity_build))
         return self.build(identity_build)
 
-    def build(self, identity):
-        rows = self.store.rows('SELECT * FROM environment_builds WHERE id=?', (identity,))
+    def build(self, identity, conn=None):
+        rows = self.store.rows('SELECT * FROM environment_builds WHERE id=?', (identity,), connection=conn)
         if not rows:
             raise HTTPException(404, 'Build not found.')
         return rows[0]
@@ -301,6 +304,12 @@ class Environments:
             previous = run.get('snapshot_id') or run.get('parent_run_id') or self.store.rows(
                 "SELECT 1 FROM messages WHERE run_id=? AND role='assistant' LIMIT 1", (run_id,))
             row = None if previous else self.choose(run.get('environment_id', 'auto'), run['repo_url'], run.get('github_repository_id'))
+            denial = row and self.access_denial(run, row, prepared_build)
+            if denial and run.get('environment_id') not in {'auto', ''}:
+                raise HTTPException(403, denial)
+            if denial:
+                self.store.event(run_id, 'status', 'Starting without the prepared environment. ' + denial)
+                row = None
             if row and not row['active_build'] and not prepared_build:
                 raise HTTPException(409, 'This repository environment is still being prepared.')
             identity = (prepared_build or row['active_build']) if row else 'none'
@@ -309,6 +318,30 @@ class Environments:
                 recipe = json.loads(self.build(identity)['recipe'])
                 self.store.event(run_id, 'status', 'Using prepared environment: ' + recipe['name'], {'environment_build_id': identity})
         return self.context(self.store.run(run_id))
+
+    def access_denial(self, run, row, build=None, conn=None):
+        """Why the requester may not use this selected environment, or ''.
+
+        A build snapshot can hold a private checkout made with the GitHub App, so
+        selection never grants more than the requester's role and session policy.
+        """
+        roles, profiles = getattr(self.store, 'user_roles', None), getattr(self.store, 'security_profiles', None)
+        with self.store.connect() if conn is None else nullcontext(conn) as conn:
+            build = build or row['active_build']
+            github = json.loads(self.build(build, conn)['recipe'] if build else row['recipe']).get('clone_access') == 'github'
+            granted = roles.permissions_for_actor_in(conn, run.get('active_user_id') or run.get('owner_id') or '') if roles else None
+            policy = profiles.effective(run, conn) if github and profiles else None
+        if granted is not None and 'environments.read' not in granted:
+            return 'Your workspace role does not permit prepared project environments.'
+        if github and granted is not None and 'connections.read' not in granted:
+            return 'Your workspace role does not permit this repository environment.'
+        # Same decision as SecurityProfiles.allowed_tool(run, 'github_checkout', 'github'),
+        # evaluated on the caller's connection.
+        if policy and (policy['git_access'] == 'none'
+                       or policy['connected_apps'] is not None and 'github' not in policy['connected_apps']
+                       or policy['tools'] is not None and 'github_checkout' not in policy['tools']):
+            return 'The session security profile does not allow this repository environment.'
+        return ''
 
     def context(self, run):
         identity = run.get('environment_build_id')

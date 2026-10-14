@@ -270,7 +270,10 @@ class Attachments:
         uploads = AttachmentUploads(self)
 
         def actor(request, mutation=False):
-            security.require(request, mutation=mutation)
+            # Unsent uploads serve both a new session and a follow-up message.
+            permission = ('sessions.create' if security.has_permission(request, 'sessions.create')
+                          else 'sessions.manage') if mutation else None
+            security.require(request, mutation=mutation, permission=permission)
             return self.store.identity(security.session_info(request))
 
         def upload_actor(request, attachment_id):

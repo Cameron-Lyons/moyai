@@ -15,6 +15,7 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse, Response
 from fastapi.routing import APIRoute
 from pydantic import BaseModel, ConfigDict, Field
+from starlette.concurrency import run_in_threadpool
 
 from .database import INTEGRITY_ERRORS
 from .db import now
@@ -24,16 +25,43 @@ API = 'urn:ietf:params:scim:api:messages:2.0:'
 MEDIA = 'application/scim+json'
 MAX_RESULTS = 100
 MAX_MEMBERS = 10000
+MAX_BODY = 2 * 1024 * 1024
+CHUNK = 500  # Below SQLite's historical 999 bound-variable limit.
 EMAIL = re.compile(r"[a-z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?")
 USER_FIELDS = {'userName', 'externalId', 'active', 'displayName', 'name', 'emails',
                'title', 'userType', 'nickName', 'preferredLanguage', 'locale', 'timezone', 'profileUrl'}
 GROUP_FIELDS = {'displayName', 'externalId', 'members'}
 READ_ONLY = {'id', 'meta', 'groups'}
+ALWAYS = {'schemas', 'id', 'meta'}
+REQUIRED = {'User': {'userName'}, 'Group': {'displayName'}}
+
+
+READY_SCHEMAS = set()
+
+
+def scim_ready_in(conn):
+    """Whether the provisioning tables exist, without a catalog query per check.
+
+    The tables are never dropped at runtime, so presence is cached once per
+    PostgreSQL schema (or per SQLite connection) and authorization does not list
+    tables on every request. Absence is rechecked. initialize_schema creates
+    every provisioning table together, so users imply groups and members.
+    """
+    schema = getattr(conn, 'schema', None)
+    if schema in READY_SCHEMAS or getattr(conn, 'moyai_scim_ready', False):
+        return True
+    if 'scim_users' not in conn.table_names():
+        return False
+    if schema is None:
+        conn.moyai_scim_ready = True
+    else:
+        READY_SCHEMAS.add(schema)
+    return True
 
 
 def active_for_email_in(conn, email):
     """Unmanaged people keep existing access; deprovisioned emails fail closed."""
-    if not email or 'scim_users' not in conn.table_names():
+    if not email or not scim_ready_in(conn):
         return True
     row = conn.execute("SELECT active,deleted_at FROM scim_users WHERE user_name=? ORDER BY (deleted_at='') DESC,updated_at DESC LIMIT 1",
                        (email.strip().lower(),)).fetchone()
@@ -41,7 +69,7 @@ def active_for_email_in(conn, email):
 
 
 def active_for_actor_in(conn, actor_id):
-    if not actor_id or 'scim_users' not in conn.table_names():
+    if not actor_id or not scim_ready_in(conn):
         return True
     rows = conn.execute('''SELECT source.kind,source.email,linked.email AS linked_email FROM users source
         LEFT JOIN users linked ON linked.id=source.linked_user_id WHERE source.id=?''', (actor_id,)).fetchall()
@@ -57,9 +85,10 @@ def require_active_actor(store, actor_id):
             raise HTTPException(403, 'This workspace account has been deactivated.')
 
 
-class ScimError(Exception):
+class ScimError(HTTPException):
     def __init__(self, status, detail, kind=''):
-        self.status, self.detail, self.kind = status, detail, kind
+        super().__init__(status, detail)
+        self.status, self.kind = status, kind
 
 
 def error_response(error):
@@ -159,7 +188,46 @@ def normalize_path(path, kind):
     return path
 
 
-def patch_document(original, body, kind):
+def patch_value(kind, path, value):
+    # Entra sends active as the strings "True"/"False" unless its compliance
+    # flag is set. Accept only those literals, and only through PATCH.
+    if kind == 'User' and path == 'active' and isinstance(value, str) and value.strip().lower() in {'true', 'false'}:
+        return value.strip().lower() == 'true'
+    return value
+
+
+def merged(result, kind, op, path, value):
+    """RFC 7644 add/replace semantics for the complex and multi-valued attributes."""
+    if kind == 'User' and path == 'name':
+        if not isinstance(value, dict):
+            raise ScimError(400, 'name must be an object.', 'invalidValue')
+        return {**result.get('name', {}), **value}
+    if kind == 'User' and path == 'emails' and op == 'add':
+        if not isinstance(value, list):
+            raise ScimError(400, 'emails must be an array.', 'invalidValue')
+        emails = [dict(item) for item in result.get('emails', [])]
+        seen = {(str(item.get('value', '')).lower(), item.get('type')) for item in emails}
+        for item in value:
+            if not isinstance(item, dict):
+                raise ScimError(400, 'emails contains unsupported attributes.', 'invalidValue')
+            key = (str(item.get('value', '')).lower(), item.get('type'))
+            if key in seen:
+                continue
+            if item.get('primary') is True:
+                for other in emails:
+                    if other.get('primary'):
+                        other['primary'] = False
+            seen.add(key)
+            emails.append(item)
+        return emails
+    if kind == 'Group' and path == 'members' and op == 'add':
+        if not isinstance(value, list):
+            raise ScimError(400, 'members must be an array.', 'invalidValue')
+        return result.get('members', []) + value
+    return patch_value(kind, path, value)
+
+
+def patch_document(original, body, kind, identity=None):
     if not isinstance(body, dict) or set(body) - {'schemas', 'Operations'} or body.get('schemas') != [API + 'PatchOp']:
         raise ScimError(400, 'Use the SCIM PatchOp schema and Operations array.', 'invalidSyntax')
     operations = body.get('Operations')
@@ -182,24 +250,21 @@ def patch_document(original, body, kind):
             if op == 'remove' or not isinstance(value, dict):
                 raise ScimError(400, 'A path is required for remove; no-path values must be objects.', 'invalidPath')
             for key, item in value.items():
+                if key == 'id' and identity is not None and item == identity:
+                    continue  # Okta repeats the unchanged resource ID when renaming a group.
                 if key in READ_ONLY:
                     raise ScimError(400, 'This attribute is read-only.', 'mutability')
                 if key not in (USER_FIELDS if kind == 'User' else GROUP_FIELDS):
                     raise ScimError(400, 'Unsupported PATCH attribute.', 'invalidPath')
-                if kind == 'Group' and key == 'members' and op == 'add':
-                    if not isinstance(item, list):
-                        raise ScimError(400, 'members must be an array.', 'invalidValue')
-                    result[key] = result.get(key, []) + item
-                else:
-                    result[key] = item
+                result[key] = merged(result, kind, op, key, item)
             continue
         member = re.fullmatch(r'members\[value eq ("(?:[^"\\]|\\.)*")\]', path, re.I)
         if member and kind == 'Group':
             if op != 'remove':
                 raise ScimError(400, 'Filtered membership paths support remove only.', 'invalidPath')
-            identity = json.loads(member[1])
+            identity_value = json.loads(member[1])
             before = result.get('members', [])
-            result['members'] = [item for item in before if item.get('value') != identity]
+            result['members'] = [item for item in before if item.get('value') != identity_value]
             if len(before) == len(result['members']):
                 raise ScimError(400, 'The member path did not match a resource.', 'noTarget')
             continue
@@ -220,16 +285,20 @@ def patch_document(original, body, kind):
         if op == 'remove':
             if path in {'userName', 'displayName'} and (kind == 'Group' or path == 'userName'):
                 raise ScimError(400, 'A required attribute cannot be removed.', 'mutability')
+            if kind == 'Group' and path == 'members' and operation.get('value') is not None:
+                # Entra's default member removal names the members in a value
+                # array; dropping the whole attribute would empty the group.
+                targets = operation['value']
+                if not isinstance(targets, list) or not all(isinstance(item, dict) and isinstance(item.get('value'), str) for item in targets):
+                    raise ScimError(400, 'members must be an array of member references.', 'invalidValue')
+                removed = {item['value'] for item in targets}
+                result['members'] = [item for item in result.get('members', []) if item.get('value') not in removed]
+                continue
             if path not in result:
                 raise ScimError(400, 'The attribute does not exist.', 'noTarget')
             result.pop(path)
-        elif kind == 'Group' and path == 'members' and op == 'add':
-            members = operation['value']
-            if not isinstance(members, list):
-                raise ScimError(400, 'members must be an array.', 'invalidValue')
-            result['members'] = result.get('members', []) + members
         else:
-            result[path] = operation['value']
+            result[path] = merged(result, kind, op, path, operation['value'])
     return result
 
 
@@ -253,19 +322,36 @@ class Scim:
             raise ScimError(401, 'A valid provisioning bearer credential is required.')
         return row['id']
 
-    def guard_admins_in(self, conn):
+    def active_admins_in(self, conn):
+        roles = self.security.user_roles
+        return roles.admins_in(conn) if roles is not None else set()
+
+    def guard_admins_in(self, conn, before):
+        # Directory writes change activity, never roles. A write may not remove
+        # the last active administrator, but it is not blamed for an earlier loss.
+        if before and not self.active_admins_in(conn):
+            raise ScimError(409, 'Keep at least one active administrator. Promote another user first.')
+
+    def require_admin_in(self, conn, actor):
+        """A provisioning credential controls membership, group permissions and deactivation."""
+        actor = actor or {}
         if self.governance is not None:
-            self.governance.guard_admins_in(conn)
-        elif self.security.user_roles is not None:
+            allowed = self.governance.builtin_admin_in(conn, actor)
+        elif actor.get('method') in {'local', 'password'}:
+            allowed = actor.get('role') == 'admin'
+        else:
+            email = actor.get('identity', {}).get('email', '').strip().lower()
             roles = self.security.user_roles
-            if not any(active_for_email_in(conn, email) for email in roles.admins_in(conn)) and roles.settings.google_domains():
-                raise ScimError(409, 'Keep at least one active workspace administrator.')
+            allowed = bool(actor.get('method') in {'google', 'cloudflare'} and roles and roles.eligible(email)
+                           and active_for_email_in(conn, email) and roles.role_in(conn, email) == 'admin')
+        if not allowed:
+            raise HTTPException(403, 'Only a built-in administrator can create provisioning credentials.')
 
     def audit_in(self, conn, actor, action, kind, identity):
         conn.execute('INSERT INTO scim_audit(id,actor,action,resource_type,resource_id,created_at) VALUES(?,?,?,?,?,?)',
                      (uuid4().hex, actor, action, kind, identity, now()))
 
-    def resource_in(self, conn, kind, identity):
+    def resource_in(self, conn, kind, identity, *, related=True):
         table = 'scim_users' if kind == 'User' else 'scim_groups'
         row = conn.execute(f'SELECT * FROM {table} WHERE id=? AND deleted_at=\'\'', (identity,)).fetchone()
         if not row:
@@ -277,11 +363,12 @@ class Scim:
             result['externalId'] = row['external_id']
         if kind == 'User':
             result.update(userName=row['user_name'], active=bool(row['active']))
-            result['groups'] = [{'value': group['id'], 'display': group['display_name'], 'type': 'direct',
-                                 '$ref': self.base_url + '/Groups/' + group['id']}
-                                for group in conn.execute('''SELECT g.id,g.display_name FROM scim_groups g
-                                    JOIN scim_group_members m ON m.group_id=g.id WHERE m.user_id=? AND g.deleted_at='' ORDER BY g.id''', (identity,))]
-        else:
+            if related:
+                result['groups'] = [{'value': group['id'], 'display': group['display_name'], 'type': 'direct',
+                                     '$ref': self.base_url + '/Groups/' + group['id']}
+                                    for group in conn.execute('''SELECT g.id,g.display_name FROM scim_groups g
+                                        JOIN scim_group_members m ON m.group_id=g.id WHERE m.user_id=? AND g.deleted_at='' ORDER BY g.id''', (identity,))]
+        elif related:
             result['members'] = [{'value': user['id'], 'display': user['user_name'], 'type': 'User',
                                   '$ref': self.base_url + '/Users/' + user['id']}
                                  for user in conn.execute('''SELECT u.id,u.user_name FROM scim_users u
@@ -290,25 +377,31 @@ class Scim:
                           'location': self.base_url + '/' + kind + 's/' + identity}
         return result
 
-    def write_in(self, conn, kind, body, identity=None):
+    def write_in(self, conn, kind, body, identity=None, *, related=True):
         stamp = now()
-        current = self.resource_in(conn, kind, identity) if identity else None
+        table = 'scim_users' if kind == 'User' else 'scim_groups'
+        if identity and not conn.execute(f"SELECT 1 FROM {table} WHERE id=? AND deleted_at=''", (identity,)).fetchone():
+            raise ScimError(404, 'The requested resource does not exist.')
+        created = identity is None
         identity = identity or uuid4().hex
         body = validate_user(body) if kind == 'User' else document(body, kind)
         external = value_text(body.get('externalId'), 'externalId', maximum=1000)
-        if external and conn.execute(f'SELECT 1 FROM scim_{"users" if kind == "User" else "groups"} WHERE external_id=? AND deleted_at=\'\' AND id!=?',
+        if external and conn.execute(f"SELECT 1 FROM {table} WHERE external_id=? AND deleted_at='' AND id!=?",
                                      (external, identity)).fetchone():
             raise ScimError(409, 'externalId must be unique for this resource type.', 'uniqueness')
         if kind == 'User':
             # Renaming would leave an old verified cookie ungoverned. Identity
             # migrations need an explicit account-linking workflow instead.
-            if current and current['userName'] != body['userName']:
+            saved = None if created else conn.execute('SELECT user_name FROM scim_users WHERE id=?', (identity,)).fetchone()
+            if saved and saved['user_name'] != body['userName']:
                 raise ScimError(400, 'userName cannot be changed; deactivate the old identity and provision a new one.', 'mutability')
+            before = self.active_admins_in(conn)
             profile = {key: value for key, value in body.items() if key not in {'externalId', 'userName', 'active'}}
             conn.execute('''INSERT INTO scim_users(id,external_id,user_name,profile,active,deleted_at,created_at,updated_at,revision)
                 VALUES(?,?,?,?,?,'',?,?,1) ON CONFLICT(id) DO UPDATE SET external_id=excluded.external_id,
                 profile=excluded.profile,active=excluded.active,updated_at=excluded.updated_at,revision=scim_users.revision+1''',
                          (identity, external, body['userName'], json.dumps(profile), int(body['active']), stamp, stamp))
+            self.guard_admins_in(conn, before)
         else:
             display = value_text(body.get('displayName'), 'displayName', required=True, maximum=254)
             members = body.get('members', [])
@@ -318,24 +411,70 @@ class Scim:
             for member in members:
                 if not isinstance(member, dict) or set(member) - {'value', '$ref', 'display', 'type'} or member.get('type', 'User') != 'User':
                     raise ScimError(400, 'Only User members are supported.', 'invalidValue')
-                user = value_text(member.get('value'), 'members.value', required=True, maximum=100)
-                if not conn.execute("SELECT 1 FROM scim_users WHERE id=? AND deleted_at=''", (user,)).fetchone():
+                selected.add(value_text(member.get('value'), 'members.value', required=True, maximum=100))
+            # Change only the membership delta: one join or leave must not
+            # revalidate and rewrite a large group under the writer lock.
+            existing = set() if created else {row['user_id'] for row in conn.execute(
+                'SELECT user_id FROM scim_group_members WHERE group_id=?', (identity,))}
+            added, removed = sorted(selected - existing), sorted(existing - selected)
+            for offset in range(0, len(added), CHUNK):
+                chunk = added[offset:offset + CHUNK]
+                found = conn.execute(f"SELECT COUNT(*) AS n FROM scim_users WHERE deleted_at='' AND id IN ({','.join('?' * len(chunk))})",
+                                     chunk).fetchone()['n']
+                if found != len(chunk):
                     raise ScimError(400, 'A member must reference an existing provisioned user.', 'invalidValue')
-                selected.add(user)
             conn.execute('''INSERT INTO scim_groups(id,external_id,display_name,display_key,deleted_at,created_at,updated_at,revision)
                 VALUES(?,?,?,?,'',?,?,1) ON CONFLICT(id) DO UPDATE SET external_id=excluded.external_id,
                 display_name=excluded.display_name,display_key=excluded.display_key,updated_at=excluded.updated_at,revision=scim_groups.revision+1''',
                          (identity, external, display, display.casefold(), stamp, stamp))
-            conn.execute('DELETE FROM scim_group_members WHERE group_id=?', (identity,))
-            for user in sorted(selected):
+            for offset in range(0, len(removed), CHUNK):
+                chunk = removed[offset:offset + CHUNK]
+                conn.execute(f"DELETE FROM scim_group_members WHERE group_id=? AND user_id IN ({','.join('?' * len(chunk))})",
+                             [identity, *chunk])
+            for user in added:
                 conn.execute('INSERT INTO scim_group_members(group_id,user_id) VALUES(?,?)', (identity, user))
-        self.guard_admins_in(conn)
-        return self.resource_in(conn, kind, identity)
+        return self.resource_in(conn, kind, identity, related=related)
+
+    @staticmethod
+    def projection(request, kind):
+        """RFC 7644 attributes/excludedAttributes for supported top-level attributes."""
+        attributes, excluded = (request.query_params.get(name) for name in ('attributes', 'excludedAttributes'))
+        if attributes is not None and excluded is not None:
+            raise ScimError(400, 'Use either attributes or excludedAttributes, not both.', 'invalidValue')
+        value = attributes if attributes is not None else excluded
+        if value is None:
+            return None
+        known = {name.lower(): name for name in (USER_FIELDS | {'groups'} if kind == 'User' else GROUP_FIELDS) | ALWAYS}
+        prefix = (CORE + kind + ':').lower()
+        names = set()
+        for item in value.split(','):
+            item = item.strip()
+            item = item[len(prefix):] if item.lower().startswith(prefix) else item
+            if item.lower() not in known:
+                raise ScimError(400, 'attributes and excludedAttributes accept supported top-level attribute names.', 'invalidValue')
+            names.add(known[item.lower()])
+        return attributes is not None, names
+
+    @staticmethod
+    def related(selection, kind):
+        if selection is None:
+            return True
+        include, names = selection
+        return (('groups' if kind == 'User' else 'members') in names) == include
+
+    @staticmethod
+    def project(resource, selection, kind):
+        if selection is None:
+            return resource
+        include, names = selection
+        keep = ALWAYS | names if include else set(resource) - (names - ALWAYS - REQUIRED[kind])
+        return {key: value for key, value in resource.items() if key in keep}
 
     def list_in(self, conn, request, kind):
-        allowed = {'filter', 'startIndex', 'count'}
+        allowed = {'filter', 'startIndex', 'count', 'attributes', 'excludedAttributes'}
         if set(request.query_params) - allowed:
-            raise ScimError(400, 'Only filter, startIndex, and count query parameters are supported.', 'invalidValue')
+            raise ScimError(400, 'Only filter, startIndex, count, attributes and excludedAttributes query parameters are supported.', 'invalidValue')
+        selection = self.projection(request, kind)
         try:
             start = max(1, int(request.query_params.get('startIndex', '1')))
             count = min(MAX_RESULTS, max(0, int(request.query_params.get('count', str(MAX_RESULTS)))))
@@ -366,7 +505,8 @@ class Scim:
         total = conn.execute(f'SELECT COUNT(*) AS n FROM {table} WHERE {predicate}', args).fetchone()['n']
         ids = conn.execute(f'SELECT id FROM {table} WHERE {predicate} ORDER BY id LIMIT ? OFFSET ?',
                            [*args, count, start - 1]).fetchall()
-        resources = [self.resource_in(conn, kind, row['id']) for row in ids]
+        related = self.related(selection, kind)
+        resources = [self.project(self.resource_in(conn, kind, row['id'], related=related), selection, kind) for row in ids]
         return {'schemas': [API + 'ListResponse'], 'totalResults': total, 'startIndex': start,
                 'itemsPerPage': len(resources), 'Resources': resources}
 
@@ -375,8 +515,7 @@ class Scim:
 
         @router.get('/ServiceProviderConfig')
         async def config(request: Request):
-            with self.store.connect() as conn:
-                self.authenticate_in(conn, request)
+            await run_in_threadpool(self.authenticate, request)
             return JSONResponse({'schemas': [CORE + 'ServiceProviderConfig'],
                 'patch': {'supported': True}, 'bulk': {'supported': False, 'maxOperations': 0, 'maxPayloadSize': 0},
                 'filter': {'supported': True, 'maxResults': MAX_RESULTS}, 'changePassword': {'supported': False},
@@ -389,8 +528,7 @@ class Scim:
         @router.get('/ResourceTypes')
         @router.get('/ResourceTypes/{identity}')
         async def resource_types(request: Request, identity: str = ''):
-            with self.store.connect() as conn:
-                self.authenticate_in(conn, request)
+            await run_in_threadpool(self.authenticate, request)
             resources = [{'schemas': [CORE + 'ResourceType'], 'id': kind, 'name': kind,
                           'endpoint': '/' + kind + 's', 'schema': CORE + kind, 'schemaExtensions': []}
                          for kind in ('User', 'Group')]
@@ -399,8 +537,7 @@ class Scim:
         @router.get('/Schemas')
         @router.get('/Schemas/{identity:path}')
         async def schemas(request: Request, identity: str = ''):
-            with self.store.connect() as conn:
-                self.authenticate_in(conn, request)
+            await run_in_threadpool(self.authenticate, request)
             resources = [self.schema(kind) for kind in ('User', 'Group')]
             return self.discovery(resources, identity)
 
@@ -444,74 +581,91 @@ class Scim:
         return {'schemas': [CORE + 'Schema'], 'id': CORE + kind, 'name': kind,
                 'description': 'Moyai supported provisioning attributes.', 'attributes': attributes}
 
+    def authenticate(self, request):
+        with self.store.connect() as conn:
+            return self.authenticate_in(conn, request)
+
     async def body(self, request):
         # Fail unauthenticated calls before parsing client-supplied content, then
         # recheck the credential inside the transaction that changes resources.
-        with self.store.connect() as conn:
-            self.authenticate_in(conn, request)
+        await run_in_threadpool(self.authenticate, request)
         if request.headers.get('content-type', '').split(';')[0].strip().lower() not in {MEDIA, 'application/json'}:
             raise ScimError(415, 'Use application/scim+json or application/json.')
         try:
-            raw = await request.body()
-            if len(raw) > 2 * 1024 * 1024:
+            declared = int(request.headers.get('content-length') or 0)
+        except ValueError:
+            raise ScimError(400, 'Invalid Content-Length.', 'invalidSyntax') from None
+        if declared > MAX_BODY:
+            raise ScimError(413, 'The provisioning request is too large.')
+        # A chunked request declares no length: stop reading at the limit.
+        raw = bytearray()
+        async for chunk in request.stream():
+            raw += chunk
+            if len(raw) > MAX_BODY:
                 raise ScimError(413, 'The provisioning request is too large.')
+        try:
             return json.loads(raw)
         except (ValueError, UnicodeError):
             raise ScimError(400, 'The request body must be valid JSON.', 'invalidSyntax') from None
 
     def resource_routes(self, router, kind):
         collection = '/' + kind + 's'
+        fields = USER_FIELDS if kind == 'User' else GROUP_FIELDS
 
-        async def listing(request: Request):
+        def read(request, identity=None):
+            selection = self.projection(request, kind)
             with self.store.connect() as conn:
                 conn.begin_read()
                 self.authenticate_in(conn, request)
-                result = self.list_in(conn, request, kind)
-            return JSONResponse(result, media_type=MEDIA)
+                if identity is None:
+                    return self.list_in(conn, request, kind)
+                return self.project(self.resource_in(conn, kind, identity, related=self.related(selection, kind)), selection, kind)
 
-        async def reading(identity: str, request: Request):
-            with self.store.connect() as conn:
-                conn.begin_read()
-                self.authenticate_in(conn, request)
-                result = self.resource_in(conn, kind, identity)
-            return JSONResponse(result, media_type=MEDIA)
-
-        async def creating(request: Request):
-            body = await self.body(request)
+        def write(request, body, identity=None):
+            selection = self.projection(request, kind)
             with self.store.connect() as conn:
                 conn.begin_write()
                 actor = self.authenticate_in(conn, request)
-                result = self.write_in(conn, kind, body)
-                self.audit_in(conn, actor, 'create', kind, result['id'])
-            return JSONResponse(result, status_code=201, media_type=MEDIA, headers={'Location': result['meta']['location']})
-
-        async def updating(identity: str, request: Request):
-            body = await self.body(request)
-            with self.store.connect() as conn:
-                conn.begin_write()
-                actor = self.authenticate_in(conn, request)
-                current = self.resource_in(conn, kind, identity)
                 if request.method == 'PATCH':
-                    current = {key: value for key, value in current.items() if key in (USER_FIELDS if kind == 'User' else GROUP_FIELDS)}
-                    body = patch_document(current, body, kind)
-                result = self.write_in(conn, kind, body, identity)
-                self.audit_in(conn, actor, request.method.lower(), kind, identity)
-            return JSONResponse(result, media_type=MEDIA)
+                    current = self.resource_in(conn, kind, identity)
+                    body = patch_document({key: value for key, value in current.items() if key in fields}, body, kind, identity)
+                result = self.write_in(conn, kind, body, identity, related=self.related(selection, kind))
+                self.audit_in(conn, actor, 'create' if identity is None else request.method.lower(), kind, result['id'])
+            return self.project(result, selection, kind)
 
-        async def deleting(identity: str, request: Request):
+        def delete(request, identity):
             with self.store.connect() as conn:
                 conn.begin_write()
                 actor = self.authenticate_in(conn, request)
-                self.resource_in(conn, kind, identity)
+                self.resource_in(conn, kind, identity, related=False)
                 stamp = now()
+                before = self.active_admins_in(conn) if kind == 'User' else set()
                 if kind == 'User':
                     conn.execute('UPDATE scim_users SET active=0,deleted_at=?,updated_at=?,revision=revision+1 WHERE id=?', (stamp, stamp, identity))
                     conn.execute('DELETE FROM scim_group_members WHERE user_id=?', (identity,))
                 else:
                     conn.execute('UPDATE scim_groups SET deleted_at=?,updated_at=?,revision=revision+1 WHERE id=?', (stamp, stamp, identity))
                     conn.execute('DELETE FROM scim_group_members WHERE group_id=?', (identity,))
-                self.guard_admins_in(conn)
+                self.guard_admins_in(conn, before)
                 self.audit_in(conn, actor, 'delete', kind, identity)
+
+        # Database work runs in the threadpool so a large directory or a busy
+        # writer lock cannot stall this process's event loop.
+        async def listing(request: Request):
+            return JSONResponse(await run_in_threadpool(read, request), media_type=MEDIA)
+
+        async def reading(identity: str, request: Request):
+            return JSONResponse(await run_in_threadpool(read, request, identity), media_type=MEDIA)
+
+        async def creating(request: Request):
+            result = await run_in_threadpool(write, request, await self.body(request))
+            return JSONResponse(result, status_code=201, media_type=MEDIA, headers={'Location': result['meta']['location']})
+
+        async def updating(identity: str, request: Request):
+            return JSONResponse(await run_in_threadpool(write, request, await self.body(request), identity), media_type=MEDIA)
+
+        async def deleting(identity: str, request: Request):
+            await run_in_threadpool(delete, request, identity)
             return Response(status_code=204)
 
         for path, endpoint, methods in [(collection, listing, ['GET']), (collection, creating, ['POST']),
@@ -538,15 +692,16 @@ class Scim:
 
         @router.post('/api/admin/scim/tokens')
         async def create_token(body: TokenCreate, request: Request):
-            self.security.require(request, admin=True, mutation=True, permission='scim.manage')
+            # Unlike viewing or revoking, issuing a credential needs the built-in
+            # administrator: it controls membership, group grants and deactivation.
+            self.security.require(request, admin=True, mutation=True)
             identity = uuid4().hex
             token = 'moyai_scim_' + identity + '.' + secrets.token_urlsafe(32)
             actor = self.security.session_info(request)
             label = actor.get('identity', {}).get('email') or actor.get('method', 'admin')
             with self.store.connect() as conn:
                 conn.begin_write()
-                if self.governance is not None:
-                    self.governance.authorize_in(conn, actor, 'scim.manage')
+                self.require_admin_in(conn, actor)
                 conn.execute('INSERT INTO scim_tokens(id,label,token_hash,prefix,created_at,revoked_at) VALUES(?,?,?,?,?,\'\')',
                              (identity, body.label, hashlib.sha256(token.encode()).hexdigest(), token[:19], now()))
                 self.audit_in(conn, label, 'create credential', 'Credential', identity)
@@ -593,5 +748,7 @@ def initialize_schema(store):
         resource_id TEXT NOT NULL, created_at TEXT NOT NULL)''')
     store.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_scim_users_external ON scim_users(external_id) WHERE external_id!='' AND deleted_at=''")
     store.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_scim_users_name ON scim_users(user_name) WHERE deleted_at=''")
+    # Activity checks include tombstones, which the live-only index cannot serve.
+    store.execute('CREATE INDEX IF NOT EXISTS idx_scim_users_lookup ON scim_users(user_name,updated_at)')
     store.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_scim_groups_external ON scim_groups(external_id) WHERE external_id!='' AND deleted_at=''")
     store.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_scim_groups_display ON scim_groups(display_key) WHERE deleted_at=''")

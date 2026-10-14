@@ -1308,3 +1308,28 @@ async def test_deferred_child_delivery_retains_parent_admission_and_snapshot_tra
     assert lifecycle.archives(actor) == {root}
     manager.store.update_run(child, summary='Later worker answer')
     assert coordinator.results(root, result['group_id'])['children'][0]['summary'] == 'Frozen worker answer'
+
+
+def test_credential_request_never_borrows_a_nested_connection_under_its_writer(workspace, monkeypatch):
+    import threading
+    from contextlib import contextmanager
+    app, client = workspace
+    sign_in(app, client)
+    for suffix in '123':
+        assert save(client, suffix=suffix).status_code == 201
+    run, store = active(app), app.state.store
+    caller, depth, deepest, original = threading.get_ident(), [0], [0], type(store).connect
+    @contextmanager
+    def tracked(self, *args, **kwargs):
+        mine = threading.get_ident() == caller  # Ignore background pollers.
+        depth[0] += mine
+        deepest[0] = max(deepest[0], depth[0])
+        try:
+            with original(self, *args, **kwargs) as conn:
+                yield conn
+        finally:
+            depth[0] -= mine
+    monkeypatch.setattr(type(store), 'connect', tracked)
+    # Each candidate's permission check reuses the writer's own connection.
+    requested(app, run)
+    assert deepest[0] == 1

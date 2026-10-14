@@ -39,7 +39,7 @@ jobs:
     # Database contracts stay on every PR. General feature compatibility runs
     # nightly/on demand in postgres-compatibility.yml instead of once per PR.
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     services:
       postgres:
         image: postgres:17-alpine
@@ -61,6 +61,8 @@ jobs:
         run: uv run --frozen --python 3.13 pytest -q --tb=short tests/test_admission_scaling.py
       - name: Verify personal Slack and immutable private sessions on PostgreSQL
         run: uv run --frozen --python 3.13 pytest --postgres-backend -q --tb=short tests/test_personal_slack.py tests/test_private_sessions.py tests/test_private_sinks.py tests/test_slack_secrets.py tests/test_private_integrations.py
+      - name: Verify workspace roles, provisioning and session policies on PostgreSQL
+        run: uv run --frozen --python 3.13 pytest --postgres-backend -q --tb=short tests/test_enterprise_roles.py tests/test_scim.py tests/test_security_profiles.py tests/test_governance_audit.py
       - name: Verify enrolled bootstrap reads and deferred identity maintenance
         run: |
           uv run --frozen --python 3.13 pytest -q --tb=short tests/test_session_bootstrap.py

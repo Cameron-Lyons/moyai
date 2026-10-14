@@ -3,15 +3,36 @@
 Uses one always-on Modal Server. Keep max_containers=1 and strategy=recreate;
 SQLite checkpoints require one writer, including during deployments.
 """
+import os
 from pathlib import Path
 
 import modal
 
-from app.config import Settings
-from app.organization_scope import scoped_name
-
 ROOT = Path(__file__).parent
-ORGANIZATION_ID = Settings().moyai_organization_id
+
+
+def scoped_name(value, organization_id, maximum=None):
+    """Copy of app.organization_scope.scoped_name: the container imports only this file."""
+    suffix = '-org-' + organization_id
+    if not value:
+        return value
+    if value.endswith(suffix):
+        if not maximum or len(value) <= maximum:
+            return value
+        value = value[:-len(suffix)]
+    if maximum:
+        value = value[:maximum - len(suffix)].rstrip('-')
+    return value + suffix
+
+
+# Modal imports this module in the Web container with only stdlib and modal; the
+# app package and its dependencies live in the image's separate virtualenv.
+if modal.is_local():
+    from app.config import Settings
+    ORGANIZATION_ID = Settings().moyai_organization_id
+else:
+    # deployment_config() exports the ID through the configuration secret.
+    ORGANIZATION_ID = os.environ.get('MOYAI_ORGANIZATION_ID', '')
 APP_NAME = scoped_name('moyai', ORGANIZATION_ID, 64) if ORGANIZATION_ID else 'moyai'
 VOLUME_NAME = scoped_name('hermes-workspace-state', ORGANIZATION_ID, 64) if ORGANIZATION_ID else 'hermes-workspace-state'
 CONFIG_SECRET_NAME = scoped_name('hermes-workspace-config', ORGANIZATION_ID, 64) if ORGANIZATION_ID else 'hermes-workspace-config'

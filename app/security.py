@@ -110,9 +110,10 @@ class Security:
             # assertion. Cookies alone, including legacy admin cookies, cannot
             # authenticate or override the currently signed-in Access identity.
             info = getattr(request.state, 'access_session', None)
-            if not info or not self.identity_active(info['identity']['email']):
+            person = self.person(info['identity']['email']) if info else None
+            if not person:
                 return None
-            return {**info, 'role': self.google_role(info['identity']['email'])}
+            return {**info, **person}
         try:
             info = self.signer.loads(request.cookies.get("workspace_session", ""), max_age=43200)
             # Sessions from the original single-password deployment belong to
@@ -126,10 +127,12 @@ class Security:
                 email, domain = identity.get("email", ""), identity.get("domain", "")
                 if (not self.settings.google_enabled() or domain not in self.settings.google_domains()
                         or email.rpartition("@")[2] != domain or not identity.get("sub")
-                        or info.get("client_id") != self.settings.google_client_id
-                        or not self.identity_active(email)):
+                        or info.get("client_id") != self.settings.google_client_id):
                     return None
-                role = self.google_role(email)
+                person = self.person(email)
+                if not person:
+                    return None
+                return {**info, **person}
             elif method == "local":
                 if not self.local_preview():
                     return None
@@ -176,16 +179,28 @@ class Security:
             return self.user_roles.role(email)
         return 'admin' if email in self.settings.google_admins() else 'member'
 
-    def identity_active(self, email: str) -> bool:
+    def person(self, email: str) -> dict | None:
+        """Directory status, built-in role and permissions on one connection.
+
+        Every authorization resolves these together, so a request borrows one
+        pooled connection per check rather than one for each value. None means
+        the provisioned account is inactive.
+        """
         if self.user_roles is None:
-            return True
+            return {'role': self.google_role(email)}
+        email = email.strip().lower()
         with self.user_roles.store.connect() as conn:
-            return self.user_roles.active_email_in(conn, email.strip().lower())
+            if not self.user_roles.active_email_in(conn, email):
+                return None
+            role = self.user_roles.role_in(conn, email)
+            return {'role': role, '_permissions': self.user_roles.permissions_in(conn, email, active=True, role=role)}
 
     def permissions_for_info(self, info):
         if not info:
             return frozenset()
         if info.get('method') in {'google', 'cloudflare'} and self.user_roles is not None:
+            if '_permissions' in info:
+                return info['_permissions']  # Resolved with this session_info's role.
             return self.user_roles.permissions(info['identity']['email'])
         return BUILTIN_PERMISSIONS.get(info.get('role'), frozenset())
 

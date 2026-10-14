@@ -180,7 +180,7 @@ performed by the PR. It requires a reachable Temporal service, stable
 Distributed roles already require shared object storage. Local setup must set
 `TEMPORAL_ENABLED=true`; there is no nondurable/native fallback for `deepagents-temporal`.
 
-Schema revision and compatibility revision are 19 (inherited from main). API, broker, worker and
+Schema revision and compatibility revision were 19 at that release (inherited from main). API, broker, worker and
 coordinator protocol revisions advance to 18 because old roles cannot execute the
 new harness or decode the new
 payloads. Drain and coordinate the upgrade of all roles using the existing release

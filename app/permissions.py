@@ -33,11 +33,11 @@ PERMISSIONS = {
     'spend.personal': 'View personal model spend',
     'spend.read': 'View organization spend and adoption',
     'spend.manage': 'Manage infrastructure billing and spend identity links',
-    'runtime.manage': 'Inspect and configure the workspace runtime',
+    'runtime.manage': 'View performance, capacity, pull-request and deployment details; configure session titles',
     'organization.manage': 'Change organization settings',
     'audit.read': 'Read enterprise governance audit history',
     'security.manage': 'Manage security profiles and policies',
-    'scim.manage': 'Manage directory provisioning',
+    'scim.manage': 'View directory provisioning and revoke provisioning credentials',
 }
 
 MEMBER_PERMISSIONS = frozenset({
@@ -169,7 +169,9 @@ def route_permission(request):
     if path in {'/api/admin/pull-requests', '/api/admin/capacity', '/api/admin/performance'}:
         return 'runtime.manage'
     if path == '/api/settings/sandboxes':
-        return 'workspace.read' if read else 'runtime.manage'
+        # The provider receives materialized credentials for every session, so
+        # changing it keeps the built-in administrator boundary.
+        return 'workspace.read' if read else None
     if path.startswith('/api/admin/security'):
         return 'security.manage'
     return None

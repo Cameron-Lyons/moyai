@@ -32,7 +32,7 @@ function createCommandPalette() {
         $(open?'#close-sidebar':'#open-sidebar').click();
       }},
       {id:'settings', label:'Settings', icon:'gear', action:() => navigate('settings')});
-    for (const group of (query ? settingsGroups : []).filter(group => settingsItemVisible(group, state.role))) {
+    for (const group of (query ? settingsGroups : []).filter(group => settingsGroupVisible(group, state.role))) {
       for (const item of group.items.filter(item => settingsItemVisible(item, state.role))) {
         items.push({id:item.view, label:item.title, description:item.description, icon:'grid', action:() => navigate(item.view)});
       }

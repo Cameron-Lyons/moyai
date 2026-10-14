@@ -42,6 +42,15 @@ function toast(message) { $('#toast').textContent = message; $('#toast').hidden 
 function statusLabel(status) { return `<span class="status ${esc(status)}">${esc(status==='idle'?'Ready':status.replaceAll('_',' '))}</span>`; }
 function relative(date) { const min = Math.max(0, Math.floor((Date.now() - new Date(date)) / 60000)), hours=Math.floor(min/60), days=Math.floor(min/1440), months=Math.floor(days/30); return min < 1 ? 'Just now' : min < 60 ? `${min}m ago` : hours < 24 ? `${hours} hour${hours===1?'':'s'} ago` : days < 30 ? `${days} day${days===1?'':'s'} ago` : months < 2 ? 'last month' : months < 12 ? `${months} months ago` : new Date(date).toLocaleDateString(); }
 function stopStream(){ state.swarmChat?.dispose();state.swarmChat=null;state.swarmSpace?.dispose();state.swarmSpace=null;resetCredentialNavigation();if(typeof workspacePanel!=='undefined'){workspacePanel?.dispose();workspacePanel=null;} computer.close(); clearTimeout(state.streamRetry); state.streamRetry=null; state.source?.close(); state.source = null; state.chatRun = null; state.revealSessionAncestors=null; state.sessionHeaderRun = null; savedFiles.reset(); }
+// The server ends an activity stream when the viewer's access ends. Never
+// reconnect it; reload so sign-in and permission checks decide what to show.
+function streamAccessEnded(source){
+  source.close();clearTimeout(state.streamRetry);
+  if(state.source===source)state.source=null;
+  state.navigationCache?.clear();
+  toast('Your access to this session changed. Reloading…');
+  setTimeout(()=>location.reload(),1500);
+}
 async function showUnavailableSession(id){
   state.navigationCache?.forget(`/api/runs/${id}?activity=summary`);
   if(state.selected!==id)return;
@@ -362,7 +371,7 @@ async function renderHome(initialConfig,recent=false){
     <div class="new-session-mode"><div class="swarm-view-switch" role="group" aria-label="Session mode"><button type="button" class="quiet" data-new-session-mode="chat" aria-pressed="true">Chat</button><button type="button" class="quiet" data-new-session-mode="swarm" aria-pressed="false" ${config.cloud_ready&&config.parallel_agents_enabled&&!draft.private_session?'':'disabled'}>Swarm</button></div><div class="swarm-budget" hidden>${MoyaiSwarm.budgetFields('swarm-budget',draft.budget_seconds??0)}</div><span class="swarm-setup-note">${config.cloud_ready&&config.parallel_agents_enabled?'':'Swarm needs a connected cloud workspace with durable sessions.'}</span></div>
     <div class="session-privacy-choice"><label><input id="private-session" type="checkbox" ${draft.private_session?'checked':''} ${draft.private_locked||!personalSlack?.available?'disabled':''} aria-describedby="session-privacy-description"> Private session · Only you</label><p id="session-privacy-description">${draft.private_session?'Owner-only web chat. It stays private and cannot be shared or delegated.':personalSlack?.available?'Ordinary sessions are accessible to workspace members. Choose private to use personal Slack.':'Private sessions require individual Google or Cloudflare sign-in.'}</p></div>
     <form id="task-form" class="composer"><textarea id="prompt" name="prompt" aria-label="Message Moyai" placeholder="Ask Moyai to build, investigate, or pick up a thread…" required minlength="3" rows="3"></textarea><div class="composer-toolbar"><details class="task-options"><summary aria-label="Session options">${globalThis.MoyaiIcon?.('sliders',16)||''}<span>Context</span></summary><div class="task-settings"><div class="field"><label for="repo">GitHub repository</label><input id="repo" type="url" placeholder="https://github.com/owner/repo" value="${esc(draft.repo||'')}"></div><div class="field"><label for="project-environment">Project environment</label><select id="project-environment">${environmentOptions(environments,draft.environment_id||'auto')}</select></div><div class="field"><label for="mode">Execution</label><select id="mode"><option value="modal" ${state.config.cloud_ready?'':'disabled'}>Cloud session</option><option value="demo" ${state.config.cloud_ready?'':'selected'}>Demo · simulated</option></select></div><div class="field"><label for="session-security-profile">Security policy</label><select id="session-security-profile">${globalThis.MoyaiSecurityProfiles?.options(profiles,draft.security_profile_id)||'<option value="">Organization default</option>'}</select></div><div id="plugin-options"><span>Session connections</span>${apps.map(c=>`<label class="plugin-toggle"><input type="checkbox" name="plugin" value="${c.id}" ${!draft.plugins||draft.plugins.includes(c.id)?'checked':''}>${providerNames[c.id]}</label>`).join('')||'<small>Connect apps in organization settings.</small>'}</div></div></details><button type="button" class="quiet skill-picker-button" data-skill-picker="prompt" aria-label="Choose a skill" title="Skills · or type /">${globalThis.MoyaiIcon?.('slash',16)||'/'}</button><span class="composer-pickers">${harnessPicker(draft.harness,state.config.model)}${modelPicker('new-model',state.config.model,false,draft.harness)}</span><button class="send-button" type="submit" aria-label="Start session" title="Start session">${globalThis.MoyaiIcon?.('up',18)||'↑'}</button></div></form>
-    <div class="composer-caption"><span id="mode-note">${state.config.cloud_ready?'Your own cloud workspace':'Demo responses · audio uses transcription'}</span><span>Type / for skills · Enter to send</span></div>
+    <div class="composer-caption"><span id="mode-note">${state.config.restricted?'Cloud sessions need the workspace.read permission. Ask an administrator.':state.config.cloud_ready?'Your own cloud workspace':'Demo responses · audio uses transcription'}</span><span>Type / for skills · Enter to send</span></div>
     <div class="suggestions"><button type="button" data-prompt="Help me investigate a bug. ">${globalThis.MoyaiIcon?.("bolt",20)||""}<span class="suggestion-copy"><strong>Investigate a bug</strong><small>Find the signal in the noise</small></span><span class="suggestion-arrow" aria-hidden="true">↗</span></button><button type="button" data-prompt="Read the repository and explain how it works. Make no changes. ">${globalThis.MoyaiIcon?.("terminal",20)||""}<span class="suggestion-copy"><strong>Explore a codebase</strong><small>Get the lay of the land</small></span><span class="suggestion-arrow" aria-hidden="true">↗</span></button><button type="button" data-prompt="Find the team context for ">${globalThis.MoyaiIcon?.("participants",20)||""}<span class="suggestion-copy"><strong>Find team context</strong><small>Connect the dots</small></span><span class="suggestion-arrow" aria-hidden="true">↗</span></button></div><p class="connected-note">${apps.length?`<span class="connected-dot"></span>${apps.map(c=>c.id==='slack'&&personalSlack?.connected?'Personal Slack':providerNames[c.id]).join(', ')} connected`:'Add your team’s apps in Connections'}</p></section>`);
   state.spaceCleanup?.();
   state.spaceCleanup=globalThis.MoyaiSpace?.mount($('#space-field'),{anchor:$('#home-hub')});
@@ -529,6 +538,7 @@ async function openRun(id,hash='#run='+id,submission=null){
     source.addEventListener('run-status',e=>{if(state.selected===id)MoyaiUI.render($('#run-status'), statusLabel(JSON.parse(e.data).status));});
     source.addEventListener('settled',()=>{source.close();if(state.selected===id)openRun(id).catch(showError);});
     source.addEventListener('deleted',()=>{if(version===state.pageVersion&&state.source===source)showUnavailableSession(id).catch(showError);});
+    source.addEventListener('unauthorized',()=>{if(version===state.pageVersion&&state.source===source)streamAccessEnded(source);});
     source.onerror=()=>{if(source.readyState===EventSource.CLOSED)toast('Activity stream disconnected. Reopen this task to reconnect.');};
   }
 }
@@ -639,6 +649,7 @@ function connectChatStream(run){
         (event.data?.live_status===true&&MoyaiActivity.isFocus(event)&&String(event.data.input_id)!==String(MoyaiActivity.current(state.chatRun).input)))refreshChat(id).catch(showError);
     };
     source.addEventListener('deleted',()=>{if(current())showUnavailableSession(id).catch(showError);});
+    source.addEventListener('unauthorized',()=>{if(current())streamAccessEnded(source);});
     source.addEventListener('run-status',e=>{if(current()){$('#connection-state').hidden=true;updateChatStatus(JSON.parse(e.data));}});
     source.onerror=()=>{
       if(!current())return;
@@ -1123,7 +1134,7 @@ async function boot(){
     document.querySelectorAll('.rail button:not([data-slot="select-trigger"])').forEach(b=>b.disabled=false);
     state.sessionSearchLoading=!state.runs.length;renderSidebar();
     state.configError=null;state.configLoaded=false;
-    state.configReady=(!globalThis.MoyaiPermissions||MoyaiPermissions.has('workspace.read')?api('/api/config'):Promise.resolve({missing:[],cloud_ready:false,model:''})).then(config=>{state.config=config;state.configLoaded=true;}).catch(error=>{state.configError=error;throw error;});
+    state.configReady=(!globalThis.MoyaiPermissions||MoyaiPermissions.has('workspace.read')?api('/api/config'):Promise.resolve({missing:[],cloud_ready:false,model:'',restricted:true})).then(config=>{state.config=config;state.configLoaded=true;}).catch(error=>{state.configError=error;throw error;});
     if(!globalThis.MoyaiPermissions||MoyaiPermissions.has('workspace.read'))api('/api/organization').then(value=>{state.organization=value;renderSidebar();}).catch(showError);
     refreshRuns().catch(showError);
     $('#logout').hidden=!!session.local;

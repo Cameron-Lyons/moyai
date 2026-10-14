@@ -94,6 +94,30 @@ def test_signed_snapshot_cursor_stays_stable_across_new_and_backdated_commits(au
     assert audit.listing(first['next_cursor'], 2)['events'] == audit.listing(first['next_cursor'], 2)['events']
 
 
+def test_cursor_pages_read_their_snapshot_without_writer_lock_or_rescan(audit_app, monkeypatch):
+    from app.database import PostgresConnection, SQLiteConnection
+    app, _, audit = audit_app
+    with app.state.store.connect() as conn:
+        conn.begin_write()
+        for index in range(3):
+            record_event_in(conn, 'test.event', 'tester', 'Test', str(index))
+    first = audit.listing(limit=1)
+    with app.state.store.connect() as conn:
+        conn.begin_write()
+        record_event_in(conn, 'test.late-commit', 'tester', 'Test', 'late')
+    import threading
+    writes, reader = [], threading.get_ident()
+    for kind in (SQLiteConnection, PostgresConnection):
+        # Count only this caller's transactions; background pollers also write.
+        monkeypatch.setattr(kind, 'begin_write', lambda self, original=kind.begin_write: (
+            threading.get_ident() == reader and writes.append(self)) or original(self))
+    monkeypatch.setattr(audit, 'index_in', lambda conn: pytest.fail('A cursor page rescanned every audit source'))
+    second = audit.listing(first['next_cursor'], 1)
+    third = audit.listing(second['next_cursor'], 1)
+    assert not writes and third['next_cursor'] is None
+    assert sorted(event['resource_id'] for page in (first, second, third) for event in page['events']) == ['0', '1', '2']
+
+
 def test_invalid_cursors_and_uncommitted_changes_never_enter_the_feed(audit_app):
     app, _, audit = audit_app
     with pytest.raises(RuntimeError):

@@ -12,7 +12,7 @@ import sqlite3
 import tempfile
 
 from . import captures
-from .database import PostgresConnection, SQLiteConnection, identifier, row_factory
+from .database import DatabaseError, PostgresConnection, SQLiteConnection, identifier, row_factory
 
 
 class MaintenanceError(ValueError):
@@ -62,6 +62,16 @@ def table_exists(conn, name):
 
 def attachment_columns(conn):
     return conn.column_names('attachments')
+
+
+def require_organization(directory: Path, identity: str, **options):
+    """Object keys and references embed the organization; apply the startup pin read-only."""
+    from .organization_scope import require_pin
+    with source_database(directory, **options) as conn:
+        try:
+            require_pin(conn, identity)
+        except DatabaseError as exc:
+            raise MaintenanceError(str(exc)) from None
 
 
 class MaintenanceStore:
@@ -383,6 +393,7 @@ def main(argv=None) -> int:
         if args.operation == 'plan':
             result = plan(directory, **connection_options)
         else:
+            require_organization(directory, settings.moyai_organization_id, **connection_options)
             objects = ObjectStorage(settings)
             if args.operation == 'backup':
                 result = backup(directory, objects)

@@ -325,15 +325,20 @@ class Credentials:
         return {**{k: row[k] for k in fields}, 'status': self.status(row),
                 'can_manage': admin if row['scope'] == 'organization' else row['owner_id'] == user_id}
 
-    def permitted(self, secret, run, actor_id):
+    def readable(self, actor_id, conn=None):
+        # Writers pass their connection: a nested pool borrow under the exclusive
+        # PostgreSQL writer lock can wait on the writers queued behind it.
+        return not self.security.user_roles or self.security.has_actor_permission(actor_id, 'credentials.read', connection=conn)
+
+    def permitted(self, secret, run, actor_id, conn=None, *, readable=None):
         if not actor_id or secret['revoked_at']:
             return False
-        if self.security.user_roles and not self.security.has_actor_permission(actor_id, 'credentials.read'):
+        if not (self.readable(actor_id, conn) if readable is None else readable):
             return False
         # Lifetime bounds every source of reachability, including shared access.
-        if secret['lifetime'] == 'session' and secret['root_id'] != self.root(run):
+        if secret['lifetime'] == 'session' and secret['root_id'] != (self.store.root_id_in(conn, run['id']) if conn else self.root(run)):
             return False
-        return secret['scope'] == 'organization' or self.same_requester(secret['owner_id'], actor_id)
+        return secret['scope'] == 'organization' or self.same_requester(secret['owner_id'], actor_id, connection=conn)
 
     def list_secrets(self, user_id, admin=False, root_id=''):
         rows = self.store.rows("SELECT * FROM provider_secrets WHERE revoked_at='' ORDER BY created_at DESC")
@@ -343,7 +348,8 @@ class Credentials:
 
     def inventory(self, run, args):
         rows = self.store.rows("SELECT * FROM provider_secrets WHERE revoked_at='' ORDER BY created_at DESC")
-        authorized = [row for row in rows if self.permitted(row, run, run['active_user_id'])]
+        readable = self.readable(run['active_user_id'])
+        authorized = [row for row in rows if self.permitted(row, run, run['active_user_id'], readable=readable)]
         with self.store.connect() as conn:
             pending = self.pending_rows(conn, run['id'])
         result = {'credentials': [self.metadata(row, run['active_user_id'], False) for row in authorized
@@ -502,8 +508,8 @@ class Credentials:
         if (row['status'] != 'pending' or row['generation'] != generation
                 or run['status'] not in ACCESSIBLE):
             raise HTTPException(409, 'This access request changed. Open the current session.')
-        if not (self.same_requester(actor_id, row['actor_id'])
-                or self.same_requester(row['actor_id'], actor_id)):
+        if not (self.same_requester(actor_id, row['actor_id'], connection=conn)
+                or self.same_requester(row['actor_id'], actor_id, connection=conn)):
             raise HTTPException(403, 'Only the requester can choose how to share this access.')
         if row['preferred_scope'] != scope:
             conn.execute('UPDATE credential_requests SET preferred_scope=?,scope_revision=scope_revision+1 WHERE id=?',
@@ -521,7 +527,7 @@ class Credentials:
             if current:
                 if self.matching(current, row):
                     current_secret = conn.execute('SELECT * FROM provider_secrets WHERE id=?', (current['secret_id'],)).fetchone()
-                    if (current['status'] != 'provided' or (current_secret and self.permitted(current_secret, run, run['active_user_id'])
+                    if (current['status'] != 'provided' or (current_secret and self.permitted(current_secret, run, run['active_user_id'], conn)
                             and self.status(current_secret) == 'active')):
                         return dict(current)  # A newer grant/decline wins over this older failure.
                     return self.reopen_in(conn, current, failure, run)
@@ -548,10 +554,11 @@ class Credentials:
     def matching(self, secret, capability):
         return all(secret[key] == capability[key] for key in ('provider', 'name', 'format', 'env_var'))
 
-    def saved_choice(self, conn, run, capability, secret_id=''):
+    def saved_choice(self, conn, run, capability, secret_id='', readable=None):
+        readable = self.readable(run['active_user_id'], conn) if readable is None else readable
         candidates = [dict(secret) for secret in conn.execute(
             "SELECT * FROM provider_secrets WHERE provider=? AND revoked_at=''", (capability['provider'],))
-            if self.matching(secret, capability) and self.permitted(secret, run, run['active_user_id'])
+            if self.matching(secret, capability) and self.permitted(secret, run, run['active_user_id'], conn, readable=readable)
             and self.status(secret) == 'active']
         if secret_id:
             selected = next((secret for secret in candidates if secret['id'] == secret_id), None)
@@ -562,12 +569,13 @@ class Credentials:
         choices = private or candidates
         return choices[0] if len(choices) == 1 else None
 
-    def source_lookup(self, conn, run, args):
+    def source_lookup(self, conn, run, args, readable=None):
         if args.provider == 'generic' and args.name == '1password-shared':
             return None  # Obtaining the source must not recursively require itself.
+        readable = self.readable(run['active_user_id'], conn) if readable is None else readable
         sources = [self.metadata(secret, run['active_user_id'], False) for secret in conn.execute(
             "SELECT * FROM provider_secrets WHERE provider='generic' AND name='1password-shared' AND format='env' AND revoked_at=''")
-            if self.permitted(secret, run, run['active_user_id']) and self.status(secret) == 'active']
+            if self.permitted(secret, run, run['active_user_id'], conn, readable=readable) and self.status(secret) == 'active']
         checked = set()
         for check in args.source_checks:
             used = conn.execute('''SELECT 1 FROM credential_source_uses
@@ -607,8 +615,9 @@ class Credentials:
             deny_export(self.store, run['id'])
         with self.store.connect() as conn:
             conn.begin_write()
+            readable = self.readable(run['active_user_id'], conn)
             if private_slack:
-                saved = self.saved_choice(conn, run, args.model_dump(), args.secret_id)
+                saved = self.saved_choice(conn, run, args.model_dump(), args.secret_id, readable)
                 if not saved or saved['scope'] != 'personal':
                     raise HTTPException(403, 'Save a personal slack-personal secret in Settings > Secrets first, then request it by secret_id.')
             actor = run['active_user_id']
@@ -623,8 +632,8 @@ class Credentials:
                 raise ValueError('Use the original credential inputs when retrying this request.')
             if not prior:
                 for candidate in self.pending_rows(conn, run['id']):
-                    same_actor = (self.same_requester(candidate['actor_id'], run['active_user_id'])
-                                  or self.same_requester(run['active_user_id'], candidate['actor_id']))
+                    same_actor = (self.same_requester(candidate['actor_id'], run['active_user_id'], connection=conn)
+                                  or self.same_requester(run['active_user_id'], candidate['actor_id'], connection=conn))
                     if (same_actor and candidate['request_key'] == args.request_key
                             and self.matching(candidate, args.model_dump()) and candidate['reason'] == args.reason
                             and json.loads(candidate['input_fields']) == json.loads(input_fields)):
@@ -637,15 +646,15 @@ class Credentials:
             valid_prior = False
             if prior and prior['status'] == 'provided':
                 bound = conn.execute('SELECT * FROM provider_secrets WHERE id=?', (prior['secret_id'],)).fetchone()
-                valid_prior = bool(bound and self.permitted(bound, run, actor) and self.status(bound) == 'active')
+                valid_prior = bool(bound and self.permitted(bound, run, actor, conn, readable=readable) and self.status(bound) == 'active')
                 if valid_prior and args.secret_id and args.secret_id != prior['secret_id']:
                     raise ValueError('Use a new request_key to select a different saved connection.')
             terminal_prior = prior and prior['status'] in {'declined', 'satisfied'}
             permission_retry = prior and prior['status'] == 'pending' and prior['failure'] == 'permission'
             if not valid_prior and not terminal_prior and not permission_retry:
-                secret = self.saved_choice(conn, run, args.model_dump(), args.secret_id)
+                secret = self.saved_choice(conn, run, args.model_dump(), args.secret_id, readable)
                 if not secret:
-                    lookup = self.source_lookup(conn, run, args)
+                    lookup = self.source_lookup(conn, run, args, readable)
                     if lookup:
                         return lookup
             if not prior and not secret:
@@ -788,7 +797,7 @@ class Credentials:
             run = conn.execute('SELECT * FROM runs WHERE id=?', (row['run_id'],)).fetchone()
             if not run or run['deleted_at']:
                 raise HTTPException(404, 'Session not found.')
-            own = self.same_requester(user_id, row['actor_id'])
+            own = self.same_requester(user_id, row['actor_id'], connection=conn)
             if not own and not admin:
                 raise HTTPException(403, 'Only the requester or an administrator can resolve this request.')
             if (body.generation is not None and body.generation != row['generation']) or (body.generation is None and row['generation']):
@@ -803,7 +812,7 @@ class Credentials:
                     secret = conn.execute('SELECT * FROM provider_secrets WHERE id=?', (body.secret_id,)).fetchone()
                     if (not secret or not self.matching(secret, row) or self.status(secret) != 'active'
                             or (secret['scope'] != 'organization' and (secret['owner_id'] != user_id or not own))
-                            or not self.permitted(secret, run, row['actor_id'])):
+                            or not self.permitted(secret, run, row['actor_id'], conn)):
                         raise HTTPException(403, 'Those credentials are not available to this requester and session.')
                     secret_id = secret['id']
                 else:
@@ -824,7 +833,7 @@ class Credentials:
                             value=body.value, client_id='request-' + row['id'] + '-' + str(row['generation']))
                     except ValueError:
                         raise HTTPException(422, 'Choose sharing and reuse, and check the credential format and expiry.') from None
-                    secret_id = self.insert_secret(conn, data, user_id, admin, self.root(run))
+                    secret_id = self.insert_secret(conn, data, user_id, admin, self.store.root_id_in(conn, run['id']))
             status = 'provided' if secret_id else 'declined'
             secret_revision = conn.execute('SELECT revision FROM provider_secrets WHERE id=?', (secret_id,)).fetchone()[0] if secret_id else 1
             conn.execute('UPDATE credential_requests SET status=?,secret_id=?,secret_revision=?,resolved_at=?,resolution_pending=1,resolution_error=\'\' WHERE id=?',
@@ -849,8 +858,8 @@ class Credentials:
             raise HTTPException(403, 'This credential request is not available in this session.')
         secret = conn.execute('SELECT * FROM provider_secrets WHERE id=?', (row['secret_id'],)).fetchone()
         # Handles from earlier turns may only be used under current permission.
-        same_actor = (self.same_requester(row['actor_id'], run['active_user_id'])
-                      or self.same_requester(run['active_user_id'], row['actor_id']))
+        same_actor = (self.same_requester(row['actor_id'], run['active_user_id'], connection=conn)
+                      or self.same_requester(run['active_user_id'], row['actor_id'], connection=conn))
         if not same_actor and (not secret or secret['scope'] != 'organization'):
             raise HTTPException(403, 'Request access for the current requester.')
         return dict(row), dict(secret) if secret else None
@@ -864,6 +873,7 @@ class Credentials:
         with self.store.connect() as conn:
             conn.begin_write()
             accepted = []
+            readable = self.readable(run['active_user_id'], conn)
             for request_id in args.request_ids:
                 row, secret = self.authorized_request(conn, run, request_id)
                 if row['provider'] == 'generic' and row['name'] == 'slack-personal':
@@ -875,7 +885,7 @@ class Credentials:
                 if row['status'] != 'provided':
                     self.acknowledge_in(conn, run['id'], run['active_message_id'], row['id'], row['generation'])
                     return self.ready(row)
-                if not secret or not self.permitted(secret, run, run['active_user_id']):
+                if not secret or not self.permitted(secret, run, run['active_user_id'], conn, readable=readable):
                     return self.ready(self.reopen_in(conn, row, 'unavailable', run))
                 if self.status(secret) != 'active':
                     return self.ready(self.reopen_in(conn, row, self.status(secret), run))
@@ -898,7 +908,8 @@ class Credentials:
             if (row['status'] != 'provided' or not secret or row['revision'] != args.revision
                     or row['secret_revision'] != secret['revision']):
                 return {'status': 'stale', 'message': 'Access changed since this command. Check the current connection before continuing.'}
-            if not self.permitted(secret, run, run['active_user_id']):
+            readable = self.readable(run['active_user_id'], conn)
+            if not self.permitted(secret, run, run['active_user_id'], conn, readable=readable):
                 raise HTTPException(403, 'This access is unavailable to the current requester.')
             if args.failure == 'unknown':
                 return {'status': 'unknown', 'request_id': row['id'], 'revision': row['revision'],
@@ -906,7 +917,7 @@ class Credentials:
             if args.failure != 'permission':
                 conn.execute('UPDATE provider_secrets SET invalid_reason=? WHERE id=? AND revision=?',
                              (args.failure, secret['id'], secret['revision']))
-            replacement = self.saved_choice(conn, run, row) if args.failure != 'permission' else None
+            replacement = self.saved_choice(conn, run, row, readable=readable) if args.failure != 'permission' else None
             if replacement:
                 row = self.reuse_in(conn, row, replacement)
                 result = {**self.ready(row), 'retry_required': True,
@@ -915,7 +926,7 @@ class Credentials:
                 lookup_args = CredentialRequest(**{key: row[key] for key in
                     ('provider', 'name', 'format', 'env_var', 'reason', 'request_key', 'setup_url', 'setup_instructions')},
                     input_fields=json.loads(row['input_fields']))
-                lookup = self.source_lookup(conn, run, lookup_args) if args.failure != 'permission' else None
+                lookup = self.source_lookup(conn, run, lookup_args, readable) if args.failure != 'permission' else None
                 result = lookup or self.ready(self.reopen_in(conn, row, args.failure, run))
             self.audit_in(conn, run['active_user_id'], secret['id'], 'authentication ' + args.failure, run['id'])
         message = ('Checking alternative access' if result['status'] != 'pending' else

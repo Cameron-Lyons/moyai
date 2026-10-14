@@ -78,8 +78,13 @@ class GovernanceAudit:
             raise HTTPException(422, 'Choose an audit page size from 1 to 100.')
         state = self.read_cursor(cursor) if cursor else None
         with self.store.connect() as conn:
-            conn.begin_write()
-            self.index_in(conn)
+            if state:
+                # A cursor's cap fixes its snapshot, so later index rows cannot enter
+                # it; skip the writer lock and full source scan for earlier pages.
+                conn.begin_read()
+            else:
+                conn.begin_write()
+                self.index_in(conn)
             cap = state['cap'] if state else conn.execute(
                 'SELECT coalesce(max(delivery),0) AS n FROM governance_audit_index').fetchone()['n']
             before = state['before'] if state else cap + 1

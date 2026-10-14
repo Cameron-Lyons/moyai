@@ -228,12 +228,15 @@ class Automations:
         if row['owner_id'] != self.actor(request) and not (pausing and self.security.role(request) == 'admin'):
             raise HTTPException(403, 'Only the owner can edit or run this automation. Administrators can pause it.')
 
-    def validate_execution(self, definition, owner_id):
+    def validate_execution(self, definition, owner_id, conn=None):
+        # set_state passes its writer: governance reads must not borrow a second
+        # pool connection while holding the PostgreSQL writer lock.
         if self.security.user_roles:
-            self.security.user_roles.require_actor(owner_id, 'sessions.create')
+            self.security.user_roles.require_actor(owner_id, 'sessions.create', connection=conn)
         profiles = getattr(self.store, 'security_profiles', None)
+        policy = None
         if profiles:
-            policy = json.loads(profiles.binding(definition.security_profile_id, provider=self.settings.sandbox_provider)['security_policy'])
+            policy = json.loads(profiles.binding(definition.security_profile_id, provider=self.settings.sandbox_provider, conn=conn)['security_policy'])
             if policy['connected_apps'] is not None and not set(definition.plugins) <= set(policy['connected_apps']):
                 raise HTTPException(422, 'The security policy does not allow all selected apps.')
             if (definition.repo_url or definition.github_repository_id) and (
@@ -243,7 +246,7 @@ class Automations:
         # Re-evaluate access at every launch; saved workflows confer no new rights.
         if 'slack' in definition.plugins and self.connectors.personal_slack.configured(owner_id):
             raise HTTPException(409, 'Personal Slack is not supported in automations. Use a private web chat, or disconnect personal Slack in Connections.')
-        owners = self.store.rows('SELECT * FROM users WHERE id=?', (owner_id,))
+        owners = self.store.rows('SELECT * FROM users WHERE id=?', (owner_id,), connection=conn)
         if not owners or (owners[0]['kind'] in {'google', 'cloudflare'} and (not self.settings.person_login_enabled() or owners[0]['email'].rpartition('@')[2] not in self.settings.google_domains())):
             raise HTTPException(409, 'The automation owner no longer has workspace access.')
         if owners[0]['kind'] == 'shared' and not (self.security.local_preview() or self.settings.password_login_enabled):
@@ -256,7 +259,13 @@ class Automations:
         if not set(definition.plugins) <= enabled:
             raise HTTPException(409, 'Connect and enable the selected apps before running this automation.')
         self.settings.harness_model(definition.harness, definition.model)
-        self.environments.choose(definition.environment_id, definition.repo_url, definition.github_repository_id)
+        selected = self.environments.choose(definition.environment_id, definition.repo_url, definition.github_repository_id)
+        if selected and definition.environment_id not in {'auto', ''}:
+            # Launch falls back from an auto selection; an explicit one fails now.
+            denial = self.environments.access_denial(
+                {'owner_id': owner_id, 'security_policy': json.dumps(policy) if policy else ''}, selected, conn=conn)
+            if denial:
+                raise HTTPException(403, denial)
 
     def public(self, row, actor):
         result = {key: row[key] for key in ('id', 'owner_id', 'revision', 'synced_revision', 'paused', 'sync_error', 'created_at', 'updated_at')}
@@ -370,7 +379,7 @@ class Automations:
                     raise HTTPException(409, 'Enable Temporal before enabling automatic runs.')
                 if not self.events.ready(row):
                     raise HTTPException(409, 'Configure the webhook or Slack connection before enabling this trigger.')
-                self.validate_execution(Definition.model_validate_json(row['definition']), row['owner_id'])
+                self.validate_execution(Definition.model_validate_json(row['definition']), row['owner_id'], conn)
                 if any(t.event and t.event.provider == 'session' for t in Definition.model_validate_json(row['definition']).triggers):
                     self.events.seed_session_cursor(conn, automation_id)
             conn.execute("UPDATE automations SET paused=?,revision=revision+1,updated_at=?,sync_error='' WHERE id=?",

@@ -849,3 +849,89 @@ def test_supervisor_launcher_can_resume_flat_and_packaged_runtimes(tmp_path, pac
         check=True, capture_output=True, text=True, timeout=10,
     )
     assert json.loads(result.stdout) == ['packaged' if packaged else 'legacy', 'read', '/journal', '42']
+
+
+def governed(manager, run_id):
+    """Attach live roles and provisioning to the durable fixture; return identity helpers."""
+    from app.scim import initialize_schema
+    from app.user_roles import UserRoles
+    store = manager.store
+    manager.settings.google_allowed_domains = 'example.com'
+    store.user_roles = UserRoles(store, manager.settings)
+    initialize_schema(store)
+
+    def person(name):
+        return store.identity({'method': 'google', 'identity': {'email': name + '@example.com', 'sub': name}})
+
+    def deactivate(name):
+        store.execute("""INSERT INTO scim_users(id,external_id,user_name,profile,active,deleted_at,created_at,updated_at,revision)
+            VALUES(?,'',?,'{}',0,'','now','now',1)""", (name, name + '@example.com'))
+
+    bob = person('bob')
+    store.execute('UPDATE runs SET owner_id=?,active_user_id=? WHERE id=?', (bob, bob, run_id))
+    store.execute("UPDATE messages SET user_id=? WHERE run_id=?", (bob, run_id))
+    return person, deactivate, bob
+
+
+@pytest.mark.parametrize('warm', [False, True])
+async def test_denied_requester_fails_only_their_input_and_never_gets_a_machine(durable, warm):
+    manager, cloud, run_id = durable
+    manager.settings.sandbox_idle_seconds = 300 if warm else 0
+    person, deactivate, bob = governed(manager, run_id)
+    await drive(manager, run_id, phase='warm' if warm else 'idle')
+    alice = person('alice')
+    # Admission checks each input's own sender, not the previous turn's.
+    manager.store.enqueue_message(run_id, 'Alice follow up', 'alice-input', user_id=alice)
+    manager.store.enqueue_message(run_id, 'Bob follow up', 'bob-input', user_id=bob)
+    deactivate('alice')
+    for _ in range(60):
+        await manager.advance(run_id)
+        statuses = {m['content']: m['status'] for m in manager.store.messages(run_id) if m['role'] == 'user'}
+        if statuses['Bob follow up'] == 'completed':
+            break
+    assert statuses['Alice follow up'] == 'failed' and statuses['Bob follow up'] == 'completed', statuses
+    answers = [m for m in manager.store.messages(run_id) if m['role'] == 'assistant']
+    assert any('deactivated' in m['content'] for m in answers)
+    assert len(cloud.launches) == 2 and len(cloud.machines) == (1 if warm else 2)
+    assert manager.store.run(run_id)['active_user_id'] == bob
+
+
+async def test_deactivated_sole_requester_settles_instead_of_retrying_forever(durable):
+    manager, cloud, run_id = durable
+    _, deactivate, _ = governed(manager, run_id)
+    deactivate('bob')
+    for _ in range(3):
+        await manager.advance(run_id)  # Never raises into the activity's unlimited retries.
+    message = next(m for m in manager.store.messages(run_id) if m['role'] == 'user')
+    assert message['status'] == 'failed' and manager.store.run(run_id)['status'] == 'failed'
+    assert not cloud.launches and not cloud.machines
+
+
+async def test_warm_policy_error_or_stop_releases_the_machine(durable, monkeypatch):
+    from fastapi import HTTPException
+    from app.security_profiles import SecurityProfiles
+    manager, cloud, run_id = durable
+    manager.settings.sandbox_idle_seconds = 600
+    SecurityProfiles(manager.store, manager.settings)
+    await drive(manager, run_id, phase='warm')
+    def broken(*args, **kwargs):
+        raise HTTPException(409, 'Allow the broker hostname in Substrate egress settings.')
+    monkeypatch.setattr(SecurityProfiles, 'network_hosts', broken)
+    # A policy error ends reuse; it never keeps the machine or escapes advance().
+    await manager.advance(run_id)
+    assert not cloud.machines[0].alive and manager.state(run_id)['phase'] == 'idle'
+
+
+async def test_network_restricted_machine_stays_warm_across_reuse(durable, monkeypatch):
+    from app.security_profiles import SecurityProfiles
+    manager, cloud, run_id = durable
+    manager.settings.sandbox_idle_seconds = 600
+    SecurityProfiles(manager.store, manager.settings)
+    monkeypatch.setattr(SecurityProfiles, 'network_hosts', lambda self, run, **kwargs: ['a.example.com', 'broker.example.com'])
+    await drive(manager, run_id, phase='warm')
+    assert manager.state(run_id)['security_network'] == ['a.example.com', 'broker.example.com']
+    manager.store.enqueue_message(run_id, 'Follow up', 'follow-up-input')
+    await drive(manager, run_id, phase='monitor')
+    await drive(manager, run_id, phase='warm')
+    assert manager.state(run_id)['security_network'] == ['a.example.com', 'broker.example.com']
+    assert len(cloud.machines) == 1 and cloud.machines[0].alive and len(cloud.launches) == 2

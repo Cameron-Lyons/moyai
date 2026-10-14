@@ -37,7 +37,9 @@ async def test_worker_replacement_reuses_live_sandbox_and_rollback_handles_new_w
         return app.state.manager
 
     old, candidate = worker('a' * 40), worker('b' * 40)
-    run = control.state.store.create_run('Keep the live sandbox', '', 'modal', [], chat_enabled=True)
+    # Broker admission checks the run's requester; use the local preview owner.
+    run = control.state.store.create_run('Keep the live sandbox', '', 'modal', [], chat_enabled=True,
+                                         user_id=control.state.store.identity({'method': 'local', 'role': 'admin'}))
     cloud = Cloud(monkeypatch, control.state.store, run['id'])
     cloud.finished = False
     for manager in (old, candidate):

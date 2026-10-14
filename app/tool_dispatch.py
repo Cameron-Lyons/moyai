@@ -68,7 +68,10 @@ class ToolDispatch:
             if run and profiles:
                 from .connectors import TOOLS
                 spec = TOOLS.get(body.name)
-                if not profiles.allowed_tool(dict(run), body.name, spec[0] if spec else None, spec[1] if spec else False):
+                # Read the policy in this transaction: borrowing another pooled
+                # connection while holding the session lock can exhaust the pool.
+                if not profiles.allowed_tool(dict(run), body.name, spec[0] if spec else None, spec[1] if spec else False,
+                                             conn=conn):
                     raise ToolRejected(403, 'This operation is disabled by the session security profile.')
             self.metadata = {'request_id': body.request_id, 'signature': signature,
                              'turn_id': caller['active_message_id'], 'input_id': body.input_id,

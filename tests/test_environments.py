@@ -67,7 +67,8 @@ def test_pin_once_checkpoint_precedence_and_opt_out(workspace):
     app, _ = workspace
     env, store = app.state.environments, app.state.store
     build_id = prepared(env)
-    run = store.create_run('Use this project', '', 'modal', [], chat_enabled=True)
+    # Environment access is checked against the requester; ownerless runs have none.
+    run = store.create_run('Use this project', '', 'modal', [], chat_enabled=True, user_id='shared:local:admin')
     context = env.bind(run['id'])
     assert context['build_id'] == build_id and context['snapshot_id'] == 'im-project'
     assert store.run(run['id'])['repo_url'] == ''  # Preserve original submission for idempotent retries.
@@ -506,3 +507,36 @@ def test_environment_launcher_imports_real_sibling_helpers(tmp_path, packaged):
     )
     assert json.loads(result.stdout) == {'done': False}
     assert journal.is_dir()
+
+
+def test_prepared_environments_follow_requester_role_and_session_policy(users_app):
+    from test_enterprise_roles import assign, create_role
+    app, client = users_app
+    env, store = app.state.environments, app.state.store
+    sign_as(app, client, 'maya@berri.ai')
+    maya = store.identity({'method': 'google', 'identity': {'email': 'maya@berri.ai', 'sub': 'maya'}})
+    env.save_recipe('e' * 32, SaveRecipe(recipe=recipe(clone_access='github')), 'admin')
+    build = env.enqueue('e' * 32, 1, 'admin')
+    env.update(build['id'], phase='ready', snapshot_id='im-private', commit_sha='a' * 40)
+    store.execute('UPDATE environments SET enabled=1,is_default=1,active_build=? WHERE id=?', (build['id'], 'e' * 32))
+    sign_as(app, client, 'tin@berri.ai')
+    create_role(client, 'session-only', ['workspace.read', 'sessions.read', 'sessions.create'])
+    assert assign(client, role_id='session-only').status_code == 200
+    # A private checkout made with the GitHub App never reaches a role without access.
+    auto = store.create_run('Use the default', '', 'modal', [], chat_enabled=True, user_id=maya)
+    assert env.bind(auto['id']) == {} and store.run(auto['id'])['environment_build_id'] == 'none'
+    assert any('Starting without the prepared environment' in e['message'] for e in store.events(auto['id']))
+    explicit = store.create_run('Use this project', '', 'modal', [], chat_enabled=True, user_id=maya, environment_id='e' * 32)
+    with pytest.raises(HTTPException) as error:
+        env.bind(explicit['id'])
+    assert error.value.status_code == 403
+    update = {'id': 'session-only', 'name': 'Session-Only', 'description': 'Reviewed workspace role', 'revision': 1,
+              'permissions': ['workspace.read', 'sessions.read', 'sessions.create', 'environments.read', 'connections.read']}
+    assert client.put('/api/admin/roles/session-only', json=update).status_code == 200
+    allowed = store.create_run('Use the default', '', 'modal', [], chat_enabled=True, user_id=maya)
+    assert env.bind(allowed['id'])['snapshot_id'] == 'im-private'
+    # The session profile still decides whether a repository checkout is allowed.
+    profile = client.post('/api/admin/security-profiles', json={'name': 'No Git', 'policy': {'git_access': 'none'}}).json()
+    restricted = store.create_run('Use the default', '', 'modal', [], chat_enabled=True, user_id=maya)
+    app.state.security_profiles.bind_session(store.run(restricted['id']), profile['id'])
+    assert env.bind(restricted['id']) == {}

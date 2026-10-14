@@ -8,7 +8,7 @@ on:
       - 'tests/**.cjs'
       - 'tests/browser/**'
       - 'tests/helpers/**'
-      - 'scripts/settings_ui_preview.cjs'
+      - 'scripts/*.cjs'
       - 'scripts/session_ui_demo.py'
       - 'package*.json'
       - 'tsconfig.json'

@@ -30,6 +30,9 @@ jobs:
       - name: Test Cloudflare identity gate and sandbox transport
         if: matrix.group == 'security'
         run: uv run --python 3.13 pytest -q --tb=line tests/test_cloudflare_access.py tests/test_cloudflare_login.py tests/test_access_transport.py
+      - name: Test workspace roles, provisioning and session security policies
+        if: matrix.group == 'security'
+        run: uv run --frozen --python 3.13 pytest -q --tb=short tests/test_enterprise_roles.py tests/test_user_roles.py tests/test_scim.py tests/test_security_profiles.py tests/test_governance_audit.py tests/test_governance_integration.py tests/test_governance_sessions.py tests/test_organization_isolation.py tests/test_session_read.py
       - name: Test personal memory ownership, capture and privacy
         if: matrix.group == 'interfaces'
         run: uv run --python 3.13 pytest -q --tb=line tests/test_memory.py tests/test_memory_review.py tests/test_skill_learning.py tests/test_initial_context.py tests/test_skills.py tests/test_bundled_skills.py

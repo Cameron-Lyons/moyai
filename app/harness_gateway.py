@@ -138,7 +138,7 @@ class HarnessGateway:
         return [fit_context(context, allocation) for context in contexts]
 
     async def context_window(self, run_id, request):
-        run = self.require_run(run_id, request)
+        run = await database(self.require_run, run_id, request)
         try:
             model = self.settings.resolve_model(fallback=run['active_model'] or run['model'])
         except ValueError as exc:
@@ -148,13 +148,13 @@ class HarnessGateway:
         # The SDK cannot see broker-injected context. Reserve its byte bound as
         # well as room for a new tool result before the next native compact.
         window = max(1, budget.input_budget - len(context.encode()) - 4096)
-        self.require_run(run_id, request)
+        await database(self.require_run, run_id, request)
         return {'model': model, 'input_budget': window, 'live_compaction': True}
 
     async def forward(self, run_id, request, route):
         if route != '/context/compact':
             return await self._forward_once(run_id, request, route)
-        self.require_run(run_id, request)
+        await database(self.require_run, run_id, request)
         # Decrypt once while the transport envelope is fresh. A valid recovery
         # can outlive its five-minute envelope TTL; authorization is still
         # rechecked for every inference attempt below.
@@ -220,7 +220,8 @@ class HarnessGateway:
                 if selected != expected_model:
                     raise HTTPException(409, 'The originating model has changed.')
             return current
-        run = current_run()
+        # Role and policy admission reads the database; keep it off the event loop.
+        run = await database(current_run)
         if not compact and self.store.goals:
             with self.store.connect() as conn:
                 goal = self.store.goals.current(conn, run_id)
@@ -351,10 +352,10 @@ class HarnessGateway:
             stage = 'admission'
             if not compact:
                 model_stage(request, stage)
-            current_run()
+            await database(current_run)
             slot_permit = await self.model_slots.acquire()
             slot_acquired = True
-            current_run()
+            await database(current_run)
             admitted = self.store.execute(
                 "UPDATE runs SET model_calls=model_calls+1,turn_model_calls=turn_model_calls+1 "
                 "WHERE id=? AND (?=0 OR (CASE WHEN chat_enabled=1 THEN turn_model_calls ELSE model_calls END)<?) "
@@ -381,7 +382,7 @@ class HarnessGateway:
                 if request.headers.get('anthropic-beta'):
                     headers['anthropic-beta'] = request.headers['anthropic-beta']
             await self.checkpoints.flush()
-            current_run()
+            await database(current_run)
             client = httpx.AsyncClient(timeout=httpx.Timeout(300, connect=30))
             base = self.settings.litellm_api_base.rstrip('/')
             upstream_route = '/v1/chat/completions' if compact else route

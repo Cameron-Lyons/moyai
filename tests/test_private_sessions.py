@@ -154,7 +154,7 @@ def test_broker_discovery_and_execution_pass_server_run(private_app, monkeypatch
     message = app.state.store.claim_message(run['id'])
     seen = []
 
-    def allowed(name, context):
+    def allowed(name, context, **options):  # e.g. a catalog's resolved policy
         assert context['private_owner_id'] == 'google:maya'
         seen.append(name)
         return True

@@ -28,7 +28,13 @@ Permission checks apply to API requests and runtime admission, not just hidden
 buttons. Broker tools are filtered and checked against their corresponding
 permissions, including direct Git, artifact, and goal transports. Permission to
 start a session does not restore removed workflow, library, or connection access.
-These checks do not make a shared conversation private.
+These checks do not make a shared conversation private. Attachment uploads are
+allowed with either `sessions.create` or `sessions.manage`. Repository context
+that Moyai adds to model requests follows `connections.read` and the session
+profile's GitHub access, like the repository tools. The Deep Agents runtime's
+internal goal channel (state reads, clock receipts and wrap-up) is not a tool
+call; a user's goal control command needs `sessions.manage` and a profile that
+allows the `goal` tool.
 
 `connections.read` allows viewing connections and using enabled app read tools.
 `connections.write` allows enabled app write tools; `connections.manage` controls
@@ -44,15 +50,24 @@ and the role editor. Relevant governance permissions are:
 | `users.read` | Read the user directory |
 | `users.manage` | Change built-in user assignments |
 | `roles.manage` | Manage custom roles, email assignments, and group grants |
-| `scim.manage` | Manage provisioning credentials and view the provisioning directory |
+| `scim.manage` | View the provisioning directory and revoke provisioning credentials |
 | `security.manage` | Manage security profiles and organization defaults |
 | `audit.read` | Read governance audit history |
 
 Use **Roles → Create role**, select catalog permissions, and save. Use **Assign
 role** to assign a built-in or custom role to a work email. The existing
-**Settings → Users** page remains available for built-in assignments. Assignments
-do not grant sign-in eligibility to an external email, and neither a Slack
-accounting link nor an unverified profile grants elevated web permissions.
+**Settings → Users** page remains available for built-in assignments; it shows a
+person's custom role and replaces it only after explicit confirmation, and only
+for an editor who also holds `roles.manage`. Assignments do not grant sign-in
+eligibility to an external email, and neither a Slack accounting link nor an
+unverified profile grants elevated web permissions.
+
+Only a built-in administrator can grant or remove Administrator access, including
+through **Settings → Users**. A delegate who holds `users.manage` or
+`roles.manage` without being a built-in administrator can create, assign, or
+group-grant only roles whose permissions the delegate already holds. Delegated
+permissions are therefore bounded by the delegate's own access, but they still
+let that person change other people's access within those bounds.
 
 Changes apply on the next authorized request. Edits use revisions; a stale edit
 returns `409` and must be reloaded. Archiving a custom role removes its permissions
@@ -61,8 +76,8 @@ role does not fall back to the internal-user defaults. Active group grants can
 still add their own permissions. Assign a replacement role before archiving when
 continued access is intended.
 
-Under **Provisioning → Assign group role**, map a provisioned group to a custom
-role or the internal-user role. Choose **No additional permissions** to remove
+Under **Roles → Directory group grants** (or **Provisioning → Assign group
+role**), map a provisioned group to a custom role or the internal-user role. Choose **No additional permissions** to remove
 the grant. The built-in administrator role must be assigned directly to a person;
 it cannot be assigned to a directory group. User deactivation, group deletion,
 membership removal, and role archival remove the corresponding group permissions.
@@ -70,12 +85,18 @@ membership removal, and role archival remove the corresponding group permissions
 Built-in administrator demotion and SCIM deactivation/deletion run their
 last-administrator checks inside the same serialized transaction as the change.
 Keep at least one eligible active administrator. Concurrent attempts to deactivate
-the final two administrators cannot remove both.
+the final two administrators cannot remove both. The checks protect the last
+*active* administrator: a deactivated administrator can still be demoted, so
+reprovisioning that email later does not silently restore administrator access.
 
 ## Connect an identity provider with SCIM
 
-1. In **Provisioning**, select **Create token** and give the credential a useful
-   label, such as the directory provider and environment.
+1. As a built-in administrator, open **Provisioning**, select **Create token**,
+   and give the credential a useful label, such as the directory provider and
+   environment. A provisioning credential controls directory membership,
+   group-derived permissions, and deactivation, so only the built-in
+   Administrator can create one; `scim.manage` can view the directory and revoke
+   credentials.
 2. Copy the bearer token immediately. It is shown only once. The server stores
    its SHA-256 hash, a nonsecret prefix, and lifecycle metadata, not the bearer
    secret. Browser and SCIM cookies cannot substitute for this credential.
@@ -138,19 +159,29 @@ supported.
 Groups support `displayName`, `externalId`, and direct User `members`. Membership
 values must reference existing, nondeleted provisioned user IDs. Nested groups
 are unsupported. Group updates and all their membership changes commit together;
-an invalid member rolls the update back. Group names are unique case-insensitively
+an invalid member rolls the update back. Updates write only the membership
+change, so one join or leave in a large group stays a small write. Group names are unique case-insensitively
 among live groups; nonempty external IDs are unique within each live resource
 type.
 
 `PATCH` uses `urn:ietf:params:scim:api:messages:2.0:PatchOp` with an `Operations`
 array. Supported operations are `add`, `replace`, and `remove`, with direct
 supported attribute paths, individual `name` subattributes, or object-valued
-add/replace without a path. Group membership additions/replacements use arrays;
-removing all `members` or one `members[value eq "<user-id>"]` is supported.
+add/replace without a path. Group membership additions/replacements use arrays.
+Remove `members` without a value to remove every member, with a value array
+(Microsoft Entra ID's default form) to remove only the listed members, or with a
+`members[value eq "<user-id>"]` path to remove one member. `add` or `replace` on
+`name` merges the supplied sub-attributes, and `add` on `emails` appends new
+entries. `active` accepts JSON booleans and, in PATCH only, Entra's string forms
+`"True"` and `"False"`. An unchanged `id` repeated in a no-path value is ignored.
 Unsupported filtered paths fail explicitly. Required/immutable/read-only
 attributes cannot be removed or rewritten through PATCH.
 
-Lists accept only `filter`, `startIndex`, and `count`. Pagination starts at 1,
+Lists accept `filter`, `startIndex`, `count`, and either `attributes` or
+`excludedAttributes`; reads of a single resource accept the latter two.
+Projections name supported top-level attributes (optionally with the core schema
+URN prefix); `schemas`, `id`, and `meta` are always returned, and `userName` or
+`displayName` cannot be excluded. Pagination starts at 1,
 returns at most 100 resources, and reports `totalResults`, `startIndex`, and
 `itemsPerPage`; `count=0` returns metadata without resources. Each request is a
 fresh list, so concurrent provisioning can change pages. Supported filters are:
@@ -162,7 +193,7 @@ fresh list, so concurrent provisioning can change pages. Supported filters are:
 
 User-name and group-display-name comparisons ignore case; IDs/external IDs retain
 their exact values. Boolean filter values must be unquoted. Compound filters,
-other operators, attribute projection, sorting, bulk operations, `.search`,
+other operators, sub-attribute projection, sorting, bulk operations, `.search`,
 password changes, and ETags are not implemented. Unsupported query/filter forms
 return an error rather than silently broadening the result. Requests are limited
 to 2 MiB, PATCH to 100 operations, groups to 10,000 submitted members, and user
@@ -172,13 +203,19 @@ surface before relying on automated provisioning.
 ### Deactivation and retained identities
 
 For a provisioned email, `active: false` invalidates existing signed-in access on
-the next request and denies new runtime/tool admissions. Known Slack senders are
+the next request and denies new runtime/tool admissions. Open activity streams
+recheck access about every 10 seconds and close when access ends. A queued
+durable turn whose requester was deactivated, or lacks permission, fails with a
+visible error instead of retrying; other people's queued messages still run. Known Slack senders are
 checked through their profile email and linked identity. A directory with SCIM
 entries requires an unknown Slack sender to obtain a verified provider profile
 before accepting work; enable Slack identity linking and the existing
-`users:read` and `users:read.email` scopes. Missing profile permissions or lookup
-failures fail closed. Already-running unknown Slack actors also cannot continue
-through the broker until mapped to a verified profile.
+`users:read` and `users:read.email` scopes. Missing profile permissions fail
+closed. A transient profile-lookup failure leaves a recent request retryable
+rather than discarding it; requests older than ten minutes fail closed. The check
+gates work admission only: thread observations and Slack event automations still
+receive messages from other participants. Already-running unknown Slack actors
+also cannot continue through the broker until mapped to a verified profile.
 
 Deletion returns `204`, removes membership, and hides the resource from SCIM
 reads. An inactive email tombstone remains so a saved session cannot regain
@@ -217,7 +254,11 @@ policy** select a profile; an empty selection uses the organization default.
 Saving a session pins the selected revision and a serialized policy snapshot.
 Editing that profile later affects future bindings, not the saved snapshot.
 Children and side chats inherit restrictions from their ancestors; selecting a
-broader child profile cannot loosen them. The current mandatory policy intersects
+broader child profile cannot loosen them. Delegated agents and swarm workers
+inherit their parent's effective policy plus the mandatory policy; the
+organization default applies only to new top-level sessions, side chats, and
+workflows with no selection. An agent that creates or changes a workflow through
+its tools must select a policy at least as restrictive as its own session. The current mandatory policy intersects
 with those snapshots at execution, so it can further restrict existing sessions.
 Relaxing the mandatory policy does not relax an already-pinned stricter snapshot.
 Create a new session when broader authorized access is needed.
@@ -225,8 +266,9 @@ Create a new session when broader authorized access is needed.
 An enabled profile used as the default or mandatory policy cannot be disabled
 until removed from those defaults. Profile/default edits are revision checked.
 Changing the mandatory **network** restriction requires releasing live session
-computers and independent-runtime guests first; the server returns `409` while
-any such machine remains. Let work finish and release its retained machines,
+computers, warm durable machines, and independent-runtime guests first; the
+server returns `409` while any such machine remains. Completed sessions do not
+count. Let work finish and release its retained machines,
 then retry the change. Closing a Computer tab alone is not a machine release.
 
 ### Network and provider enforcement
@@ -256,8 +298,12 @@ harness's native shell commands or prevent local file edits. For native shell,
 browser, and other guest network activity, use the provider-enforced domain policy.
 This is a host-level egress boundary, not a URL-path allowlist or a promise to
 filter content sent to an allowed host. Prepared project builds remain their
-separate administrator-managed setup workflow; select suitable setup recipes and
-provider access for those builds.
+separate setup workflow managed by holders of `environments.manage`. That
+permission controls the images sessions start from, so treat it as highly
+privileged. Using a prepared environment requires `environments.read`: an
+automatic selection starts without it and an explicit selection is rejected.
+Environments that clone from GitHub also require `connections.read` and a session
+profile that allows GitHub read access.
 
 ## Audit history and API routes
 
@@ -284,10 +330,15 @@ not an audit of every model request, file read, or tool action; see existing
 | `GET /api/admin/governance/audit` | Shared governance feed |
 
 Browser mutations retain origin/CSRF checking. Each governance route requires
-its corresponding catalog permission. Audit pages default to 50 entries and
+its corresponding catalog permission; creating a provisioning credential also
+requires the built-in Administrator. Changing the sandbox provider
+(`PUT /api/settings/sandboxes`) remains a built-in Administrator action, because
+the provider receives every session's materialized credentials; `runtime.manage`
+covers performance, capacity, and pull-request analytics and session-title
+settings. Audit pages default to 50 entries and
 allow 1–100; follow `next_cursor` for earlier entries in the same snapshot.
-Cursors are signed and expire after 24 hours. Refresh to see changes committed
-after the first page.
+Cursors are signed and expire after 24 hours, and later pages are served from a
+read snapshot. Refresh to see changes committed after the first page.
 
 ## Operator rollout and verification
 
@@ -326,14 +377,14 @@ roles do not perform feature DDL during normal startup. Run the focused local
 regressions against the repository's pinned environment:
 
 ```sh
-uv run --frozen --python 3.13 pytest -q tests/test_enterprise_roles.py tests/test_scim.py tests/test_security_profiles.py tests/test_governance_audit.py tests/test_governance_integration.py tests/test_user_roles.py tests/test_cloudflare_access.py tests/test_schema_migrations.py
+uv run --frozen --python 3.13 pytest -q tests/test_enterprise_roles.py tests/test_scim.py tests/test_security_profiles.py tests/test_governance_audit.py tests/test_governance_integration.py tests/test_governance_sessions.py tests/test_organization_isolation.py tests/test_user_roles.py tests/test_cloudflare_access.py tests/test_schema_migrations.py
 ```
 
 For database conformance, use a **disposable** PostgreSQL database; the existing
 test harness creates and removes isolated schemas:
 
 ```sh
-MOYAI_TEST_POSTGRES_URL=postgresql:///postgres uv run --frozen --python 3.13 pytest --postgres-backend -q tests/test_enterprise_roles.py tests/test_scim.py tests/test_security_profiles.py tests/test_governance_audit.py
+MOYAI_TEST_POSTGRES_URL=postgresql:///postgres uv run --frozen --python 3.13 pytest --postgres-backend -q tests/test_enterprise_roles.py tests/test_scim.py tests/test_security_profiles.py tests/test_governance_audit.py tests/test_governance_integration.py tests/test_governance_sessions.py tests/test_organization_isolation.py
 ```
 
 These tests cover real application authorization and database transactions with
@@ -368,17 +419,22 @@ The ID scopes infrastructure defaults idempotently:
 
 | Resource | Organization-specific name |
 | --- | --- |
-| Temporal namespace and task queue | Append `-org-<id>` |
+| Temporal task queue | Append `-org-<id>` |
+| Temporal namespace | Not derived: set `TEMPORAL_NAMESPACE` to the organization's own provisioned namespace (Temporal Cloud IDs are `<name>.<account>`); startup refuses `default` when Temporal is enabled |
 | Modal app and checkpoint volume | Append `-org-<id>`; the Modal deployment wrapper also scopes its configuration secret |
 | Substrate atespace | Append `-org-<id>` |
 | Object storage and Lambda checkpoint prefixes | Append `/organizations/<id>` |
 
-Names retain the provider length limits. Configuration round trips and saved
-sandbox settings do not append the suffix twice. Provision the derived Temporal
+Names retain the provider length limits; a scoped object-storage prefix that
+would exceed its limit fails on first startup. Configuration round trips and
+saved sandbox settings do not append the suffix twice. Provision the Temporal
 namespace, Substrate atespace/templates, and other required resources through
-their existing setup procedures before admitting work. Inspect the effective ID
-and namespace values through authenticated `GET /api/organization`; its
-`deployment` object reports the dedicated-deployment metadata. See the
+their existing setup procedures before admitting work. `GET /api/organization`
+returns the organization ID to every signed-in user; its `deployment` object,
+with namespace and prefix values, is returned only to holders of
+`runtime.manage` or `organization.manage`. An unpinned legacy deployment reports
+`deployment_mode: "legacy"`. Storage maintenance commands verify the
+organization pin before touching object storage. See the
 [Substrate](substrate.md) and [Lambda MicroVM](aws-lambda-microvms.md) setup guides
 for those providers.
 

@@ -13,6 +13,8 @@ from .automation_permissions import AutomationPermissions, Permission
 from .automation_history import History, DESCRIPTION as HISTORY_DESCRIPTION, read_history
 from .automation_events import WebhookSetup
 from .connector_errors import ConnectorError
+from .db import database
+from .security_profiles import intersect
 
 
 class Arguments(BaseModel):
@@ -169,11 +171,24 @@ class AutomationTools:
             raise HTTPException(404, 'Automation not found for the current requester.')
         return rows[0]
 
+    def check_policy(self, run, definition):
+        # Saved work must not escape the restrictions of the session creating it.
+        profiles = getattr(self.store, 'security_profiles', None)
+        if not profiles:
+            return
+        with self.store.connect() as conn:
+            conn.begin_read()
+            selected = json.loads(profiles.binding(definition.security_profile_id, conn=conn,
+                provider=self.service.settings.sandbox_provider)['security_policy'])
+            if intersect(profiles.effective(run, conn), selected) != selected:
+                raise HTTPException(403, 'Select a security policy at least as restrictive as this session.')
+
     async def check_scope(self, run, definition):
         if not set(definition.plugins) <= set(run['plugins']):
             raise HTTPException(403, 'Select the required connections for this chat before scheduling work with them.')
         if definition.mode != run['mode']:
             raise HTTPException(403, 'Use the current chat’s execution mode for its automation.')
+        await database(self.check_policy, run, definition)
         try:
             await self.service.identify_repositories(definition)
         except ConnectorError as exc:

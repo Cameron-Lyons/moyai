@@ -787,9 +787,11 @@ def _create_app(settings, store):
     @app.get("/api/organization")
     async def organization(request: Request):
         security.require(request)
+        # Provider namespaces are operator details; members only need the ID.
+        operator = bool(security.permissions(request) & {'runtime.manage', 'organization.manage'})
         return {"name": store.rows("SELECT name FROM organization WHERE id=1")[0]["name"],
                 "id": settings.moyai_organization_id,
-                "deployment": store.organization_scope.metadata(),
+                **({"deployment": store.organization_scope.metadata()} if operator else {}),
                 "role": security.role(request), "member_access_configured": bool(settings.workspace_member_password) or settings.person_login_enabled(),
                 "google_signin": settings.google_enabled(),
                 "slack_sessions": slack.status(),
@@ -877,9 +879,16 @@ def _create_app(settings, store):
             model = settings.harness_model(harness, requested_model)
         except ValueError as exc:
             raise HTTPException(422, str(exc))
-        security_fields = await database(security_profiles.binding, body.security_profile_id,
-                                         provider=settings.sandbox_provider,
-                                         parent_run_id=body.side_chat_of)
+        session = await database(security.session_info, request)
+        if not session:
+            raise HTTPException(401, 'Sign in to the workspace.')
+        user_id = await database(store.identity, session)
+        # A retry returns the session admitted under the policy then in force,
+        # even after the defaults, floor or its profile changed.
+        admitted = await database(store.admitted_security, body.client_id, user_id) if body.client_id else None
+        security_fields = admitted or await database(security_profiles.binding, body.security_profile_id,
+                                                     provider=settings.sandbox_provider,
+                                                     parent_run_id=body.side_chat_of)
         selected_policy = json.loads(security_fields['security_policy'])
         if selected_policy['connected_apps'] is not None and not set(body.plugins) <= set(selected_policy['connected_apps']):
             raise HTTPException(422, 'The selected security policy does not allow all selected apps.')
@@ -905,17 +914,14 @@ def _create_app(settings, store):
             body.github_repository_id = identity
         if body.mode == "modal" and not metadata_request:
             await database(environments.choose, body.environment_id, body.repo_url, body.github_repository_id)
-        session = await database(security.session_info, request)
-        if not session:
-            raise HTTPException(401, 'Sign in to the workspace.')
-        user_id = await database(store.identity, session)
         try:
             run = await database(store.create_run, body.prompt, body.repo_url, body.mode, sorted(set(body.plugins)), chat_enabled=body.chat_enabled or settings.temporal_enabled, model=model, user_id=user_id,
                                    attachment_ids=body.attachment_ids, client_id=body.client_id, environment_id=body.environment_id, side_chat_of=body.side_chat_of, harness=harness, github_repository_id=body.github_repository_id, metadata_request=metadata_request,
                                    swarm_budget_seconds=body.swarm.budget_seconds if body.swarm else None,
                                    durable_submit=manager.submit_in if body.swarm else None,
                                    swarm_bootstrap=manager.swarms.bootstrap_in if body.swarm else None, received_at=received_at, private_owner_id=private_owner_id,
-                                   security_fields=security_fields)
+                                   security_fields=security_fields, requested_profile_id=body.security_profile_id,
+                                   replay=admitted is not None)
         except ValueError as exc:
             raise HTTPException(429 if 'queue' in str(exc) else 409, str(exc))
         await checkpoints.flush()
@@ -1227,6 +1233,10 @@ def _create_app(settings, store):
         if not store.rows('SELECT 1 FROM runs WHERE id=?', (run_id,)):
             raise HTTPException(404, 'Task not found')
 
+    # An open stream never makes a next request. Recheck deactivation, roles and
+    # privacy periodically, not on every half-second poll.
+    app.state.event_reauthorize_seconds = 10
+
     @app.get("/api/runs/{run_id}/events")
     async def events(run_id: str, request: Request, after: int = 0):
         await run_in_threadpool(require_event_run, run_id, request)
@@ -1237,7 +1247,15 @@ def _create_app(settings, store):
 
         async def stream():
             cursor = max(after, last_id, 0)
+            authorized = time.monotonic()
             while not await request.is_disconnected():
+                if time.monotonic() - authorized >= app.state.event_reauthorize_seconds:
+                    try:
+                        await run_in_threadpool(require_event_run, run_id, request)
+                    except HTTPException:
+                        yield "event: unauthorized\ndata: {}\n\n"
+                        break
+                    authorized = time.monotonic()
                 row, batch, status = await run_in_threadpool(read_event_batch, run_id, cursor)
                 if row is None:
                     yield "event: deleted\ndata: {}\n\n"
@@ -1386,6 +1404,16 @@ def _create_app(settings, store):
             observation.setdefault('run', dict(run))
         return run
 
+    def require_capability(run, name, permission=None, provider=None, write=False):
+        """Role and session-policy admission on one connection; returns the policy."""
+        with store.connect() as conn:
+            conn.begin_read()
+            if permission:
+                user_roles.require_actor(run['active_user_id'] or run['owner_id'], permission, connection=conn)
+            policy = security_profiles.effective(run, conn)
+        security_profiles.require_tool(run, name, provider, write, policy=policy)
+        return policy
+
     from .broker_payloads import BrokerPayloads
     broker_payloads = BrokerPayloads(store, security)
 
@@ -1416,9 +1444,8 @@ def _create_app(settings, store):
                         route == '/control' and isinstance(body, dict) and body.get('receipt_only') is True or
                         route == '/payloads' and isinstance(body, dict) and body.get('route') == '/context/native')
         admission = require_run_state if receipt_only else require_run
-        await asyncio.to_thread(admission, request.path_params['run_id'], request)
+        caller = await asyncio.to_thread(admission, request.path_params['run_id'], request)
         if isinstance(body, dict) and 'moyai_payload' in body:
-            caller = await asyncio.to_thread(admission, request.path_params['run_id'], request)
             return await asyncio.to_thread(broker_payloads.resolve, caller, route, body)
         return body
 
@@ -1473,17 +1500,17 @@ def _create_app(settings, store):
     def workspace_catalog(run):
         from .tool_schema_cache import tool_schema
         from .session_journal import READ_TOOL
-        listed = [DIAGNOSTIC_TOOL, READ_TOOL, GOAL_TOOL, COMPUTER_HANDOFF] + ([COMPUTER_OPERATION_READ] if computer_operations else []) + ARTIFACT_TOOLS + ([SLACK_CONTEXT_TOOL, SLACK_PARTICIPATION_TOOL] if store.rows('SELECT 1 FROM slack_threads WHERE run_id=?', (run['id'],)) else []) + media_shares.tools() + session_lifecycle.tools(run) + model_tools.tools(run) + automation_tools.tools(run) + automations.tools(run) + memory.tools(run) + skills.tools(run) + credentials.tools(run) + coordinator.tools(run) + [{"name": name, "description": spec[3], "inputSchema": tool_schema(spec[2]), "annotations": {"readOnlyHint": not spec[1], "idempotentHint": name in RETRY_SAFE_READS}}
-                for name, spec in TOOLS.items() if spec[0] in run["plugins"] and connectors.allowed(name, run)]
+        # Resolve role and session policy once per listing, never per tool.
         with store.connect() as conn:
             conn.begin_read()
             permissions = user_roles.permissions_for_actor_in(conn, run['active_user_id'] or run['owner_id'])
+            policy = security_profiles.effective(run, conn)
+        listed = [DIAGNOSTIC_TOOL, READ_TOOL, GOAL_TOOL, COMPUTER_HANDOFF] + ([COMPUTER_OPERATION_READ] if computer_operations else []) + ARTIFACT_TOOLS + ([SLACK_CONTEXT_TOOL, SLACK_PARTICIPATION_TOOL] if store.rows('SELECT 1 FROM slack_threads WHERE run_id=?', (run['id'],)) else []) + media_shares.tools() + session_lifecycle.tools(run) + model_tools.tools(run) + automation_tools.tools(run) + automations.tools(run) + memory.tools(run) + skills.tools(run) + credentials.tools(run) + coordinator.tools(run) + [{"name": name, "description": spec[3], "inputSchema": tool_schema(spec[2]), "annotations": {"readOnlyHint": not spec[1], "idempotentHint": name in RETRY_SAFE_READS}}
+                for name, spec in TOOLS.items() if spec[0] in run["plugins"] and connectors.allowed(name, run, policy=policy)]
         return [tool for tool in listed
                 if privacy.allow_tool(run, tool["name"], TOOLS.get(tool["name"], (None, False))[1])
                 and (tool_permission(tool['name']) is None or tool_permission(tool['name']) in permissions)
-                and security_profiles.allowed_tool(run, tool['name'],
-                                                  TOOLS.get(tool['name'], (None, False))[0],
-                                                  TOOLS.get(tool['name'], (None, False))[1])]
+                and security_profiles.permits(policy, tool['name'], *TOOLS.get(tool['name'], (None, False))[:2])]
 
     @app.get("/broker/{run_id}/tools")
     def tool_list(run_id: str, request: Request):
@@ -1501,12 +1528,11 @@ def _create_app(settings, store):
 
     @app.post('/broker/{run_id}/artifacts/transfer')
     async def artifact_transfer(run_id: str, request: Request):
-        run = require_run(run_id, request)
-        await database(user_roles.require_actor, run['active_user_id'] or run['owner_id'], 'sessions.manage')
-        security_profiles.require_tool(run, 'artifact_publish')
+        run = await database(require_run, run_id, request)
+        await database(require_capability, run, 'artifact_publish', 'sessions.manage')
         try:
             body = await broker_body(request, '/artifacts/transfer')
-            await database(user_roles.require_actor, run['active_user_id'] or run['owner_id'], 'sessions.manage')
+            await database(require_capability, run, 'artifact_publish', 'sessions.manage')
             result = await asyncio.to_thread(published_artifacts.transfer, run, body)
         except ValidationError:
             raise HTTPException(422, 'Invalid artifact transfer arguments.') from None
@@ -1515,7 +1541,7 @@ def _create_app(settings, store):
 
     @app.post("/broker/{run_id}/tools/call")
     async def tool_call(run_id: str, request: Request):
-        run = require_run(run_id, request)
+        run = await database(require_run, run_id, request)
         try:
             body = ToolCall.model_validate(await broker_body(request, '/tools/call'))
         except ValidationError:
@@ -1541,12 +1567,9 @@ def _create_app(settings, store):
         return result
 
     async def execute_tool(run_id, request, run, body, dispatch):
-        permission = tool_permission(body.name)
-        if permission:
-            await database(user_roles.require_actor, run['active_user_id'] or run['owner_id'], permission)
         tool_spec = TOOLS.get(body.name)
-        security_profiles.require_tool(run, body.name, tool_spec[0] if tool_spec else None,
-                                       tool_spec[1] if tool_spec else False)
+        policy = await database(require_capability, run, body.name, tool_permission(body.name),
+                                tool_spec[0] if tool_spec else None, tool_spec[1] if tool_spec else False)
         def rejected_result(error, **fields):
             return {'error': error, **fields, **({'outcome': 'rejected', 'dispatched': False} if dispatch else {})}
 
@@ -1622,7 +1645,7 @@ def _create_app(settings, store):
                 DiagnosticArgs.model_validate(body.arguments)
             except ValidationError:
                 raise ToolRejected(422, 'Workspace diagnostics takes no arguments and only reads the current session.') from None
-            return inspect_workspace(store, connectors, run, workspace_catalog(run))
+            return await database(lambda: inspect_workspace(store, connectors, run, workspace_catalog(run)))
         if body.name in MEDIA_TOOLS:
             try:
                 result = await asyncio.to_thread(media_shares.call, run, body.name, body.arguments)
@@ -1735,7 +1758,8 @@ def _create_app(settings, store):
                     personal_slack.eligible(run, owner)
             except ConnectorError as exc:
                 return ConnectorError(str(exc), code='access_denied', dispatched=False).receipt(write=write)
-        if not connectors.allowed(body.name, run, **({'as_bot': True} if provider == 'slack' and arguments.get('as_bot') else {})):
+        bot = {'as_bot': True} if provider == 'slack' and arguments.get('as_bot') else {}
+        if not await database(connectors.allowed, body.name, run, policy=policy, **bot):
             return ConnectorError("This operation is disabled by the organization's connection policy.",
                                   code='access_denied', dispatched=False).receipt(write=write)
         if provider == 'github':
@@ -1746,8 +1770,8 @@ def _create_app(settings, store):
             run = {**run, 'github_connection_version': connectors.github.connection_version()}
         # Enabled tools, including newly registered writes, execute directly.
         # Connection policies and the live session capability still apply.
-        require_run(run_id, request)
-        if not connectors.allowed(body.name, run, **({'as_bot': True} if provider == 'slack' and arguments.get('as_bot') else {})):
+        await database(require_run, run_id, request)
+        if not await database(connectors.allowed, body.name, run, **bot):
             return ConnectorError('The organization connection changed. No action was sent.',
                                   code='access_changed', dispatched=False).receipt(write=write)
         if dispatch:
@@ -1827,13 +1851,18 @@ def _create_app(settings, store):
     goals = Goals(store)
     store.goals = goals
 
+    # The runtime's own goal channel: state reads, clock receipts, legacy import,
+    # and review/report bookkeeping that lets an existing goal wind down. Only a
+    # user's goal control command changes a goal here, so only it needs the
+    # goal tool and sessions.manage; a disabled tool or role never blocks turns.
+    GOAL_RUNTIME_ACTIONS = ('get', 'tick', 'import', 'review', 'report')  # Tuple: an action may be unhashable.
+
     @app.post('/broker/{run_id}/goal')
     async def goal_clock(run_id: str, request: Request):
-        caller = require_run(run_id, request)
-        await database(user_roles.require_actor, caller['active_user_id'] or caller['owner_id'], 'sessions.manage')
-        security_profiles.require_tool(caller, 'goal')
+        caller = await database(require_run, run_id, request)
         body = await broker_body(request, '/goal')
-        await database(user_roles.require_actor, caller['active_user_id'] or caller['owner_id'], 'sessions.manage')
+        if not isinstance(body, dict) or body.get('action') not in GOAL_RUNTIME_ACTIONS:
+            await database(require_capability, caller, 'goal', tool_permission('goal'))
         result = await asyncio.to_thread(goals.exchange, caller, body, internal=True)
         if body.get('action') == 'review' and (result.get('goal') or {}).get('status') == 'active':
             result = await goals.review(caller, GoalArgs(action='progress', note=body.get('note', '')),

@@ -303,3 +303,82 @@ def test_session_creation_rechecks_revocation_inside_commit(governed_app, monkey
     assert response.status_code == 403, response.text
     assert not app.state.store.rows('SELECT 1 FROM runs')
     app.state.manager.submit.assert_not_called()
+
+
+def test_goal_runtime_channel_survives_tool_allowlist_but_user_control_does_not(governed_app):
+    app, client = governed_app
+    # A tools allowlist without 'goal' must not break the runtime's per-turn goal reads.
+    profile = save_profile(client, tools=['github_search'])
+    run = create_session(client, security_profile_id=profile['id'])
+    headers = activate(app, run['id'])
+    path = '/broker/' + run['id'] + '/goal'
+    assert client.post(path, headers=headers, json={'action': 'get'}).json()['goal'] is None
+    assert client.post(path, headers=headers, json={'action': 'tick', 'segment': 's', 'elapsed': 1}).status_code == 200
+    control = client.post(path, headers=headers, json={'action': 'control'})
+    assert control.status_code == 403 and 'security profile' in control.json()['detail']
+
+
+def test_agent_created_automation_cannot_broaden_session_policy(governed_app):
+    from app.automations import Definition
+    app, client = governed_app
+    strict = save_profile(client, 'Read only', git_access='read', connected_apps=[])
+    broader = save_profile(client, 'Broader', git_access='read')
+    run = app.state.store.run(create_session(client, security_profile_id=strict['id'])['id'])
+    tools = app.state.automation_tools
+    definition = {'name': 'Nightly', 'prompt': 'Summarize releases', 'mode': 'demo'}
+    for selected in ('', broader['id']):
+        with pytest.raises(Exception) as error:
+            tools.check_policy(run, Definition.model_validate({**definition, 'security_profile_id': selected}))
+        assert getattr(error.value, 'status_code', None) == 403
+    tools.check_policy(run, Definition.model_validate({**definition, 'security_profile_id': strict['id']}))
+
+
+def test_repository_context_follows_session_git_policy(governed_app):
+    app, client = governed_app
+    context = app.state.repository_context
+    allowed = app.state.store.run(create_session(client)['id'])
+    denied = app.state.store.run(create_session(client, security_profile_id=save_profile(client, git_access='none')['id'])['id'])
+    assert context.permitted(allowed)
+    assert not context.permitted(denied)
+
+
+def test_tool_listing_resolves_session_policy_once(governed_app, monkeypatch):
+    from app.security_profiles import SecurityProfiles
+    app, client = governed_app
+    profile = save_profile(client, git_access='read')
+    run = create_session(client, security_profile_id=profile['id'])
+    for provider in ('github', 'linear'):
+        app.state.connectors.save(provider, {'access_token': 'test-token', 'kind': 'personal'}, 'Test connection')
+    headers = activate(app, run['id'], plugins=['github', 'linear'])
+    calls, original = [], SecurityProfiles.effective
+    monkeypatch.setattr(SecurityProfiles, 'effective', lambda self, *args, **kwargs: calls.append(1) or original(self, *args, **kwargs))
+    catalog = client.get('/broker/' + run['id'] + '/tools', headers=headers)
+    assert catalog.status_code == 200 and any(tool['name'].startswith('linear_') for tool in catalog.json())
+    # Once for the catalog filter; never once per listed tool.
+    assert len(calls) <= 2, len(calls)
+
+
+def test_tool_claim_reads_policy_without_a_nested_connection(governed_app, monkeypatch):
+    from types import SimpleNamespace
+    from app.tool_dispatch import ToolDispatch
+    app, client = governed_app
+    run = create_session(client, security_profile_id=save_profile(client, git_access='read')['id'])
+    activate(app, run['id'])
+    caller, store = app.state.store.run(run['id']), app.state.store
+    import threading
+    from contextlib import contextmanager
+    claimant, depth, deepest, original = threading.get_ident(), [0], [0], type(store).connect
+    @contextmanager
+    def tracked(self, *args, **kwargs):
+        mine = threading.get_ident() == claimant  # Ignore background pollers.
+        depth[0] += mine
+        deepest[0] = max(deepest[0], depth[0])
+        try:
+            with original(self, *args, **kwargs) as conn:
+                yield conn
+        finally:
+            depth[0] -= mine
+    monkeypatch.setattr(type(store), 'connect', tracked)
+    body = SimpleNamespace(request_id='nested-check', input_id=caller['active_message_id'], name='sessions_search', arguments={})
+    assert ToolDispatch(store, caller, body).claim() is None
+    assert deepest[0] == 1

@@ -18,9 +18,13 @@ from .environments import EnvironmentPending
 from .runner import RunManager, SAVE_WARNING, TERMINAL, completed_response, safe_error_detail, refresh_sandbox_files, stop_requested
 from .security import digest
 from .sandboxes import ProvisioningTerminated
-from .db import database
+from .db import database, now
 from .runtime_files import RUNTIME_COMMAND, RUNTIME_ROOT, SANDBOX_PYTHON
 from agent.transport_recovery import MAX_TRANSPORT_ATTEMPTS, valid_retry
+
+# Admission rejections settle the claimed input. Anything else, such as a 503
+# from missing broker configuration, stays a retryable activity failure.
+ADMISSION_DENIED = {401, 403, 404, 409}
 
 
 class LostExecution(Exception):
@@ -310,7 +314,10 @@ class DurableRunner(RunManager):
                     started = await database(self.begin_turn, run_id, row, state)
                     if started == 'capacity':
                         return 'capacity'
-                    if not started:
+                    if not started or started == 'denied':
+                        # A rejected input never received the machine. The warm
+                        # journal is unchanged, so the next permitted input can
+                        # reuse it and the idle deadline still releases it.
                         return True
                     state = await database(self.state, run_id)
             if not state or state.get('phase') == 'idle':
@@ -338,7 +345,7 @@ class DurableRunner(RunManager):
                     started = await database(self.begin_turn, run_id, await database(self.store.run, run_id))
                     if started == 'capacity':
                         return 'capacity'
-                    if not started:
+                    if not started or started == 'denied':
                         return True
                     state = await database(self.state, run_id)
                 if state.get('phase') == 'idle' or not state:
@@ -396,20 +403,28 @@ class DurableRunner(RunManager):
                 return True
 
     def begin_turn(self, run_id, row, warm=None):
-        row = self.enforce_session_security(row)
         if stop_requested(row) or row['status'] in {'cancelled', 'interrupted'}:
             return False
         messages = self.store.rows("SELECT * FROM messages WHERE run_id=? AND status='running'", (run_id,))
         message = messages[0] if messages else self.store.claim_message(run_id)
         if not message:
             return False
+        try:
+            # claim_message made this input's sender the active requester.
+            # Admit that requester, never the previous turn's.
+            row = self.enforce_session_security(self.store.run(run_id))
+        except HTTPException as exc:
+            if exc.status_code not in ADMISSION_DENIED:
+                raise  # The claimed input stays running and is resumed on retry.
+            self.deny_turn(run_id, message['id'], str(exc.detail))
+            return 'denied'
         state = {'version': 1, 'phase': 'prepare', 'message_id': message['id'], 'segment': 0,
                  'snapshot_id': row['snapshot_id'], 'sandbox_id': '', 'cursor': 0, 'turn_started': time.time()}
         if self.agent_runtime.supports(row) and (not warm or warm.get('independent_runtime')):
             state['independent_runtime'] = True
             if warm:
                 state.update({key: warm[key] for key in
-                    ('sandbox_id', 'sandbox_name', 'machine_started', 'runtime_scope') if key in warm})
+                    ('sandbox_id', 'sandbox_name', 'machine_started', 'runtime_scope', 'security_network') if key in warm})
                 state['reused_machine'] = True
         initial_group = self.swarms.initial_group(run_id, message['id']) if self.coordinator else None
         if initial_group and initial_group['status'] == 'running':
@@ -423,7 +438,8 @@ class DurableRunner(RunManager):
             self.save(run_id, state)
             return True
         if warm and warm.get('sandbox_id'):
-            state.update(sandbox_id=warm['sandbox_id'], machine_started=warm['machine_started'], reused_machine=True)
+            state.update(sandbox_id=warm['sandbox_id'], machine_started=warm['machine_started'], reused_machine=True,
+                         security_network=warm.get('security_network'))
             self.store.event(run_id, 'status', 'Reusing the saved session sandbox for this response.')
         elif self.prepared.assign(run_id, row, state):
             return True
@@ -435,6 +451,25 @@ class DurableRunner(RunManager):
             return 'capacity'
         self.save(run_id, state)
         return True
+
+    def deny_turn(self, run_id, message_id, explanation):
+        """Fail one input that admission rejected. Later senders are admitted on their own."""
+        with self.store.connect(write_scope=run_id) as conn:
+            conn.begin_write()
+            self.store.finish_message_in(conn, run_id, message_id, explanation, 'failed')
+            queued = conn.execute("SELECT 1 FROM messages WHERE run_id=? AND status='queued' LIMIT 1", (run_id,)).fetchone()
+            # A stop or deletion that raced this admission stays authoritative.
+            conn.execute("""UPDATE runs SET status=?,token_hash='',error=?,summary=?,updated_at=?
+                WHERE id=? AND status!='stopping' AND deletion_requested_at=''""",
+                         ('queued' if queued else 'failed', explanation, explanation, now(), run_id))
+        self.store.event(run_id, 'chat', 'Response saved', {'message_id': message_id})
+        # An unadmitted swarm round blocks its mission instead of re-queueing forever.
+        self.swarms.settle(run_id, {'message_id': message_id, 'outcome': 'failed', 'response': explanation})
+
+    def has_pending_input(self, run_id):
+        # Like the idle path, include an input claimed before a retryable
+        # admission error. begin_turn resumes it before any queued input.
+        return bool(self.store.rows("SELECT 1 FROM messages WHERE run_id=? AND status IN ('queued','running') LIMIT 1", (run_id,)))
 
     def rotation_seconds(self, state):
         from .sandboxes import provider_for_id
@@ -450,14 +485,21 @@ class DurableRunner(RunManager):
             return self.agent_runtime.idle_seconds()
         return self.settings.sandbox_idle_seconds or (300 if state.get('computer_only') else 0)
 
-    def can_keep_warm(self, run, state):
+    def network_current(self, run, state, *, bind=False):
+        """Whether a retained machine still has the egress policy it was created with."""
         profiles = getattr(self.store, 'security_profiles', None)
-        if profiles and profiles.network_hosts(run) != state.get('security_network'):
-            return False
+        try:
+            return not profiles or profiles.network_hosts(
+                profiles.bind_session(run) if bind else run) == state.get('security_network')
+        except HTTPException:
+            return False  # Only reuse ends. The next admission reports the policy error.
+
+    def can_keep_warm(self, run, state):
         return (bool(self.computer_idle_seconds(state)) and not run['parent_run_id']
                 and bool(state.get('sandbox_id'))
                 and time.time() < state['machine_started'] + self.rotation_seconds(state)
-                and (not state.get('independent_runtime') or self.agent_runtime.reusable(run, state)))
+                and (not state.get('independent_runtime') or self.agent_runtime.reusable(run, state))
+                and self.network_current(run, state))
 
     async def release_warm(self, run_id, state, reason):
         # Persist before the provider call: a lost termination ACK is retryable
@@ -473,13 +515,6 @@ class DurableRunner(RunManager):
 
     async def warm(self, run_id, state):
         row = await database(self.store.run, run_id)
-        profiles = getattr(self.store, 'security_profiles', None)
-        if profiles:
-            row = await database(profiles.bind_session, row)
-            if await database(profiles.network_hosts, row) != state.get('security_network'):
-                state['idle_reason'] = 'session network policy changed'
-                await self.release_warm(run_id, state, state['idle_reason'])
-                return await database(self.store.has_queued_messages, run_id)
         if (getattr(self, 'computer', None) and state.get('phase') == 'warm'
                 and not state.get('independent_runtime')):
             touched = self.computer.touched(run_id)
@@ -487,20 +522,25 @@ class DurableRunner(RunManager):
                 state['idle_until'] = max(state['idle_until'], touched + self.computer_idle_seconds(state))
                 await database(self.save, run_id, state)
         stopping = stop_requested(row) or (not state.get('computer_only') and row['status'] in {'cancelled', 'interrupted'})
-        queued = await database(self.store.has_queued_messages, run_id)
+        queued = await database(self.has_pending_input, run_id)
         expired = (time.time() >= state['machine_started'] + self.rotation_seconds(state)
                    or (not queued and time.time() >= self.idle_deadline(state)))
         if state.get('independent_runtime') and not self.agent_runtime.reusable(row, state):
             state['idle_reason'] = 'agent runtime configuration changed'
             expired = True
-        if (state['phase'] == 'warm_cleanup' or stopping or not self.computer_idle_seconds(state)
-                or expired):
+        release = state['phase'] == 'warm_cleanup' or stopping or not self.computer_idle_seconds(state) or expired
+        # Evaluate policy only for a machine that would be kept, so a policy
+        # error can never block stop, deletion or expiry from releasing it.
+        if not release and not await database(self.network_current, row, state, bind=True):
+            state['idle_reason'] = 'session network policy changed'
+            release = True
+        if release:
             await self.release_warm(run_id, state, state.get('idle_reason', 'idle timeout' if not stopping else 'stop requested'))
             row = await database(self.store.run, run_id)
             stopping = stop_requested(row) or row['status'] in {'cancelled', 'interrupted'}
             if row['status'] == 'stopping':
                 await database(self.store.update_run, run_id, status='cancelled')
-            return False if stopping else (await database(self.store.has_queued_messages, run_id))
+            return False if stopping else (await database(self.has_pending_input, run_id))
         if not queued:
             if state.get('idle_until') is None:
                 state['idle_until'] = time.time() + self.computer_idle_seconds(state)

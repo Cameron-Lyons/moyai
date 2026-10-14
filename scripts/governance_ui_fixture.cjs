@@ -35,7 +35,7 @@ module.exports=function(req,res,url,body,role,fixture){
   if(path==='/api/admin/governance/audit'){
     const earlier=url.searchParams.has('cursor');
     json(res,200,{events:empty?[]:[{id:earlier?'fixture-audit-1':'fixture-audit-2',action:earlier?'role.created':'security.defaults.updated',actor:'alex@example.com',resource_type:earlier?'Role':'Organization',resource_id:earlier?'auditor':'1',created_at:'2026-10-13T12:00:00Z'}],next_cursor:empty||earlier?null:'fixture-audit-next'});
-  }else if(path==='/api/admin/roles'&&method==='GET')json(res,200,{roles:empty?roles.filter(r=>r.builtin):roles,permissions,assignments:empty?[]:assignments,group_roles:groupRoles,activity:[]});
+  }else if(path==='/api/admin/roles'&&method==='GET')json(res,200,{roles:empty?roles.filter(r=>r.builtin):roles,permissions,assignments:empty?[]:assignments,group_roles:groupRoles,groups:empty?[]:groups.map(group=>({id:group.id,display_name:group.displayName,members:group.members.length})),activity:[]});
   else if(path==='/api/admin/roles'&&method==='POST'){
     const row={...body,revision:1,builtin:false,archived:false};roles.push(row);json(res,201,row);
   }else if(path.startsWith('/api/admin/roles/')){

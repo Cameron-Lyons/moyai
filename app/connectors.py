@@ -216,10 +216,11 @@ class Connectors:
         row = rows[0] if rows else {"enabled": True, "read_only": False, "checked_at": None, "check_status": None}
         return {**row, "enabled": bool(row["enabled"]), "read_only": bool(row["read_only"])}
 
-    def allowed(self, name, run=None, *, as_bot=False):
+    def allowed(self, name, run=None, *, as_bot=False, policy=None):
         provider, write, _, _ = TOOLS[name]
         profiles = getattr(self.store, 'security_profiles', None)
-        if run is not None and profiles and not profiles.allowed_tool(run, name, provider, write):
+        # A catalog passes its once-resolved effective session policy.
+        if run is not None and profiles and not profiles.allowed_tool(run, name, provider, write, policy=policy):
             return False
         policy = self.policy(provider)
         if run is not None and not as_bot and name in {'slack_search', 'slack_thread', 'slack_channel'}:
@@ -383,9 +384,11 @@ class Connectors:
         provider, _, schema, _ = TOOLS[name]
         args = schema.model_validate(arguments).model_dump()
         selection = None
-        if name in {'slack_search', 'slack_thread', 'slack_channel'} and not args.get('as_bot'):
+        # Bot reads use the organization installation, never personal Slack.
+        bot = name in {'slack_search', 'slack_thread', 'slack_channel'} and bool(args.get('as_bot'))
+        if name in {'slack_search', 'slack_thread', 'slack_channel'} and not bot:
             selection = await self.personal_slack.select(run, name)
-        if not self.allowed(name, run=run):
+        if not self.allowed(name, run=run, as_bot=bot):
             raise ConnectorError("This operation is disabled by your organization's connection policy.", dispatched=False)
         if name == 'slack_send':
             return await self.slack_send(args, run)
@@ -397,7 +400,7 @@ class Connectors:
                 raise ConnectorError('Reconnect Slack with the Moyai bot im:history permission to read its DMs.', dispatched=False)
         else:
             headers = self.headers(provider, selection.credentials if selection else await self.credentials(provider))
-        if not self.allowed(name, run=run):
+        if not self.allowed(name, run=run, as_bot=bot):
             raise ConnectorError("This operation is disabled by your organization's connection policy.", dispatched=False)
         self.check_execution(run, name)
         if provider == "linear":

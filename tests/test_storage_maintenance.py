@@ -227,6 +227,32 @@ def test_backup_failure_has_no_receipt_cleans_temp_and_sanitizes_sdk_details(tmp
     assert not staged[0].exists()
 
 
+def test_object_storage_commands_require_the_database_organization_pin(tmp_path, monkeypatch, capsys):
+    from app.organization_scope import OrganizationScope
+    pinned, legacy = tmp_path / 'pinned', tmp_path / 'legacy'
+    store = Store(pinned)
+    OrganizationScope(store, Settings(_env_file=None, data_dir=pinned, moyai_organization_id='acme'))
+    attachment_id = legacy_attachment(store)
+    Store(legacy).create_run('Existing unpinned work', '', 'demo', [])
+    before = store.path.read_bytes()
+    # The organization changes the object prefix and reference identity.
+    monkeypatch.setattr('app.blob_storage.ObjectStorage', lambda settings: pytest.fail('Unverified organization reached storage'))
+    for directory, identity, message in ((pinned, '', 'different organization'), (pinned, 'other', 'different organization'),
+                                         (legacy, 'acme', 'no organization pin')):
+        monkeypatch.setattr('app.config.Settings', lambda: Settings(_env_file=None, data_dir=directory, moyai_organization_id=identity))
+        for operation in ('migrate', 'verify', 'backup'):
+            assert maintenance.main([operation]) == 1
+            report = json.loads(capsys.readouterr().out)
+            assert report['error_type'] == 'MaintenanceError' and message in report['error']
+    assert store.path.read_bytes() == before
+    assert store.rows('SELECT data_ref FROM attachments WHERE id=?', (attachment_id,)) == [{'data_ref': ''}]
+    objects = MemoryObjects()
+    monkeypatch.setattr('app.config.Settings', lambda: Settings(_env_file=None, data_dir=pinned, moyai_organization_id='acme'))
+    monkeypatch.setattr('app.blob_storage.ObjectStorage', lambda settings: objects)
+    assert maintenance.main(['migrate']) == 0
+    assert json.loads(capsys.readouterr().out)['attachments_published'] == 1
+
+
 @pytest.mark.parametrize('operation', ['plan', 'backup'])
 def test_read_only_maintenance_requires_owner_before_sqlite_open(tmp_path, monkeypatch, operation):
     Store(tmp_path)

@@ -53,7 +53,7 @@ for(const width of [1440,768,320])test(`Governance and policy editor work at ${w
   await page.getByRole('button',{name:'Save defaults',exact:true}).click();
   await page.getByText('Defaults saved',{exact:true}).waitFor();
 });
-test('Provisioning token appears once, is masked, and revocation supports cancellation',async t=>{
+test('Provisioning token appears once, cannot be dismissed by accident, and revocation supports cancellation',async t=>{
   const page=await open(t);
   await page.getByRole('button',{name:'Provisioning',exact:true}).click();
   await page.getByRole('button',{name:'Create token',exact:true}).click();
@@ -61,8 +61,12 @@ test('Provisioning token appears once, is masked, and revocation supports cancel
   await dialog.getByRole('textbox',{name:'Token label',exact:true}).fill('Preview directory');
   await dialog.getByRole('button',{name:'Create token',exact:true}).click();
   await dialog.getByText('Provisioning token created',{exact:true}).waitFor();
-  assert.equal(await dialog.locator('#governance-token-secret').getAttribute('type'),'password');
+  // A readonly text field keeps manual copy possible when the clipboard is blocked.
+  assert.equal(await dialog.locator('#governance-token-secret').getAttribute('type'),'text');
   assert.match(await dialog.locator('#governance-token-secret').inputValue(),/^fixture-only-/);
+  // The secret is shown once, so Escape cannot dismiss it; only Done closes the view.
+  await page.keyboard.press('Escape');
+  assert.equal(await dialog.locator('#governance-token-secret').count(),1);
   await dialog.getByRole('button',{name:'Done',exact:true}).click();
   await page.getByText('Preview directory',{exact:true}).waitFor();
   assert.equal(await page.locator('#governance-token-secret').count(),0);
@@ -167,4 +171,32 @@ test('Load failures offer retry and late reads cannot overwrite another page',as
   await page.evaluate(()=>location.hash='#settings');
   await page.getByRole('heading',{name:'Settings',exact:true}).waitFor();release();await page.unrouteAll({behavior:'wait'});
   assert.equal(await page.locator('#content h1').innerText(),'Settings');
+});
+test('Policy app choices are disabled until apps are restricted, and saved as shown',async t=>{
+  const page=await open(t);
+  await page.getByRole('button',{name:'Security policies',exact:true}).click();
+  await page.getByRole('button',{name:'Create policy',exact:true}).click();
+  const policy=page.getByRole('dialog',{name:'Create security policy',exact:true});
+  const linear=policy.getByRole('checkbox',{name:'Linear',exact:true});
+  assert.equal(await linear.isDisabled(),true);
+  let saved;page.on('request',request=>{if(request.method()==='POST'&&request.url().endsWith('/api/admin/security-profiles'))saved=request.postDataJSON();});
+  await policy.getByRole('checkbox',{name:'Restrict connected apps',exact:true}).check();
+  assert.equal(await linear.isDisabled(),false);
+  await linear.uncheck();
+  await policy.getByRole('textbox',{name:'Policy name',exact:true}).fill('Apps shown');
+  await policy.getByRole('button',{name:'Save',exact:true}).click();
+  await page.getByRole('heading',{name:'Apps shown',exact:true}).waitFor();
+  assert.deepEqual(saved.policy.connected_apps,['github','slack','notion']);
+});
+test('Role managers manage group grants from the Roles tab, and tab switches keep focus',async t=>{
+  const page=await open(t);
+  const row=page.getByRole('row').filter({hasText:'Engineering reviewers'});
+  await row.getByRole('button',{name:'Change',exact:true}).click();
+  const dialog=page.getByRole('dialog',{name:'Assign group role',exact:true});
+  assert.match(await dialog.getByRole('combobox',{name:'Directory group',exact:true}).innerText(),/Engineering reviewers/);
+  await dialog.getByRole('button',{name:'Cancel',exact:true}).click();
+  await page.getByRole('button',{name:'Audit history',exact:true}).focus();
+  await page.keyboard.press('Enter');
+  await page.getByRole('heading',{name:'Governance audit history',exact:true}).waitFor();
+  assert.equal(await page.evaluate(()=>document.activeElement?.dataset.governanceTab),'audit');
 });

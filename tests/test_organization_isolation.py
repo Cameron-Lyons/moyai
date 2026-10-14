@@ -2,7 +2,10 @@
 from contextlib import ExitStack
 import importlib.util
 import json
+import os
 from pathlib import Path
+import shutil
+import subprocess
 import sys
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
@@ -10,6 +13,7 @@ from unittest.mock import AsyncMock, Mock
 from cryptography.fernet import Fernet
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
+from pydantic import ValidationError
 import pytest
 
 from app.blob_storage import ObjectStorage
@@ -18,7 +22,7 @@ from app.database import DatabaseError
 from app.db import Store
 from app.durable_runner import DurableRunner
 from app.main import create_app
-from app.organization_scope import OrganizationScope, NAMESPACE_FIELDS
+from app.organization_scope import OrganizationScope, NAMESPACE_FIELDS, scoped_name
 from app.security import digest
 
 
@@ -73,11 +77,28 @@ def capability(app, identity):
     return {'Authorization': 'Bearer ' + token}
 
 
+WRAPPER = Path(__file__).resolve().parents[1] / 'deploy_modal.py'
+
+
+def wrapper(monkeypatch, settings, name):
+    monkeypatch.setattr('app.config.Settings', lambda: settings)
+    spec = importlib.util.spec_from_file_location(name, WRAPPER)
+    module = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, name, module)
+    spec.loader.exec_module(module)
+    return module
+
+
 def test_namespace_defaults_are_distinct_idempotent_and_legacy_unchanged(tmp_path):
-    north = configured(tmp_path / 'north', 'north', object_storage_bucket='shared', modal_volume_name='checkpoints')
-    south = configured(tmp_path / 'south', 'south', object_storage_bucket='shared', modal_volume_name='checkpoints')
+    # Temporal Cloud namespaces are <name>.<account>; operators provision each one.
+    north = configured(tmp_path / 'north', 'north', object_storage_bucket='shared', modal_volume_name='checkpoints',
+                       temporal_namespace='north.a1b2c')
+    south = configured(tmp_path / 'south', 'south', object_storage_bucket='shared', modal_volume_name='checkpoints',
+                       temporal_namespace='south.a1b2c')
     for field in NAMESPACE_FIELDS:
         assert getattr(north, field) != getattr(south, field)
+    assert north.temporal_namespace == 'north.a1b2c'
+    assert north.temporal_task_queue == 'moyai-sessions-v1-org-north'
     again = Settings(_env_file=None, **north.model_dump())
     assert again.model_dump() == north.model_dump()
     saved_override = Settings(_env_file=None, **{**north.model_dump(), 'modal_app_name': 'saved-app', 'substrate_atespace': 'saved-space'})
@@ -91,6 +112,38 @@ def test_namespace_defaults_are_distinct_idempotent_and_legacy_unchanged(tmp_pat
     assert legacy.object_storage_prefix == 'moyai'
     assert legacy.modal_app_name == 'hermes-workspace'
     assert legacy.substrate_atespace == 'moyai'
+
+
+def test_scoped_object_prefix_is_bounded_on_first_construction(tmp_path):
+    longest = configured(tmp_path / 'longest', 'acme', object_storage_prefix='p' * 181)
+    assert longest.object_storage_prefix == 'p' * 181 + '/organizations/acme'
+    # Saved sandbox settings rebuild Settings from model_dump on every later start.
+    assert Settings(_env_file=None, **longest.model_dump()).model_dump() == longest.model_dump()
+    with pytest.raises(ValidationError, match='too long after organization scoping'):
+        configured(tmp_path / 'too-long', 'acme', object_storage_prefix='p' * 182)
+    assert Settings(_env_file=None, object_storage_prefix='p' * 200).object_storage_prefix == 'p' * 200
+
+
+def test_temporal_org_deployment_requires_explicit_namespace(tmp_path):
+    path = tmp_path / 'temporal'
+    store = Store(path)
+    try:
+        with pytest.raises(DatabaseError, match='TEMPORAL_NAMESPACE'):
+            OrganizationScope(store, configured(path, 'north', temporal_enabled=True))
+        with store.connect() as conn:
+            assert 'organization_scope' not in conn.table_names()  # Refused before any DDL.
+        scope = OrganizationScope(store, configured(path, 'north', temporal_enabled=True, temporal_namespace='north.a1b2c'))
+        assert scope.metadata()['deployment_mode'] == 'dedicated'
+        assert scope.metadata()['namespaces']['temporal_namespace'] == 'north.a1b2c'
+    finally:
+        store.close()
+    legacy = tmp_path / 'legacy'
+    store = Store(legacy)
+    try:
+        scope = OrganizationScope(store, Settings(_env_file=None, data_dir=legacy, temporal_enabled=True))
+        assert scope.metadata()['id'] == '' and scope.metadata()['deployment_mode'] == 'legacy'
+    finally:
+        store.close()
 
 
 def test_database_pin_is_immutable_and_missing_id_cannot_open_it(tmp_path):
@@ -250,16 +303,10 @@ def test_identical_library_cursor_versions_include_organization():
 
 
 def test_modal_deployment_resources_are_separate_and_config_exports_org_id(tmp_path, monkeypatch):
-    wrapper_path = Path(__file__).resolve().parents[1] / 'deploy_modal.py'
     deployments = []
     for identity in ('north', 'south', ''):
         settings = configured(tmp_path / identity, identity) if identity else Settings(_env_file=None, data_dir=tmp_path / 'legacy')
-        monkeypatch.setattr('app.config.Settings', lambda: settings)
-        name = 'organization_deployment_' + (identity or 'legacy')
-        spec = importlib.util.spec_from_file_location(name, wrapper_path)
-        module = importlib.util.module_from_spec(spec)
-        monkeypatch.setitem(sys.modules, name, module)
-        spec.loader.exec_module(module)
+        module = wrapper(monkeypatch, settings, 'organization_deployment_' + (identity or 'legacy'))
         assert module.ORGANIZATION_ID == identity
         exported = module.deployment_config(settings)
         assert exported['MOYAI_ORGANIZATION_ID'] == identity
@@ -267,3 +314,34 @@ def test_modal_deployment_resources_are_separate_and_config_exports_org_id(tmp_p
         deployments.append((module.APP_NAME, module.VOLUME_NAME, module.CONFIG_SECRET_NAME))
     assert all(left != right for left, right in zip(deployments[0], deployments[1]))
     assert deployments[2] == ('moyai', 'hermes-workspace-state', 'hermes-workspace-config')
+
+
+def test_modal_container_imports_wrapper_with_only_stdlib_and_modal(tmp_path):
+    # Modal mounts only the entrypoint file and imports it with the image's system
+    # Python; the app package and its dependencies are not on that interpreter's path.
+    shutil.copy(WRAPPER, tmp_path / 'deploy_modal.py')
+    probe = '\n'.join((
+        'import json, sys',
+        'sys.path.insert(0, sys.argv[1])',
+        "sys.modules.update(dict.fromkeys(('app', 'pydantic', 'pydantic_settings', 'dotenv', 'cryptography')))",
+        'from modal._runtime.task_lifecycle_manager import _TaskLifecycleManager',
+        '_TaskLifecycleManager._singleton = object()  # Modal sets this before importing user code.',
+        'import deploy_modal as m',
+        'print(json.dumps([m.ORGANIZATION_ID, m.APP_NAME, m.VOLUME_NAME, m.CONFIG_SECRET_NAME]))'))
+    for identity, expected in (
+            ('north', ['north', 'moyai-org-north', 'hermes-workspace-state-org-north', 'hermes-workspace-config-org-north']),
+            ('', ['', 'moyai', 'hermes-workspace-state', 'hermes-workspace-config'])):
+        environment = {'PATH': os.environ.get('PATH', ''), 'HOME': str(tmp_path), 'MOYAI_ORGANIZATION_ID': identity}
+        result = subprocess.run([sys.executable, '-I', '-c', probe, str(tmp_path)], cwd=tmp_path, env=environment,
+                                capture_output=True, text=True, timeout=120)
+        assert result.returncode == 0, result.stderr
+        assert json.loads(result.stdout.strip().splitlines()[-1]) == expected
+
+
+def test_modal_wrapper_scoped_name_copy_matches_application(tmp_path, monkeypatch):
+    module = wrapper(monkeypatch, Settings(_env_file=None, data_dir=tmp_path), 'organization_deployment_names')
+    for value, identity, maximum in (('moyai', 'north', 64), ('hermes-workspace-config', 'n' * 32, 64),
+                                     ('a' * 70, 'acme', 64), ('saved-app-org-north', 'north', 64),
+                                     ('a' * 60 + '-org-north', 'north', 64), ('name--', 'acme', 14),
+                                     ('moyai-sessions-v1', 'acme', None), ('', 'acme', 64)):
+        assert module.scoped_name(value, identity, maximum) == scoped_name(value, identity, maximum)

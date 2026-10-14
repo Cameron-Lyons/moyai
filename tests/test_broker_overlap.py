@@ -38,7 +38,8 @@ def verified(split_settings, request):
 
 def pending(app, label):
     store = app.state.store
-    run = store.create_run(label, '', 'modal', [], chat_enabled=True)
+    # Broker admission checks the run's requester; use the local preview owner.
+    run = store.create_run(label, '', 'modal', [], chat_enabled=True, user_id=store.identity({'method': 'local', 'role': 'admin'}))
     request_id = app.state.spend.begin(run, 'synthetic-model')
     operation_id = f'context-{request_id}'
     with store.connect() as conn:
@@ -504,7 +505,7 @@ async def test_existing_native_stream_finishes_while_replacement_handles_new_inf
         from app.context_budget import ModelContextLimits
         app.state.settings.model_context_limits = {app.state.settings.resolve_model(): ModelContextLimits(
             context_window=65536, max_input_tokens=65536, max_output_tokens=8192)}
-        run = app.state.store.create_run(label, '', 'modal', [])
+        run = app.state.store.create_run(label, '', 'modal', [], user_id=app.state.store.identity({'method': 'local', 'role': 'admin'}))
         app.state.store.update_run(run['id'], status='running', token_hash=digest('cap'))
         return f"/broker/{run['id']}/v1/responses"
 

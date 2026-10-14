@@ -5,7 +5,8 @@ const settingsGroups = [
     {view:'memory', title:'Memory', description:'Review what Moyai remembers for your future sessions.', permission:'memory.read'},
   ]},
   {id:'integrations', title:'Integrations', items:[
-    {view:'connections', title:'Connections', description:'Connect GitHub, Slack, Linear, and Notion.', permission:'connections.read'},
+    // The page also reads organization settings, so it needs workspace.read too.
+    {view:'connections', title:'Connections', description:'Connect GitHub, Slack, Linear, and Notion.', permission:'connections.read', requires:['workspace.read']},
     {view:'personal-slack', title:'Personal Slack', description:'Connect your own Slack account for private web chats.', permission:'credentials.read'},
     {view:'secrets', title:'Secrets', description:'Manage personal and shared service access.', permission:'credentials.read'},
   ]},
@@ -27,7 +28,7 @@ const settingsViews = new Set(['settings', 'adoption', ...settingsGroups.flatMap
 function settingsItemVisible(item, role) {
   const allowed=permission=>role==='admin'||Array.isArray(state.permissions)&&state.permissions.includes(permission);
   const delegated=item.permission?allowed(item.permission):item.permissions?.some(allowed);
-  return (!(Array.isArray(state.permissions)&&item.permission)||allowed(item.permission)) && (!item.admin || role === 'admin' || delegated) && (!item.memberOnly || role !== 'admin' && !(item.view==='spend'&&allowed('spend.read')));
+  return (!(Array.isArray(state.permissions)&&item.permission)||allowed(item.permission)) && (!Array.isArray(state.permissions)||(item.requires||[]).every(allowed)) && (!item.admin || role === 'admin' || delegated) && (!item.memberOnly || role !== 'admin' && !(item.view==='spend'&&allowed('spend.read')));
 }
 
 function settingsGroupVisible(group, role) {

@@ -8,6 +8,14 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from .db import now
 from .permissions import BUILTIN_PERMISSIONS, PERMISSIONS, catalog
 
+ADMIN_ONLY = 'Only a built-in administrator can grant or remove administrator access.'
+SCIM_GROUP_TABLES = frozenset({'scim_users', 'scim_groups', 'scim_group_members'})
+
+
+def scim_groups_ready_in(conn):
+    from .scim import scim_ready_in
+    return scim_ready_in(conn)  # The provisioning tables are created together.
+
 
 def normalized_email(value):
     value = value.strip().lower()
@@ -83,6 +91,29 @@ class EnterpriseRoles:
             raise HTTPException(403, 'Your workspace role does not permit this action.')
         return 'Local preview admin' if method == 'local' else 'Shared password admin'
 
+    def builtin_admin_in(self, conn, actor):
+        """Administrator authority comes from the built-in role, never a custom allowlist."""
+        method = (actor or {}).get('method')
+        if method in {'local', 'password'}:
+            return actor.get('role') == 'admin'
+        email = actor.get('identity', {}).get('email', '').strip().lower() if method in {'google', 'cloudflare'} else ''
+        roles = self.user_roles
+        return bool(roles.eligible(email) and roles.active_email_in(conn, email) and roles.role_in(conn, email) == 'admin')
+
+    def held_in(self, conn, actor):
+        """Permissions a delegate may grant; None for an unrestricted built-in administrator."""
+        if self.builtin_admin_in(conn, actor):
+            return None
+        if actor.get('method') in {'google', 'cloudflare'}:
+            return self.user_roles.permissions_in(conn, actor.get('identity', {}).get('email', ''))
+        return frozenset()
+
+    @staticmethod
+    def require_grantable(held, permissions):
+        # Delegation must never amplify: a delegate grants only what it holds.
+        if held is not None and not frozenset(permissions) <= held:
+            raise HTTPException(403, 'You can only grant permissions you hold.')
+
     def role_exists_in(self, conn, role_id):
         return role_id in BUILTIN_PERMISSIONS or bool(conn.execute(
             'SELECT 1 FROM enterprise_roles WHERE id=? AND archived=0', (role_id,)).fetchone())
@@ -100,8 +131,7 @@ class EnterpriseRoles:
         return self.role_permissions_in(conn, row['role_id']) if row else None
 
     def group_permissions_in(self, conn, email):
-        tables = set(conn.table_names())
-        if not {'scim_users', 'scim_groups', 'scim_group_members'} <= tables:
+        if not scim_groups_ready_in(conn):
             return frozenset()
         rows = conn.execute('''SELECT DISTINCT r.role_id FROM enterprise_group_roles r
             JOIN scim_groups g ON g.id=r.group_id
@@ -110,10 +140,6 @@ class EnterpriseRoles:
             WHERE u.user_name=? AND u.active=1 AND u.deleted_at='' AND g.deleted_at=''
               AND r.role_id IS NOT NULL''', (email,)).fetchall()
         return frozenset().union(*(self.role_permissions_in(conn, row['role_id']) for row in rows))
-
-    def guard_admins_in(self, conn):
-        if self.user_roles.settings.google_admins() and not self.user_roles.admins_in(conn):
-            raise HTTPException(409, 'Keep at least one active administrator. Promote another user first.')
 
     def listing(self):
         with self.store.connect() as conn:
@@ -127,8 +153,12 @@ class EnterpriseRoles:
             group_roles = [dict(row) for row in conn.execute('SELECT group_id,role_id,revision FROM enterprise_group_roles ORDER BY group_id')]
             activity = [dict(row) for row in conn.execute('''SELECT id,action,actor,subject,created_at
                 FROM enterprise_role_audit ORDER BY id DESC LIMIT 100''')]
+            # Role managers grant to live groups without needing provisioning access.
+            groups = [dict(row) for row in conn.execute('''SELECT g.id,g.display_name,COUNT(m.user_id) AS members
+                FROM scim_groups g LEFT JOIN scim_group_members m ON m.group_id=g.id WHERE g.deleted_at=''
+                GROUP BY g.id,g.display_name,g.display_key ORDER BY g.display_key,g.id''')] if scim_groups_ready_in(conn) else []
         return {'roles': builtins + roles, 'permissions': catalog(), 'assignments': assignments,
-                'group_roles': group_roles, 'activity': activity}
+                'group_roles': group_roles, 'groups': groups, 'activity': activity}
 
     def save(self, body, actor, role_id=None):
         if role_id is not None and role_id != body.id:
@@ -136,6 +166,7 @@ class EnterpriseRoles:
         with self.store.connect() as conn:
             conn.begin_write()
             actor_label = self.authorize_in(conn, actor)
+            self.require_grantable(self.held_in(conn, actor), body.permissions)
             old = conn.execute('SELECT * FROM enterprise_roles WHERE id=?', (body.id,)).fetchone()
             if (old is None and role_id is not None) or (old is not None and role_id is None):
                 raise HTTPException(404 if old is None else 409, 'Role not found.' if old is None else 'Choose a new role ID or edit the existing role.')
@@ -180,13 +211,18 @@ class EnterpriseRoles:
             actor_label = self.authorize_in(conn, actor)
             if not self.role_exists_in(conn, body.role_id):
                 raise HTTPException(422, 'Choose an active workspace role.')
+            held = self.held_in(conn, actor)
+            if held is not None and 'admin' in {body.role_id, self.user_roles.role_in(conn, body.email)}:
+                raise HTTPException(403, ADMIN_ONLY)
+            self.require_grantable(held, self.role_permissions_in(conn, body.role_id))
             old = conn.execute('SELECT * FROM enterprise_role_assignments WHERE email=?', (body.email,)).fetchone()
             if body.revision != (old['revision'] if old else 0):
                 raise HTTPException(409, 'This assignment changed. Refresh before saving.')
             base = conn.execute('SELECT revision FROM user_roles WHERE email=?', (body.email,)).fetchone()
             base_role = body.role_id if body.role_id in BUILTIN_PERMISSIONS else 'member'
             # Reuse the existing serialized last-admin check; authorization above
-            # permits role administrators while the legacy method checks users.manage.
+            # permits role administrators while the legacy method checks users.manage
+            # and the built-in permission set it grants.
             self.user_roles.change_in(conn, RoleChange(email=body.email, role=base_role,
                 revision=base['revision'] if base else 0), actor, clear_custom=False, authorized_actor=actor_label)
             result = {'email': body.email, 'role_id': body.role_id, 'revision': body.revision + 1}
@@ -199,11 +235,14 @@ class EnterpriseRoles:
         return result
 
     def set_group_role_in(self, conn, group_id, role_id, actor, expected_revision=None):
+        actor_label = self.authorize_in(conn, actor)
         if role_id == 'admin':
             raise HTTPException(422, 'Assign administrator access directly to a user, not a directory group.')
         if role_id is not None and not self.role_exists_in(conn, role_id):
             raise HTTPException(422, 'Choose an active workspace role.')
-        if 'scim_groups' not in conn.table_names() or not conn.execute("SELECT id FROM scim_groups WHERE id=? AND deleted_at=''", (group_id,)).fetchone():
+        if role_id is not None:
+            self.require_grantable(self.held_in(conn, actor), self.role_permissions_in(conn, role_id))
+        if not scim_groups_ready_in(conn) or not conn.execute("SELECT id FROM scim_groups WHERE id=? AND deleted_at=''", (group_id,)).fetchone():
             raise HTTPException(404, 'Directory group not found.')
         old = conn.execute('SELECT * FROM enterprise_group_roles WHERE group_id=?', (group_id,)).fetchone()
         revision = old['revision'] if old else 0
@@ -213,8 +252,8 @@ class EnterpriseRoles:
         conn.execute('''INSERT INTO enterprise_group_roles(group_id,role_id,revision,updated_by,updated_at)
             VALUES(?,?,?,?,?) ON CONFLICT(group_id) DO UPDATE SET role_id=excluded.role_id,
             revision=excluded.revision,updated_by=excluded.updated_by,updated_at=excluded.updated_at''',
-            (group_id, role_id, result['revision'], actor, now()))
-        self.audit_in(conn, 'group-grant.updated', actor, group_id,
+            (group_id, role_id, result['revision'], actor_label, now()))
+        self.audit_in(conn, 'group-grant.updated', actor_label, group_id,
                       {key: old[key] for key in result} if old else None, result)
         return result
 
@@ -256,8 +295,7 @@ class EnterpriseRoles:
             security.require(request, mutation=True, permission='roles.manage')
             with self.store.connect() as conn:
                 conn.begin_write()
-                actor = self.authorize_in(conn, security.session_info(request))
-                return self.set_group_role_in(conn, group_id, body.role_id, actor, body.revision)
+                return self.set_group_role_in(conn, group_id, body.role_id, security.session_info(request), body.revision)
 
         return router
 

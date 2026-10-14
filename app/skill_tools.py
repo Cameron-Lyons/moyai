@@ -89,7 +89,7 @@ def require_turn(run):
         raise HTTPException(403, 'Skills require an authenticated chat turn.')
 
 
-def writing_actor(skills, run):
+def writing_actor(skills, run, conn=None):
     require_turn(run)
     actor = run['active_user_id']
     if skills.security.local_preview() and actor == 'shared:local:admin':
@@ -97,16 +97,16 @@ def writing_actor(skills, run):
     settings = skills.security.settings
     # Only independently verified Google profiles and fresh matching Slack
     # profiles qualify. Accounting links never grant access or admin status.
-    users = skills.store.rows("SELECT * FROM users WHERE kind IN ('google','cloudflare')")
-    matches = [u for u in users if skills.same_requester(u['id'], actor)]
+    users = skills.store.rows("SELECT * FROM users WHERE kind IN ('google','cloudflare')", connection=conn)
+    matches = [u for u in users if skills.same_requester(u['id'], actor, connection=conn)]
     if len(matches) != 1 or not settings.person_login_enabled():
         raise HTTPException(403, 'Sign in with Google first. Slack also needs a fresh verified matching profile to save skills.')
     user = matches[0]
     if user['email'].rpartition('@')[2] not in settings.google_domains():
         raise HTTPException(403, 'This account is no longer eligible to manage skills.')
     if skills.security.user_roles:
-        skills.security.user_roles.require_actor(user['id'], 'skills.manage')
-        return user['id'], skills.security.has_actor_permission(user['id'], 'skills.publish')
+        skills.security.user_roles.require_actor(user['id'], 'skills.manage', connection=conn)
+        return user['id'], skills.security.has_actor_permission(user['id'], 'skills.publish', connection=conn)
     return user['id'], skills.security.google_role(user['email']) == 'admin'
 
 
@@ -181,7 +181,7 @@ def save_skill(skills, run, args):
             current = conn.execute('SELECT active_message_id,active_user_id,chat_enabled,deleted_at FROM runs WHERE id=?', (run['id'],)).fetchone()
             if (not current or current['deleted_at'] or any(current[key] != run[key]
                     for key in ('active_message_id', 'active_user_id', 'chat_enabled'))
-                    or writing_actor(skills, run) != (actor, admin)):
+                    or writing_actor(skills, run, conn) != (actor, admin)):
                 raise HTTPException(409, 'The active chat turn changed. Retry from the current turn.')
             for attachment_id, (original, _) in imports.items():
                 current = skills.store.attachments.broker_row(run, attachment_id, conn=conn)
