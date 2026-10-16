@@ -2,7 +2,7 @@
 
 Explicit schema verification is the database prerequisite for
 [compatible rolling releases](rolling-deploy.md). This release requires
-revision **20**. Verified roles can overlap under their reviewed protocols and
+revision **22**. Verified roles can overlap under their reviewed protocols and
 shared settings. After every role runs the bridge, future explicitly reviewed
 additive revisions can use the rolling action; initial activation and breaking
 changes still require maintenance. Production is not opted in by merging code.
@@ -36,7 +36,7 @@ is insufficient.
    python -m app.schema_migrations --apply
    ```
 
-   It prints `{"schema_revision": 20, "status": "ready"}` on success. An empty
+   It prints `{"schema_revision": 22, "status": "ready"}` on success. An empty
    schema must already exist, and requires `MOYAI_DATABASE_INITIALIZE=true`.
    Existing schemas do not need that flag. No credentials are printed.
 4. Set `MOYAI_SCHEMA_MODE=verify` on every role, including the dedicated API.
@@ -51,14 +51,17 @@ transition before enabling them. A normal pre-deploy hook that runs while the ol
 app is live will be rejected. Once this activation is complete, deploy the bridge
 at the same schema revision to all four roles before using online expansions.
 An installation still on an earlier revision, such as revision 14, first needs
-the one-time maintenance adoption of the current revision (20); the empty online
+the one-time maintenance adoption of the current revision (22); the empty online
 registry does not provide a migration path for it.
 
 ## Enterprise governance upgrade
 
-Revision 20 adds workspace roles, SCIM provisioning, session security profiles,
-the governance audit feed and the organization pin, and advances the
-compatibility baseline to 20. Use the coordinated maintenance steps above; the
+Revision 22 combines the fork's workspace roles, SCIM provisioning, session security
+profiles, governance audit feed and organization pin with upstream revisions 20
+and 21. It advances the compatibility baseline to 22. The earlier governance
+branch also used revision 20 for a different schema; neither that version nor
+upstream's 20-to-21 online expansion is an online path to this combined schema.
+Use the coordinated maintenance steps above; the
 rolling and API release actions reject it. See
 [Enterprise governance](enterprise-governance.md#operator-rollout-and-verification)
 for the verification checklist.
@@ -70,11 +73,11 @@ advances the compatibility baseline to 19: older application code treats all
 sessions as shared and cannot safely overlap once private sessions exist.
 
 Use the coordinated maintenance steps above for an existing revision-18 deployment
-(this release migrates it directly to revision 20):
+(this release migrates it directly to revision 22):
 back up the database, drain work, stop **all four roles** (including the dedicated
 API), run `python -m app.schema_migrations --apply` from the target release, and
 start every role at that release with `MOYAI_SCHEMA_MODE=verify`. Confirm the
-migration prints this release's revision (20), health checks pass, and an ordinary saved session
+migration prints this release's revision (22), health checks pass, and an ordinary saved session
 opens before reopening ingress. Verify that a private test session returns 404
 for a second individual account.
 

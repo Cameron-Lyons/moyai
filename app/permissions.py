@@ -76,7 +76,7 @@ TOOL_PERMISSIONS = {
     **dict.fromkeys({'memory_search', 'memory_read'}, 'memory.read'),
     **dict.fromkeys({'memory_save', 'memory_forget'}, 'memory.manage'),
     **dict.fromkeys({'credentials_list', 'credentials_resolve', 'credentials_request',
-                     'credentials_run', 'credentials_report_failure',
+                     'credentials_run', 'credentials_report_failure', 'credentials_aws_login',
                      'credentials_http_request', 'slack_personal_search',
                      'slack_personal_conversations', 'slack_personal_history',
                      'slack_personal_thread'}, 'credentials.read'),

@@ -13,6 +13,7 @@ from app.config import Settings
 from app.db import Store
 from app.main import create_app
 from app.memory import Note
+from app.security import digest
 from test_slack import event, signed, slack_app, wait_for
 from test_spend import sign_in
 
@@ -386,7 +387,7 @@ def test_spend_identities_exclude_unrelated_channel_participants(profiles):
 
 @pytest.fixture
 def memory_profiles(profiles, monkeypatch):
-    from app import credentials, identities
+    from app import credentials, identities, requester_identity
 
     app, control = profiles
     clock = [time.time()]
@@ -399,11 +400,15 @@ def memory_profiles(profiles, monkeypatch):
     monkeypatch.setattr(identities, 'time', SimpleNamespace(time=lambda: clock[0]))
     monkeypatch.setattr(identities, 'now', lambda: Clock.now(timezone.utc).isoformat())
     monkeypatch.setattr(credentials, 'datetime', Clock)
+    monkeypatch.setattr(requester_identity, 'datetime', Clock)
     app.state.settings.google_client_id = 'test-client'
     app.state.settings.google_client_secret = 'test-secret'
     google(app.state.store)
     actor = sender(app.state.store)
-    run = app.state.store.run(app.state.store.rows('SELECT id FROM runs')[0]['id'])
+    run_id = app.state.store.rows('SELECT id FROM runs')[0]['id']
+    # Claiming assigns the input; memory tools require admitted execution.
+    app.state.store.update_run(run_id, status='running', token_hash=digest('memory-profile-capability'))
+    run = app.state.store.run(run_id)
     sync(app)
     assert {tool['name'] for tool in app.state.memory.tools(run)} == {'memory_search', 'memory_read', 'memory_save', 'memory_forget'}
     app.state.memory.save('google:alice', Note(key='response-style', title='Response style',

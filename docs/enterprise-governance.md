@@ -7,8 +7,16 @@ person's permissions: **Roles**, **Provisioning**, **Security policies**, and
 **Audit history**. Existing sign-in protocols and private-session ownership rules
 remain in effect; provisioning does not create a browser login.
 
+These governance features apply to the existing `MOYAI_CORE=legacy` runtime,
+which remains the application default. Upstream's optional `MOYAI_CORE=pydantic`
+runtime has separate authorization and does not yet implement these custom
+roles, SCIM admission, session profiles, or the governance feed. Keep the legacy
+core selected when relying on the controls in this guide. The upstream
+**Deploy production** workflow defaults to a Pydantic cutover; select
+`execution_core=preserve` when updating an existing legacy deployment.
+
 This guide describes the current source. The changes require schema revision
-**20** and a coordinated release. Local tests do not establish a production
+**22** and a coordinated release. Local tests do not establish a production
 deployment, identity-provider certification, or live sandbox-provider enforcement.
 
 ## Roles and permissions
@@ -343,8 +351,10 @@ read snapshot. Refresh to see changes committed after the first page.
 ## Operator rollout and verification
 
 This release raises both the physical schema and compatibility baseline to
-**20**. It is a coordinated offline migration, not an automatically compatible
-rolling expansion.
+**22**. It is a coordinated offline migration, not an automatically compatible
+rolling expansion. The merged branch includes upstream revisions 20 and 21;
+revision 22 combines those changes with the governance schema. Both upstream
+and earlier governance deployments require the offline migration below.
 
 1. Back up the target database and retained files. Keep the existing signing and
    encryption keys, shared settings, database/schema, and resource ownership.
@@ -358,7 +368,7 @@ rolling expansion.
    uv run --frozen --python 3.13 python -m app.schema_migrations --apply
    ```
 
-   Require `{"schema_revision": 20, "status": "ready"}`. Explicit migration
+   Require `{"schema_revision": 22, "status": "ready"}`. Explicit migration
    requires PostgreSQL plus the existing explicit `SESSION_SECRET` and
    `ENCRYPTION_KEY`. Initializing an empty schema also requires the existing
    `MOYAI_DATABASE_INITIALIZE=true` setting.

@@ -2,6 +2,7 @@ import hashlib
 import hmac
 import ipaddress
 import secrets
+from contextlib import nullcontext
 import time
 from pathlib import Path
 from urllib.parse import urlparse
@@ -104,13 +105,13 @@ class Security:
         ):
             raise ValueError("WORKSPACE_MEMBER_PASSWORD must be at least 16 characters and different from the administrator password.")
 
-    def session_info(self, request: Request) -> dict | None:
+    def session_info(self, request: Request, *, connection=None) -> dict | None:
         if self.settings.cloudflare_access_login:
             # Set only by the middleware after verifying THIS request's Access
             # assertion. Cookies alone, including legacy admin cookies, cannot
             # authenticate or override the currently signed-in Access identity.
             info = getattr(request.state, 'access_session', None)
-            person = self.person(info['identity']['email']) if info else None
+            person = self.person(info['identity']['email'], connection=connection) if info else None
             if not person:
                 return None
             return {**info, **person}
@@ -129,7 +130,7 @@ class Security:
                         or email.rpartition("@")[2] != domain or not identity.get("sub")
                         or info.get("client_id") != self.settings.google_client_id):
                     return None
-                person = self.person(email)
+                person = self.person(email, connection=connection)
                 if not person:
                     return None
                 return {**info, **person}
@@ -174,12 +175,14 @@ class Security:
         self.set_session_cookie(response, info)
         return response.headers['set-cookie'].encode('latin-1')
 
-    def google_role(self, email: str) -> str:
+    def google_role(self, email: str, *, connection=None) -> str:
         if self.user_roles is not None:
+            if connection is not None:
+                return self.user_roles.role_in(connection, email.strip().lower())
             return self.user_roles.role(email)
         return 'admin' if email in self.settings.google_admins() else 'member'
 
-    def person(self, email: str) -> dict | None:
+    def person(self, email: str, *, connection=None) -> dict | None:
         """Directory status, built-in role and permissions on one connection.
 
         Every authorization resolves these together, so a request borrows one
@@ -189,7 +192,7 @@ class Security:
         if self.user_roles is None:
             return {'role': self.google_role(email)}
         email = email.strip().lower()
-        with self.user_roles.store.connect() as conn:
+        with self.user_roles.store.connect() if connection is None else nullcontext(connection) as conn:
             if not self.user_roles.active_email_in(conn, email):
                 return None
             role = self.user_roles.role_in(conn, email)
@@ -225,8 +228,8 @@ class Security:
         info = self.session_info(request)
         return info["sid"] if info else None
 
-    def role(self, request: Request) -> str | None:
-        info = self.session_info(request)
+    def role(self, request: Request, *, connection=None) -> str | None:
+        info = self.session_info(request, connection=connection)
         return info["role"] if info else None
 
     def client_key(self, request: Request) -> str:
@@ -243,8 +246,8 @@ class Security:
         return hmac.new(self.secret.encode(), f"csrf:{sid}".encode(), hashlib.sha256).hexdigest()
 
     def require(self, request: Request, *, mutation: bool = False, admin: bool = False,
-                permission: str | None = None) -> str:
-        info = self.session_info(request)
+                permission: str | None = None, connection=None) -> str:
+        info = self.session_info(request, connection=connection)
         sid = info['sid'] if info else None
         if not sid:
             raise HTTPException(401, "Sign in to the workspace.")

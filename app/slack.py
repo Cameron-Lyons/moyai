@@ -11,7 +11,7 @@ from fastapi import HTTPException
 
 from .connectors import ConnectorError
 from .agentchat_slack import connect_agentchat
-from .db import now
+from .db import database, now
 from .slack_chat import SlackChat, USER_MENTION
 from .slack_notifications import SlackNotifications
 from .slack_files import SlackFiles, file_ids as slack_file_ids
@@ -21,27 +21,9 @@ from .slack_references import attachment_reference
 from .slack_origin import is_self
 
 
-# Literal examples are context, not recipients. Preserve them in the prompt.
-# re.M anchors quote prefixes; \Z keeps fences open across line endings.
-QUOTED_TEXT = re.compile(r'```[\s\S]*?(?:```|\Z)|`[^`\n]*(?:`|$)|^[ \t]*>>>[\s\S]*|^[ \t]*>[^\n]*', re.M)
-# A request waits through one or two profile lookup backoffs, then fails closed.
+from .slack_format import routing_text
+# A request waits through profile lookup backoffs, then fails closed.
 PROVISIONING_RETRY_SECONDS = 600
-
-
-def routing_text(text: str, mention: str) -> tuple[str, str]:
-    parts, visible = [], []
-    end = 0
-    for match in QUOTED_TEXT.finditer(text):
-        plain = text[end:match.start()]
-        visible.append(plain)
-        parts.extend((plain.replace(mention, ''), match[0]))
-        visible.append('\n')
-        end = match.end()
-    plain = text[end:]
-    visible.append(plain)
-    parts.append(plain.replace(mention, ''))
-    return ''.join(visible), ''.join(parts).strip()
-
 
 class SlackSessions:
     def __init__(self, store, connectors, manager, checkpoints, settings, lens_feedback=None):
@@ -63,12 +45,13 @@ class SlackSessions:
         self.feedback = SlackFeedback(self, lens_feedback)
         self.agentchat, self.channel = connect_agentchat(self)
 
-    def status(self):
-        bot = self.connectors.slack_installation()
+    def status(self, *, connection=None):
+        bot = self.connectors.slack_installation(connection=connection)
         enabled = bool(self.settings.slack_bot_enabled and self.settings.slack_signing_secret
                        and self.settings.slack_session_users and bot.get("installed")
-                       and self.connectors.policy("slack")["enabled"])
-        latest = self.store.rows("SELECT created_at,reply_status FROM slack_events ORDER BY created_at DESC LIMIT 1")
+                       and self.connectors.policy("slack", connection=connection)["enabled"])
+        latest = self.store.rows("SELECT created_at,reply_status FROM slack_events ORDER BY created_at DESC LIMIT 1",
+                                 connection=connection)
         return {"enabled": enabled, "bot_installed": bot.get("installed", False),
                 "thread_chat_enabled": self.settings.slack_thread_chat_enabled,
                 "messaging_adapter": "agentchat",
@@ -266,7 +249,7 @@ class SlackSessions:
 
     async def prepare(self, run_id):
         await self.prepare_source(run_id)
-        self.files.include_context(run_id)
+        await database(self.files.include_context, run_id)
         await self.files.prepare(run_id)
 
     async def prepare_source(self, run_id):

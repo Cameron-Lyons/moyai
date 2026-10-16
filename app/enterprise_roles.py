@@ -293,9 +293,10 @@ class EnterpriseRoles:
         @router.put('/api/admin/group-roles/{group_id}')
         async def group_role(group_id: str, body: GroupRole, request: Request):
             security.require(request, mutation=True, permission='roles.manage')
+            actor = security.session_info(request)
             with self.store.connect() as conn:
                 conn.begin_write()
-                return self.set_group_role_in(conn, group_id, body.role_id, security.session_info(request), body.revision)
+                return self.set_group_role_in(conn, group_id, body.role_id, actor, body.revision)
 
         return router
 

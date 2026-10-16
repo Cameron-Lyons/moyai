@@ -7,7 +7,7 @@ from urllib.parse import urlsplit
 from pydantic import AliasChoices, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from .context_budget import ModelContextLimits
-from .model_selection import ASTRA_ULTRAFAST
+from .model_selection import ASTRA, ASTRA_ULTRAFAST
 
 
 # Keep picker IDs and labels in code so a stale deployment environment cannot
@@ -32,6 +32,16 @@ class Settings(BaseSettings):
     data_dir: Path = Path(".data")
     moyai_organization_id: str = Field(default='', max_length=32,
         pattern=r'^(?:[a-z][a-z0-9]*(?:-[a-z0-9]+)*)?$')
+    # Release/ownership contracts need these values without importing the new
+    # framework into the legacy interpreter. Native validation is stricter at
+    # the selected entrypoint; the legacy defaults preserve existing hashes.
+    moyai_core: Literal["legacy", "pydantic"] = "legacy"
+    moyai_native_schema: str = ""
+    moyai_native_task_queue: str = ""
+    moyai_native_encryption_key: str = Field(default="", repr=False)
+    moyai_native_key_format: str = ""
+    moyai_native_object_prefix: str = ""
+    moyai_native_object_format: str = ""
     moyai_database_url: str = Field(default='', repr=False)
     moyai_database_initialize: bool = False
     moyai_schema_mode: Literal['auto', 'verify'] = 'auto'
@@ -206,6 +216,8 @@ class Settings(BaseSettings):
     braintrust_parent: str = "project_name:moyai"
     agent_model: str = ""
     agent_harness: str = 'deepagents-temporal'
+    # Exact saved model IDs; other gateway/provider combinations must opt in.
+    native_web_search_models: list[str] = Field(default_factory=lambda: [ASTRA])
     sandbox_provider: Literal['modal', 'substrate', 'lambda'] = 'modal'
     lambda_region: str = 'us-east-1'
     lambda_image: str = ''

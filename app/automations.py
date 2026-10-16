@@ -2,25 +2,36 @@
 import asyncio
 import json
 import logging
-import re
 from contextlib import nullcontext
 from datetime import datetime, timedelta, timezone
-from typing import Annotated, Literal
 from uuid import uuid4
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import APIRouter, HTTPException, Request
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
-from temporalio.client import (Schedule, ScheduleActionStartWorkflow, ScheduleAlreadyRunningError,
-                               ScheduleCalendarSpec, ScheduleOverlapPolicy, SchedulePolicy,
-                               ScheduleRange, ScheduleSpec, ScheduleState, ScheduleUpdate)
+from temporalio.client import (
+    Schedule,
+    ScheduleActionStartWorkflow,
+    ScheduleAlreadyRunningError,
+    ScheduleOverlapPolicy,
+    SchedulePolicy,
+    ScheduleState,
+    ScheduleUpdate,
+)
 from temporalio.service import RPCError, RPCStatusCode
 
+from .automation_definitions import (  # noqa: F401 - existing public aliases
+    Claim,
+    Definition,
+    Launch,
+    Save,
+    SelfManagement,
+    Timing,
+    Toggle,
+    Trigger,
+)
+from .automation_events import EVENT_CHOICES, AutomationEvents, EventTrigger  # noqa: F401 - existing public aliases
 from .automation_history import read_history
-from .automation_permissions import SelfManagement
-from .automation_workflow import AutomationWorkflow
 from .automation_templates import templates
-from .automation_events import AutomationEvents, EventTrigger, EVENT_CHOICES
+from .automation_workflow import AutomationWorkflow
 from .connector_errors import ConnectorError
 from .db import now
 from .runner import response_status
@@ -33,153 +44,6 @@ LINEAR_TEMPLATE = '''Use linear_my_issues to read my open Linear tickets. Pick a
 Before starting work, call automation_claim_item with the Linear issue identifier as item_key. If it is already claimed by another run, skip it and try another ticket. If no suitable tickets remain, report that and stop. Do not repeat work from earlier automation runs.
 
 Implement the fix in the repository, run the relevant tests, and prepare a normal ready-for-review PR. Include the Linear ticket link, the problem, the change, and test results. Use github_create_pull_request and follow its connection and approval policy. Do not approve, merge, enable auto-merge, or write to Slack or Linear. If access or requirements are missing, explain the blocker in this session. Finish with the PR link or the approval/blocker status.'''
-
-
-class Timing(BaseModel):
-    model_config = ConfigDict(extra='forbid')
-    frequency: Literal['hourly', 'daily', 'weekdays', 'weekly', 'cron', 'once'] = 'weekdays'
-    time: str = Field(default='09:00', pattern=r'^([01]\d|2[0-3]):[0-5]\d$')
-    weekday: int = Field(default=1, ge=0, le=6)  # Sunday = 0, as in Temporal.
-    timezone: str = Field(default='America/Los_Angeles', max_length=100)
-    cron: str = Field(default='', max_length=200)
-    run_at: datetime | None = None
-
-    @model_validator(mode='after')
-    def valid_schedule(self):
-        if self.frequency == 'once':
-            if not self.run_at or self.run_at.utcoffset() is None:
-                raise ValueError('Choose a one-time date with its timezone.')
-            self.run_at = self.run_at.astimezone(timezone.utc).replace(microsecond=0)
-        if self.frequency == 'cron':
-            fields = self.cron.split()
-            if len(fields) != 5:
-                raise ValueError('Use five cron fields: minute hour day month weekday.')
-            for field, (low, high) in zip(fields, [(0,59),(0,23),(1,31),(1,12),(0,7)]):
-                for part in field.split(','):
-                    if not re.fullmatch(r'(\*|\d+(?:-\d+)?)(?:/\d+)?', part):
-                        raise ValueError('Use numeric cron fields with *, lists, ranges, or / steps.')
-                    value, *step = part.split('/')
-                    values = [int(n) for n in value.split('-')] if value != '*' else []
-                    if any(n < low or n > high for n in values) or (len(values) == 2 and values[0] > values[1]) or (step and not 1 <= int(step[0]) <= high-low+1):
-                        raise ValueError('Cron contains an out-of-range value.')
-        return self
-
-    @field_validator('timezone')
-    @classmethod
-    def valid_zone(cls, value):
-        try:
-            ZoneInfo(value)
-        except (ZoneInfoNotFoundError, ValueError):
-            raise ValueError('Choose a valid IANA timezone, such as America/Los_Angeles.') from None
-        return value
-
-    def spec(self):
-        if self.frequency == 'cron':
-            return ScheduleSpec(cron_expressions=[self.cron], time_zone_name=self.timezone)
-        if self.frequency == 'once':
-            at = self.run_at
-            return ScheduleSpec(time_zone_name='UTC', calendars=[ScheduleCalendarSpec(
-                year=[ScheduleRange(at.year)], month=[ScheduleRange(at.month)], day_of_month=[ScheduleRange(at.day)],
-                hour=[ScheduleRange(at.hour)], minute=[ScheduleRange(at.minute)], second=[ScheduleRange(at.second)])])
-        hour, minute = map(int, self.time.split(':'))
-        days = [ScheduleRange(1, 5)] if self.frequency == 'weekdays' else [ScheduleRange(self.weekday)] if self.frequency == 'weekly' else [ScheduleRange(0, 6)]
-        return ScheduleSpec(time_zone_name=self.timezone, calendars=[ScheduleCalendarSpec(
-            hour=[ScheduleRange(0, 23)] if self.frequency == 'hourly' else [ScheduleRange(hour)],
-            minute=[ScheduleRange(minute)], day_of_week=days)])
-
-
-class Trigger(BaseModel):
-    model_config = ConfigDict(extra='forbid')
-    id: str = Field(default_factory=lambda: uuid4().hex, pattern=r'^[A-Za-z0-9_-]{1,40}$')
-    schedule: Timing | None = None
-    event: EventTrigger | None = None
-
-    @model_validator(mode='after')
-    def one_source(self):
-        if bool(self.schedule) == bool(self.event):
-            raise ValueError('Each trigger must have one schedule or one event source.')
-        return self
-
-
-class Definition(BaseModel):
-    model_config = ConfigDict(extra='forbid', str_strip_whitespace=True)
-    name: str = Field(min_length=2, max_length=100)
-    prompt: str = Field(min_length=3)
-    triggers: list[Trigger] = Field(min_length=1)
-    max_runs_per_hour: int | None = Field(default=50, ge=1)
-    queue_events: bool = False
-    metadata: dict[Annotated[str, Field(min_length=1)], str] = Field(default_factory=dict)
-    self_management: SelfManagement = Field(default_factory=SelfManagement,
-        description='Owner-authorized changes this automation and its workers may make to its own instructions or existing schedules. Enable only when the owner requests this. Other definition fields remain fixed.')
-    repo_url: str = Field(default='', max_length=500)
-    github_repository_id: int | None = Field(default=None, gt=0, strict=True)
-    environment_id: str = Field(default='auto', pattern=r'^(auto|none|[0-9a-f]{32})$',
-                                description='Reusable project environment id from automation_environments. Each run pins its active validated build. auto matches the repository, or the workspace default when no repository is set; none uses base tools.')
-    security_profile_id: str = Field(default='', pattern=r'^([0-9a-f]{32})?$')
-    plugins: list[Literal['linear', 'github', 'slack', 'notion']] = Field(default_factory=list, max_length=4)
-    model: str = Field(default='', max_length=120)
-    # Missing on old saved definitions: preserve their original runtime.
-    harness: str = Field(default='hermes', min_length=1, max_length=80)
-    mode: Literal['modal', 'demo'] = 'modal'
-
-    @model_validator(mode='before')
-    @classmethod
-    def upgrade_single_trigger(cls, value):
-        if not isinstance(value, dict):
-            return value
-        data = dict(value)
-        timing, event = data.pop('timing', None), data.pop('event', None)
-        if 'triggers' not in data:
-            if event:
-                event = dict(event)
-                if 'max_runs_per_hour' in event:
-                    data.setdefault('max_runs_per_hour', event.pop('max_runs_per_hour'))
-                data['triggers'] = [{'id': 'default', 'event': event}]
-            else:
-                data['triggers'] = [{'id': 'default', 'schedule': timing or {}}]
-        sources = [t.model_dump() if isinstance(t, BaseModel) else t for t in data['triggers']] if isinstance(data['triggers'], list) else []
-        events = [t.get('event') for t in sources if isinstance(t, dict)]
-        events = [e.model_dump() if isinstance(e, BaseModel) else e for e in events]
-        if 'max_runs_per_hour' not in data and any(e.get('provider') == 'slack' and e.get('event') == 'message.posted' for e in events if isinstance(e, dict)):
-            data['max_runs_per_hour'] = 150
-        return data
-
-    @model_validator(mode='after')
-    def distinct_triggers(self):
-        if len({t.id for t in self.triggers}) != len(self.triggers):
-            raise ValueError('Each trigger needs a unique identifier.')
-        return self
-
-    @field_validator('repo_url')
-    @classmethod
-    def repository(cls, value):
-        value = value.removesuffix('/')
-        if value and not re.fullmatch(r'https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', value):
-            raise ValueError('Use a https://github.com/owner/repository URL.')
-        return value
-
-
-class Save(BaseModel):
-    model_config = ConfigDict(extra='forbid')
-    definition: Definition
-    revision: int = Field(default=0, ge=0)
-
-
-class Toggle(BaseModel):
-    model_config = ConfigDict(extra='forbid')
-    revision: int = Field(ge=1)
-    paused: bool
-
-
-class Launch(BaseModel):
-    model_config = ConfigDict(extra='forbid')
-    revision: int = Field(ge=1)
-    client_id: str = Field(pattern=r'^[A-Za-z0-9_-]{8,80}$')
-
-
-class Claim(BaseModel):
-    model_config = ConfigDict(extra='forbid', str_strip_whitespace=True)
-    item_key: str = Field(min_length=1, max_length=160, pattern=r'^[A-Za-z0-9][A-Za-z0-9_.:/-]*$')
 
 
 class Automations:
@@ -212,8 +76,8 @@ class Automations:
             self.task.cancel()
             await asyncio.gather(self.task, return_exceptions=True)
 
-    def row(self, automation_id):
-        rows = self.store.rows('SELECT * FROM automations WHERE id=?', (automation_id,))
+    def row(self, automation_id, *, connection=None):
+        rows = self.store.rows('SELECT * FROM automations WHERE id=?', (automation_id,), connection=connection)
         if not rows:
             raise HTTPException(404, 'Automation not found.')
         return rows[0]
@@ -228,15 +92,15 @@ class Automations:
         if row['owner_id'] != self.actor(request) and not (pausing and self.security.role(request) == 'admin'):
             raise HTTPException(403, 'Only the owner can edit or run this automation. Administrators can pause it.')
 
-    def validate_execution(self, definition, owner_id, conn=None):
+    def validate_execution(self, definition, owner_id, *, connection=None):
         # set_state passes its writer: governance reads must not borrow a second
         # pool connection while holding the PostgreSQL writer lock.
         if self.security.user_roles:
-            self.security.user_roles.require_actor(owner_id, 'sessions.create', connection=conn)
+            self.security.user_roles.require_actor(owner_id, 'sessions.create', connection=connection)
         profiles = getattr(self.store, 'security_profiles', None)
         policy = None
         if profiles:
-            policy = json.loads(profiles.binding(definition.security_profile_id, provider=self.settings.sandbox_provider, conn=conn)['security_policy'])
+            policy = json.loads(profiles.binding(definition.security_profile_id, provider=self.settings.sandbox_provider, conn=connection)['security_policy'])
             if policy['connected_apps'] is not None and not set(definition.plugins) <= set(policy['connected_apps']):
                 raise HTTPException(422, 'The security policy does not allow all selected apps.')
             if (definition.repo_url or definition.github_repository_id) and (
@@ -244,9 +108,9 @@ class Automations:
                     policy['connected_apps'] is not None and 'github' not in policy['connected_apps']):
                 raise HTTPException(422, 'The security policy does not allow managed repository access.')
         # Re-evaluate access at every launch; saved workflows confer no new rights.
-        if 'slack' in definition.plugins and self.connectors.personal_slack.configured(owner_id):
+        if 'slack' in definition.plugins and self.connectors.personal_slack.configured(owner_id, connection=connection):
             raise HTTPException(409, 'Personal Slack is not supported in automations. Use a private web chat, or disconnect personal Slack in Connections.')
-        owners = self.store.rows('SELECT * FROM users WHERE id=?', (owner_id,), connection=conn)
+        owners = self.store.rows('SELECT * FROM users WHERE id=?', (owner_id,), connection=connection)
         if not owners or (owners[0]['kind'] in {'google', 'cloudflare'} and (not self.settings.person_login_enabled() or owners[0]['email'].rpartition('@')[2] not in self.settings.google_domains())):
             raise HTTPException(409, 'The automation owner no longer has workspace access.')
         if owners[0]['kind'] == 'shared' and not (self.security.local_preview() or self.settings.password_login_enabled):
@@ -255,15 +119,15 @@ class Automations:
             return
         if self.settings.missing_sandbox() or not all((self.settings.litellm_api_base, self.settings.litellm_api_key)):
             raise HTTPException(409, 'Cloud setup is incomplete. Check Runtime before running this automation.')
-        enabled = {c['id'] for c in self.connectors.list() if c['connected'] and c['enabled']}
+        enabled = self.connectors.enabled_providers(connection=connection)
         if not set(definition.plugins) <= enabled:
             raise HTTPException(409, 'Connect and enable the selected apps before running this automation.')
         self.settings.harness_model(definition.harness, definition.model)
-        selected = self.environments.choose(definition.environment_id, definition.repo_url, definition.github_repository_id)
+        selected = self.environments.choose(definition.environment_id, definition.repo_url, definition.github_repository_id, connection=connection)
         if selected and definition.environment_id not in {'auto', ''}:
             # Launch falls back from an auto selection; an explicit one fails now.
             denial = self.environments.access_denial(
-                {'owner_id': owner_id, 'security_policy': json.dumps(policy) if policy else ''}, selected, conn=conn)
+                {'owner_id': owner_id, 'security_policy': json.dumps(policy) if policy else ''}, selected, conn=connection)
             if denial:
                 raise HTTPException(403, denial)
 
@@ -311,16 +175,16 @@ class Automations:
                 event.repository_id, event.repository = identity, github.repository_name(identity)
 
     def save(self, body, owner_id, automation_id=None, *, connection=None, preserve_state=False):
-        if 'slack' in body.definition.plugins and self.connectors.personal_slack.configured(owner_id):
+        if 'slack' in body.definition.plugins and self.connectors.personal_slack.configured(owner_id, connection=connection):
             raise HTTPException(409, 'Personal Slack is not supported in automations. Use a private web chat, or disconnect personal Slack in Settings > Personal Slack.')
         harness = body.definition.harness
         if 'harness' not in body.definition.model_fields_set:
-            harness = (Definition.model_validate_json(self.row(automation_id)['definition']).harness
+            harness = (Definition.model_validate_json(self.row(automation_id, connection=connection)['definition']).harness
                        if automation_id else self.settings.default_harness(body.definition.model or None))
         definition = body.definition.model_copy(update={'harness': harness,
                                                       'model': self.settings.harness_model(harness, body.definition.model or None),
                                                       'plugins': sorted(set(body.definition.plugins))})
-        old_triggers = {t.id:t for t in Definition.model_validate_json(self.row(automation_id)['definition']).triggers} if automation_id else {}
+        old_triggers = {t.id:t for t in Definition.model_validate_json(self.row(automation_id, connection=connection)['definition']).triggers} if automation_id else {}
         for trigger in definition.triggers:
             if (trigger.schedule and trigger.schedule.frequency == 'once' and trigger.schedule.run_at <= datetime.now(timezone.utc)
                     and not (old_triggers.get(trigger.id) and old_triggers[trigger.id].schedule
@@ -377,9 +241,9 @@ class Automations:
             if not body.paused:
                 if not self.settings.temporal_enabled:
                     raise HTTPException(409, 'Enable Temporal before enabling automatic runs.')
-                if not self.events.ready(row):
+                if not self.events.ready(row, connection=conn):
                     raise HTTPException(409, 'Configure the webhook or Slack connection before enabling this trigger.')
-                self.validate_execution(Definition.model_validate_json(row['definition']), row['owner_id'], conn)
+                self.validate_execution(Definition.model_validate_json(row['definition']), row['owner_id'], connection=conn)
                 if any(t.event and t.event.provider == 'session' for t in Definition.model_validate_json(row['definition']).triggers):
                     self.events.seed_session_cursor(conn, automation_id)
             conn.execute("UPDATE automations SET paused=?,revision=revision+1,updated_at=?,sync_error='' WHERE id=?",

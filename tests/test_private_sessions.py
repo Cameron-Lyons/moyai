@@ -97,7 +97,10 @@ def test_shared_login_cannot_create_private(users_app, monkeypatch):
     assert client.post('/api/runs', json={'prompt': 'No individual', 'private_session': True}).status_code == 403
 
 
-@pytest.mark.parametrize('name', ['slack_send', 'linear_create_issue', 'skills_save', 'memory_save',
+@pytest.mark.parametrize('name', ['slack_send', 'linear_create_issue', 'linear_update_issue',
+                                  'slack_reply', 'slack_edit_message', 'slack_delete_message', 'slack_reaction',
+                                  'notion_create_page', 'notion_update_page', 'notion_append_blocks', 'notion_update_block',
+                                  'skills_save', 'memory_save',
                                   'credentials_request', 'credentials_run', 'automation_create',
                                   'agents_fanout', 'media_share'])
 def test_broker_private_exports_denied_before_dispatch(private_app, name):
@@ -109,6 +112,16 @@ def test_broker_private_exports_denied_before_dispatch(private_app, name):
                            headers={'Authorization': 'Bearer private-capability'},
                            json={'name': name, 'arguments': {}, 'input_id': message['id'], 'request_id': 'a' * 32})
     assert response.status_code == 403, response.text
+    events = app.state.store.events(run['id'])
+    if name == 'credentials_request':
+        # This fixture lacks durable credential access; that ordinary 403 is
+        # not evidence that the private-export guard ran.
+        assert not any(e['data'].get('exception_type') == 'PrivateExportDenied' for e in events)
+        return
+    diagnostic = next(e for e in events if e['data'].get('phase') == 'tool_failure')
+    assert diagnostic['data']['turn_id'] == message['id']
+    assert diagnostic['failure_explanation']['category'] == 'private-export'
+    assert diagnostic['failure_explanation']['action'] == {'dispatched': False, 'outcome': 'rejected'}
 
 
 def test_attached_resource_and_websocket_guard(private_app):

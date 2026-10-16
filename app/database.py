@@ -5,12 +5,16 @@ falls back to a local database. Cross-session decisions retain the exclusive
 writer lock; explicitly scoped session writes share it and lock only their run.
 """
 from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass
 from decimal import Decimal
 from functools import lru_cache
 import hashlib
 import json
 import re
 import sqlite3
+import sys
+from pathlib import Path
 
 
 class DatabaseError(RuntimeError):
@@ -25,6 +29,59 @@ class DatabaseBusyError(DatabaseError):
     """Pool admission or a lock timed out; never permission to replay a write."""
 
 
+class NestedDatabaseConnectionError(DatabaseError):
+    """A programming error, not transient database pressure."""
+
+
+@dataclass
+class _ConnectionScope:
+    owner: object
+    location: str
+    active: bool = True
+
+
+_connection_scopes: ContextVar[tuple[_ConnectionScope, ...]] = ContextVar(
+    'moyai_connection_scopes', default=())
+
+
+def _checkout_location():
+    frame = sys._getframe(1)
+    try:
+        for _ in range(12):
+            if frame is None:
+                break
+            filename, function = Path(frame.f_code.co_filename).name, frame.f_code.co_name
+            if filename != 'contextlib.py' and not (
+                    filename in {'database.py', 'db.py'}
+                    and function in {'connect', 'connection_scope'}):
+                return f'{filename}:{frame.f_lineno} ({function})'
+            frame = frame.f_back
+        return 'database operation'
+    finally:
+        del frame
+
+
+@contextmanager
+def connection_scope(owner):
+    """Reject a nested checkout before it can wait behind its own transaction."""
+    location = _checkout_location()
+    # A task created in this context may run after the connection closes. Its
+    # inherited scope must then be inactive, not a permanent reentry warning.
+    scopes = tuple(scope for scope in _connection_scopes.get() if scope.active)
+    previous = next((scope.location for scope in scopes if scope.owner is owner), None)
+    if previous is not None:
+        raise NestedDatabaseConnectionError(
+            f'Nested database checkout at {location}; existing connection belongs to {previous}. '
+            'Pass the existing connection instead of borrowing another one.')
+    current = _ConnectionScope(owner, location)
+    token = _connection_scopes.set((*scopes, current))
+    try:
+        yield
+    finally:
+        current.active = False
+        _connection_scopes.reset(token)
+
+
 RUNTIME_SETTINGS = ('session_secret', 'encryption_key', 'object_storage_bucket', 'object_storage_endpoint',
              'object_storage_prefix', 'public_url', 'temporal_address', 'temporal_namespace', 'temporal_task_queue',
              'max_concurrent_runs', 'max_pending_runs', 'max_concurrent_model_requests', 'moyai_build_sha',
@@ -33,7 +90,12 @@ RUNTIME_SETTINGS = ('session_secret', 'encryption_key', 'object_storage_bucket',
 
 
 def runtime_fingerprint(settings):
-    return hashlib.sha256(json.dumps({name: getattr(settings, name) for name in RUNTIME_SETTINGS}, sort_keys=True).encode()).hexdigest()
+    from .native_contract import core_contract
+    values = {name: getattr(settings, name) for name in RUNTIME_SETTINGS}
+    native = core_contract(settings)
+    if native is not None:
+        values["execution_core"] = native
+    return hashlib.sha256(json.dumps(values, sort_keys=True).encode()).hexdigest()
 
 
 INTEGRITY_ERRORS = (sqlite3.IntegrityError, IntegrityError)
@@ -420,7 +482,7 @@ class PostgresDatabase:
             # operations; never reconnect it behind a running recovery loop.
             if self.owner_pid is not None and (self.owner.closed or self.owner.broken):
                 raise DatabaseError('Postgres ownership connection was lost. Restart this application process.')
-            with self.pool.connection() as raw:
+            with connection_scope(self), self.pool.connection() as raw:
                 yield PostgresConnection(raw, self.schema, self.owner_pid, write_scope=write_scope, policy=self.policy,
                                          api_policy=self.api_policy, worker_policy=self.worker_policy,
                                          broker_policy=self.broker_policy,
