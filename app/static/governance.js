@@ -1,4 +1,5 @@
-const governanceState = {tab:'roles', query:''};
+const governanceState = {tab:'roles', query:'', renderId:0, auditFilters:{}, auditDraft:{}};
+const governanceAuditFields = ['actor','action','resource_type','resource_id','start','end'];
 const governanceTabs = [
   ['roles','Roles','roles.manage'],
   ['provisioning','Provisioning','scim.manage'],
@@ -14,16 +15,18 @@ globalThis.MoyaiSecurityProfiles = {
 };
 
 async function renderGovernance() {
-  const version=state.pageVersion;
+  const version=state.pageVersion,renderId=++governanceState.renderId;
+  const current=()=>version===state.pageVersion&&renderId===governanceState.renderId;
+  const read=async path=>{try{return await api(path);}catch(error){if(current())throw error;}};
   // Tab switches and Refresh update in place: keep the activated control focused
   // and expanded details open instead of replacing the page with a loading state.
   const page=document.querySelector('.governance-page');
-  const focused=document.activeElement?.closest?.('[data-governance-tab],#governance-refresh');
-  const focusTarget=focused?.id==='governance-refresh'?'#governance-refresh':focused?'[data-governance-tab="'+governanceState.tab+'"]':'';
+  const focused=document.activeElement?.closest?.('[data-governance-tab],#governance-refresh,#governance-audit-filters input,#governance-audit-apply,#governance-audit-clear,#governance-audit-empty-clear');
+  const focusTarget=focused?.id?'#'+(focused.id==='governance-audit-empty-clear'?'governance-audit-actor':focused.id):focused?'[data-governance-tab="'+governanceState.tab+'"]':'';
   const opened=new Set([...document.querySelectorAll('.governance-page details[open][data-details-key]')].map(item=>item.dataset.detailsKey));
   if(!page)MoyaiUI.render($('#content'), '<p class="subtext" role="status">Loading governance…</p>');
-  const session=await api('/api/session');
-  if(version!==state.pageVersion)return;
+  const session=await read('/api/session');
+  if(!current())return;
   applyUserSession(session);
   const tabs=governanceTabs.filter(([, ,permission])=>hasWorkspacePermission(permission));
   if(!tabs.length){
@@ -33,8 +36,9 @@ async function renderGovernance() {
   if(!tabs.some(([id])=>id===governanceState.tab))governanceState.tab=tabs[0][0];
   const tab=governanceState.tab;
   const path={roles:'/api/admin/roles',provisioning:'/api/admin/scim',policies:'/api/admin/security-profiles',audit:'/api/admin/governance/audit'}[tab];
-  const data=await api(path);
-  if(version!==state.pageVersion||tab!==governanceState.tab)return;
+  const filters={...governanceState.auditFilters};
+  const data=await read(tab==='audit'?governanceAuditPath(filters):path);
+  if(!current()||tab!==governanceState.tab)return;
   MoyaiUI.render($('#content'), `<section class="governance-page">
     <div class="page-heading"><div><h1>Governance</h1><p class="subtext">Control workspace permissions, user provisioning, and agent access.</p></div><button id="governance-refresh" class="quiet">Refresh</button></div>
     <div class="analytics-tabs governance-tabs" role="group" aria-label="Governance settings">${tabs.map(([id,label])=>`<button data-governance-tab="${id}" aria-pressed="${tab===id}">${label}</button>`).join('')}</div>
@@ -49,31 +53,138 @@ async function renderGovernance() {
   if(focusTarget)document.querySelector(focusTarget)?.focus();
   if(tab==='roles')bindGovernanceRoles(data,version);
   else if(tab==='provisioning')bindGovernanceProvisioning(data,version);
-  else if(tab==='audit')bindGovernanceAudit(data,version);
+  else if(tab==='audit')bindGovernanceAudit(data,version,renderId,filters);
   else bindGovernancePolicies(data,version);
 }
 
+function governanceAuditPath(filters,cursor='',limit=50) {
+  const params=new URLSearchParams();
+  for(const name of governanceAuditFields)if(filters[name])params.set(name,filters[name]);
+  if(cursor)params.set('cursor',cursor);
+  params.set('limit',String(limit));
+  return '/api/admin/governance/audit?'+params;
+}
+
 function governanceAudit(data) {
-  return `<section class="governance-section"><h2>Governance audit history</h2><p class="subtext">Saved role, provisioning, and security policy changes. This history contains action metadata.</p><div id="governance-audit-table">${governanceAuditRows(data.events)}</div>${data.next_cursor?'<button class="quiet" id="governance-audit-more">Load earlier changes</button>':''}<p id="governance-audit-status" role="status"></p></section>`;
+  const draft=governanceState.auditDraft;
+  const textFields=[['actor','Actor','alex@example.com',254],['action','Action','role.created',120],['resource_type','Resource type','CustomRole',120],['resource_id','Resource ID','auditor',254]];
+  return `<section class="governance-section" id="governance-audit"><div class="section-header"><div><h2>Governance audit history</h2><p class="subtext">Saved role, provisioning, and security policy changes. This history contains action metadata.</p></div><button type="button" class="quiet" id="governance-audit-export">Export CSV</button></div>
+    <form id="governance-audit-filters"><div class="governance-audit-filters">${textFields.map(([name,label,placeholder,maxlength])=>`<div class="field"><label for="governance-audit-${name}">${label}</label><input id="governance-audit-${name}" name="${name}" value="${esc(draft[name]||'')}" placeholder="${placeholder}" maxlength="${maxlength}"></div>`).join('')}
+    <div class="field"><label for="governance-audit-start">From (UTC, inclusive)</label><input type="datetime-local" step="1" id="governance-audit-start" name="start" value="${esc(draft.start||'')}"></div>
+    <div class="field"><label for="governance-audit-end">Before (UTC, exclusive)</label><input type="datetime-local" step="1" id="governance-audit-end" name="end" value="${esc(draft.end||'')}"></div></div>
+    <p class="subtext">Text filters match exactly. Dates and times use UTC. Export includes up to 10,000 matching changes.</p>
+    <div class="governance-actions"><button type="submit" class="primary" id="governance-audit-apply">Apply filters</button><button type="button" class="quiet" id="governance-audit-clear">Clear filters</button></div><p id="governance-audit-filter-error" role="alert"></p></form>
+    <div id="governance-audit-table">${governanceAuditRows(data.events)}</div>${data.next_cursor?'<button type="button" class="quiet" id="governance-audit-more">Load earlier changes</button>':''}
+    <p id="governance-audit-status" role="status"></p><div class="governance-actions"><p id="governance-audit-export-status" role="status"></p><button type="button" class="quiet" id="governance-audit-cancel" hidden>Cancel export</button></div></section>`;
 }
 
 function governanceAuditRows(rows) {
-  return governanceTable('Governance audit history',['When','Action','Actor','Resource'],rows.map(row=>`<tr><td>${esc(new Date(row.created_at).toLocaleString())}</td><td>${esc(row.action)}</td><td>${esc(row.actor)}</td><td>${esc(row.resource_type)}<small>${esc(row.resource_id)}</small></td></tr>`),'No governance changes have been recorded yet.');
+  const filtered=Object.keys(governanceState.auditFilters).length>0;
+  if(!rows.length&&filtered)return '<p class="subtext">No governance changes match these filters.</p><button type="button" class="quiet" id="governance-audit-empty-clear">Clear filters</button>';
+  return governanceTable('Governance audit history',['When (UTC)','Action','Actor','Resource'],rows.map(row=>`<tr><td>${esc(new Date(row.created_at).toLocaleString(undefined,{timeZone:'UTC'}))}</td><td>${esc(row.action)}</td><td>${esc(row.actor)}</td><td>${esc(row.resource_type)}<small>${esc(row.resource_id)}</small></td></tr>`),'No governance changes have been recorded yet.');
 }
 
-function bindGovernanceAudit(data,version) {
-  const button=$('#governance-audit-more');
-  if(!button)return;
-  button.onclick=async()=>{
-    button.disabled=true;$('#governance-audit-status').textContent='Loading…';
+function governanceAuditFilterValues(draft) {
+  const filters={};
+  for(const name of governanceAuditFields){
+    const value=(draft[name]||'').trim();
+    if(!value)continue;
+    if(name==='start'||name==='end'){
+      const timestamp=new Date(value+'Z');
+      if(!Number.isFinite(timestamp.getTime()))throw new Error('Enter valid UTC dates and times.');
+      filters[name]=timestamp.toISOString();
+    }else filters[name]=value;
+  }
+  if(filters.start&&filters.end&&filters.start>=filters.end)throw new Error('The end time must be later than the start time.');
+  return filters;
+}
+
+function governanceAuditCSVCell(value) {
+  let text=String(value??'');
+  // Quoting alone does not stop spreadsheet formulas, including after whitespace.
+  if(/^[\s\u0000-\u001f\u007f]*[=+@-]|^[\t\r\n]/.test(text))text="'"+text;
+  return '"'+text.replaceAll('"','""')+'"';
+}
+
+function bindGovernanceAudit(data,version,renderId,filters) {
+  const section=$('#governance-audit'),form=$('#governance-audit-filters');
+  const button=$('#governance-audit-more'),exportButton=$('#governance-audit-export'),cancel=$('#governance-audit-cancel');
+  const status=$('#governance-audit-status'),exportStatus=$('#governance-audit-export-status');
+  const current=()=>version===state.pageVersion&&renderId===governanceState.renderId&&governanceState.tab==='audit'&&section.isConnected;
+  let exportController=null;
+  const capture=()=>{governanceState.auditDraft=Object.fromEntries(governanceAuditFields.map(name=>[name,form.elements.namedItem(name).value]));};
+  const dirty=()=>{try{return JSON.stringify(governanceAuditFilterValues(governanceState.auditDraft))!==JSON.stringify(filters);}catch{return true;}};
+  const stopExport=message=>{exportController?.abort();exportController=null;cancel.hidden=true;exportButton.disabled=dirty();exportStatus.textContent=message;};
+  const accessError=error=>{
+    if(!current()||![401,403].includes(error.status))return false;
+    stopExport('');data.events=[];data.next_cursor=null;
+    MoyaiUI.render($('#governance-panel'),`<p role="alert">${esc(error.message)}</p><button type="button" class="quiet" id="governance-audit-retry">Check access</button>`);
+    $('#governance-audit-retry').onclick=()=>renderGovernance().catch(error=>settingsLoadError('Governance',error,()=>renderGovernance()));
+    return true;
+  };
+  const refresh=()=>renderGovernance().catch(error=>settingsLoadError('Governance',error,()=>renderGovernance()));
+  const clear=()=>{stopExport('');governanceState.auditFilters={};governanceState.auditDraft={};refresh();};
+  $('#governance-audit-clear').onclick=clear;
+  $('#governance-audit-empty-clear')?.addEventListener('click',clear);
+  form.addEventListener('input',()=>{capture();stopExport(dirty()?'Apply filters to update the history and export.':'');});
+  form.onsubmit=event=>{
+    event.preventDefault();capture();
+    try{governanceState.auditFilters=governanceAuditFilterValues(governanceState.auditDraft);stopExport('');refresh();}
+    catch(error){$('#governance-audit-filter-error').textContent=error.message;}
+  };
+  exportButton.disabled=dirty();
+  cancel.onclick=()=>stopExport('Export cancelled.');
+  if(button)button.onclick=async()=>{
+    if(!current()||!data.next_cursor)return;
+    button.disabled=true;status.textContent='Loading…';
     try{
-      const page=await api('/api/admin/governance/audit?cursor='+encodeURIComponent(data.next_cursor));
-      if(version!==state.pageVersion||governanceState.tab!=='audit')return;
+      const page=await api(governanceAuditPath(filters,data.next_cursor));
+      if(!current())return;
       data.events.push(...page.events);data.next_cursor=page.next_cursor;
       MoyaiUI.render($('#governance-audit-table'),governanceAuditRows(data.events));
-      button.hidden=!data.next_cursor;$('#governance-audit-status').textContent='';
-    }catch(error){if(version===state.pageVersion&&governanceState.tab==='audit')$('#governance-audit-status').textContent=error.message;}
-    finally{if(version===state.pageVersion)button.disabled=false;}
+      button.hidden=!data.next_cursor;status.textContent='';
+    }catch(error){if(current()&&!accessError(error))status.textContent=error.message;}
+    finally{if(current())button.disabled=false;}
+  };
+  exportButton.onclick=async()=>{
+    if(!current()||dirty()||exportController)return;
+    const controller=new AbortController();exportController=controller;
+    const exporting=()=>current()&&exportController===controller&&!controller.signal.aborted;
+    const fields=['created_at','action','actor','resource_type','resource_id','id'];
+    const parts=[fields.map(governanceAuditCSVCell).join(',')+'\r\n'],encoder=new TextEncoder();
+    const started=Date.now(),cursors=new Set();let cursor='',count=0,bytes=encoder.encode(parts[0]).length;
+    exportButton.disabled=true;cancel.hidden=false;exportStatus.textContent='Preparing export…';
+    try{
+      // Start a fresh committed snapshot; never mix the displayed pages with it.
+      do{
+        const remaining=60000-(Date.now()-started);
+        if(remaining<=0)throw new Error('Export took too long. Narrow the filters and try again.');
+        const page=await api(governanceAuditPath(filters,cursor,100),{signal:AbortSignal.any([controller.signal,AbortSignal.timeout(remaining)])});
+        if(!exporting())return;
+        for(const row of page.events){
+          if(++count>10000)throw new Error('More than 10,000 changes match. Narrow the filters before exporting.');
+          const line=fields.map(name=>governanceAuditCSVCell(row[name])).join(',')+'\r\n';
+          bytes+=encoder.encode(line).length;
+          if(bytes>10*1024*1024)throw new Error('Export is too large. Narrow the filters and try again.');
+          parts.push(line);
+        }
+        cursor=page.next_cursor;
+        if(cursor&&(count>=10000||cursors.size>=100))throw new Error('More than 10,000 changes match. Narrow the filters before exporting.');
+        if(cursor&&(!page.events.length||cursors.has(cursor)))throw new Error('Export could not finish. Refresh the history and try again.');
+        if(cursor)cursors.add(cursor);
+        exportStatus.textContent=`Preparing export… ${count.toLocaleString()} changes`;
+      }while(cursor);
+      if(!exporting())return;
+      if(Date.now()-started>=60000)throw new Error('Export took too long. Narrow the filters and try again.');
+      const url=URL.createObjectURL(new Blob(['\uFEFF',...parts],{type:'text/csv;charset=utf-8'}));
+      const link=document.createElement('a');link.href=url;link.download='moyai-governance-audit-'+new Date().toISOString().slice(0,10)+'.csv';
+      document.body.append(link);link.click();link.remove();setTimeout(()=>URL.revokeObjectURL(url),1000);
+      exportStatus.textContent=`Exported ${count.toLocaleString()} changes.`;
+    }catch(error){
+      if(exporting()&&!accessError(error))exportStatus.textContent=error.name==='TimeoutError'?'Export took too long. Narrow the filters and try again.':error.message;
+    }finally{
+      if(exportController===controller){exportController=null;if(current()){exportButton.disabled=dirty();cancel.hidden=true;}}
+    }
   };
 }
 

@@ -44,7 +44,19 @@ internal goal channel (state reads, clock receipts and wrap-up) is not a tool
 call; a user's goal control command needs `sessions.manage` and a profile that
 allows the `goal` tool.
 
-`connections.read` allows viewing connections and using enabled app read tools.
+Prepared environments recheck access to the pinned build before its first
+materialization, including provisioning retries. Revoking environment or
+repository access after selection prevents that private checkout from being
+restored into a new session. Only an existing project VM or saved session
+snapshot proves a retained checkout; assistant replies and agent-only control
+guests do not. Existing project VMs and session snapshots retain their current
+behavior.
+
+`connections.read` allows viewing connections and using enabled app read tools,
+including opening live pull-request details from a session. That reader also
+requires `sessions.read` and rechecks both permissions before returning fetched
+GitHub data. Personal Slack reads honor the session's connected-app and exact
+tool restrictions before using a credential and before returning a response.
 `connections.write` allows enabled app write tools; `connections.manage` controls
 connection setup and organization policies. Internal users retain read and write
 tool access under those policies. A custom reader can omit `connections.write`,
@@ -347,6 +359,36 @@ settings. Audit pages default to 50 entries and
 allow 1–100; follow `next_cursor` for earlier entries in the same snapshot.
 Cursors are signed and expire after 24 hours, and later pages are served from a
 read snapshot. Refresh to see changes committed after the first page.
+
+In **Audit history**, filter by exact actor, action, resource type, or resource
+identifier, and optionally a UTC time range. The start is inclusive and the end
+is exclusive. Refresh preserves the applied filters; **Clear filters** returns
+to the complete feed. The API accepts the same `actor`, `action`,
+`resource_type`, `resource_id`, `start`, and `end` query parameters. Times must
+be ISO 8601 timestamps with an explicit timezone, such as
+`2026-10-16T00:00:00Z`; equivalent timezone offsets normalize to UTC. Filters
+apply before the page limit. Repeat the same filters with `next_cursor`:
+changing or omitting a bound filter returns `422`, requiring a fresh query.
+Unfiltered cursors issued before this update remain usable until they expire.
+
+**Export CSV** starts a fresh, filtered snapshot and downloads all matching
+metadata, up to 10,000 events. If more match, narrow the filters and export again;
+no partial export is downloaded. Each page rechecks `audit.read`, so revoking
+the caller's permission stops the export. CSV cells are quoted and potential
+spreadsheet formulas are escaped. Exporting does not create an external audit
+sink, change retention, or expand the feed to every model/tool/data-access event.
+
+Private-session deletion retains the owner-only request boundary. Once the owner
+has requested deletion, background cleanup and restart recovery can finish it
+from the persisted intent without an owner's browser session. This remains the
+existing soft-delete lifecycle, not a payload-retention or permanent-purge policy.
+
+[Devin's security profiles](https://docs.devin.ai/product-guides/security-profiles)
+also document wildcard/CIDR network rules, enterprise-wide profile scopes, and
+session access requests. This branch supports exact DNS destinations and
+dedicated organization deployments. Those broader controls, and governance
+enforcement in the optional Pydantic runtime, remain separate work; these fixes
+do not establish complete Devin feature parity.
 
 ## Operator rollout and verification
 

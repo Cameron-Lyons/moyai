@@ -540,3 +540,108 @@ def test_prepared_environments_follow_requester_role_and_session_policy(users_ap
     restricted = store.create_run('Use the default', '', 'modal', [], chat_enabled=True, user_id=maya)
     app.state.security_profiles.bind_session(store.run(restricted['id']), profile['id'])
     assert env.bind(restricted['id']) == {}
+
+
+@pytest.fixture
+def pinned_private_environment(users_app):
+    app, client = users_app
+    env, store = app.state.environments, app.state.store
+    sign_as(app, client, 'maya@berri.ai')
+    maya = store.identity({'method': 'google', 'identity': {'email': 'maya@berri.ai', 'sub': 'maya'}})
+    env.save_recipe('e' * 32, SaveRecipe(recipe=recipe(clone_access='github')), 'admin')
+    build = env.enqueue('e' * 32, 1, 'admin')
+    env.update(build['id'], phase='ready', snapshot_id='im-private', commit_sha='a' * 40)
+    store.execute('UPDATE environments SET enabled=1,active_build=? WHERE id=?', (build['id'], 'e' * 32))
+    run = store.create_run('Use this project', '', 'modal', [], chat_enabled=True,
+                           user_id=maya, environment_id='e' * 32)
+    assert env.bind(run['id'])['snapshot_id'] == 'im-private'
+    # A later public recipe cannot change the access needed by the pinned private build.
+    env.save_recipe('e' * 32, SaveRecipe(recipe=recipe(), revision=1), 'admin')
+    sign_as(app, client, 'tin@berri.ai')
+    return app, client, run['id'], build['id']
+
+
+@pytest.mark.parametrize('revocation', [
+    'environments.read', 'connections.read', 'git', 'connected_apps', 'tools',
+])
+async def test_pinned_environment_rechecks_access_before_first_restore_and_on_retry(pinned_private_environment, revocation):
+    from test_enterprise_roles import assign, create_role
+    app, client, run_id, build_id = pinned_private_environment
+    env, store = app.state.environments, app.state.store
+    if revocation.endswith('.read'):
+        permissions = ['workspace.read', 'sessions.read', 'sessions.create', 'environments.read', 'connections.read']
+        create_role(client, 'project-access', [permission for permission in permissions if permission != revocation])
+        assert assign(client, role_id='project-access').status_code == 200
+    else:
+        policy = {'git_access': 'none'} if revocation == 'git' else {revocation: []}
+        profiles = app.state.security_profiles
+        profiles.save('project-policy', {'name': 'Project policy', 'policy': policy}, 'admin')
+        profiles.save_defaults({'floor_profile_id': 'project-policy'})
+    for _ in range(2):
+        with pytest.raises(HTTPException) as denied:
+            await env.prepare(run_id)
+        assert denied.value.status_code == 403
+        with pytest.raises(HTTPException) as denied:
+            env.context(store.run(run_id))
+        assert denied.value.status_code == 403
+    assert store.run(run_id)['environment_build_id'] == build_id
+    assert not store.run(run_id)['snapshot_id']
+
+
+@pytest.mark.parametrize('retained', ['snapshot', 'sandbox', 'durable_sandbox'])
+async def test_pinned_environment_recheck_preserves_existing_session_work(pinned_private_environment, retained):
+    from test_enterprise_roles import assign, create_role
+    app, client, run_id, build_id = pinned_private_environment
+    env, store = app.state.environments, app.state.store
+    if retained == 'snapshot':
+        store.update_run(run_id, snapshot_id='im-session')
+    elif retained == 'sandbox':
+        store.update_run(run_id, sandbox_id='sb-retained-project')
+    else:
+        from app.durable_runner import initialize_schema
+        initialize_schema(store)
+        store.execute('INSERT INTO durable_sessions(run_id,state) VALUES(?,?)',
+                      (run_id, json.dumps({'phase': 'idle', 'sandbox_id': 'sb-retained-project'})))
+    create_role(client, 'session-only', ['workspace.read', 'sessions.read', 'sessions.create'])
+    assert assign(client, role_id='session-only').status_code == 200
+    profiles = app.state.security_profiles
+    profiles.save('no-projects', {'name': 'No projects', 'policy': {'git_access': 'none'}}, 'admin')
+    profiles.save_defaults({'floor_profile_id': 'no-projects'})
+    assert (await env.prepare(run_id))['build_id'] == build_id
+    assert env.context(store.run(run_id))['build_id'] == build_id
+
+
+@pytest.mark.parametrize('reply', ['failed', 'metadata', 'completed', 'independent_runtime'])
+async def test_assistant_replies_without_a_project_computer_cannot_bypass_revocation(pinned_private_environment, reply):
+    from test_enterprise_roles import assign, create_role
+    app, client, run_id, _ = pinned_private_environment
+    env, store = app.state.environments, app.state.store
+    message = store.claim_message(run_id)
+    create_role(client, 'session-only', ['workspace.read', 'sessions.read', 'sessions.create'])
+    assert assign(client, role_id='session-only').status_code == 200
+    with pytest.raises(HTTPException) as denied:
+        await env.prepare(run_id)
+    assert denied.value.status_code == 403
+    # Admission failures save assistant text even though no computer was created.
+    store.finish_message(run_id, message['id'], 'Project access was denied', 'failed')
+    owner = store.run(run_id)['owner_id']
+    if reply == 'metadata':
+        with store.connect() as conn:
+            conn.begin_write()
+            store.enqueue_message_in(conn, run_id, '/session-id', 'metadata-reply', user_id=owner,
+                                     metadata_request=True, restore_archived=True)
+    elif reply in {'completed', 'independent_runtime'}:
+        store.enqueue_message(run_id, 'Answer without opening the computer', 'no-computer-turn', user_id=owner)
+        message = store.claim_message(run_id)
+        store.finish_message(run_id, message['id'], 'Answered without a project checkout')
+        if reply == 'independent_runtime':
+            from app.durable_runner import initialize_schema
+            initialize_schema(store)
+            store.execute('INSERT INTO durable_sessions(run_id,state) VALUES(?,?)',
+                          (run_id, json.dumps({'phase': 'idle', 'sandbox_id': 'sb-agent-guest', 'independent_runtime': True})))
+    followup, _ = store.enqueue_message(run_id, 'Now open the project', 'project-followup', user_id=owner)
+    assert store.claim_message(run_id)['id'] == followup['id']
+    with pytest.raises(HTTPException) as denied:
+        await env.prepare(run_id)
+    assert denied.value.status_code == 403
+    assert not store.run(run_id)['snapshot_id'] and not store.run(run_id)['sandbox_id']

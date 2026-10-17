@@ -319,7 +319,7 @@ class Environments:
                 self.store.event(run_id, 'status', 'Using prepared environment: ' + recipe['name'], {'environment_build_id': identity})
         return self.context(self.store.run(run_id))
 
-    def access_denial(self, run, row, build=None, conn=None):
+    def access_denial(self, run, row=None, build=None, conn=None):
         """Why the requester may not use this selected environment, or ''.
 
         A build snapshot can hold a private checkout made with the GitHub App, so
@@ -348,12 +348,34 @@ class Environments:
         if not identity or identity == 'none':
             return {}
         build = self.build(identity)
+        if not self.retained_workspace(run):
+            # Pinning selects a version; it does not grant permanent access to a
+            # private checkout that has not reached this session yet. Recheck the
+            # pinned build on provisioning retries, without replacing retained work.
+            denial = self.access_denial(run, build=identity)
+            if denial:
+                raise HTTPException(403, denial)
         if build.get('sandbox_provider', 'modal') != run.get('sandbox_provider', 'modal'):
             raise HTTPException(409, 'Rebuild this environment using the session’s sandbox provider, or start without a prepared environment.')
         recipe = json.loads(build.get('resolved_recipe') or build['recipe'])
         stored = json.loads(build['recipe'])
         recipe['repository_id'] = recipe.get('repository_id') or stored.get('repository_id')
         return {**recipe, 'build_id': identity, 'snapshot_id': build['snapshot_id'], 'commit_sha': build['commit_sha']}
+
+    def retained_workspace(self, run):
+        if run.get('snapshot_id') or run.get('sandbox_id'):
+            return True
+        with self.store.connect() as conn:
+            if 'durable_sessions' not in conn.table_names():
+                return False
+            row = conn.execute('SELECT state FROM durable_sessions WHERE run_id=?', (run['id'],)).fetchone()
+        try:
+            state = json.loads(row['state']) if row else {}
+        except (TypeError, ValueError):
+            return False
+        # An independent-runtime guest runs the agent, not the project computer.
+        # Assistant replies (including errors and /session-id) do not prove a retained checkout.
+        return isinstance(state, dict) and bool(state.get('sandbox_id')) and not state.get('independent_runtime')
 
     async def rpc(self, sandbox, action, *, token=''):
         proc = await sandbox.exec.aio(SANDBOX_PYTHON, '-I', '-c', RUNTIME_COMMAND,

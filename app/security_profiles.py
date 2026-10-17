@@ -301,6 +301,10 @@ class SecurityProfiles:
     @staticmethod
     def permits(policy, name, provider=None, write=False):
         """Evaluate one tool against an already resolved effective policy."""
+        # Personal Slack reads are credential tools rather than connector tools,
+        # so broker catalogs/dispatch do not supply their app from TOOLS.
+        if provider is None and name.startswith('slack_personal_'):
+            provider = 'slack'
         if policy['tools'] is not None and name not in policy['tools']:
             return False
         if provider and policy['connected_apps'] is not None and provider not in policy['connected_apps']:

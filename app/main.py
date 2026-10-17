@@ -1078,14 +1078,18 @@ def _create_app(settings, store):
             ), request)
         return result
 
+    def require_pull_request_reader(request):
+        security.require(request)
+        security.require(request, permission='connections.read')
+
     @app.get('/api/runs/{run_id}/pull-request')
     async def read_pull_request(run_id: str, request: Request, url: str = Query(max_length=512),
                                 page: int = Query(default=1, ge=1),
                                 head_sha: str = Query(default='', pattern=r'^(?:[0-9a-f]{40})?$'),
                                 base_sha: str = Query(default='', pattern=r'^(?:[0-9a-f]{40})?$')):
-        security.require(request)
+        await database(require_pull_request_reader, request)
         result = await session_pull_requests.read(run_id, url, page=page, head_sha=head_sha, base_sha=base_sha)
-        security.require(request)
+        await database(require_pull_request_reader, request)
         return result
 
     @app.post("/api/runs/{run_id}/messages", status_code=202)

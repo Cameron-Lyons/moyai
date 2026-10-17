@@ -678,7 +678,7 @@ class Scim:
         router = APIRouter()
 
         @router.get('/api/admin/scim')
-        async def directory(request: Request):
+        def directory(request: Request):
             self.security.require(request, admin=True, permission='scim.manage')
             with self.store.connect() as conn:
                 conn.begin_read()
@@ -691,7 +691,7 @@ class Scim:
                                           'Groups': ['displayName eq', 'externalId eq', 'id eq']}}
 
         @router.post('/api/admin/scim/tokens')
-        async def create_token(body: TokenCreate, request: Request):
+        def create_token(body: TokenCreate, request: Request):
             # Unlike viewing or revoking, issuing a credential needs the built-in
             # administrator: it controls membership, group grants and deactivation.
             self.security.require(request, admin=True, mutation=True)
@@ -709,7 +709,7 @@ class Scim:
                                 headers={'Cache-Control': 'no-store'})
 
         @router.delete('/api/admin/scim/tokens/{identity}')
-        async def revoke_token(identity: str, request: Request):
+        def revoke_token(identity: str, request: Request):
             self.security.require(request, admin=True, mutation=True, permission='scim.manage')
             actor = self.security.session_info(request)
             label = actor.get('identity', {}).get('email') or actor.get('method', 'admin')

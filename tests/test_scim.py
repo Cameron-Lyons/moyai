@@ -315,20 +315,35 @@ def test_handlers_query_the_database_off_the_event_loop(provision, monkeypatch):
     import asyncio
     service, client, _ = provision
     running, original = [], service.authenticate_in
+    borrows, original_connect = [], service.store.connect
     def authenticate_in(conn, request):
         try:
             running.append(bool(asyncio.get_running_loop()))
         except RuntimeError:
             running.append(False)
         return original(conn, request)
+
+    def connect(*args, **kwargs):
+        try:
+            borrows.append(bool(asyncio.get_running_loop()))
+        except RuntimeError:
+            borrows.append(False)
+        return original_connect(*args, **kwargs)
+
     monkeypatch.setattr(service, 'authenticate_in', authenticate_in)
+    monkeypatch.setattr(service.store, 'connect', connect)
     person = user(client)
     assert client.get('/scim/v2/Users/' + person['id']).status_code == 200
     assert client.get('/scim/v2/Users').status_code == 200
     assert client.get('/scim/v2/ServiceProviderConfig').status_code == 200
     assert patch(client, '/scim/v2/Users/' + person['id'], [{'op': 'replace', 'path': 'title', 'value': 'Lead'}]).status_code == 200
     assert client.delete('/scim/v2/Users/' + person['id']).status_code == 204
+    assert client.get('/api/admin/scim').status_code == 200
+    issued = client.post('/api/admin/scim/tokens', json={'label': 'Off-loop lifecycle'})
+    assert issued.status_code == 200, issued.text
+    assert client.delete('/api/admin/scim/tokens/' + issued.json()['id']).status_code == 204
     assert len(running) >= 7 and not any(running)
+    assert len(borrows) > len(running) and not any(borrows)
 
 
 @pytest.mark.asyncio

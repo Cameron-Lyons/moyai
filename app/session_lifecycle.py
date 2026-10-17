@@ -83,7 +83,11 @@ class SessionLifecycle:
 
     async def complete_delete(self, run_id):
         while True:
+            intent_verified = False
             try:
+                # A worker resumes a saved request, never initiates deletion.
+                await database(self.confirm_delete_intent, run_id)
+                intent_verified = True
                 # A transient checkpoint failure must retry with the intent,
                 # without requiring the browser to submit another request.
                 await self.checkpoints.flush()
@@ -91,17 +95,19 @@ class SessionLifecycle:
                     self.deletion_errors.pop(run_id, None)
                     return
                 await self.manager.stop_for_deletion(run_id)
-                await database(self.delete, run_id, '', True, check_only=True)
+                await database(self.finalize_delete, run_id, check_only=True)
                 # Legacy rows retain historical sandbox IDs, including after
                 # a failed release. Confirm absence through the runtime owner.
                 for member in await database(self.store.rows,
                         'SELECT id,sandbox_id FROM runs WHERE id IN (SELECT run_id FROM run_ancestry WHERE ancestor_id=?)', (run_id,)):
                     await self.manager.cleanup(member, member['id'])
-                await database(self.delete, run_id, '', True)
+                await database(self.finalize_delete, run_id)
                 await self.checkpoints.flush()
                 self.deletion_errors.pop(run_id, None)
                 return
             except Exception as exc:
+                if not intent_verified and isinstance(exc, HTTPException):
+                    raise  # No saved authority: do not stop or clean up this run.
                 log.warning('Session deletion cleanup will retry (%s)', type(exc).__name__)
                 self.deletion_errors[run_id] = 'Workspace cleanup is taking longer than expected. Deletion will retry automatically.'
                 await asyncio.sleep(2)
@@ -251,13 +257,37 @@ class SessionLifecycle:
         return {'id': run_id, 'archived': archived}
 
     def delete(self, run_id, actor, admin, *, check_only=False):
+        return self._delete(run_id, actor, admin, check_only=check_only)
+
+    def confirm_delete_intent(self, run_id):
+        with self.store.connect() as conn:
+            conn.begin_write()
+            self.require_delete_intent(conn.execute('SELECT * FROM runs WHERE id=?', (run_id,)).fetchone())
+
+    @staticmethod
+    def require_delete_intent(run):
+        if not run:
+            raise HTTPException(404, 'Session not found.')
+        if run['parent_run_id']:
+            raise HTTPException(422, 'Delete the parent session to keep its agents together.')
+        if not run['deletion_requested_at']:
+            raise HTTPException(409, 'Session deletion has not been requested.')
+
+    def finalize_delete(self, run_id, *, check_only=False):
+        """Complete already-authorized deletion without borrowing an administrator identity."""
+        return self._delete(run_id, '', False, check_only=check_only, confirmed_intent=True)
+
+    def _delete(self, run_id, actor, admin, *, check_only=False, confirmed_intent=False):
         # Shared with enqueue's BEGIN IMMEDIATE: one commits first, and the
         # other observes either queued work or the retained deletion marker.
-        SessionPrivacy(self.store).require_owner(self.store.run(run_id), actor)
         with self.store.connect() as conn:
             conn.begin_write()
             run = conn.execute('SELECT * FROM runs WHERE id=?', (run_id,)).fetchone()
-            self.require_delete(run, actor, admin)
+            if confirmed_intent:
+                self.require_delete_intent(run)
+            else:
+                SessionPrivacy(self.store).require_owner(run, actor)
+                self.require_delete(run, actor, admin)
             if not run['deleted_at']:
                 family = conn.execute('SELECT id,status FROM runs WHERE id IN (SELECT run_id FROM run_ancestry WHERE ancestor_id=?)', (run_id,)).fetchall()
                 durable = 'durable_sessions' in conn.table_names()

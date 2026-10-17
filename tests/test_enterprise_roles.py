@@ -25,6 +25,47 @@ def assign(client, email='maya@berri.ai', role_id='reader', revision=0):
     return client.put('/api/admin/role-assignments', json={'email': email, 'role_id': role_id, 'revision': revision})
 
 
+def test_role_handlers_query_the_database_off_the_event_loop(users_app, monkeypatch):
+    import asyncio
+    from contextvars import ContextVar
+    app, client = users_app
+    sign_as(app, client, 'tin@berri.ai')
+    group = directory_write(app, 'Group', {'displayName': 'Off-loop reviewers'})
+    current_request = ContextVar('governance_database_request', default=None)
+    borrows, original_require, original_connect = [], app.state.security.require, app.state.store.connect
+
+    def require(request, *args, **kwargs):
+        current_request.set((request.method, request.scope['path']))
+        return original_require(request, *args, **kwargs)
+
+    def connect(*args, **kwargs):
+        if identity := current_request.get():
+            try:
+                running = bool(asyncio.get_running_loop())
+            except RuntimeError:
+                running = False
+            borrows.append((identity, running))
+        return original_connect(*args, **kwargs)
+
+    monkeypatch.setattr(app.state.security, 'require', require)
+    monkeypatch.setattr(app.state.store, 'connect', connect)
+    definition = {'id': 'off-loop', 'name': 'Off-loop', 'permissions': ['workspace.read'], 'revision': 0}
+    requests = [
+        ('GET', '/api/permissions', {}, 200),
+        ('GET', '/api/admin/roles', {}, 200),
+        ('POST', '/api/admin/roles', {'json': definition}, 201),
+        ('PUT', '/api/admin/roles/off-loop', {'json': {**definition, 'revision': 1}}, 200),
+        ('PUT', '/api/admin/role-assignments', {'json': {'email': 'maya@berri.ai', 'role_id': 'off-loop', 'revision': 0}}, 200),
+        ('PUT', '/api/admin/group-roles/' + group['id'], {'json': {'role_id': 'off-loop', 'revision': 0}}, 200),
+        ('DELETE', '/api/admin/roles/off-loop?revision=2', {}, 200),
+    ]
+    for method, path, kwargs, status in requests:
+        response = client.request(method, path, **kwargs)
+        assert response.status_code == status, response.text
+    assert {identity for identity, _ in borrows} == {(method, path.split('?')[0]) for method, path, _, _ in requests}
+    assert not any(running for _, running in borrows)
+
+
 def test_custom_assignment_updates_existing_cookie_and_is_an_allowlist(users_app):
     app, client = users_app
     sign_as(app, client, 'maya@berri.ai')
@@ -61,6 +102,63 @@ def test_delegated_permission_opens_only_its_admin_surface(users_app):
     with pytest.raises(HTTPException) as error:
         app.state.security.require(request, admin=True)
     assert error.value.status_code == 403
+
+
+@pytest.mark.parametrize('permissions,expected', [
+    (['sessions.read'], 403),
+    (['connections.read'], 403),
+    (['sessions.read', 'connections.read'], 200),
+])
+def test_native_pr_reader_requires_session_and_connection_read(users_app, monkeypatch, permissions, expected):
+    app, client = users_app
+    sign_as(app, client, 'maya@berri.ai')
+    run = app.state.store.create_run('Read a delivered PR', '', 'demo', [], user_id='google:maya')
+    sign_as(app, client, 'tin@berri.ai')
+    create_role(client, 'pr-reader', permissions)
+    assert assign(client, role_id='pr-reader').status_code == 200
+    sign_as(app, client, 'maya@berri.ai')
+    calls = []
+
+    async def read(*args, **kwargs):
+        calls.append((args, kwargs))
+        return {'number': 100, 'files': [{'filename': 'private.py', 'patch': 'private code'}]}
+
+    monkeypatch.setattr(app.state.session_pull_requests, 'read', read)
+    response = client.get(f"/api/runs/{run['id']}/pull-request", params={'url': 'https://github.com/org/repo/pull/100'})
+    assert response.status_code == expected, response.text
+    assert len(calls) == int(expected == 200)
+    if expected != 200:
+        assert 'private code' not in response.text
+
+
+@pytest.mark.parametrize('revocation', ['sessions.read', 'connections.read', 'deactivate'])
+def test_native_pr_reader_discards_data_when_access_is_revoked_during_read(users_app, monkeypatch, revocation):
+    app, client = users_app
+    sign_as(app, client, 'maya@berri.ai')
+    run = app.state.store.create_run('Read a delivered PR', '', 'demo', [], user_id='google:maya')
+    sign_as(app, client, 'tin@berri.ai')
+    role = create_role(client, 'pr-reader', ['sessions.read', 'connections.read'])
+    assert assign(client, role_id='pr-reader').status_code == 200
+    sign_as(app, client, 'maya@berri.ai')
+    calls = []
+
+    async def read(*args, **kwargs):
+        calls.append((args, kwargs))
+        if revocation == 'deactivate':
+            directory_write(app, 'User', {'userName': 'maya@berri.ai', 'active': False})
+        else:
+            app.state.user_roles.enterprise.save(RoleDefinition(
+                id=role['id'], name=role['name'], description=role['description'],
+                permissions=[permission for permission in role['permissions'] if permission != revocation],
+                revision=role['revision']),
+                {'method': 'google', 'identity': {'email': 'tin@berri.ai'}}, role['id'])
+        return {'number': 100, 'files': [{'filename': 'private.py', 'patch': 'private code'}]}
+
+    monkeypatch.setattr(app.state.session_pull_requests, 'read', read)
+    response = client.get(f"/api/runs/{run['id']}/pull-request", params={'url': 'https://github.com/org/repo/pull/100'})
+    assert response.status_code == (401 if revocation == 'deactivate' else 403), response.text
+    assert len(calls) == 1
+    assert 'private code' not in response.text
 
 
 def test_delegated_spend_reader_gets_organization_report_and_live_revocation(users_app):

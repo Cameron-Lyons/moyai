@@ -33,8 +33,16 @@ module.exports=function(req,res,url,body,role,fixture){
   if(fixture==='error'){json(res,503,{detail:'This preview simulates a governance outage.'});return true;}
   const empty=fixture==='empty',method=req.method;
   if(path==='/api/admin/governance/audit'){
-    const earlier=url.searchParams.has('cursor');
-    json(res,200,{events:empty?[]:[{id:earlier?'fixture-audit-1':'fixture-audit-2',action:earlier?'role.created':'security.defaults.updated',actor:'alex@example.com',resource_type:earlier?'Role':'Organization',resource_id:earlier?'auditor':'1',created_at:'2026-10-13T12:00:00Z'}],next_cursor:empty||earlier?null:'fixture-audit-next'});
+    let rows=empty?[]:[
+      {id:'fixture-audit-2',action:'security.defaults.updated',actor:'alex@example.com',resource_type:'Organization',resource_id:'1',created_at:'2026-10-13T12:00:00Z'},
+      {id:'fixture-audit-1',action:'role.created',actor:'alex@example.com',resource_type:'CustomRole',resource_id:'auditor',created_at:'2026-10-12T12:00:00Z'},
+    ];
+    for(const name of ['actor','action','resource_type','resource_id'])if(url.searchParams.get(name))rows=rows.filter(row=>row[name]===url.searchParams.get(name));
+    if(url.searchParams.get('start'))rows=rows.filter(row=>Date.parse(row.created_at)>=Date.parse(url.searchParams.get('start')));
+    if(url.searchParams.get('end'))rows=rows.filter(row=>Date.parse(row.created_at)<Date.parse(url.searchParams.get('end')));
+    // A single-row display page keeps pagination reviewable; exports honor limit.
+    const offset=Number(url.searchParams.get('cursor')||0),limit=url.searchParams.get('limit')==='100'?100:1;
+    json(res,200,{events:rows.slice(offset,offset+limit),next_cursor:offset+limit<rows.length?String(offset+limit):null});
   }else if(path==='/api/admin/roles'&&method==='GET')json(res,200,{roles:empty?roles.filter(r=>r.builtin):roles,permissions,assignments:empty?[]:assignments,group_roles:groupRoles,groups:empty?[]:groups.map(group=>({id:group.id,display_name:group.displayName,members:group.members.length})),activity:[]});
   else if(path==='/api/admin/roles'&&method==='POST'){
     const row={...body,revision:1,builtin:false,archived:false};roles.push(row);json(res,201,row);

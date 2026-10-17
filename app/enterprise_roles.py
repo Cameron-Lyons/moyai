@@ -261,37 +261,37 @@ class EnterpriseRoles:
         router = APIRouter()
 
         @router.get('/api/permissions')
-        async def current_permissions(request: Request):
+        def current_permissions(request: Request):
             security.require(request)
             return {'permissions': sorted(security.permissions(request)), 'catalog': catalog(), 'role': security.role(request)}
 
         @router.get('/api/admin/roles')
-        async def roles(request: Request):
+        def roles(request: Request):
             security.require(request, permission='roles.manage')
             return self.listing()
 
         @router.post('/api/admin/roles', status_code=201)
-        async def create_role(body: RoleDefinition, request: Request):
+        def create_role(body: RoleDefinition, request: Request):
             security.require(request, mutation=True, permission='roles.manage')
             return self.save(body, security.session_info(request))
 
         @router.put('/api/admin/roles/{role_id}')
-        async def edit_role(role_id: str, body: RoleDefinition, request: Request):
+        def edit_role(role_id: str, body: RoleDefinition, request: Request):
             security.require(request, mutation=True, permission='roles.manage')
             return self.save(body, security.session_info(request), role_id)
 
         @router.delete('/api/admin/roles/{role_id}')
-        async def archive_role(role_id: str, request: Request, revision: int = Query(ge=0)):
+        def archive_role(role_id: str, request: Request, revision: int = Query(ge=0)):
             security.require(request, mutation=True, permission='roles.manage')
             return self.archive(role_id, revision, security.session_info(request))
 
         @router.put('/api/admin/role-assignments')
-        async def assignment(body: RoleAssignment, request: Request):
+        def assignment(body: RoleAssignment, request: Request):
             security.require(request, mutation=True, permission='roles.manage')
             return self.assign(body, security.session_info(request))
 
         @router.put('/api/admin/group-roles/{group_id}')
-        async def group_role(group_id: str, body: GroupRole, request: Request):
+        def group_role(group_id: str, body: GroupRole, request: Request):
             security.require(request, mutation=True, permission='roles.manage')
             actor = security.session_info(request)
             with self.store.connect() as conn:

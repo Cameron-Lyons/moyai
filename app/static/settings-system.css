@@ -636,6 +636,15 @@
 .settings-view .governance-row > div:first-child { min-width: 0; }
 .settings-view .governance-actions { display: flex; flex-wrap: wrap; gap: 8px; flex-shrink: 0; }
 .settings-view .governance-form-grid { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 24px; }
+.settings-view .governance-audit-filters { display: grid; grid-template-columns: repeat(3,minmax(0,1fr)); gap: 16px; margin-block: 20px 12px; }
+.settings-view .governance-audit-filters .field { min-width: 0; margin: 0; }
+.settings-view .governance-audit-filters input { width: 100%; min-width: 0; }
+.settings-view #governance-audit-filters { margin-block-end: 24px; }
+.settings-view #governance-audit-filter-error { color: var(--settings-danger); }
+.settings-view #governance-audit-export-status { overflow-wrap: anywhere; }
+.settings-view .governance-section .users-table td small { display: block; color: var(--settings-muted); margin-block-start: 4px; overflow-wrap: anywhere; }
+@media (max-width: 900px) { .settings-view .governance-audit-filters { grid-template-columns: repeat(2,minmax(0,1fr)); } }
+@media (max-width: 640px) { .settings-view .governance-audit-filters { grid-template-columns: minmax(0,1fr); } }
 .settings-view .governance-activity { padding: 0; list-style: none; }
 .settings-view .governance-activity li { display: flex; flex-wrap: wrap; gap: 8px 16px; border-bottom: 1px solid var(--settings-line); padding-block: 12px; overflow-wrap: anywhere; }
 .settings-view .governance-activity time { color: var(--settings-muted); margin-inline-start: auto; }

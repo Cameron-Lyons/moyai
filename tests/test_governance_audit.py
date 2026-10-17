@@ -144,3 +144,91 @@ def test_security_defaults_mutations_commit_their_audit_atomically(audit_app):
     defaults = [event for event in audit.listing()['events'] if event['action'] == 'security.defaults.updated']
     assert len(defaults) == 1 and defaults[0]['actor'] == 'policy-owner@berri.ai'
     assert 'rejected-editor' not in json.dumps(defaults)
+
+
+def seed_filtered_audit(app):
+    """Interleave matching and unrelated rows so filters must precede LIMIT."""
+    with app.state.store.connect() as conn:
+        conn.begin_write()
+        for index in range(8):
+            identity = record_event_in(conn, 'role.updated' if index % 2 == 0 else 'user.created',
+                'owner@berri.ai' if index % 2 == 0 else 'provisioner', 'CustomRole', 'reader')
+            conn.execute('UPDATE governance_audit_events SET created_at=? WHERE id=?',
+                         (f'2026-10-16T0{index}:00:00+00:00', identity))
+
+
+def test_filters_apply_before_pagination_and_remain_bound_to_the_snapshot(audit_app):
+    app, client, audit = audit_app
+    sign_as(app, client, 'tin@berri.ai')
+    seed_filtered_audit(app)
+    filters = {'actor': 'owner@berri.ai', 'action': 'role.updated', 'resource_type': 'CustomRole',
+               'resource_id': 'reader', 'start': '2026-10-16T01:00:00Z', 'end': '2026-10-16T06:00:00Z'}
+    response = client.get('/api/admin/governance/audit', params={**filters, 'limit': 1})
+    assert response.status_code == 200, response.text
+    first = response.json()
+    assert first['events'][0]['created_at'] == '2026-10-16T04:00:00+00:00'
+    assert first['next_cursor']
+    with app.state.store.connect() as conn:
+        conn.begin_write()
+        identity = record_event_in(conn, 'role.updated', 'owner@berri.ai', 'CustomRole', 'reader')
+        conn.execute('UPDATE governance_audit_events SET created_at=? WHERE id=?',
+                     ('2026-10-16T03:00:00+00:00', identity))
+    # Even when a different caller indexes a backdated commit, it cannot enter
+    # an earlier snapshot, including a filtered export's subsequent pages.
+    audit.listing()
+    page = client.get('/api/admin/governance/audit', params={**filters, 'limit': 1, 'cursor': first['next_cursor']})
+    assert page.status_code == 200, page.text
+    assert [row['created_at'] for row in page.json()['events']] == ['2026-10-16T02:00:00+00:00']
+    assert page.json()['next_cursor'] is None
+    for changed in ({}, {**filters, 'actor': 'provisioner'}, {**filters, 'end': '2026-10-17T00:00:00Z'}):
+        assert client.get('/api/admin/governance/audit', params={**changed, 'cursor': first['next_cursor']}).status_code == 422
+    # Equivalent timezone offsets refer to the same signed filter interval.
+    equivalent = {**filters, 'start': '2026-10-15T20:00:00-05:00', 'cursor': first['next_cursor']}
+    assert client.get('/api/admin/governance/audit', params=equivalent).json()['events'] == page.json()['events']
+
+
+def test_exact_filters_utc_boundaries_and_invalid_ranges(audit_app):
+    app, client, audit = audit_app
+    sign_as(app, client, 'tin@berri.ai')
+    seed_filtered_audit(app)
+    for name, value in {'actor': 'owner@berri.ai', 'action': 'role.updated', 'resource_type': 'CustomRole', 'resource_id': 'reader'}.items():
+        rows = audit.listing(**{name: value})['events']
+        assert rows and all(row[name] == value for row in rows)
+        assert audit.listing(**{name: value + '%'})['events'] == []
+        assert audit.listing(**{name: "' OR 1=1 --"})['events'] == []
+    rows = audit.listing(start='2026-10-16T02:00:00Z', end='2026-10-16T04:00:00Z')['events']
+    assert {row['created_at'] for row in rows} == {'2026-10-16T02:00:00+00:00', '2026-10-16T03:00:00+00:00'}
+    for filters in ({'start': '2026-10-16'}, {'end': '2026-10-16T03:00:00'}, {'start': 'invalid'},
+                    {'start': '2026-10-16T04:00:00Z', 'end': '2026-10-16T04:00:00Z'},
+                    {'start': '2026-10-17T04:00:00Z', 'end': '2026-10-16T04:00:00Z'},
+                    {'actor': 'a' * 255}):
+        response = client.get('/api/admin/governance/audit', params=filters)
+        assert response.status_code == 422, response.text
+
+
+def test_cursor_pages_reauthorize_and_old_unfiltered_cursors_remain_valid(audit_app):
+    app, client, audit = audit_app
+    sign_as(app, client, 'tin@berri.ai')
+    create_role(client, 'auditor', ['workspace.read', 'audit.read'])
+    assert assign(client, role_id='auditor').status_code == 200
+    seed_filtered_audit(app)
+    sign_as(app, client, 'maya@berri.ai')
+    first = client.get('/api/admin/governance/audit', params={'limit': 1, 'actor': 'owner@berri.ai'}).json()
+    assert first['next_cursor']
+    state = audit.read_cursor(first['next_cursor'])
+    legacy = app.state.security.signer.dumps({'v': 1, 'cap': state['cap'], 'before': state['before']}, salt='governance-audit-v1')
+    assert audit.listing(legacy)['events']
+    sign_as(app, client, 'tin@berri.ai')
+    assert assign(client, role_id='member', revision=1).status_code == 200
+    sign_as(app, client, 'maya@berri.ai')
+    assert client.get('/api/admin/governance/audit', params={
+        'cursor': first['next_cursor'], 'actor': 'owner@berri.ai'}).status_code == 403
+
+
+def test_signed_cursor_rejects_invalid_filter_state(audit_app):
+    app, _, audit = audit_app
+    for filters in ({'unknown': 'value'}, {'actor': []}, {'start': '2026-10-16'}, {'actor': ' owner@berri.ai '}):
+        cursor = app.state.security.signer.dumps({'v': 2, 'cap': 10, 'before': 5, 'filters': filters}, salt='governance-audit-v1')
+        with pytest.raises(HTTPException) as error:
+            audit.listing(cursor)
+        assert error.value.status_code == 422

@@ -680,6 +680,11 @@ class DurableRunner(RunManager):
             try:
                 sandbox = await backend.find(name, initialize=True, token=token)
             except modal.exception.NotFoundError:
+                if self.environments:
+                    # Provider lookup can await while a role or mandatory policy
+                    # changes. A pinned image still needs authorization before
+                    # its first materialization; retained session work stays intact.
+                    project = await database(self.environments.context, await database(self.store.run, run_id))
                 try:
                     sandbox = await backend.create(name=name, snapshot_id=state['snapshot_id'] or project.get('snapshot_id') or '',
                                                    token=token)

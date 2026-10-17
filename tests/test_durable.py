@@ -935,3 +935,70 @@ async def test_network_restricted_machine_stays_warm_across_reuse(durable, monke
     await drive(manager, run_id, phase='warm')
     assert manager.state(run_id)['security_network'] == ['a.example.com', 'broker.example.com']
     assert len(cloud.machines) == 1 and cloud.machines[0].alive and len(cloud.launches) == 2
+
+
+@pytest.mark.parametrize('revocation', ['connections.read', 'git'])
+@pytest.mark.parametrize('retained', ['none', 'snapshot', 'machine'])
+async def test_private_environment_revocation_during_provider_lookup(durable, monkeypatch, revocation, retained):
+    from fastapi import HTTPException
+    from app.enterprise_roles import RoleAssignment, RoleDefinition
+    from app.environments import Environments, Recipe, SaveRecipe
+    from app.permissions import MEMBER_PERMISSIONS
+    from app.security_profiles import SecurityProfiles
+
+    manager, cloud, run_id = durable
+    _, _, bob = governed(manager, run_id)
+    store = manager.store
+    manager.settings.google_admin_emails = 'admin@example.com'
+    actor = {'method': 'google', 'identity': {'email': 'admin@example.com'}}
+    roles = store.user_roles.enterprise
+    role = roles.save(RoleDefinition(id='project-reader', name='Project reader',
+        permissions=sorted(MEMBER_PERMISSIONS)), actor)
+    roles.assign(RoleAssignment(email='bob@example.com', role_id=role['id']), actor)
+    profiles = SecurityProfiles(store, manager.settings)
+    env = manager.environments = Environments(store, manager.settings, None, manager, None, None)
+    env.save_recipe('e' * 32, SaveRecipe(recipe=Recipe(repository_id=101,
+        name='Private project', repository='org/private', verify='true', clone_access='github')), 'admin')
+    build = env.enqueue('e' * 32, 1, 'admin')
+    env.update(build['id'], phase='ready', snapshot_id='im-private', commit_sha='a' * 40)
+    store.execute('UPDATE environments SET enabled=1,active_build=? WHERE id=?', (build['id'], 'e' * 32))
+    store.execute('UPDATE runs SET environment_id=? WHERE id=?', ('e' * 32, run_id))
+    assert env.bind(run_id)['snapshot_id'] == 'im-private'
+    await drive(manager, run_id, phase='provision')
+    state = manager.state(run_id)
+    if retained == 'snapshot':
+        store.update_run(run_id, snapshot_id='im-session')
+        state['snapshot_id'] = 'im-session'
+    elif retained == 'machine':
+        machine = await cloud.create(name=manager.provision_name(run_id, state))
+        store.update_run(run_id, sandbox_id=machine.object_id)
+        state['sandbox_id'] = machine.object_id
+    manager.save(run_id, state)
+    backend = manager.provider(store.run(run_id))
+    original_find = backend.find
+
+    async def find(*args, **kwargs):
+        if revocation == 'connections.read':
+            roles.save(RoleDefinition(id=role['id'], name=role['name'], revision=role['revision'],
+                permissions=sorted(MEMBER_PERMISSIONS - {'connections.read'})), actor, role['id'])
+        else:
+            profiles.save('project-floor', {'name': 'Project floor', 'policy': {'git_access': 'none'}}, 'admin')
+            profiles.save_defaults({'floor_profile_id': 'project-floor'})
+        return await original_find(*args, **kwargs)
+
+    monkeypatch.setattr(backend, 'find', find)
+    monkeypatch.setattr(manager, 'provider', lambda *args, **kwargs: backend)
+    images = []
+    monkeypatch.setattr('app.durable_runner.modal.Image.from_id', lambda identity, **kwargs: images.append(identity) or 'image')
+    if retained == 'none':
+        with pytest.raises(HTTPException) as denied:
+            await manager.provision(run_id, state)
+        assert denied.value.status_code == 403
+        assert not cloud.machines and not images
+        assert store.run(run_id)['sandbox_id'] == store.run(run_id)['snapshot_id'] == ''
+    else:
+        sandbox = await manager.provision(run_id, state)
+        assert sandbox is cloud.machines[0] and len(cloud.machines) == 1
+        assert images == (['im-session'] if retained == 'snapshot' else [])
+    assert store.run(run_id)['owner_id'] == bob
+    assert store.run(run_id)['environment_build_id'] == build['id']

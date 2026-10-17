@@ -200,3 +200,139 @@ test('Role managers manage group grants from the Roles tab, and tab switches kee
   await page.getByRole('heading',{name:'Governance audit history',exact:true}).waitFor();
   assert.equal(await page.evaluate(()=>document.activeElement?.dataset.governanceTab),'audit');
 });
+
+for(const width of [1440,768,320])test(`Audit filters retain UTC bounds, refresh and clear at ${width}px`,async t=>{
+  const page=await open(t,width);
+  await page.getByRole('button',{name:'Audit history',exact:true}).click();
+  await page.getByRole('heading',{name:'Governance audit history',exact:true}).waitFor();
+  await page.screenshot({path:`/tmp/moyai-governance-ui/audit-after-${width}.png`,fullPage:true});
+  assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true);
+  await page.locator('#governance-audit-actor').focus();await page.keyboard.press('Tab');
+  assert.equal(await page.evaluate(()=>document.activeElement?.id),'governance-audit-action');
+  const fields={actor:'alex@example.com',action:'role.created',resource_type:'CustomRole',resource_id:'auditor',start:'2026-10-12T12:00',end:'2026-10-13T12:00'};
+  for(const [name,value] of Object.entries(fields))await page.locator(`#governance-audit-${name}`).fill(value);
+  const request=page.waitForRequest(request=>{const url=new URL(request.url());return url.pathname==='/api/admin/governance/audit'&&url.searchParams.get('action')==='role.created';});
+  await page.getByRole('button',{name:'Apply filters',exact:true}).click();
+  const params=new URL((await request).url()).searchParams;
+  assert.equal(params.get('start'),'2026-10-12T12:00:00.000Z');
+  assert.equal(params.get('end'),'2026-10-13T12:00:00.000Z');
+  for(const name of ['actor','action','resource_type','resource_id'])assert.equal(params.get(name),fields[name]);
+  await page.getByText('role.created',{exact:true}).waitFor();
+  assert.equal(await page.getByText('security.defaults.updated',{exact:true}).count(),0);
+  await page.getByRole('button',{name:'Refresh',exact:true}).click();
+  await page.getByText('role.created',{exact:true}).waitFor();
+  assert.equal(await page.locator('#governance-audit-actor').inputValue(),fields.actor);
+  await page.locator('#governance-audit-actor').fill('missing@example.com');
+  await page.getByRole('button',{name:'Apply filters',exact:true}).click();
+  await page.getByText('No governance changes match these filters.',{exact:true}).waitFor();
+  await page.locator('#governance-audit-empty-clear').click();
+  await page.getByText('security.defaults.updated',{exact:true}).waitFor();
+  assert.equal(await page.locator('#governance-audit-actor').inputValue(),'');
+  await page.locator('#governance-audit-start').fill('2026-10-13T12:00');
+  await page.locator('#governance-audit-end').fill('2026-10-12T12:00');
+  await page.getByRole('button',{name:'Apply filters',exact:true}).click();
+  await page.getByText('The end time must be later than the start time.',{exact:true}).waitFor();
+});
+
+test('CSV export starts a fresh filtered snapshot, follows its cursor and escapes spreadsheet formulas',async t=>{
+  const page=await open(t);
+  const exported=[];
+  const row={id:'fresh-1',action:'role.created',actor:'alex@example.com',resource_type:'CustomRole',resource_id:'auditor',created_at:'2026-10-12T12:00:00Z'};
+  await page.route('**/api/admin/governance/audit?*',async route=>{
+    const params=new URL(route.request().url()).searchParams;
+    if(params.get('limit')!=='100')return route.fulfill({json:{events:[{...row,id:'display-only',resource_id:'display-only'}],next_cursor:null}});
+    exported.push(Object.fromEntries(params));
+    await route.fulfill({json:params.get('cursor')?{events:[{...row,id:'fresh-2',action:' \t=1+1',resource_id:'line one, "quoted"\nline two'}],next_cursor:null}:{events:[row],next_cursor:'signed-snapshot-2'}});
+  });
+  await page.getByRole('button',{name:'Audit history',exact:true}).click();
+  await page.locator('#governance-audit-actor').fill('alex@example.com');
+  await page.getByRole('button',{name:'Apply filters',exact:true}).click();
+  await page.getByText('display-only',{exact:true}).waitFor();
+  const downloaded=page.waitForEvent('download');
+  await page.getByRole('button',{name:'Export CSV',exact:true}).click();
+  const download=await downloaded,csv=await require('node:fs/promises').readFile(await download.path(),'utf8');
+  assert.match(csv,/"fresh-1"/);assert.match(csv,/"fresh-2"/);assert.doesNotMatch(csv,/display-only/);
+  assert.ok(csv.includes('"\' \t=1+1"'));
+  assert.ok(csv.includes('"line one, ""quoted""\nline two"'));
+  assert.equal(exported.length,2);
+  assert.deepEqual(exported.map(params=>params.actor),['alex@example.com','alex@example.com']);
+  assert.equal(exported[0].cursor,undefined);assert.equal(exported[1].cursor,'signed-snapshot-2');
+  await page.getByText('Exported 2 changes.',{exact:true}).waitFor();
+});
+
+test('CSV export refuses a partial download above 10,000 changes',async t=>{
+  const page=await open(t);let downloads=0,reads=0;
+  page.on('download',()=>downloads++);
+  await page.route('**/api/admin/governance/audit?*',async route=>{
+    const params=new URL(route.request().url()).searchParams;
+    if(params.get('limit')!=='100')return route.fulfill({json:{events:[],next_cursor:null}});
+    const offset=Number(params.get('cursor')||0);reads++;
+    await route.fulfill({json:{events:Array.from({length:100},(_,index)=>({id:String(offset+index),action:'role.created',actor:'alex@example.com',resource_type:'CustomRole',resource_id:'auditor',created_at:'2026-10-12T12:00:00Z'})),next_cursor:String(offset+100)}});
+  });
+  await page.getByRole('button',{name:'Audit history',exact:true}).click();
+  await page.getByRole('button',{name:'Export CSV',exact:true}).click();
+  await page.getByText('More than 10,000 changes match. Narrow the filters before exporting.',{exact:true}).waitFor();
+  assert.equal(downloads,0);assert.equal(reads,100);
+  assert.equal(await page.getByRole('button',{name:'Export CSV',exact:true}).isEnabled(),true);
+});
+
+test('A late export cannot download after leaving audit, and live access errors clear saved rows',async t=>{
+  const page=await open(t);let downloads=0,release,entered;
+  const gate=new Promise(resolve=>release=resolve),pending=new Promise(resolve=>entered=resolve);
+  page.on('download',()=>downloads++);
+  await page.getByRole('button',{name:'Audit history',exact:true}).click();
+  await page.getByText('security.defaults.updated',{exact:true}).waitFor();
+  await page.route('**/api/admin/governance/audit?*',async route=>{
+    const params=new URL(route.request().url()).searchParams;
+    if(params.get('limit')==='100'){entered();await gate;return route.fulfill({json:{events:[],next_cursor:null}});}
+    return route.fulfill({status:403,json:{detail:'Audit access was revoked.'}});
+  });
+  await page.getByRole('button',{name:'Export CSV',exact:true}).click();await pending;
+  await page.getByRole('button',{name:'Roles',exact:true}).click();
+  await page.getByRole('heading',{name:'Workspace roles',exact:true}).waitFor();
+  release();await page.unrouteAll({behavior:'wait'});assert.equal(downloads,0);
+  await page.getByRole('button',{name:'Audit history',exact:true}).click();
+  await page.getByText('security.defaults.updated',{exact:true}).waitFor();
+  await page.route('**/api/admin/governance/audit?*',route=>route.fulfill({status:403,json:{detail:'Audit access was revoked.'}}));
+  await page.getByRole('button',{name:'Load earlier changes',exact:true}).click();
+  await page.getByText('Audit access was revoked.',{exact:true}).waitFor();
+  assert.equal(await page.getByText('security.defaults.updated',{exact:true}).count(),0);
+  assert.equal(await page.getByRole('button',{name:'Export CSV',exact:true}).count(),0);
+  await page.getByRole('button',{name:'Check access',exact:true}).waitFor();
+});
+
+test('Superseded audit filters cannot restore stale success or error responses',async t=>{
+  const page=await open(t);let release,entered;
+  const gate=new Promise(resolve=>release=resolve),pending=new Promise(resolve=>entered=resolve);
+  await page.getByRole('button',{name:'Audit history',exact:true}).click();
+  await page.route('**/api/admin/governance/audit?*',async route=>{
+    const actor=new URL(route.request().url()).searchParams.get('actor');
+    if(actor==='old@example.com'){entered();await gate;return route.fulfill({status:503,json:{detail:'Old request failed.'}});}
+    await route.fulfill({json:{events:[],next_cursor:null}});
+  });
+  await page.locator('#governance-audit-actor').fill('old@example.com');
+  await page.getByRole('button',{name:'Apply filters',exact:true}).click();await pending;
+  await page.locator('#governance-audit-actor').fill('new@example.com');
+  await page.getByRole('button',{name:'Apply filters',exact:true}).click();
+  await page.getByText('No governance changes match these filters.',{exact:true}).waitFor();
+  release();await page.unrouteAll({behavior:'wait'});
+  assert.equal(await page.locator('#governance-audit-actor').inputValue(),'new@example.com');
+  assert.equal(await page.getByRole('heading',{name:'Unable to load this page',exact:true}).count(),0);
+});
+
+test('Editing an audit filter cancels an in-flight export until filters are applied',async t=>{
+  const page=await open(t);let downloads=0,release,entered;
+  const gate=new Promise(resolve=>release=resolve),pending=new Promise(resolve=>entered=resolve);
+  page.on('download',()=>downloads++);
+  await page.getByRole('button',{name:'Audit history',exact:true}).click();
+  await page.route('**/api/admin/governance/audit?*',async route=>{
+    if(new URL(route.request().url()).searchParams.get('limit')!=='100')return route.continue();
+    entered();await gate;await route.fulfill({json:{events:[],next_cursor:null}});
+  });
+  await page.getByRole('button',{name:'Export CSV',exact:true}).click();await pending;
+  await page.locator('#governance-audit-actor').fill('new@example.com');
+  await page.getByText('Apply filters to update the history and export.',{exact:true}).waitFor();
+  assert.equal(await page.getByRole('button',{name:'Export CSV',exact:true}).isDisabled(),true);
+  assert.equal(await page.getByRole('button',{name:'Cancel export',exact:true}).isVisible(),false);
+  release();await page.unrouteAll({behavior:'wait'});assert.equal(downloads,0);
+});

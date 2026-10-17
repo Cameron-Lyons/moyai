@@ -2,7 +2,7 @@
 from app.database import INTEGRITY_ERRORS
 
 import pytest
-from fastapi import WebSocket
+from fastapi import HTTPException, WebSocket
 from starlette.websockets import WebSocketDisconnect
 
 from app.security import digest
@@ -55,6 +55,92 @@ def test_bob_admin_cannot_read_or_mutate(private_app, method, suffix, body):
     response = client.request(method, '/api/runs/' + run['id'] + suffix, json=body)
     assert response.status_code == 404, response.text
     assert 'orchid' not in response.text
+
+
+def test_owner_private_delete_finishes_and_retries_idempotently(private_app):
+    app, client, run = private_app
+    lifecycle, store = app.state.session_lifecycle, app.state.store
+    url = '/api/runs/' + run['id']
+    response = client.delete(url)
+    assert response.status_code == 200, response.text
+    assert response.json() == {'id': run['id'], 'deleted': True}
+    deleted_at = store.run(run['id'])['deleted_at']
+    assert deleted_at and store.run(run['id'])['deletion_requested_at']
+    assert client.delete(url).status_code == 200
+    assert lifecycle.finalize_delete(run['id']) == {'id': run['id'], 'deleted': True}
+    client.portal.call(lifecycle.complete_delete, run['id'])
+    assert store.run(run['id'])['deleted_at'] == deleted_at
+    assert run['id'] not in lifecycle.deletion_errors
+
+
+@pytest.mark.parametrize('email,admin', [('tin@berri.ai', True), ('ana@berri.ai', False)])
+def test_private_delete_finalizer_does_not_grant_other_users_authority(private_app, email, admin):
+    app, client, run = private_app
+    sign_as(app, client, email)
+    assert client.delete('/api/runs/' + run['id']).status_code == 404
+    actor = 'google:' + email.split('@')[0]
+    with pytest.raises(HTTPException) as denied:
+        app.state.session_lifecycle.delete(run['id'], actor, admin)
+    assert denied.value.status_code == 404
+    with pytest.raises(HTTPException) as denied:
+        app.state.session_lifecycle.request_delete(run['id'], actor, admin)
+    assert denied.value.status_code == 403
+    assert not app.state.store.run(run['id'])['deletion_requested_at']
+
+
+def test_private_delete_finalizer_requires_persisted_owner_intent(private_app, monkeypatch):
+    from unittest.mock import AsyncMock
+    app, client, run = private_app
+    lifecycle = app.state.session_lifecycle
+    stopped = AsyncMock()
+    monkeypatch.setattr(app.state.manager, 'stop_for_deletion', stopped)
+    for check_only in (True, False):
+        with pytest.raises(HTTPException) as denied:
+            lifecycle.finalize_delete(run['id'], check_only=check_only)
+        assert denied.value.status_code == 409
+    with pytest.raises(HTTPException) as denied:
+        client.portal.call(lifecycle.complete_delete, run['id'])
+    assert denied.value.status_code == 409
+    stopped.assert_not_awaited()
+    assert not app.state.store.run(run['id'])['deleted_at']
+    assert not app.state.store.run(run['id'])['deletion_requested_at']
+
+
+@pytest.mark.parametrize('failure', ['cleanup', 'intent_read'])
+def test_private_delete_recovers_saved_intent_and_retries_cleanup(private_app, monkeypatch, failure):
+    from app.session_lifecycle import SessionLifecycle
+    app, client, run = private_app
+    lifecycle, manager, store = app.state.session_lifecycle, app.state.manager, app.state.store
+    monkeypatch.setattr(lifecycle, 'schedule_delete', lambda run_id: None)
+    response = client.delete('/api/runs/' + run['id'])
+    assert response.status_code == 202, response.text
+    assert store.run(run['id'])['deletion_requested_at'] and not store.run(run['id'])['deleted_at']
+    recovered = SessionLifecycle(store, app.state.security, manager, lifecycle.checkpoints)
+    cleanup, attempts = manager.cleanup, []
+    confirm, confirmations = recovered.confirm_delete_intent, []
+
+    def retry_confirmation(run_id):
+        confirmations.append(run_id)
+        if failure == 'intent_read' and len(confirmations) == 1:
+            raise ConnectionError('Temporary database failure')
+        return confirm(run_id)
+
+    async def retry_cleanup(member, run_id):
+        attempts.append(run_id)
+        if failure == 'cleanup' and len(attempts) == 1:
+            raise ConnectionError('Temporary cleanup failure')
+        return await cleanup(member, run_id)
+
+    monkeypatch.setattr(recovered, 'confirm_delete_intent', retry_confirmation)
+    monkeypatch.setattr(manager, 'cleanup', retry_cleanup)
+    client.portal.call(recovered.complete_delete, run['id'])
+    assert len(attempts) >= (3 if failure == 'cleanup' else 2)
+    assert len(confirmations) >= 2
+    assert store.run(run['id'])['deleted_at'] and not recovered.deletion_errors
+    count = len(attempts)
+    client.portal.call(recovered.complete_delete, run['id'])
+    assert len(attempts) == count
+    assert client.delete('/api/runs/' + run['id']).status_code == 200
 
 
 def test_admin_lists_search_focus_pins_and_archives_cannot_reveal(private_app):

@@ -147,6 +147,44 @@ def test_broker_discovers_and_executes_personal_reads(personal, workspace, monke
     assert result.json() == {'ok': True, 'messages': {'matches': []}}
 
 
+@pytest.mark.parametrize('policy', [{'connected_apps': []}, {'tools': []}])
+@pytest.mark.parametrize('name,args', [
+    ('slack_personal_search', {'query': 'private'}),
+    ('slack_personal_conversations', {}),
+    ('slack_personal_history', {'channel': 'D12345678'}),
+    ('slack_personal_thread', {'channel': 'G12345678', 'thread_ts': '1791520602.639729'}),
+])
+async def test_session_policy_blocks_direct_personal_reads_before_network(personal, monkeypatch, policy, name, args):
+    app, run, request_id, _ = personal
+    profiles = app.state.security_profiles
+    profiles.save('restricted-slack', {'name': 'Restricted Slack', 'policy': policy}, 'admin')
+    profiles.save_defaults({'floor_profile_id': 'restricted-slack'})
+    monkeypatch.setattr('app.slack_secrets.httpx.AsyncClient',
+                        lambda **kw: pytest.fail('Session policy allowed an unauthorized Slack request'))
+    with pytest.raises(HTTPException) as denied:
+        await app.state.credentials.call(run, name, {'request_id': request_id, **args})
+    assert denied.value.status_code == 403
+
+
+def test_mandatory_app_revocation_hides_and_rejects_personal_slack_tools(personal, workspace, monkeypatch):
+    app, run, request_id, _ = personal
+    _, client = workspace
+    app.state.settings.temporal_enabled = True
+    profiles = app.state.security_profiles
+    profiles.save('no-slack', {'name': 'No Slack', 'policy': {'connected_apps': []}}, 'admin')
+    profiles.save_defaults({'floor_profile_id': 'no-slack'})
+    monkeypatch.setattr('app.slack_secrets.httpx.AsyncClient',
+                        lambda **kw: pytest.fail('Revoked Slack app reached the network'))
+    headers = {'Authorization': 'Bearer capability'}
+    endpoint = '/broker/' + run['id'] + '/tools'
+    listing = client.get(endpoint, headers=headers)
+    assert listing.status_code == 200, listing.text
+    assert not set(TOOLS) & {tool['name'] for tool in listing.json()}
+    result = client.post(endpoint + '/call', headers=headers, json={
+        'name': 'slack_personal_search', 'arguments': {'request_id': request_id, 'query': 'private'}})
+    assert result.status_code == 403, result.text
+
+
 @pytest.mark.parametrize('scope', ['matching', 'different', 'changed_during_request'])
 async def test_session_lifetime_is_enforced(personal, monkeypatch, scope):
     app, run, request_id, secret_id = personal
@@ -177,7 +215,7 @@ async def test_session_lifetime_is_enforced(personal, monkeypatch, scope):
     assert len(calls) == (0 if scope == 'different' else 1)
 
 
-@pytest.mark.parametrize('change', ['requester', 'policy', 'rotation'])
+@pytest.mark.parametrize('change', ['requester', 'policy', 'rotation', 'profile_app', 'profile_tool'])
 async def test_access_change_during_request_does_not_release_messages(personal, monkeypatch, change):
     app, run, request_id, secret_id = personal
     def respond(request):
@@ -185,6 +223,11 @@ async def test_access_change_during_request_does_not_release_messages(personal, 
             app.state.store.execute("UPDATE runs SET active_user_id='google:bob' WHERE id=?", (run['id'],))
         elif change == 'policy':
             app.state.store.execute("INSERT INTO connection_policies(provider,enabled) VALUES('slack',0)")
+        elif change.startswith('profile_'):
+            policy = {'connected_apps': []} if change == 'profile_app' else {'tools': []}
+            profiles = app.state.security_profiles
+            profiles.save('revoked-slack', {'name': 'Revoked Slack', 'policy': policy}, 'admin')
+            profiles.save_defaults({'floor_profile_id': 'revoked-slack'})
         else:
             app.state.store.execute('UPDATE provider_secrets SET encrypted=? WHERE id=?',
                 (app.state.security.encrypt(json.dumps({'SLACK_USER_TOKEN': 'xoxp-replacement'})), secret_id))
