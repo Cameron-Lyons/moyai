@@ -44,6 +44,11 @@ internal goal channel (state reads, clock receipts and wrap-up) is not a tool
 call; a user's goal control command needs `sessions.manage` and a profile that
 allows the `goal` tool.
 
+Starting a side chat also requires `sessions.read`, because it copies the original
+conversation into the new session. The server checks this before reading the
+source and again in the transaction that saves the copy. Session creation alone
+does not grant access to existing conversation content.
+
 Prepared environments recheck access to the pinned build before its first
 materialization, including provisioning retries. Revoking environment or
 repository access after selection prevents that private checkout from being
@@ -348,6 +353,11 @@ not an audit of every model request, file read, or tool action; see existing
 | `/api/admin/security-profiles`, `/api/admin/security-profiles/{id}` | Profile administration |
 | `PUT /api/admin/security-profiles/defaults` | Default and mandatory profiles |
 | `GET /api/admin/governance/audit` | Shared governance feed |
+
+Security-profile creation, editing, disabling, and default/mandatory-policy changes
+recheck the editor's live `security.manage` permission inside the write transaction.
+A role revocation or SCIM deactivation committed before that transaction prevents
+the change and its successful-change audit entry.
 
 Browser mutations retain origin/CSRF checking. Each governance route requires
 its corresponding catalog permission; creating a provisioning credential also

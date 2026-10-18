@@ -868,6 +868,7 @@ def _create_app(settings, store):
         metadata_request = ((body.chat_enabled or settings.temporal_enabled)
                             and not body.swarm and not body.attachment_ids and is_session_id_request(body.prompt))
         if body.side_chat_of:
+            await database(security.require, request, permission='sessions.read')
             parent = await database(store.run, body.side_chat_of)
             if not parent or parent['deleted_at']:
                 raise HTTPException(404, 'Original session not found.')

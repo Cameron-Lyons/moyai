@@ -626,6 +626,8 @@ class Store:
                 # revocation before this transaction must prevent the session
                 # and any durable wake from being committed together.
                 self.user_roles.require_actor(user_id, 'sessions.create', connection=conn)
+                if side_chat_of:
+                    self.user_roles.require_actor(user_id, 'sessions.read', connection=conn)
             if client_id:
                 previous = conn.execute("SELECT m.*,r.repo_url,r.github_repository_id,r.mode,r.plugins,r.environment_id,r.side_chat_of,r.harness,r.sandbox_provider,r.deleted_at,r.deletion_requested_at,r.private_owner_id FROM messages m JOIN runs r ON r.id=m.run_id WHERE m.client_id=? AND m.user_id=? AND m.role='user'", ('new:' + client_id, user_id)).fetchone()
                 if previous:

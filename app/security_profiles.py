@@ -135,10 +135,19 @@ class SecurityProfiles:
         if live:
             raise HTTPException(409, 'Release session sandboxes before changing the mandatory network policy.')
 
+    def authorize_in(self, conn, actor):
+        # Browser callers retain their verified identity until the writer lock
+        # is held. Do not authorize a queued write from cached permissions or
+        # reduce its identity to an audit label before rechecking live access.
+        if isinstance(actor, dict):
+            return self.security.user_roles.enterprise.authorize_in(conn, actor, 'security.manage')
+        return actor  # Trusted in-process callers already supply an audit label.
+
     def save(self, identity, body, actor):
         body = SaveProfile.model_validate(body)
         with self.store.connect() as conn:
             conn.begin_write()
+            actor = self.authorize_in(conn, actor)
             previous = conn.execute('SELECT * FROM security_profiles WHERE id=?', (identity,)).fetchone()
             if (previous['revision'] if previous else 0) != body.revision:
                 raise HTTPException(409, 'This profile changed. Reload before saving.')
@@ -167,6 +176,7 @@ class SecurityProfiles:
         body = ProfileDefaults.model_validate(body)
         with self.store.connect() as conn:
             conn.begin_write()
+            actor = self.authorize_in(conn, actor)
             old = self.defaults(conn)
             if old['revision'] != body.revision:
                 raise HTTPException(409, 'Organization security defaults changed. Reload before saving.')
@@ -327,13 +337,15 @@ class SecurityProfiles:
             raise HTTPException(403, 'This destination is disabled by the session security profile.')
 
     def routes(self, security=None):
-        security = security or self.security
+        self.security = security = security or self.security
         router = APIRouter()
 
         def actor(request):
             security.require(request, permission='security.manage', mutation=True)
             info = security.session_info(request)
-            return info.get('identity', {}).get('email') or info.get('method', 'admin')
+            if not info:
+                raise HTTPException(401, 'Sign in to the workspace.')
+            return info
 
         @router.get('/api/security-profiles')
         def catalog(request: Request):

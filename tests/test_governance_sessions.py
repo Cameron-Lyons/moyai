@@ -173,3 +173,96 @@ def test_client_id_retry_returns_the_admitted_session_after_policy_changes(works
     vanished = client.post('/api/runs', json={**implicit, 'client_id': 'client-retry-0004'})
     assert vanished.status_code == 409 and 'deleted' in vanished.json()['detail']
     assert len(store.rows('SELECT id FROM runs')) == 2
+
+
+@pytest.mark.parametrize('revoke_at_commit', [False, True])
+def test_side_chat_context_requires_live_session_read_permission(users_app, monkeypatch, revoke_at_commit):
+    from app.enterprise_roles import RoleDefinition
+    app, client = users_app
+    store = app.state.store
+    monkeypatch.setattr(app.state.manager, 'submit', lambda run: None)
+    sign_as(app, client, 'tin@berri.ai')
+    permissions = ['workspace.read', 'sessions.create']
+    create_role(client, 'starter', permissions + (['sessions.read'] if revoke_at_commit else []))
+    assert assign(client, role_id='starter').status_code == 200
+    parent = store.create_run('Existing conversation content', '', 'demo', [], chat_enabled=True)
+    if revoke_at_commit:
+        original = store.create_run
+
+        def revoked_create(*args, **kwargs):
+            app.state.user_roles.enterprise.save(RoleDefinition(
+                id='starter', name='Starter', permissions=permissions, revision=1),
+                {'method': 'google', 'identity': {'email': 'tin@berri.ai'}}, 'starter')
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(store, 'create_run', revoked_create)
+    sign_as(app, client, 'maya@berri.ai')
+    response = client.post('/api/runs', json={
+        'prompt': 'Summarize the original conversation', 'mode': 'demo', 'side_chat_of': parent['id']})
+    assert response.status_code == 403, response.text
+    assert [row['id'] for row in store.rows('SELECT id FROM runs')] == [parent['id']]
+
+
+@pytest.mark.parametrize('operation', ['create', 'update', 'disable', 'defaults'])
+@pytest.mark.parametrize('revocation', ['role', 'scim'])
+def test_security_policy_writes_recheck_access_at_commit(users_app, monkeypatch, operation, revocation):
+    from app.enterprise_roles import RoleDefinition
+    from test_user_roles import directory_write
+    app, client = users_app
+    profiles, roles = app.state.security_profiles, app.state.user_roles.enterprise
+    sign_as(app, client, 'tin@berri.ai')
+    profile = client.post('/api/admin/security-profiles', json={'name': 'Original policy'}).json()
+    create_role(client, 'policy-editor', ['workspace.read', 'security.manage'])
+    assert assign(client, role_id='policy-editor').status_code == 200
+    provisioned = directory_write(app, 'User', {'userName': 'maya@berri.ai'}) if revocation == 'scim' else None
+    method = 'save_defaults' if operation == 'defaults' else 'save'
+    original = getattr(profiles, method)
+
+    def revoked_write(*args, **kwargs):
+        if revocation == 'role':
+            roles.save(RoleDefinition(id='policy-editor', name='Policy editor',
+                permissions=['workspace.read'], revision=1),
+                {'method': 'google', 'identity': {'email': 'tin@berri.ai'}}, 'policy-editor')
+        else:
+            directory_write(app, 'User', {'userName': 'maya@berri.ai', 'active': False}, provisioned['id'])
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(profiles, method, revoked_write)
+    sign_as(app, client, 'maya@berri.ai')
+    path = '/api/admin/security-profiles'
+    if operation == 'create':
+        response = client.post(path, json={'name': 'Unauthorized policy'})
+    elif operation == 'update':
+        response = client.put(path + '/' + profile['id'], json={'name': 'Unauthorized edit', 'revision': 1})
+    elif operation == 'disable':
+        response = client.delete(path + '/' + profile['id'])
+    else:
+        response = client.put(path + '/defaults', json={'floor_profile_id': profile['id']})
+    assert response.status_code == 403, response.text
+    assert profiles.catalog(admin=True) == [profile]
+    assert profiles.defaults()['revision'] == 0
+    assert len(app.state.store.rows('SELECT * FROM security_profile_revisions')) == 1
+    assert not app.state.store.rows("SELECT 1 FROM governance_audit_events WHERE action='security.defaults.updated'")
+
+
+def test_delegated_security_manager_can_save_policies_with_attributed_audit(users_app):
+    app, client = users_app
+    sign_as(app, client, 'tin@berri.ai')
+    create_role(client, 'policy-editor', ['workspace.read', 'security.manage'])
+    assert assign(client, role_id='policy-editor').status_code == 200
+    sign_as(app, client, 'maya@berri.ai')
+    path = '/api/admin/security-profiles'
+    created = client.post(path, json={'name': 'Managed policy', 'policy': {'git_access': 'read'}})
+    assert created.status_code == 201, created.text
+    profile = created.json()
+    assert profile['updated_by'] == 'maya@berri.ai'
+    updated = client.put(path + '/' + profile['id'], json={
+        'name': 'Managed policy v2', 'revision': 1, 'policy': {'git_access': 'none'}})
+    assert updated.status_code == 200 and updated.json()['revision'] == 2
+    assert client.put(path + '/defaults', json={'floor_profile_id': profile['id']}).status_code == 200
+    assert client.put(path + '/defaults', json={'revision': 1}).status_code == 200
+    disabled = client.delete(path + '/' + profile['id'])
+    assert disabled.status_code == 200 and disabled.json()['enabled'] is False
+    revisions = app.state.store.rows('SELECT created_by FROM security_profile_revisions WHERE profile_id=?', (profile['id'],))
+    assert len(revisions) == 3 and all(row['created_by'] == 'maya@berri.ai' for row in revisions)
+    assert {row['actor'] for row in app.state.store.rows('SELECT actor FROM governance_audit_events')} == {'maya@berri.ai'}
