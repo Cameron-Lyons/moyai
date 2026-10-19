@@ -416,7 +416,12 @@ class ProductIdentityAdapter:
         from jwt import PyJWTError
 
         # Ignore even prepopulated state: the assertion must be checked here.
-        verified = Request({**request.scope, "state": {}})
+        # This synchronous helper validates the signed cookie and CSRF only.
+        # It has no canonical role store, so authorizing the requested route
+        # here would incorrectly apply built-in member permissions to delegates.
+        # The original route is authorized below using the live principal.
+        verified = Request({**request.scope, "path": '/api/product/identity',
+                            "raw_path": b'/api/product/identity', "state": {}})
         access_identity = None
         if self.access.enabled:
             try:

@@ -747,3 +747,57 @@ def test_from_runtime_keeps_schemas_distinct_and_does_no_io_before_lifespan(tmp_
     assert service.schema == "moyai_source" and service.native_schema == "moyai_core"
     assert service.infrastructure_reporter.__self__.store is proxy
     assert "app.main" not in sys.modules and "app.agent" not in sys.modules
+
+
+async def assign_billing_role(context, permissions):
+    import json
+    async with context.writer.begin() as db:
+        await db.execute(text("INSERT INTO enterprise_roles VALUES('billing-reader','Billing reader','',:permissions,1,0,'owner','now','now')"),
+                         {'permissions': json.dumps(permissions)})
+        await db.execute(text("INSERT INTO enterprise_role_assignments VALUES('member@example.test','billing-reader',1,'owner','now')"))
+
+
+async def test_custom_spend_reader_can_read_organization_reports_without_builtin_admin(billing_product):
+    context = billing_product
+    await assign_billing_role(context, ['spend.read'])
+    await seed(context.writer, old=[old_row(user_id='google:admin-sub', cost='8')])
+    cookie, _ = google_cookie(context.identity, sub='member-sub', email='member@example.test')
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=context.app), base_url='http://testserver') as client:
+        client.cookies.set('workspace_session', cookie)
+        for path in ('/api/admin/spend', '/api/settings/billing'):
+            response = await client.get(path, params={'start': '2026-10-01', 'end': '2026-10-31'})
+            assert response.status_code == 200, response.text
+            assert response.json()['scope'] == 'organization'
+            assert response.json()['total']['spend'] == '8'
+        assert (await client.get('/api/spend')).status_code == 403
+
+
+async def test_custom_role_without_personal_spend_is_denied_before_reporting(billing_product, monkeypatch):
+    context = billing_product
+    await assign_billing_role(context, [])
+    async def unexpected(**kwargs):
+        pytest.fail('A role without spend permission reached the accounting reader.')
+    monkeypatch.setattr(context.service, 'report', unexpected)
+    cookie, _ = google_cookie(context.identity, sub='member-sub', email='member@example.test')
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=context.app), base_url='http://testserver') as client:
+        client.cookies.set('workspace_session', cookie)
+        for path in ('/api/spend', '/api/admin/spend', '/api/settings/billing'):
+            assert (await client.get(path)).status_code == 403
+
+
+async def test_custom_spend_permission_loss_during_report_drops_result(billing_product, monkeypatch):
+    context = billing_product
+    await assign_billing_role(context, ['spend.read'])
+    original = context.service.report
+    async def revoked(**kwargs):
+        result = await original(**kwargs)
+        async with context.writer.begin() as db:
+            await db.execute(text("UPDATE enterprise_roles SET permissions='[]',revision=2 WHERE id='billing-reader'"))
+        return result
+    monkeypatch.setattr(context.service, 'report', revoked)
+    cookie, _ = google_cookie(context.identity, sub='member-sub', email='member@example.test')
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=context.app), base_url='http://testserver') as client:
+        client.cookies.set('workspace_session', cookie)
+        response = await client.get('/api/admin/spend', params={'start': '2026-10-01', 'end': '2026-10-31'})
+        assert response.status_code == 401
+        assert 'request_details' not in response.text

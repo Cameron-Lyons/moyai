@@ -56,6 +56,8 @@ async def shared(runtime, actor, historical_store):
     class FixtureIdentity:
         """Test-only native-cookie authority; actual-product SSO is tested separately."""
 
+        permissions = None
+
         source_engine = source
 
         @asynccontextmanager
@@ -78,17 +80,20 @@ async def shared(runtime, actor, historical_store):
                 raise HTTPException(403)
             return SimpleNamespace(
                 id=current.id, role=current.role, individual=True,
-                effective_permissions=BUILTIN_PERMISSIONS[current.role],
+                effective_permissions=self.permissions if self.permissions is not None else BUILTIN_PERMISSIONS[current.role],
                 grant=(current.id, current.auth_version),
             )
 
         async def read_native_user(self, db, principal):
-            return await db.get(User, principal.id)
+            user = await db.get(User, principal.id)
+            user.product_grant = principal.grant
+            return user
 
         async def require_current(self, grant):
             current = await runtime.database.user(grant[0])
             if current.auth_version != grant[1]:
                 raise HTTPException(401)
+            current.governance_permissions = self.permissions
             return current
 
     identity = FixtureIdentity()
@@ -381,3 +386,29 @@ async def test_verified_linked_alias_keeps_explicit_native_override(runtime, act
         assert person["cost_usd_exact"] == value["total"]["cost_usd_exact"] == "0.623400000000000002"
         assert native.id not in str(value["request_details"])
         assert turn.id not in str(value["activity"]["rows"])
+
+
+async def test_delegated_spend_reader_can_view_usage_without_builtin_admin(runtime, actor, shared):
+    async with runtime.database.sessions.begin() as db:
+        await db.execute(update(User).where(User.id == actor.id).values(role='member'))
+    runtime.product_identity.permissions = frozenset({'spend.read'})
+    async with client_for(runtime, actor) as client:
+        response = await client.get('/api/settings/usage', params=params())
+        assert response.status_code == 200, response.text
+        assert response.json()['summary']['cost_usd_exact'] == '0.323400000000000002'
+
+
+async def test_usage_rechecks_delegated_permission_before_returning_data(runtime, actor, shared, monkeypatch):
+    async with runtime.database.sessions.begin() as db:
+        await db.execute(update(User).where(User.id == actor.id).values(role='member'))
+    runtime.product_identity.permissions = frozenset({'spend.read'})
+    original = shared.service.report
+    async def revoked(**kwargs):
+        result = await original(**kwargs)
+        runtime.product_identity.permissions = frozenset()
+        return result
+    monkeypatch.setattr(shared.service, 'report', revoked)
+    async with client_for(runtime, actor) as client:
+        response = await client.get('/api/settings/usage', params=params())
+        assert response.status_code == 403
+        assert 'cost_usd_exact' not in response.text

@@ -69,6 +69,10 @@ def route_permission(request):
         return 'audit.read'
     if path.startswith('/api/admin/spend-limits'):
         return 'spend.read' if read else 'spend.manage'
+    if path.startswith('/api/admin/spend'):
+        return 'spend.read' if read else 'spend.manage'
+    if path == '/api/spend':
+        return 'spend.personal'
     if path.startswith('/api/product/automations'):
         return 'automations.read' if read else 'automations.manage'
     if path.startswith('/api/product/memory'):

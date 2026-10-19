@@ -134,13 +134,13 @@ def routes(runtime):
 
     @router.put('/api/admin/spend-limits')
     async def spend_save(body: SpendLimitChanges, user=Depends(principal)):
-        await asyncio.to_thread(product.spend_limits.save, body, GovernanceActor.from_principal(user))
-        return await spend_view(user)
+        result = await asyncio.to_thread(product.spend_limits.save, body, GovernanceActor.from_principal(user))
+        return await spend_view(user) if 'spend.read' in user.effective_permissions else result
 
     @router.delete('/api/admin/spend-limits/{identity:path}')
     async def spend_delete(identity: str, revision: int = Query(ge=1), user=Depends(principal)):
-        await asyncio.to_thread(product.spend_limits.delete, identity, revision, GovernanceActor.from_principal(user))
-        return await spend_view(user)
+        result = await asyncio.to_thread(product.spend_limits.delete, identity, revision, GovernanceActor.from_principal(user))
+        return await spend_view(user) if 'spend.read' in user.effective_permissions else result
 
     def filters(request):
         from app.security_profiles import validated

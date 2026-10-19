@@ -44,6 +44,7 @@ from .product_billing import (
     exact_sum,
     read_product_billing,
 )
+from .product_governance import permission_for_user
 
 TOKEN_FIELDS = ("input_tokens", "output_tokens", "total_tokens", "cache_read_tokens", "cache_write_tokens", "reasoning_tokens")
 REPORT_TIMEOUT_SECONDS = 15.0
@@ -511,7 +512,7 @@ def routes(service: ProductBillingService, *, runtime: Any | None = None) -> API
         format: Literal["json", "csv"] = "json",
         export: Literal["daily", "users", "models", "sessions", "requests", "turns"] = "daily",
     ) -> Any:
-        personal = principal.role != "admin"
+        personal = not permission_for_user(principal, 'spend.read')
         if include_activity and personal:
             raise HTTPException(403, "Administrator access is required for organization activity.")
         if export == "turns" and not include_activity:
@@ -546,6 +547,7 @@ def routes(service: ProductBillingService, *, runtime: Any | None = None) -> API
                     native_user = await runtime.product_identity.read_native_user(db, principal)
                 if native_user is None:
                     raise HTTPException(401, "Sign in to Moyai to view usage activity.")
+                native_user.governance_permissions = principal.effective_permissions
                 from .analytics_service import report as activity_report
 
                 activity = await activity_report(
@@ -568,7 +570,7 @@ def routes(service: ProductBillingService, *, runtime: Any | None = None) -> API
         except (SQLAlchemyError, TimeoutError):
             raise HTTPException(503, "Product accounting is temporarily unavailable.") from None
         fresh = await service.identity.require_current(principal.grant)
-        if not fresh.enabled or (not personal and fresh.role != "admin"):
+        if not fresh.enabled or not permission_for_user(fresh, 'spend.personal' if personal else 'spend.read'):
             raise HTTPException(403, "Your accounting access changed.")
         response.headers["Cache-Control"] = "no-store"
         if activity_export is not None:
@@ -596,7 +598,7 @@ def routes(service: ProductBillingService, *, runtime: Any | None = None) -> API
         except (BillingReadError, SQLAlchemyError, TimeoutError):
             raise HTTPException(503, "Product infrastructure accounting is temporarily unavailable.") from None
         fresh = await service.identity.require_current(principal.grant)
-        if not fresh.enabled or fresh.role != "admin":
+        if not fresh.enabled or not permission_for_user(fresh, 'spend.read'):
             raise HTTPException(403, "Your accounting access changed.")
         response.headers["Cache-Control"] = "no-store"
         return value

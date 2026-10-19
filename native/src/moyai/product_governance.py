@@ -239,4 +239,6 @@ class ProductGovernance:
 def permission_for_user(user, permission):
     from app.permissions import BUILTIN_PERMISSIONS
     held = getattr(user, 'governance_permissions', None)
+    if held is None:
+        held = getattr(user, 'effective_permissions', None)
     return permission in (held if held is not None else BUILTIN_PERMISSIONS[user.role])

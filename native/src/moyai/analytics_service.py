@@ -32,6 +32,7 @@ from .analytics_identity import ReportIdentities, report_identities
 from .inference_usage import InferenceUsage
 from .models import Effect, ProductTurnAuthority, Session, Turn, User
 from .pr_publications import PRPublication, verified_status
+from .product_governance import permission_for_user
 from .pull_requests import PullRequestService, parse_pr_url
 
 if TYPE_CHECKING:
@@ -318,8 +319,8 @@ async def report(
     billing_data: dict[str, Any] | None = None,
     identities: ReportIdentities | None = None,
 ) -> Any:
-    if user.role != "admin" or not user.enabled:
-        raise HTTPException(403, "Administrator access is required.")
+    if not user.enabled or not permission_for_user(user, 'spend.read'):
+        raise HTTPException(403, "Organization spend access is required.")
     try:
         period = report_range(preset, start, end)
     except ValueError as error:
@@ -705,6 +706,15 @@ async def report(
             })
             response["cost_note"] = financial["methodology"]["cost"]
     fresh = await runtime.database.user(user.id)
-    if fresh.role != "admin" or fresh.auth_version != user.auth_version:
+    if fresh.auth_version != user.auth_version:
         raise HTTPException(401, "Your access changed. Sign in again.")
+    grant = getattr(user, 'product_grant', None)
+    if runtime.product_identity is not None and grant is not None:
+        current = await runtime.product_identity.require_current(grant)
+    else:
+        if runtime.settings.product_mode == 'existing':
+            raise HTTPException(401, "Current product authorization is required.")
+        current = fresh
+    if not permission_for_user(current, 'spend.read'):
+        raise HTTPException(403, "Your accounting access changed.")
     return response

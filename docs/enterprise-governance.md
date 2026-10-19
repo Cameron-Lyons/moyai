@@ -64,6 +64,10 @@ provisioning credential without deleting the provisioned directory.
 | `audit.read` | Audit feed and exports |
 
 `GET /api/permissions` returns the full catalog and effective permissions.
+Organization accounting and usage exports honor delegated `spend.read` access;
+`spend.personal` controls personal reports. Limit managers without `spend.read`
+receive configuration changes without usage totals. Reports recheck the original
+live authority before releasing their results.
 
 ## Session policies
 

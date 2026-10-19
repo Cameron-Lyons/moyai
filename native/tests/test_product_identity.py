@@ -568,3 +568,43 @@ async def test_postgres_admission_serializes_with_canonical_role_writes_and_reje
         if created:
             await admin.execute(f"DROP DATABASE {name} WITH (FORCE)")
         await admin.close()
+
+
+@pytest.mark.parametrize(('path', 'permission'), [
+    ('/api/admin/roles', 'roles.manage'), ('/api/admin/scim', 'scim.manage'),
+    ('/api/admin/security-profiles', 'security.manage'), ('/api/admin/spend', 'spend.read'),
+])
+async def test_live_custom_permissions_authorize_delegates_before_builtin_role_gate(product, path, permission):
+    import json
+    async with product.writer.begin() as db:
+        await db.execute(text("INSERT INTO enterprise_roles VALUES('delegate','Delegate','',:permissions,1,0,'owner','now','now')"),
+                         {'permissions': json.dumps([permission])})
+        await db.execute(text("INSERT INTO enterprise_role_assignments VALUES('member@example.test','delegate',1,'owner','now')"))
+    cookie, _ = google_cookie(product.adapter, sub='member-sub', email='member@example.test')
+    incoming = request(cookie)
+    incoming.scope['path'] = path
+    principal = await product.adapter.authenticate(incoming, admin=True)
+    assert principal.role == 'member' and principal.effective_permissions == {permission}
+    assert incoming.scope['path'] == path
+    async with product.writer.begin() as db:
+        await db.execute(text("UPDATE enterprise_roles SET permissions='[]',revision=2 WHERE id='delegate'"))
+    with pytest.raises(HTTPException) as denied:
+        await product.adapter.authenticate(incoming, admin=True)
+    assert denied.value.status_code == 403
+
+
+async def test_delegated_mutation_still_requires_cookie_csrf_and_origin(product):
+    async with product.writer.begin() as db:
+        await db.execute(text('''INSERT INTO enterprise_roles VALUES('delegate','Delegate','','["roles.manage"]',1,0,'owner','now','now')'''))
+        await db.execute(text("INSERT INTO enterprise_role_assignments VALUES('member@example.test','delegate',1,'owner','now')"))
+    cookie, csrf = google_cookie(product.adapter, sub='member-sub', email='member@example.test')
+    for headers, allowed in (({}, False), ({'origin': 'https://foreign.test', 'x-csrf-token': csrf}, False),
+                              ({'origin': 'http://127.0.0.1:8787', 'x-csrf-token': csrf}, True)):
+        incoming = request(cookie, method='POST', headers=headers)
+        incoming.scope['path'] = '/api/admin/roles'
+        if allowed:
+            assert (await product.adapter.authenticate(incoming, mutation=True)).role == 'member'
+        else:
+            with pytest.raises(HTTPException) as denied:
+                await product.adapter.authenticate(incoming, mutation=True)
+            assert denied.value.status_code == 403

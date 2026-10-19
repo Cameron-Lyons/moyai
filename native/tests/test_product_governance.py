@@ -347,3 +347,33 @@ async def test_custom_publisher_uses_native_skill_writer_without_builtin_admin(s
     created, _ = await call(ctx, 'skill_create', CreateSkill(**content(), scope='organization'), scope=prepared.scope)
     async with ctx.product.source.connect() as db:
         assert await db.scalar(text('SELECT scope FROM moyai.skills WHERE id=:id'), {'id': created['id']}) == 'organization'
+
+
+async def test_spend_management_without_read_permission_does_not_return_usage(governed):
+    import httpx
+    from fastapi import APIRouter, FastAPI
+
+    from moyai.product_governance_routes import routes
+    product = governed
+    await member_role(product, ['spend.manage'])
+    class ConfigurationOnly:
+        def save(self, body, actor):
+            return {'limits': [{'id': 'organization', 'limit_usd': 10}]}
+        def delete(self, identity, revision, actor):
+            return {'limits': []}
+        def listing(self):
+            pytest.fail('A limit writer without spend.read reached the usage response.')
+    resources = product.database.governance.product
+    resources.scim = SimpleNamespace(router=lambda: APIRouter())
+    resources.spend_limits = ConfigurationOnly()
+    app = FastAPI()
+    app.include_router(routes(SimpleNamespace(product=resources, database=product.database)))
+    cookie, csrf = google_cookie(product.adapter, sub=product.subject)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://127.0.0.1:8787',
+                                headers={'origin': 'http://127.0.0.1:8787', 'x-csrf-token': csrf}) as client:
+        client.cookies.set('workspace_session', cookie)
+        response = await client.put('/api/admin/spend-limits', json={'changes': [{'id': 'organization', 'limit_usd': 10.0, 'revision': 0}]})
+        assert response.status_code == 200 and response.json() == {'limits': [{'id': 'organization', 'limit_usd': 10}]}
+        response = await client.delete('/api/admin/spend-limits/user:person@example.test?revision=1')
+        assert response.status_code == 200 and response.json() == {'limits': []}
+        assert (await client.get('/api/admin/spend-limits')).status_code == 403
