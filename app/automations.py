@@ -203,6 +203,19 @@ class Automations:
                     raise HTTPException(403, 'Only the owner can edit this automation.')
                 if row['revision'] != body.revision:
                     raise HTTPException(409, 'This automation changed. Refresh before saving.')
+                previous_profile = row['security_profile_id']
+            else:
+                previous_profile = ''
+            if definition.security_profile_id != previous_profile:
+                # Web edits and agent tools share this transaction. Owners may
+                # keep an existing binding after losing policy-management access,
+                # but changing or removing it requires the live permission.
+                if self.security.user_roles:
+                    self.security.user_roles.require_actor(owner_id, 'security.manage', connection=conn)
+                profiles = getattr(self.store, 'security_profiles', None)
+                if profiles and definition.security_profile_id:
+                    profiles.get(definition.security_profile_id, conn, enabled=True)
+            if automation_id:
                 providers = {t.event.provider for t in definition.triggers if t.event}
                 for key in conn.execute('SELECT provider FROM automation_webhooks WHERE automation_id=?', (automation_id,)).fetchall():
                     if key['provider'] not in providers:

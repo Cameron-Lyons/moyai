@@ -147,6 +147,39 @@ test('New-session context offers the organization policies and retains its selec
   if(!await page.getByRole('combobox',{name:'Security policy',exact:true}).isVisible())await page.locator('.task-options summary').click();
   assert.match(await page.getByRole('combobox',{name:'Security policy',exact:true}).innerText(),/Read-only investigation/);
 });
+for(const width of [1440,768,320])test(`Members keep managed session and workflow policies at ${width}px`,async t=>{
+  const page=await open(t,width,'member');
+  let reads=0,saved;
+  page.on('request',request=>{if(new URL(request.url()).pathname==='/api/security-profiles')reads++;});
+  await page.route('**/api/automations',async route=>{
+    const response=await route.fetch(),data=await response.json();
+    data.automations[0].definition.security_profile_id='f'.repeat(32);
+    await route.fulfill({json:data});
+  });
+  await page.route('**/api/automations/auto-0',async route=>{
+    saved=route.request().postDataJSON();
+    await route.fulfill({json:{}});
+  });
+  await page.goto(`${base}/?fixture=member#tasks`);
+  await page.getByRole('heading',{name:'What are we working on?',exact:true}).waitFor();
+  await page.locator('.task-options summary').click();
+  await page.getByText('Security policy is managed by your organization.',{exact:true}).waitFor();
+  assert.equal(await page.getByRole('combobox',{name:'Security policy',exact:true}).count(),0);
+  assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true);
+  await page.screenshot({path:`/tmp/moyai-governance-ui/member-policy-${width}.png`,fullPage:true});
+  await page.evaluate(()=>location.hash='#automations');
+  await page.locator('[data-edit-automation="auto-0"]').click();
+  const dialog=page.getByRole('dialog',{name:'Automation editor',exact:true});
+  const notice=dialog.getByText('Saved policy retained. Ask a security policy manager to change it.',{exact:true});
+  await notice.scrollIntoViewIfNeeded();
+  assert.equal(await dialog.locator('[name=security_profile_id]').count(),0);
+  const box=await dialog.boundingBox();assert.ok(box.x>=0&&box.x+box.width<=width+1);
+  await page.screenshot({path:`/tmp/moyai-governance-ui/member-workflow-policy-${width}.png`,fullPage:true});
+  await dialog.getByRole('button',{name:'Save paused',exact:true}).click();
+  await page.getByRole('heading',{name:'Automations',exact:true}).waitFor();
+  assert.equal(saved?.definition.security_profile_id,'f'.repeat(32));
+  assert.equal(reads,0);
+});
 test('Stale role saves keep the dialog open with a recoverable error',async t=>{
   const page=await open(t);
   await page.locator('[data-role-edit="auditor"]').click();

@@ -2,6 +2,7 @@
 import asyncio
 import hashlib
 import json
+from contextlib import nullcontext
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
@@ -171,13 +172,14 @@ class AutomationTools:
             raise HTTPException(404, 'Automation not found for the current requester.')
         return rows[0]
 
-    def check_policy(self, run, definition):
+    def check_policy(self, run, definition, *, connection=None):
         # Saved work must not escape the restrictions of the session creating it.
         profiles = getattr(self.store, 'security_profiles', None)
         if not profiles:
             return
-        with self.store.connect() as conn:
-            conn.begin_read()
+        with self.store.connect() if connection is None else nullcontext(connection) as conn:
+            if connection is None:
+                conn.begin_read()
             selected = json.loads(profiles.binding(definition.security_profile_id, conn=conn,
                 provider=self.service.settings.sandbox_provider)['security_policy'])
             if intersect(profiles.effective(run, conn), selected) != selected:
@@ -367,6 +369,14 @@ class AutomationTools:
                 if row['revision'] != prior['revision']:
                     raise HTTPException(409, 'This action succeeded earlier, but the automation has since changed. List it again.')
             else:
+                if name in {'automation_create', 'automation_update', 'automation_enable', 'automation_self_update'}:
+                    selected = (definition if name == 'automation_self_update' else
+                                args.definition if hasattr(args, 'definition') else
+                                Definition.model_validate_json(row['definition']))
+                    # Repository preflight awaits external reads. Recheck the
+                    # selected policy and caller's ceiling with this writer so
+                    # a concurrent profile edit cannot expand saved work.
+                    self.check_policy(fresh, selected, connection=conn)
                 if name in {'automation_create', 'automation_update'}:
                     previous = Definition.model_validate_json(row['definition']).self_management if row else None
                     if args.definition.self_management.allowed() and args.definition.self_management != previous:

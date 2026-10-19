@@ -49,12 +49,12 @@ def activate(app, identity, *, plugins=(), actor=None):
     return {'Authorization': 'Bearer test-run-capability'}
 
 
-def test_profile_catalog_requires_live_workspace_read_permission(users_app):
+def test_profile_catalog_requires_live_security_management_permission(users_app):
     app, client = users_app
     sign_as(app, client, 'tin@berri.ai')
     profile = save_profile(client)
     role = client.post('/api/admin/roles', json={
-        'id': 'profile-reader', 'name': 'Profile reader', 'permissions': ['sessions.read']}).json()
+        'id': 'profile-reader', 'name': 'Profile reader', 'permissions': ['workspace.read']}).json()
     assignment = client.put('/api/admin/role-assignments', json={
         'email': 'maya@berri.ai', 'role_id': role['id'], 'revision': 0})
     assert assignment.status_code == 200
@@ -63,13 +63,27 @@ def test_profile_catalog_requires_live_workspace_read_permission(users_app):
     assert client.get('/api/security-profiles').status_code == 403
     sign_as(app, client, 'tin@berri.ai')
     update = client.put('/api/admin/roles/' + role['id'], json={
-        'id': role['id'], 'name': role['name'], 'permissions': ['workspace.read'], 'revision': role['revision']})
+        'id': role['id'], 'name': role['name'], 'permissions': ['security.manage'], 'revision': role['revision']})
     assert update.status_code == 200
     client.cookies.clear()
     client.cookies.update(cookie)
     catalog = client.get('/api/security-profiles')
     assert catalog.status_code == 200
     assert profile['id'] in {item['id'] for item in catalog.json()}
+
+
+@pytest.mark.parametrize('disabled', [False, True])
+def test_workflow_rejects_new_missing_or_disabled_policy_binding(governed_app, disabled):
+    app, client = governed_app
+    identity = 'a' * 32
+    if disabled:
+        identity = save_profile(client)['id']
+        assert client.delete('/api/admin/security-profiles/' + identity).status_code == 200
+    response = client.post('/api/automations', json={'definition': {
+        'name': 'Invalid policy binding', 'prompt': 'Inspect the release',
+        'mode': 'demo', 'security_profile_id': identity}})
+    assert response.status_code == (409 if disabled else 404), response.text
+    assert app.state.store.rows('SELECT id FROM automations') == []
 
 
 def test_profile_default_session_revision_and_replay_stay_pinned(governed_app):
@@ -92,6 +106,47 @@ def test_profile_default_session_revision_and_replay_stay_pinned(governed_app):
     response = client.post('/api/runs', json={'prompt': 'Inspect the release workflow', 'mode': 'demo',
         'client_id': 'governance-session-one', 'security_profile_id': other['id']})
     assert response.status_code == 409
+
+
+@pytest.mark.parametrize('change', ['default', 'revision', 'disabled', 'apps', 'repository', 'provider'])
+def test_session_policy_is_resolved_again_at_commit(governed_app, monkeypatch, change):
+    app, client = governed_app
+    profile = save_profile(client, name='Initial policy')
+    assert client.put('/api/admin/security-profiles/defaults', json={
+        'default_profile_id': profile['id']}).status_code == 200
+    fields = {} if change == 'default' else {'security_profile_id': profile['id']}
+    if change == 'apps':
+        fields['plugins'] = ['github']
+    if change == 'repository':
+        fields['repo_url'] = 'https://github.com/example/project'
+    original = app.state.store.create_run
+
+    def changed_create(*args, **kwargs):
+        profiles = app.state.security_profiles
+        if change == 'default':
+            other = profiles.save('b' * 32, {'name': 'New default', 'policy': {'git_access': 'none'}}, 'admin')
+            profiles.save_defaults({'revision': 1, 'default_profile_id': other['id']})
+        elif change == 'disabled':
+            profiles.save_defaults({'revision': 1})
+            profiles.delete(profile['id'])
+        else:
+            policy = {'connected_apps': []} if change == 'apps' else (
+                {'network_domains': []} if change == 'provider' else {'git_access': 'none'})
+            profiles.save(profile['id'], {'name': profile['name'], 'revision': 1, 'policy': policy}, 'admin')
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(app.state.store, 'create_run', changed_create)
+    response = client.post('/api/runs', json={'prompt': 'Admit under the current policy', 'mode': 'demo', **fields})
+    expected = 201 if change in {'default', 'revision'} else 422 if change in {'apps', 'repository'} else 409
+    assert response.status_code == expected, response.text
+    if expected == 201:
+        saved = app.state.store.run(response.json()['id'])
+        assert json.loads(saved['security_policy'])['git_access'] == 'none'
+        assert saved['security_profile_id'] == ('b' * 32 if change == 'default' else profile['id'])
+        assert saved['security_profile_revision'] == (1 if change == 'default' else 2)
+    else:
+        assert app.state.store.rows('SELECT id FROM runs') == []
+        app.state.manager.submit.assert_not_called()
 
 
 def test_network_provider_rejection_happens_before_repository_or_launch(governed_app, monkeypatch):

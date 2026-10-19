@@ -36,7 +36,7 @@ PERMISSIONS = {
     'runtime.manage': 'View performance, capacity, pull-request and deployment details; configure session titles',
     'organization.manage': 'Change organization settings',
     'audit.read': 'Read enterprise governance audit history',
-    'security.manage': 'Manage security profiles and policies',
+    'security.manage': 'Manage security profiles, policies and profile selections',
     'scim.manage': 'View directory provisioning and revoke provisioning credentials',
 }
 
@@ -127,7 +127,7 @@ def route_permission(request):
     if path == '/api/settings/session-titles':
         return 'workspace.read' if read else 'runtime.manage'
     if path == '/api/security-profiles':
-        return 'workspace.read'
+        return 'security.manage'
     if path == '/api/runs':
         return 'sessions.read' if read else 'sessions.create'
     if re.fullmatch(r'/api/runs/[0-9a-f]{32}(?:/.*)?', path):

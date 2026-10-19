@@ -1,5 +1,6 @@
 """Session access follows live governance state, including open streams and retries."""
 import asyncio
+import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -11,6 +12,99 @@ from test_enterprise_roles import assign, create_role
 from test_scim import patch, user
 from test_user_roles import sign_as, users_app
 from test_workspace import workspace
+
+
+@pytest.mark.parametrize('policy_manager', [False, True])
+def test_only_policy_managers_can_override_session_defaults(users_app, monkeypatch, policy_manager):
+    app, client = users_app
+    monkeypatch.setattr(app.state.manager, 'submit', lambda run: None)
+    sign_as(app, client, 'tin@berri.ai')
+    profiles = app.state.security_profiles
+    profiles.save('a' * 32, {'name': 'Default', 'policy': {'git_access': 'none'}}, 'admin')
+    profiles.save('b' * 32, {'name': 'Broader', 'policy': {}}, 'admin')
+    profiles.save_defaults({'default_profile_id': 'a' * 32})
+    if policy_manager:
+        create_role(client, 'policy-manager', ['sessions.create', 'sessions.read', 'security.manage'])
+        assert assign(client, role_id='policy-manager').status_code == 200
+    sign_as(app, client, 'maya@berri.ai')
+    inherited = client.post('/api/runs', json={'prompt': 'Use the organization policy', 'mode': 'demo'})
+    assert inherited.status_code == 201, inherited.text
+    run = app.state.store.run(inherited.json()['id'])
+    assert run['security_profile_id'] == 'a' * 32 and json.loads(run['security_policy'])['git_access'] == 'none'
+    selected = client.post('/api/runs', json={
+        'prompt': 'Select a different policy', 'mode': 'demo', 'security_profile_id': 'b' * 32})
+    assert selected.status_code == (201 if policy_manager else 403), selected.text
+    side_chat = client.post('/api/runs', json={
+        'prompt': 'Continue in a side chat', 'mode': 'demo', 'chat_enabled': True,
+        'side_chat_of': run['id'], 'security_profile_id': 'b' * 32})
+    assert side_chat.status_code == (201 if policy_manager else 403), side_chat.text
+    if policy_manager:
+        assert app.state.security_profiles.effective(side_chat.json())['git_access'] == 'none'
+
+
+def test_profile_selection_rechecks_permission_at_commit_and_preserves_retries(users_app, monkeypatch):
+    from app.enterprise_roles import RoleDefinition
+    app, client = users_app
+    monkeypatch.setattr(app.state.manager, 'submit', lambda run: None)
+    sign_as(app, client, 'tin@berri.ai')
+    permissions = ['sessions.create', 'sessions.read']
+    create_role(client, 'policy-manager', permissions + ['security.manage'])
+    assert assign(client, role_id='policy-manager').status_code == 200
+    app.state.security_profiles.save('a' * 32, {'name': 'Selected'}, 'admin')
+    sign_as(app, client, 'maya@berri.ai')
+    body = {'prompt': 'Select a session policy', 'mode': 'demo',
+            'security_profile_id': 'a' * 32, 'client_id': 'selected-policy-retry'}
+    first = client.post('/api/runs', json=body)
+    assert first.status_code == 201, first.text
+    original = app.state.store.create_run
+
+    def revoked_create(*args, **kwargs):
+        app.state.user_roles.enterprise.save(RoleDefinition(
+            id='policy-manager', name='Policy manager', permissions=permissions, revision=1),
+            {'method': 'google', 'identity': {'email': 'tin@berri.ai'}}, 'policy-manager')
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(app.state.store, 'create_run', revoked_create)
+    denied = client.post('/api/runs', json={**body, 'client_id': 'revoked-policy-choice'})
+    assert denied.status_code == 403, denied.text
+    assert len(app.state.store.rows('SELECT id FROM runs')) == 1
+    monkeypatch.setattr(app.state.store, 'create_run', original)
+    retry = client.post('/api/runs', json=body)
+    assert retry.status_code == 201 and retry.json()['id'] == first.json()['id']
+    assert client.post('/api/runs', json={**body, 'client_id': 'new-policy-choice'}).status_code == 403
+
+
+def test_workflow_policy_changes_require_security_management_but_keep_existing_pins(users_app):
+    from app.enterprise_roles import RoleDefinition
+    app, client = users_app
+    sign_as(app, client, 'tin@berri.ai')
+    permissions = ['workspace.read', 'automations.read', 'automations.manage']
+    create_role(client, 'workflow-manager', permissions + ['security.manage'])
+    assert assign(client, role_id='workflow-manager').status_code == 200
+    for identity in ('a' * 32, 'b' * 32):
+        app.state.security_profiles.save(identity, {'name': identity}, 'admin')
+    sign_as(app, client, 'maya@berri.ai')
+    definition = {'name': 'Policy-bound workflow', 'prompt': 'Inspect the release',
+                  'mode': 'demo', 'security_profile_id': 'a' * 32}
+    created = client.post('/api/automations', json={'definition': definition})
+    assert created.status_code == 201, created.text
+    workflow = created.json()
+    app.state.user_roles.enterprise.save(RoleDefinition(
+        id='workflow-manager', name='Workflow manager', permissions=permissions, revision=1),
+        {'method': 'google', 'identity': {'email': 'tin@berri.ai'}}, 'workflow-manager')
+    definition['prompt'] = 'Inspect another release'
+    edited = client.put('/api/automations/' + workflow['id'], json={
+        'definition': definition, 'revision': workflow['revision']})
+    assert edited.status_code == 200, edited.text
+    for selected in ('', 'b' * 32):
+        denied = client.put('/api/automations/' + workflow['id'], json={
+            'definition': {**definition, 'security_profile_id': selected}, 'revision': edited.json()['revision']})
+        assert denied.status_code == 403, denied.text
+    assert client.post('/api/automations', json={'definition': definition}).status_code == 403
+    inherited = client.post('/api/automations', json={'definition': {**definition, 'security_profile_id': ''}})
+    assert inherited.status_code == 201, inherited.text
+    saved = app.state.automations.row(workflow['id'])
+    assert saved['revision'] == edited.json()['revision'] and saved['security_profile_id'] == 'a' * 32
 
 
 def event_stream(app, client, run_id):

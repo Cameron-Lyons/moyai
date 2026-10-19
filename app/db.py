@@ -653,6 +653,19 @@ class Store:
             if replay:
                 # The earlier admission's policy snapshot never admits a new session.
                 raise ValueError('This session was deleted. Start a new session.')
+            if security_fields is not None and requested_profile_id and getattr(self, 'user_roles', None):
+                # Recheck a new explicit selection under the writer lock. An
+                # idempotent replay above returns its existing binding instead.
+                self.user_roles.require_actor(user_id, 'security.manage', connection=conn)
+            if security_fields is not None:
+                # Preflight can await external metadata. Resolve the new binding
+                # again under the writer lock so a changed default, profile or
+                # parent ceiling cannot admit work using stale restrictions.
+                profiles = self.security_profiles
+                security_fields = profiles.binding(requested_profile_id, provider=sandbox_provider,
+                                                   parent_run_id=side_chat_of, conn=conn)
+                profiles.require_selection(json.loads(security_fields['security_policy']), plugins=plugins,
+                                           repository=bool(repo_url or github_repository_id))
             context = ''
             if side_chat_of:
                 parent = conn.execute("SELECT prompt,summary,private_owner_id FROM runs WHERE id=? AND deleted_at='' AND deletion_requested_at=''", (side_chat_of,)).fetchone()

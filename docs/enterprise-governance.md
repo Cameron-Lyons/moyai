@@ -274,8 +274,18 @@ repositories, exact-PR authority, and ordinary tool authorization still apply.
 Managed Git read-only blocks publication; it does not remove existing checkout
 files. The GitHub installation credential stays on the broker.
 
-New-session **Context → Security policy** and the workflow editor's **Security
-policy** select a profile; an empty selection uses the organization default.
+Only holders of `security.manage` can enumerate profiles or select a profile in
+new-session **Context → Security policy** and the workflow editor's **Security
+policy**. Other session creators use the organization default. Workflow owners
+without that permission can edit a workflow while retaining its saved selection,
+but cannot change or remove it. New selections are authorized again inside the
+session/workflow write transaction; revocation before that transaction prevents
+the selection. Retrying an already-admitted session retains its original binding.
+New sessions also resolve the profile, defaults, ancestor restrictions, and
+provider support again inside that transaction. A policy edit during repository
+or environment lookup cannot admit a session under an earlier, broader policy;
+selected apps and repository access must still satisfy the current binding.
+An empty selection uses the organization default.
 Saving a session pins the selected revision and a serialized policy snapshot.
 Editing that profile later affects future bindings, not the saved snapshot.
 Children and side chats inherit restrictions from their ancestors; selecting a
@@ -283,7 +293,9 @@ broader child profile cannot loosen them. Delegated agents and swarm workers
 inherit their parent's effective policy plus the mandatory policy; the
 organization default applies only to new top-level sessions, side chats, and
 workflows with no selection. An agent that creates or changes a workflow through
-its tools must select a policy at least as restrictive as its own session. The current mandatory policy intersects
+its tools must select a policy at least as restrictive as its own session. That
+comparison is repeated in the workflow write transaction for creation, updates,
+and enabling, including scoped self-updates. The current mandatory policy intersects
 with those snapshots at execution, so it can further restrict existing sessions.
 Relaxing the mandatory policy does not relax an already-pinned stricter snapshot.
 Create a new session when broader authorized access is needed.
@@ -349,7 +361,7 @@ not an audit of every model request, file read, or tool action; see existing
 | `PUT /api/admin/group-roles/{group_id}` | Directory-group grant |
 | `GET /api/admin/scim` | Directory, token metadata, and recent provisioning activity |
 | `POST /api/admin/scim/tokens`, `DELETE /api/admin/scim/tokens/{id}` | Create/revoke provisioning credentials |
-| `GET /api/security-profiles` | Enabled session-selection catalog |
+| `GET /api/security-profiles` | Enabled session-selection catalog; requires `security.manage` |
 | `/api/admin/security-profiles`, `/api/admin/security-profiles/{id}` | Profile administration |
 | `PUT /api/admin/security-profiles/defaults` | Default and mandatory profiles |
 | `GET /api/admin/governance/audit` | Shared governance feed |

@@ -889,16 +889,14 @@ def _create_app(settings, store):
         # A retry returns the session admitted under the policy then in force,
         # even after the defaults, floor or its profile changed.
         admitted = await database(store.admitted_security, body.client_id, user_id) if body.client_id else None
+        if body.security_profile_id and admitted is None:
+            await database(security.require, request, permission='security.manage')
         security_fields = admitted or await database(security_profiles.binding, body.security_profile_id,
                                                      provider=settings.sandbox_provider,
                                                      parent_run_id=body.side_chat_of)
         selected_policy = json.loads(security_fields['security_policy'])
-        if selected_policy['connected_apps'] is not None and not set(body.plugins) <= set(selected_policy['connected_apps']):
-            raise HTTPException(422, 'The selected security policy does not allow all selected apps.')
-        if (body.repo_url or body.github_repository_id) and (
-                selected_policy['git_access'] == 'none' or
-                selected_policy['connected_apps'] is not None and 'github' not in selected_policy['connected_apps']):
-            raise HTTPException(422, 'The selected security policy does not allow managed repository access.')
+        security_profiles.require_selection(selected_policy, plugins=body.plugins,
+                                            repository=bool(body.repo_url or body.github_repository_id))
         if body.mode == "modal" and not metadata_request:
             if missing_cloud():
                 raise HTTPException(503, "Cloud setup is incomplete. See Runtime for the missing settings.")

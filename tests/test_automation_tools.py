@@ -84,6 +84,41 @@ def test_tools_available_in_verified_chat_and_create_retries_are_atomic(workspac
     assert forged.status_code == 200 and forged.json()['status_code'] == 422
 
 
+@pytest.mark.parametrize('operation', ['automation_create', 'automation_update', 'automation_enable'])
+def test_policy_change_during_tool_preflight_cannot_escape_session(workspace, monkeypatch, operation):
+    app, client = workspace
+    sign_in(app, client)
+    runtime(app)
+    profiles = app.state.security_profiles
+    for identity in ('a' * 32, 'b' * 32):
+        profiles.save(identity, {'name': identity, 'policy': {'git_access': 'read'}}, 'admin')
+    run = profiles.bind_session(active(app), 'a' * 32)
+    workflow = definition(mode='modal', security_profile_id='b' * 32)
+    arguments = {'request_key': 'policy-race'}
+    if operation != 'automation_create':
+        response = client.post('/api/automations', json={'definition': workflow})
+        assert response.status_code == 201, response.text
+        saved = response.json()
+        arguments.update(automation_id=saved['id'], revision=saved['revision'])
+    if operation != 'automation_enable':
+        arguments['definition'] = workflow
+    check_scope = app.state.automation_tools.check_scope
+
+    async def changed_scope(*args, **kwargs):
+        await check_scope(*args, **kwargs)
+        profiles.save('b' * 32, {'name': 'Broader policy', 'revision': 1, 'policy': {}}, 'admin')
+
+    monkeypatch.setattr(app.state.automation_tools, 'check_scope', changed_scope)
+    response = call(client, run, operation, **arguments)
+    assert response.status_code == 403, response.text
+    assert app.state.store.rows('SELECT * FROM automation_operations') == []
+    if operation == 'automation_create':
+        assert app.state.store.rows('SELECT * FROM automations') == []
+    else:
+        retained = app.state.automations.row(saved['id'])
+        assert retained['paused'] and retained['revision'] == saved['revision']
+
+
 def test_other_requester_cannot_read_edit_enable_or_pause_even_as_admin(workspace):
     app, client = workspace
     sign_in(app, client)

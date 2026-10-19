@@ -29,7 +29,12 @@ session family and their automation's prior sessions; unrelated shared sessions
 require a direct user chat. History is attributed reference data, not new authority.
 Deleted session bodies remain unavailable.
 
-The editor exposes Moyai's actual runtime capabilities. Runs start new sessions as the owner. Security and network access remain governed by the workspace and environment; this does not add Devin-style per-automation security profiles, domain allowlists, arbitrary run-as identities, or per-session dollar budgets.
+Runs start new sessions as the owner. Policy managers can select a per-automation
+[security profile](enterprise-governance.md#security-profiles-for-agent-sessions); other
+owners retain the saved selection or inherit the organization default. Each run
+also applies the mandatory organization restrictions. Exact-domain network
+allowlists require Substrate; other providers reject those policies. Arbitrary
+run-as identities and per-session dollar budgets remain unsupported.
 
 For a local UI demo with a real temporary database and no credentials, run
 `uv run python scripts/automation_builder_demo.py` and open

@@ -287,6 +287,14 @@ class SecurityProfiles:
         return {**run, **fields}
 
     @staticmethod
+    def require_selection(policy, *, plugins=(), repository=False):
+        if policy['connected_apps'] is not None and not set(plugins) <= set(policy['connected_apps']):
+            raise HTTPException(422, 'The selected security policy does not allow all selected apps.')
+        if repository and (policy['git_access'] == 'none' or
+                           policy['connected_apps'] is not None and 'github' not in policy['connected_apps']):
+            raise HTTPException(422, 'The selected security policy does not allow managed repository access.')
+
+    @staticmethod
     def require_provider(policy, provider):
         if policy.get('network_domains') is not None and provider != 'substrate':
             raise HTTPException(409, 'Domain network policies require Substrate. This provider cannot enforce the selected security profile.')
