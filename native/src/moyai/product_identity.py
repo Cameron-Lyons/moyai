@@ -59,6 +59,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Protocol, cast
+from weakref import WeakKeyDictionary
 
 from fastapi import HTTPException, Request
 from itsdangerous import BadSignature, SignatureExpired
@@ -69,6 +70,10 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
 from .models import User
+
+# Principals admitted in each root transaction. Its shared writer lock keeps
+# canonical role writers out until it ends, so a repeat check is the same read.
+_ADMITTED: WeakKeyDictionary[Any, dict[str, ProductPrincipal]] = WeakKeyDictionary()
 
 if TYPE_CHECKING:
     from app.config import Settings as ProductSettings
@@ -324,12 +329,16 @@ class ProductIdentityAdapter:
             principal.email, principal.role if principal.individual else 'member'))
         if state.scim_active is False:
             raise HTTPException(401, 'This workspace account has been deactivated.')
+        permissions, direct = state.permissions, state.direct_permissions
+        if principal.kind == 'slack':
+            # As in canonical actor checks, a Slack sender never exceeds member access.
+            permissions, direct = permissions & BUILTIN_PERMISSIONS['member'], direct & BUILTIN_PERMISSIONS['member']
         entry = state.authority_entry()
         version = principal.authority_version
         if entry is not None:
             version = hmac.new(self.legacy_security.secret.encode(), json.dumps(
                 [version, entry], sort_keys=True, separators=(',', ':')).encode(), hashlib.sha256).hexdigest()
-        return replace(principal, permissions=state.permissions, direct_permissions=state.direct_permissions,
+        return replace(principal, permissions=permissions, direct_permissions=direct,
                        authority_version=version, access_role=(
                            {'id': state.role_id, 'name': state.role_name or state.role_id} if state.role_id else None))
 
@@ -507,13 +516,17 @@ class ProductIdentityAdapter:
             or not db.in_transaction()
         ):
             raise HTTPException(503, "Product admission requires one explicit PostgreSQL transaction and database.")
-        # This is the SAME lock namespace used by app.database.begin_write.
-        # Shared read ownership allows native concurrency but serializes against
-        # canonical role/mapping writers, including inserting an absent role row.
-        await db.execute(text(
-            "SELECT pg_advisory_xact_lock_shared(726941, CAST(CAST(:schema AS regnamespace) AS oid)::int)"
-        ), {"schema": self.schema})
-        principal = await self._current(db, grant.user_id, await self._native_controls(grant.user_id, db))
+        admitted = _ADMITTED.setdefault(db.sync_session.get_transaction(), {})
+        principal = admitted.get(grant.user_id)
+        if principal is None:
+            # This is the SAME lock namespace used by app.database.begin_write.
+            # Shared read ownership allows native concurrency but serializes against
+            # canonical role/mapping writers, including inserting an absent role row.
+            await db.execute(text(
+                "SELECT pg_advisory_xact_lock_shared(726941, CAST(CAST(:schema AS regnamespace) AS oid)::int)"
+            ), {"schema": self.schema})
+            principal = await self._current(db, grant.user_id, await self._native_controls(grant.user_id, db))
+            admitted[grant.user_id] = principal
         if not hmac.compare_digest(principal.authority_version, grant.authority_version):
             raise HTTPException(401, "Product authority changed before admission.")
         return principal

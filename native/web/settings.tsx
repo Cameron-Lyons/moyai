@@ -14,11 +14,10 @@ import { onceUtcInput, onceUtcInstant } from "./product-automation-data"
 import { MoyaiBrand, SidebarToggle } from "./brand"
 import { AppearanceToggle } from "./appearance-toggle"
 import type { GeneralPreferences } from "./general-preferences"
+import { can, canOpenPage, PAGE_PERMISSIONS, permissionKey } from "./permissions"
 import "./settings.css"
 
 type SettingsPageProps = { user: SettingsUser; page: string; productMode?: "standalone" | "existing"; onNavigate: (page: string) => void; onBack: () => void; sidebarCollapsed: boolean; onToggleSidebar: () => void; onPreferences: (preferences: GeneralPreferences) => void }
-import { can, canOpenPage, PAGE_PERMISSIONS, permissionKey } from "./permissions"
-import "./settings.css"
 
 const GovernancePage = React.lazy(() => import("./governance").then(module => ({ default: module.GovernancePage })))
 

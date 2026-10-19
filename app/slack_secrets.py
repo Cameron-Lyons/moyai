@@ -73,9 +73,6 @@ def token_for(vault, run, request_id, *, name, audit=True):
     if not enabled(vault, run):
         raise HTTPException(403, 'Slack is disabled for this task or by organization policy.')
     with vault.store.connect() as conn:
-        profiles = getattr(vault.store, 'security_profiles', None)
-        if profiles:
-            profiles.require_tool(run, name, 'slack', conn=conn)
         row, secret = vault.authorized_request(conn, run, request_id)
         if (row['status'] != 'provided' or not secret or secret['scope'] != 'personal'
                 or not vault.permitted(secret, run, run['active_user_id'], connection=conn)

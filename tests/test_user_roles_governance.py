@@ -316,3 +316,13 @@ def test_concurrent_demotion_and_deactivation_preserve_one_active_administrator(
     assert outcomes in (['409', 'deactivated'], ['409', 'demoted'])
     with service.store.connect() as conn:
         assert len(service.roles.admins_in(conn)) == 1
+
+
+def test_security_person_resolves_directory_state_and_permissions(directory):
+    from app.security import Security
+    security = Security(directory.settings, directory.roles)
+    assert security.person('owner@example.com') == {'role': 'admin', '_permissions': ALL}
+    assert security.person('Dan@example.com') == {'role': 'member', '_permissions': MEMBER_PERMISSIONS}
+    assert security.person('dan@other.test')['_permissions'] == frozenset()  # Ineligible domain.
+    deactivate(directory, provision(directory, 'dan@example.com'))
+    assert security.person('dan@example.com') is None

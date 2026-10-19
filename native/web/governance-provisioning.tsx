@@ -8,8 +8,6 @@ import { Choice, Empty, RecordTable, Toolbar, contains, dateTime, errorText } fr
 import { ActivityList, CopyField, DialogActions, GovConfirm, GovDialog, LoadGate, MutationError, PageActions, Section, StatusBadge, useGovMutation, useGovResource } from "./governance-shared"
 import type { CreatedScimToken, ScimAdmin, ScimGroup, ScimToken, ScimUser } from "./governance-types"
 
-export const tokenStatus = (token: ScimToken) => token.revoked_at ? "Revoked" : "Active"
-
 export function TokenRows({ tokens, onRevoke }: { tokens: ScimToken[]; onRevoke?: (token: ScimToken) => void }) {
   return <RecordTable label="Provisioning tokens" headings={["Token", "Created", "Last used", "Status", "Actions"]}>{tokens.map(token => <TableRow key={token.id}>
     <TableCell><strong>{token.label}</strong><small><code>{token.prefix}…</code></small></TableCell>
@@ -39,15 +37,15 @@ export function DirectoryGroupRows({ groups }: { groups: ScimGroup[] }) {
 
 export function ProvisioningPage({ canManageRoles }: { canManageRoles: boolean }) {
   const resource = useGovResource<ScimAdmin>("/admin/scim?limit=50")
-  const [pages, setPages] = useState<{ base?: ScimAdmin; items: ScimUser[]; next: string | null; loading: boolean; error: string }>({ items: [], next: null, loading: false, error: "" })
+  const [pages, setPages] = useState<{ base?: ScimAdmin; items: ScimUser[]; next: string | null; loaded: boolean; loading: boolean; error: string }>({ items: [], next: null, loaded: false, loading: false, error: "" })
   const loadMore = useRef<AbortController | null>(null)
   const [search, setSearch] = useState(""), [status, setStatus] = useState("all")
   const [create, setCreate] = useState(false), [revoke, setRevoke] = useState<ScimToken | null>(null)
   // A refresh replaces earlier pages; a late page from before it is ignored.
-  useEffect(() => { loadMore.current?.abort(); setPages({ base: resource.data, items: [], next: null, loading: false, error: "" }) }, [resource.data])
+  useEffect(() => { loadMore.current?.abort(); setPages({ base: resource.data, items: [], next: null, loaded: false, loading: false, error: "" }) }, [resource.data])
   useEffect(() => () => loadMore.current?.abort(), [])
   return <><LoadGate resource={resource} label="provisioning">{data => {
-    const next = pages.base === data && pages.items.length ? pages.next : data.users.next_cursor
+    const next = pages.base === data && pages.loaded ? pages.next : data.users.next_cursor
     const users = [...new Map([...data.users.items, ...(pages.base === data ? pages.items : [])].map(user => [user.id, user])).values()]
     const rows = users.filter(user => contains(search, user.user_name, user.display_name, user.external_id) && (status === "all" || (status === "active") === user.active))
     const more = () => {
@@ -57,7 +55,7 @@ export function ProvisioningPage({ canManageRoles }: { canManageRoles: boolean }
       setPages(previous => ({ ...previous, loading: true, error: "" }))
       void api<ScimAdmin>(`/admin/scim?limit=50&cursor=${encodeURIComponent(next)}`, "GET", undefined, controller.signal).then(page => {
         if (controller.signal.aborted || auth !== csrfToken()) return
-        setPages(previous => previous.base === data ? { base: data, items: [...previous.items, ...page.users.items], next: page.users.next_cursor, loading: false, error: "" } : previous)
+        setPages(previous => previous.base === data ? { base: data, items: [...previous.items, ...page.users.items], next: page.users.next_cursor, loaded: true, loading: false, error: "" } : previous)
       }, reason => { if (!controller.signal.aborted) setPages(previous => ({ ...previous, loading: false, error: errorText(reason) })) })
     }
     const active = data.tokens.filter(token => !token.revoked_at).length

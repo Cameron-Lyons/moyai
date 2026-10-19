@@ -921,9 +921,6 @@ class Credentials:
     def materialize(self, run, args):
         if self.security.user_roles:
             self.security.user_roles.require_actor(run['active_user_id'], 'credentials.read')
-        profiles = getattr(self.store, 'security_profiles', None)
-        if profiles:
-            profiles.require_tool(run, 'credentials_run')
         with self.store.connect() as conn:
             conn.begin_write()
             accepted = []
@@ -1054,12 +1051,7 @@ class Credentials:
             conn.begin_write()
             if self.security.user_roles:
                 self.security.user_roles.require_actor(run['active_user_id'], 'credentials.read', connection=conn)
-            profiles = getattr(self.store, 'security_profiles', None)
-            if profiles:
-                profiles.require_tool(run, 'credentials_http_request', write=args.method == 'POST', conn=conn)
             request, secret = self.authorized_request(conn, run, args.request_id)
-            if profiles and secret and secret['provider'] != 'generic':
-                profiles.require_url(run, PROVIDERS[secret['provider']]['base'] + args.path, conn=conn)
             if secret:
                 request = self.binding_in(conn, request, secret)
             if (request['run_id'] != run['id'] or request['status'] != 'provided' or not secret

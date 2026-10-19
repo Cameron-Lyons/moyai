@@ -247,16 +247,19 @@ class Authority(AbstractCapability[RunScope]):
         return True
 
     @durable_operation('governance_tool')
-    async def governance_tool(self, scope: RunScope, name: str, read_only: bool | None) -> None:
-        governance = getattr(self.database, 'governance', None)
-        if governance is not None:
-            await governance.check_tool(scope, name, read_only=read_only)
-
-    @durable_operation('governance_model')
-    async def governance_model(self, scope: RunScope) -> None:
-        governance = getattr(self.database, 'governance', None)
-        if governance is not None:
-            await governance.check_model(scope)
+    async def governance_tool(
+        self, scope: RunScope, input_id: str | None, name: str, read_only: bool | None,
+    ) -> bool:
+        """The check operation and the tool's session policy in one durable unit and transaction."""
+        async with self.database.sessions() as db:
+            try:
+                await self.database.authorize_scope(scope, input_id=input_id, db=db)
+            except GuidanceChanged:
+                return False
+            governance = self.database.governance
+            if governance is not None:
+                await governance.check_tool(scope, name, read_only=read_only, db=db)
+        return True
 
     @durable_operation('governance_catalog')
     async def governance_catalog(self, scope: RunScope, definitions: list[tuple[str, bool | None]]) -> list[str]:
@@ -283,9 +286,9 @@ class Authority(AbstractCapability[RunScope]):
     async def before_model_request(
         self, ctx: RunContext[RunScope], request_context: ModelRequestContext
     ) -> ModelRequestContext:
+        # Product inference admission applies governance and spend limits in
+        # the transaction that records the request, so no separate check here.
         await self.check(ctx.deps)
-        if self.governed():
-            await self.governance_model(ctx.deps)
         if ctx.workspace.ref:
             await self.save_workspace(
                 ctx.deps, TypeAdapter(WorkspaceRef).dump_python(ctx.workspace.ref, mode="json")
@@ -296,12 +299,16 @@ class Authority(AbstractCapability[RunScope]):
         self, ctx: RunContext[RunScope], *, call: ToolCallPart,
         tool_def: ToolDefinition, args: dict[str, Any],
     ) -> dict[str, Any]:
-        if not await self.check(ctx.deps, input_identity(ctx)):
+        if self.governed():
+            # Tools that run in the workflow have no activity attempt to recheck,
+            # so governed runs check every tool's policy before dispatch.
+            read_only = (tool_def.metadata or {}).get('annotations', {}).get('readOnlyHint')
+            allowed = await self.governance_tool(ctx.deps, input_identity(ctx), call.tool_name, read_only)
+        else:
+            allowed = await self.check(ctx.deps, input_identity(ctx))
+        if not allowed:
             # Pair the skipped call with a result so native pending guidance can be consumed.
             raise ToolFailed("New guidance arrived before dispatch; this action did not execute.")
-        metadata = tool_def.metadata or {}
-        if self.governed():
-            await self.governance_tool(ctx.deps, call.tool_name, metadata.get('annotations', {}).get('readOnlyHint'))
         return args
 
     async def wrap_tool_execute(

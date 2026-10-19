@@ -14,6 +14,7 @@ const singletons = [
   { id: "user-default", label: "Default monthly limit per person", hint: "Applies to each person without an override below." },
   { id: "session-default", label: "Limit per session", hint: "Lifetime model spend for a session and all its delegated agents." },
 ] as const
+const listing = (value: unknown): value is SpendLimitsAdmin => typeof value === "object" && value !== null && "usage" in value && Array.isArray((value as SpendLimitsAdmin).limits)
 const monthStart = (value: string) => Number.isFinite(Date.parse(value)) ? new Date(value).toLocaleDateString(undefined, { month: "long", day: "numeric", year: "numeric", timeZone: "UTC" }) : "the start of this month"
 
 export function SpendSummary({ data }: { data: SpendLimitsAdmin }) {
@@ -41,6 +42,8 @@ export function SpendLimitsPage({ canManage }: { canManage: boolean }) {
   const resource = useGovResource<SpendLimitsAdmin>("/admin/spend-limits")
   const [search, setSearch] = useState("")
   const [editor, setEditor] = useState<SpendLimit | "new" | null>(null), [remove, setRemove] = useState<SpendLimit | null>(null)
+  // Saves return the full listing to viewers who can read spend; otherwise it is read again.
+  const saved = (value?: unknown) => listing(value) ? resource.replace(value) : resource.refresh()
   return <LoadGate resource={resource} label="spend limits">{data => {
     const manage = canManage && data.can_manage
     const overrides = data.limits.filter(limit => limit.kind === "user").sort((a, b) => a.subject.localeCompare(b.subject))
@@ -52,7 +55,7 @@ export function SpendLimitsPage({ canManage }: { canManage: boolean }) {
       {(data.usage.unknown_requests ?? 0) > 0 && <p className="ns-notice" role="status">{data.usage.unknown_requests} model requests have pending or missing costs. Reported spend is incomplete; configured limits block further requests until costs are known.</p>}
       <SpendSummary data={data} />
       <Section id="gov-spend-limits" title="Organization and defaults" description={manage ? "Leave an amount blank for no limit. Enter 0 to block model use." : "You can view limits. Changing them requires the spend.manage permission."}>
-        <LimitsForm revisionKey={revisionKey} data={data} manage={manage} onSaved={resource.refresh} />
+        <LimitsForm revisionKey={revisionKey} data={data} manage={manage} onSaved={saved} />
       </Section>
       <Section id="gov-spend-overrides" title="Per-person overrides" description="An override replaces the default monthly limit for one person, across every sign-in that uses their work email."
         action={manage && <Button variant="outline" onClick={() => setEditor("new")}><Plus />Add override</Button>}>
@@ -60,15 +63,15 @@ export function SpendLimitsPage({ canManage }: { canManage: boolean }) {
         {rows.length ? <OverrideRows rows={rows} canManage={manage} onEdit={setEditor} onRemove={setRemove} />
           : overrides.length ? <Empty filtered noun="overrides" onClear={() => setSearch("")} /> : <p className="ns-muted">No overrides. Everyone uses the default monthly limit.</p>}
       </Section>
-      {editor && manage && <OverrideEditor existing={editor === "new" ? undefined : editor} overrides={overrides} onClose={() => setEditor(null)} onSaved={resource.refresh} />}
+      {editor && manage && <OverrideEditor existing={editor === "new" ? undefined : editor} overrides={overrides} onClose={() => setEditor(null)} onSaved={saved} />}
       {remove && manage && <GovConfirm title={`Remove the override for ${remove.subject}?`} label="Remove override" onReload={resource.refresh} onClose={() => setRemove(null)}
         description={`They return to the default monthly limit (${limitText(data.limits.find(limit => limit.id === "user-default")?.limit_usd ?? null)}). Spend already recorded this month still counts.`}
-        onConfirm={async () => { await api(`/admin/spend-limits/${encodeURIComponent(remove.id)}?revision=${remove.revision}`, "DELETE"); resource.refresh() }} />}
+        onConfirm={async () => saved(await api(`/admin/spend-limits/${encodeURIComponent(remove.id)}?revision=${remove.revision}`, "DELETE"))} />}
     </>
   }}</LoadGate>
 }
 
-function LimitsForm({ data, manage, revisionKey, onSaved }: { data: SpendLimitsAdmin; manage: boolean; revisionKey: string; onSaved: () => void }) {
+function LimitsForm({ data, manage, revisionKey, onSaved }: { data: SpendLimitsAdmin; manage: boolean; revisionKey: string; onSaved: (value?: unknown) => void }) {
   const mutation = useGovMutation(), id = useId()
   const row = (key: string) => data.limits.find(limit => limit.id === key)
   const serverDrafts = () => Object.fromEntries(singletons.map(item => [item.id, usdInput(row(item.id)?.limit_usd ?? null)]))
@@ -79,10 +82,10 @@ function LimitsForm({ data, manage, revisionKey, onSaved }: { data: SpendLimitsA
   let pending = 0, invalid = ""
   try { pending = spendChanges(data.limits, drafts).length } catch (reason) { invalid = reason instanceof Error ? reason.message : "Check the amounts." }
   if (!manage) return <dl className="ns-gov-limits">{singletons.map(item => <div key={item.id}><dt>{item.label}</dt><dd>{limitText(row(item.id)?.limit_usd ?? null)}<small>{item.hint}</small></dd></div>)}</dl>
-  return <form onSubmit={event => { event.preventDefault(); setSaved(false); void mutation.run(async () => {
+  return <form onSubmit={event => { event.preventDefault(); setSaved(false); let result: unknown; void mutation.run(async () => {
     const changes = spendChanges(data.limits, drafts)
-    if (changes.length) await api("/admin/spend-limits", "PUT", { changes })
-  }, () => { setSaved(true); onSaved() }) }}>
+    if (changes.length) result = await api("/admin/spend-limits", "PUT", { changes })
+  }, () => { setSaved(true); onSaved(result) }) }}>
     <div className="ns-gov-limit-fields">{singletons.map(item => {
       const current = row(item.id)
       return <div className="ns-field" key={item.id}><label htmlFor={`${id}-${item.id}`}>{item.label}</label>
@@ -91,22 +94,22 @@ function LimitsForm({ data, manage, revisionKey, onSaved }: { data: SpendLimitsA
         <p id={`${id}-${item.id}-hint`} className="ns-field-hint">{item.hint} Current: {limitText(current?.limit_usd ?? null)}{current?.updated_at ? ` · Updated ${dateTime(current.updated_at)}` : ""}</p></div>
     })}</div>
     {invalid && <p className="ns-error" role="alert">{invalid}</p>}
-    <MutationError mutation={mutation} onReload={onSaved} />
+    <MutationError mutation={mutation} onReload={() => onSaved()} />
     <div className="ns-row-actions"><Button type="submit" disabled={mutation.busy || Boolean(invalid) || !pending}>{mutation.busy ? "Saving…" : "Save limits"}</Button>
       <span className="ns-muted" role="status">{saved ? "Limits saved." : pending ? `${pending === 1 ? "1 unsaved change" : `${pending} unsaved changes`}.` : ""}</span></div>
   </form>
 }
 
-function OverrideEditor({ existing, overrides, onClose, onSaved }: { existing?: SpendLimit; overrides: readonly SpendLimit[]; onClose: () => void; onSaved: () => void }) {
+function OverrideEditor({ existing, overrides, onClose, onSaved }: { existing?: SpendLimit; overrides: readonly SpendLimit[]; onClose: () => void; onSaved: (value?: unknown) => void }) {
   const mutation = useGovMutation(), id = useId()
   const [email, setEmail] = useState(existing?.subject ?? ""), [amount, setAmount] = useState(usdInput(existing?.limit_usd ?? null))
   return <GovDialog title={existing ? `Edit limit for ${existing.subject}` : "Add a per-person override"} busy={mutation.busy} onClose={onClose}
     description="The override replaces the default monthly limit for this person. Their spend this month still counts toward the organization limit.">
-    <form className="ns-fields" onSubmit={event => { event.preventDefault(); void mutation.run(async () => {
+    <form className="ns-fields" onSubmit={event => { event.preventDefault(); let result: unknown; void mutation.run(async () => {
       const change = overrideChange(email, amount, existing)
       if (!existing && overrides.some(row => row.id === change.id)) throw new Error("This person already has an override. Edit it instead.")
-      await api("/admin/spend-limits", "PUT", { changes: [change] })
-    }, () => { onSaved(); onClose() }) }}>
+      result = await api("/admin/spend-limits", "PUT", { changes: [change] })
+    }, () => { onSaved(result); onClose() }) }}>
       <div className="ns-field"><label htmlFor={`${id}-email`}>Work email</label><Input id={`${id}-email`} type="email" required autoFocus={!existing} maxLength={254} autoComplete="off" disabled={mutation.busy || Boolean(existing)} value={email} onChange={event => setEmail(event.target.value)} /></div>
       <div className="ns-field"><label htmlFor={`${id}-amount`}>Monthly limit (USD)</label>
         <div className="ns-gov-money"><span aria-hidden="true">$</span><Input id={`${id}-amount`} inputMode="decimal" autoFocus={Boolean(existing)} autoComplete="off" placeholder="No limit" disabled={mutation.busy} value={amount} aria-describedby={`${id}-amount-hint`} onChange={event => setAmount(event.target.value)} /></div>

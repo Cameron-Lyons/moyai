@@ -193,10 +193,11 @@ class Security:
             return {'role': self.google_role(email)}
         email = email.strip().lower()
         with self.user_roles.store.connect() if connection is None else nullcontext(connection) as conn:
-            if not self.user_roles.active_email_in(conn, email):
-                return None
             role = self.user_roles.role_in(conn, email)
-            return {'role': role, '_permissions': self.user_roles.permissions_in(conn, email, active=True, role=role)}
+            state = self.user_roles.access_in(conn, email, role)
+            if state.scim_active is False:
+                return None
+            return {'role': role, '_permissions': state.permissions if self.user_roles.eligible(email) else frozenset()}
 
     def permissions_for_info(self, info):
         if not info:

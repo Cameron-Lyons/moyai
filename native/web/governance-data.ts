@@ -211,10 +211,10 @@ export function auditPath(filters: AuditFilters, cursor?: string | null): string
   if (cursor) params.set("cursor", cursor)
   return `/admin/governance/audit?${params}`
 }
-export function auditExportUrl(filters: AuditFilters, format: "csv" | "ndjson"): string {
+export function auditExportPath(filters: AuditFilters, format: "csv" | "ndjson"): string {
   const params = auditParams(filters)
   params.set("format", format)
-  return `/api/admin/governance/audit/export?${params}`
+  return `/admin/governance/audit/export?${params}`
 }
 /** "role_assignment.updated" → "Role assignment updated". */
 const ACRONYMS: Record<string, string> = { scim: "SCIM", usd: "USD", id: "ID", sso: "SSO", aws: "AWS" }

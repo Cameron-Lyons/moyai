@@ -84,3 +84,21 @@ test('binary uploads use the same error policy without changing their body or me
   });
   await assert.rejects(apiRequest('/uploads?name=image.png',{method:'POST',body,headers:{'Content-Type':'image/png'}}),{status:500});
 });
+
+test('downloads send the session headers, return the named file and keep server error details',async t=>{
+  const {apiDownload,setCsrf}=await loaded;
+  setCsrf('download-session');
+  t.mock.method(global,'fetch',async(url,options)=>{
+    assert.equal(url,'/api/admin/governance/audit/export?format=csv');
+    assert.equal(options.headers.get('X-Moyai-CSRF'),'download-session');
+    assert.equal(options.headers.get('X-CSRF-Token'),'download-session');
+    return new Response('id,action\n',{headers:{'Content-Disposition':'attachment; filename="governance.csv"'}});
+  });
+  const file=await apiDownload('/admin/governance/audit/export?format=csv');
+  assert.equal(file.filename,'governance.csv');
+  assert.equal(await file.blob.text(),'id,action\n');
+  t.mock.method(global,'fetch',async()=>new Response(JSON.stringify({detail:'Choose a date range of at most 100 days.'}),{status:422}));
+  await assert.rejects(apiDownload('/admin/governance/audit/export?format=csv'),{status:422,message:'Choose a date range of at most 100 days.'});
+  t.mock.method(global,'fetch',async()=>new Response('<html>proxy</html>',{status:502}));
+  await assert.rejects(apiDownload('/admin/governance/audit/export?format=csv'),{status:502,message:'Moyai is temporarily unavailable (HTTP 502). Please try again.'});
+});

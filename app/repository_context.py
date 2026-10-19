@@ -167,22 +167,17 @@ class RepositoryContext:
         self.authority({**run, 'github_connection_version': version}, target)
         return snapshot
 
-    def permitted(self, run):
-        """Injection reveals repository content: require repository_context_read access."""
+    def require_permitted(self, run):
+        """Injection reveals repository content: require connections.read access."""
         roles = getattr(self.store, 'user_roles', None)
-        profiles = getattr(self.store, 'security_profiles', None)
-        with self.store.connect() as conn:
-            conn.begin_read()
-            if roles:
-                roles.require_actor(run.get('active_user_id') or run.get('owner_id'), 'connections.read', connection=conn)
-            return not profiles or profiles.allowed_tool(run, 'repository_context_read', 'github', conn=conn)
+        if roles:
+            roles.require_actor(run.get('active_user_id') or run.get('owner_id'), 'connections.read')
 
     def context(self, run):
         if not self.settings.repository_context_enabled or 'github' not in run.get('plugins', []):
             return ''
         try:
-            if not self.permitted(run):
-                return ''
+            self.require_permitted(run)
             snapshot = self.snapshot(run)
             if not snapshot:
                 return ''  # A cold/failed index never holds up a model request.

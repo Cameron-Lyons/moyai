@@ -161,11 +161,9 @@ class GroupRoleChange(BaseModel):
 ACCESS_TABLES = ('user_roles', 'scim_users', 'scim_groups', 'scim_group_members',
                  'enterprise_roles', 'enterprise_role_assignments', 'enterprise_group_roles')
 ACCESS_QUERIES = {
-    'user_role': 'SELECT role, revision FROM {user_roles} WHERE email=:email',
     # A live row wins over tombstones, then the latest update (idx_scim_users_lookup).
     'scim_user': ("SELECT id, active, deleted_at, access_epoch FROM {scim_users} WHERE user_name=:email "
                   "ORDER BY (deleted_at='') DESC, updated_at DESC LIMIT 1"),
-    'scim_any': 'SELECT 1 AS present FROM {scim_users} LIMIT 1',
     'assignment': 'SELECT role_id, revision FROM {enterprise_role_assignments} WHERE email=:email',
     'role': 'SELECT id, name, permissions, revision, archived FROM {enterprise_roles} WHERE id=:role_id',
     'group_grants': '''SELECT r.group_id, r.revision, r.role_id, e.permissions, e.archived,
@@ -322,6 +320,16 @@ def resolve_access(fetch: Fetch, email: str, builtin_role: str) -> AccessState:
         direct_permissions=frozenset() if scim_active is False else frozenset(direct),
         grant_roles=tuple(sorted(grant_roles)), directory=directory,
     )
+
+
+def narrow_group_in(conn, group_id: str) -> None:
+    """Advance the access epoch of a group's members when its role grant ends.
+
+    Losing a last grant can otherwise return an authority entry to None and
+    revalidate a version issued before the grant.
+    """
+    conn.execute('''UPDATE scim_users SET access_epoch=access_epoch+1
+        WHERE id IN (SELECT user_id FROM scim_group_members WHERE group_id=?)''', (group_id,))
 
 
 def scim_state_in(conn, email: str) -> bool | None:
@@ -514,13 +522,6 @@ class EnterpriseRoles:
 
     def authorize_in(self, conn, actor, permission: str) -> Authority:
         return self.authority_in(conn, actor).require(permission)
-
-    def builtin_admin_in(self, conn, actor) -> bool:
-        """Administrator authority comes from the built-in role, never a custom allowlist."""
-        try:
-            return self.authority_in(conn, actor).builtin_admin
-        except GovernanceError:
-            return False
 
     @staticmethod
     def live_role_in(conn, role_id: str):
@@ -760,6 +761,8 @@ class EnterpriseRoles:
         if current == body.role_id:
             return {**view, 'revision': revision, 'updated_at': row['updated_at'] if row else None,
                     'updated_by': row['updated_by'] if row else ''}
+        if current is not None and body.role_id is None:
+            narrow_group_in(conn, group_id)
         stamp = timestamp()
         conn.execute('''INSERT INTO enterprise_group_roles(group_id,role_id,revision,updated_by,updated_at)
             VALUES(?,?,?,?,?) ON CONFLICT(group_id) DO UPDATE SET role_id=excluded.role_id,

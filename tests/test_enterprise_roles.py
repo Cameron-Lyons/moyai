@@ -119,7 +119,7 @@ def test_catalog_lists_every_permission_once_with_labels_and_groups():
     assert {entry['id'] for entry in entries} == set(PERMISSIONS) and len(entries) == len(PERMISSIONS)
     assert all(entry['label'] and entry['group'] and entry['description'] == PERMISSIONS[entry['id']] for entry in entries)
     assert BUILTIN_PERMISSIONS['admin'] == frozenset(PERMISSIONS) and MEMBER_PERMISSIONS < ALL
-    assert len(MEMBER_PERMISSIONS) == 16 and len(PERMISSIONS) == 30
+    assert len(MEMBER_PERMISSIONS) == 16 and len(PERMISSIONS) == 28
 
 
 def tool_names_of(capability):
@@ -251,7 +251,7 @@ def test_resolution_is_pure_and_matches_named_queries(governance):
             assert resolve_access(fetch, 'nobody@example.com', 'member').default
     finally:
         engine.dispose()
-    assert all('{' in sql and ':' in sql for name, sql in ACCESS_QUERIES.items() if name != 'scim_any')
+    assert all('{' in sql and ':' in sql for sql in ACCESS_QUERIES.values())
 
 
 def test_default_state_and_member_rows_never_change_governance(governance):
@@ -553,6 +553,20 @@ def test_returning_to_default_never_restores_an_earlier_authority_entry(governan
     assert lees[0]['grant_roles'] == [['operator', 1]] and 'directory' not in lees[0]
     assert lees[2]['directory'] == [lee, 1] and lees[4]['directory'] == [lee, 2]
     assert lees[-1]['grant_roles'] == [['operator', 3]] and lees[-1]['permissions'] == lees[0]['permissions']
+
+    # Ending the only grant, by clearing it or deleting its group, also never restores the earlier entry.
+    for end in ('clear', 'delete'):
+        ray = provision(service, f'ray-{end}@example.com')
+        team = directory_group(service, f'Team {end}', [ray])
+
+        def grant(role_id, revision, team=team):
+            return lambda: service.enterprise.set_group_role(team, GroupRoleChange(role_id=role_id, revision=revision),
+                                                             OWNER)
+
+        rays = entries(f'ray-{end}@example.com', grant('operator', 0),
+                       grant(None, 1) if end == 'clear' else lambda team=team: service.scim.delete(
+                           service.header, 'Group', team))
+        assert rays[0] is None and rays[2]['directory'] == [ray, 1]
 
     # People governance never touched keep no entry: provisioning, grantless groups, joining and leaving them.
     kim = provision(service, 'kim@example.com')

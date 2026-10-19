@@ -107,22 +107,31 @@ class ProductGovernance:
             if policy.git_access == 'none' or (policy.connected_apps is not None and 'github' not in policy.connected_apps):
                 raise HTTPException(403, 'The repository exceeds the session security policy.')
 
-    async def check_tool(self, scope, name, *, read_only=None):
+    @staticmethod
+    def _tool_denial(principal, policy, name, read_only):
+        """Why the principal and policy refuse one tool call, or None when both allow it."""
         from app.permissions import connector_tool, tool_permission
-        async with self.database.sessions.begin() as db:
-            principal = await self.principal(db, scope.product_grant, tool_permission(name, read_only=read_only))
-            policy = await self.policy(db, scope.session_id)
+        permission = tool_permission(name, read_only=read_only)
+        provider, operation = connector_tool(name) or (None, name)
+        if permission not in principal.effective_permissions:
+            return 'Your workspace role does not allow this action.'
+        aliases = {name, operation, f'{provider}_{operation}' if provider else name}
+        if policy.tools is not None and not aliases.intersection(policy.tools):
+            return 'This tool is disabled by the session security policy.'
+        if provider and policy.connected_apps is not None and provider not in policy.connected_apps:
+            return 'This connection is disabled by the session security policy.'
+        if provider == 'github' and (
+                policy.git_access == 'none' or policy.git_access != 'write' and permission == 'connections.write'):
+            return 'Managed Git access is disabled by the session security policy.'
+        return None
+
+    async def check_tool(self, scope, name, *, read_only=None, db=None):
+        async with self._snapshot(db) as transaction:
+            principal = await self.principal(transaction, scope.product_grant)
+            policy = await self.policy(transaction, scope.session_id)
             self.require_provider(policy)
-            connector = connector_tool(name)
-            provider, operation = connector if connector else (None, name)
-            if policy.tools is not None and not {name, operation, f'{provider}_{operation}'}.intersection(policy.tools):
-                raise HTTPException(403, 'This tool is disabled by the session security policy.')
-            if provider and policy.connected_apps is not None and provider not in policy.connected_apps:
-                raise HTTPException(403, 'This connection is disabled by the session security policy.')
-            if provider == 'github' and (policy.git_access == 'none' or (
-                policy.git_access != 'write' and tool_permission(name, read_only=read_only) == 'connections.write'
-            )):
-                raise HTTPException(403, 'Managed Git access is disabled by the session security policy.')
+            if denial := self._tool_denial(principal, policy, name, read_only):
+                raise HTTPException(403, denial)
             return principal
 
     async def connection(self, scope, grant, *, write=False):
@@ -135,26 +144,11 @@ class ProductGovernance:
                 raise HTTPException(403, 'Managed Git access is disabled by the session security policy.')
 
     async def tools(self, scope, definitions):
-        from app.permissions import connector_tool, tool_permission
         async with self.database.sessions.begin() as db:
             principal = await self.principal(db, scope.product_grant)
             policy = await self.policy(db, scope.session_id)
-            allowed = []
-            for name, read_only in definitions:
-                permission = tool_permission(name, read_only=read_only)
-                connector = connector_tool(name)
-                provider, operation = connector if connector else (None, name)
-                aliases = {name, operation, f'{provider}_{operation}' if provider else name}
-                if permission not in principal.effective_permissions:
-                    continue
-                if policy.tools is not None and not aliases.intersection(policy.tools):
-                    continue
-                if provider and policy.connected_apps is not None and provider not in policy.connected_apps:
-                    continue
-                if provider == 'github' and (policy.git_access == 'none' or policy.git_access != 'write' and permission == 'connections.write'):
-                    continue
-                allowed.append(name)
-            return allowed
+            return [name for name, read_only in definitions
+                    if self._tool_denial(principal, policy, name, read_only) is None]
 
     @asynccontextmanager
     async def _snapshot(self, db=None):
@@ -165,56 +159,50 @@ class ProductGovernance:
                 yield snapshot
 
     async def check_model(self, scope, *, db=None):
-        from app.spend_limits import evaluate, limits_from_rows
+        from app.spend_limits import evaluate, limit_ids, limits_from_rows
 
         from .inference_usage import InferenceUsage
         async with self._snapshot(db) as transaction:
             principal = await self.principal(transaction, scope.product_grant)
             self.require_provider(await self.policy(transaction, scope.session_id))
-            # Serialize the check and durable admission. Once a request is
-            # pending, its unknown final cost blocks other budgeted requests.
-            await transaction.execute(text('SELECT pg_advisory_xact_lock(726942, CAST(CAST(:schema AS regnamespace) AS oid)::int)'),
-                             {'schema': self.identity.schema})
-            rows = (await transaction.execute(text(f'SELECT id,limit_usd FROM {self.identity._table("spend_limits")}'))).mappings().all()
+            rows = (await transaction.execute(
+                text(f'SELECT id,limit_usd FROM {self.identity._table("spend_limits")} WHERE id = ANY(:ids)'),
+                {'ids': list(limit_ids(principal.email))})).mappings().all()
             limits = limits_from_rows(rows, principal.email)
             if limits.unlimited:
                 return
+            # In-flight requests were admitted below every limit and may cross it
+            # once priced, so they neither count nor block concurrent admission.
+            # A finished request without a reported cost fails closed until
+            # receipt recovery settles it.
+            settled = select(func.coalesce(func.sum(cast(InferenceUsage.cost_usd, Numeric)), 0),
+                             func.count().filter(InferenceUsage.cost_usd.is_(None))).where(
+                InferenceUsage.status.not_in(('not_dispatched', 'pending')))
             since = datetime.now(UTC).replace(day=1, hour=0, minute=0, second=0, microsecond=0).isoformat()
-            usage = {}
-            for kind in ('organization', 'user', 'session'):
-                if getattr(limits, kind) is None:
-                    continue
-                query = select(func.coalesce(func.sum(cast(InferenceUsage.cost_usd, Numeric)), 0))
-                unknown = select(func.count()).select_from(InferenceUsage).where(InferenceUsage.cost_usd.is_(None))
-                clauses = [InferenceUsage.status != 'not_dispatched']
-                if kind == 'session':
-                    # A child shares every ancestor's session budget. Each
-                    # ancestor's total includes all its delegated descendants.
-                    ancestors = list(await transaction.scalars(text('''WITH RECURSIVE ancestors(id) AS (
+            scopes = {
+                'organization': [InferenceUsage.created_at >= since],
+                'user': [InferenceUsage.created_at >= since, InferenceUsage.actor_id.in_(
+                    select(text('id')).select_from(text(self.identity._table('users')))
+                    .where(text('email=:email')).params(email=principal.email))
+                    if principal.email else InferenceUsage.actor_id == principal.id],
+                # A delegated child shares every ancestor's lifetime session
+                # budget. The root's family includes each ancestor's family, so
+                # its total is the largest one that any ancestor's limit sees.
+                'session': [InferenceUsage.session_id.in_(text('''WITH RECURSIVE ancestors(id) AS (
                         SELECT CAST(:session AS text) UNION
                         SELECT p.inherited_from FROM moyai_product_session_policies p
                         JOIN ancestors a ON p.session_id=a.id WHERE p.inherited_from IS NOT NULL
-                    ) SELECT id FROM ancestors'''), {'session': scope.session_id}))
-                    amounts = []
-                    for ancestor in ancestors:
-                        family = text('''WITH RECURSIVE family(id) AS (
-                            SELECT CAST(:ancestor AS text) UNION
-                            SELECT p.session_id FROM moyai_product_session_policies p
-                            JOIN family f ON p.inherited_from=f.id
-                        ) SELECT id FROM family''').bindparams(ancestor=ancestor)
-                        selected = [*clauses, InferenceUsage.session_id.in_(family)]
-                        if await transaction.scalar(unknown.where(*selected)):
-                            amounts.append(None)
-                        else:
-                            amounts.append(await transaction.scalar(query.where(*selected)))
-                    usage[kind] = None if None in amounts else max(amounts)
-                    continue
-                clauses.append(InferenceUsage.created_at >= since)
-                if kind == 'user':
-                    actors = select(text('id')).select_from(text(self.identity._table('users'))).where(text('email=:email')).params(email=principal.email)
-                    clauses.append(InferenceUsage.actor_id.in_(actors) if principal.email else InferenceUsage.actor_id == principal.id)
-                pending = await transaction.scalar(unknown.where(*clauses))
-                usage[kind] = None if pending else await transaction.scalar(query.where(*clauses))
+                    ), family(id) AS (
+                        SELECT id FROM ancestors UNION
+                        SELECT p.session_id FROM moyai_product_session_policies p
+                        JOIN family f ON p.inherited_from=f.id
+                    ) SELECT id FROM family''').bindparams(session=scope.session_id))],
+            }
+            usage = {}
+            for kind, clauses in scopes.items():
+                if getattr(limits, kind) is not None:
+                    total, unpriced = (await transaction.execute(settled.where(*clauses))).one()
+                    usage[kind] = None if unpriced else total
             if evaluate(limits, usage):
                 raise HTTPException(403, 'The configured spend limit has been reached. Ask a spend manager to review it.')
 

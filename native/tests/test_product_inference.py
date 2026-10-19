@@ -506,7 +506,8 @@ async def test_failed_product_preparation_does_not_make_recorded_costs_partial(i
     async with ctx.product.database.sessions.begin() as db:
         paid = await db.get(Turn, ctx.turn.id)
         paid.usage = json.dumps({"requests": 1, "input_tokens": 11, "output_tokens": 7})
-    runtime = SimpleNamespace(database=ctx.product.database, security=ctx.product.database.security)
+    runtime = SimpleNamespace(database=ctx.product.database, security=ctx.product.database.security,
+                              product_identity=ctx.product.adapter, settings=ctx.product.settings)
     value = await report(runtime, ctx.product.actor, None, None, None, None, None, 100, 0, "json")
     assert value["summary"]["pricing_status"] == "priced"
     assert value["summary"]["cost_usd_exact"] == "0.120000001"
@@ -527,7 +528,8 @@ async def test_failed_product_turn_with_observed_attempt_remains_unpriced(infere
         turn.status, turn.preparation, turn.usage = "failed", None, "{}"
         if missing_usage_row:
             await db.execute(delete(InferenceUsage).where(InferenceUsage.turn_id == turn.id))
-    runtime = SimpleNamespace(database=ctx.product.database, security=ctx.product.database.security)
+    runtime = SimpleNamespace(database=ctx.product.database, security=ctx.product.database.security,
+                              product_identity=ctx.product.adapter, settings=ctx.product.settings)
     value = await report(runtime, ctx.product.actor, None, None, None, None, None, 100, 0, "json")
     assert value["summary"]["pricing_status"] == "unpriced"
     assert value["coverage"]["undispatched_failed_turns"] == 0
@@ -548,7 +550,8 @@ async def test_proven_unsent_product_failure_does_not_invent_missing_cost(infere
     with pytest.raises(httpx2.ConnectError):
         await perform(ctx, handler=never_connected)
     await ctx.product.database.fail(ctx.turn.id, "Failed before connecting to the model.")
-    runtime = SimpleNamespace(database=ctx.product.database, security=ctx.product.database.security)
+    runtime = SimpleNamespace(database=ctx.product.database, security=ctx.product.database.security,
+                              product_identity=ctx.product.adapter, settings=ctx.product.settings)
     value = await report(runtime, ctx.product.actor, None, None, None, None, None, 100, 0, "json")
     assert value["summary"]["requests"] == value["summary"]["unpriced_requests"] == 0
     assert value["summary"]["pricing_status"] == "empty"

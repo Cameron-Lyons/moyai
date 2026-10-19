@@ -6,10 +6,9 @@ Legacy deployments with no ID retain their existing configuration. Temporal
 namespaces are provisioned externally (Cloud IDs are <name>.<account>), so an
 organization deployment names its own instead of receiving a derived one.
 """
-import json
-
 from .database import DatabaseError
 from .db import now
+from .schema_initializers import initialize_organization_scope as initialize_schema
 
 
 NAMESPACE_FIELDS = ('temporal_namespace', 'temporal_task_queue', 'object_storage_prefix',
@@ -103,8 +102,3 @@ class OrganizationScope:
         return {'id': self.settings.moyai_organization_id,
                 'deployment_mode': 'dedicated' if self.settings.moyai_organization_id else 'legacy',
                 'namespaces': {field: getattr(self.settings, field) for field in NAMESPACE_FIELDS}}
-
-
-def initialize_schema(store):
-    store.execute('''CREATE TABLE IF NOT EXISTS organization_scope (
-        id INTEGER PRIMARY KEY CHECK(id=1),organization_id TEXT NOT NULL,created_at TEXT NOT NULL)''')

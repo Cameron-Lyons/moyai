@@ -12,11 +12,11 @@ const P1='0123456789abcdef'.repeat(2), P2='fedcba9876543210'.repeat(2), P3='0011
 const STALE='This changed elsewhere. Reload and try again.';
 const stamp='2026-10-15T09:30:00+00:00';
 const catalogRows=[
-  ['workspace.read','View workspace settings','Workspace'],['organization.manage','Change organization settings','Workspace'],
+  ['workspace.read','View workspace settings','Workspace'],
   ['sessions.read','View sessions','Sessions'],['sessions.create','Start sessions','Sessions'],['sessions.manage','Steer and organize sessions','Sessions'],
   ['connections.read','Use connected apps to read','Connections'],['connections.write','Use connected apps to make changes','Connections'],['connections.manage','Manage organization connections','Connections'],
   ['automations.read','View automations','Automations'],['automations.manage','Manage automations','Automations'],
-  ['environments.read','Use environments','Environments'],['environments.manage','Manage environments','Environments'],
+  ['environments.read','Use environments','Environments'],
   ['skills.read','Use skills','Skills'],['skills.manage','Manage personal skills','Skills'],['skills.publish','Publish organization skills','Skills'],
   ['memory.read','Recall memory','Memory'],['memory.manage','Manage memory','Memory'],
   ['credentials.read','Use credentials','Credentials'],['credentials.manage','Manage personal credentials','Credentials'],['credentials.publish','Manage organization credentials','Credentials'],
@@ -74,7 +74,7 @@ async function handle(req,res,next) {
   if(!url.pathname.startsWith('/api/'))return next();
   let body=''; for await(const chunk of req)body+=chunk;
   const data=body?JSON.parse(body):null, method=req.method, p=decodeURIComponent(url.pathname);
-  state.requests.push({path:p,query:url.search,method,body:data});
+  state.requests.push({path:p,query:url.search,method,body:data,csrf:req.headers['x-moyai-csrf']});
   const json=(value,status=200)=>{res.writeHead(status,{'Content-Type':'application/json','Cache-Control':'no-store'});res.end(JSON.stringify(value));};
   const has=permission=>state.permissions.includes(permission);
   const deny=()=>json({detail:'Your workspace role does not allow this action.'},403);
@@ -114,7 +114,7 @@ async function handle(req,res,next) {
   if(p.startsWith('/api/admin/scim')) {
     if(!has('scim.manage'))return deny();
     if(p==='/api/admin/scim'&&method==='GET'){const page=url.searchParams.get('cursor')==='users-2'?1:0;
-      return json({base_url:'https://moyai.example.test/scim/v2',users:{items:scimUsers[page],next_cursor:page?null:'users-2'},
+      return json({base_url:'https://moyai.example.test/scim/v2',users:{items:page&&state.emptyNextPage?[]:scimUsers[page],next_cursor:page?null:'users-2'},
         groups:state.groups.map(group=>{const grant=state.groupRoles.find(row=>row.group_id===group.id&&row.role_id);return {...group,role_id:grant?.role_id??null,role_name:grant?.role_name??null};}),
         tokens:state.tokens,activity:[entry('s1','scim_user.deactivated','scim_user','u2',{},'Okta production'),entry('s2','scim_token.created','scim_token','tok-1')],can_create_tokens:state.role==='admin'});}
     if(p==='/api/admin/scim/tokens'&&method==='POST'){const token={id:'tok-2',label:data.label,prefix:'moyai_scim_new1',created_at:stamp,created_by:'admin@example.test',last_used_at:null,revoked_at:null};
@@ -146,15 +146,22 @@ async function handle(req,res,next) {
       for(const change of data.changes){const row=state.limits.find(item=>item.id===change.id);
         if(row)Object.assign(row,{limit_usd:change.limit_usd,revision:row.revision+1,updated_at:stamp});
         else state.limits.push({id:change.id,kind:'user',subject:change.id.slice(5),limit_usd:change.limit_usd,revision:1,updated_at:stamp,updated_by:'admin@example.test',used_usd:0});}
-      return json(spendView());}
+      return json(state.configOnly?{limits:state.limits}:spendView());}
     const match=p.match(/^\/api\/admin\/spend-limits\/(.+)$/);
-    if(match&&method==='DELETE'){const id=decodeURIComponent(match[1]);state.limits=state.limits.filter(row=>row.id!==id);return json({id,deleted:true});}
+    if(match&&method==='DELETE'){const id=decodeURIComponent(match[1]);state.limits=state.limits.filter(row=>row.id!==id);return json(state.configOnly?{id,deleted:true}:spendView());}
   }
   // Audit log
+  if(p==='/api/admin/governance/audit/export') {
+    if(!has('audit.read'))return deny();
+    if(state.exportError)return json({detail:state.exportError},400);
+    const format=url.searchParams.get('format');
+    res.writeHead(200,{'Content-Type':format==='csv'?'text/csv':'application/x-ndjson','Content-Disposition':`attachment; filename="governance.${format}"`,'Cache-Control':'no-store'});
+    return res.end(format==='csv'?'id,action\na2,scim_token.revoked\n':'{"id":"a2","action":"scim_token.revoked"}\n');
+  }
   if(p==='/api/admin/governance/audit') {
     if(!has('audit.read'))return deny();
     const page=url.searchParams.get('cursor')==='audit-2'?1:0;
-    let entries=auditPages[page];
+    let entries=page&&state.emptyNextPage?[]:auditPages[page];
     if(url.searchParams.get('action'))entries=entries.filter(row=>row.action===url.searchParams.get('action'));
     return json({entries,next_cursor:page||url.searchParams.get('action')?null:'audit-2',facets:{actions:['role.created','role.changed','scim_token.revoked','spend_limit.updated'],resource_types:['role','user_role','scim_token','spend_limit']}});
   }
@@ -242,6 +249,7 @@ test('navigation, palette and direct routes follow permissions, and standalone h
 test('roles: create with grouped permissions, assign by email, grant a group and archive with an explained effect',async t=>{
   reset();const page=await pageFor(t,'#settings/roles');
   await page.getByRole('heading',{name:'Auditor'}).waitFor();
+  const meReads=()=>state.requests.filter(req=>req.path==='/api/me').length;let reads=meReads();
   assert.equal(await page.getByRole('heading',{name:'Legacy operations'}).count(),0,'archived roles are filtered out by default');
   await page.getByRole('button',{name:'New role',exact:true}).click();
   const dialog=page.getByRole('dialog',{name:'New role'});await dialog.waitFor();
@@ -255,6 +263,7 @@ test('roles: create with grouped permissions, assign by email, grant a group and
   await dialog.getByRole('button',{name:'Create role'}).click();await dialog.waitFor({state:'hidden'});
   assert.deepEqual(last('/api/admin/roles','POST').body,{id:'finance-reviewer',name:'Finance Reviewer',description:'',permissions:['audit.read','sessions.read','spend.read']});
   await page.getByRole('heading',{name:'Finance Reviewer'}).waitFor();
+  await waitFor(()=>meReads()>reads,'own access is re-read after a role change');reads=meReads();
 
   await page.getByRole('button',{name:'Assign role',exact:true}).click();
   const assign=page.getByRole('dialog',{name:'Assign a custom role'});await assign.getByRole('textbox',{name:'Work email'}).fill('  Erin@Example.test ');
@@ -269,6 +278,7 @@ test('roles: create with grouped permissions, assign by email, grant a group and
   await page.getByRole('button',{name:'Change grant for Finance'}).click();
   const grant=page.getByRole('dialog',{name:'Grant for Finance'});await choose(grant,page,'Additional role','Auditor');await grant.getByRole('button',{name:'Save grant'}).click();await grant.waitFor({state:'hidden'});
   assert.deepEqual(last('/api/admin/group-roles/g-fin','PUT').body,{role_id:'auditor',revision:0});
+  await waitFor(()=>meReads()>reads,'own access is re-read after a group grant');
 
   await page.getByRole('button',{name:'Archive Contractor'}).click();
   const archive=page.getByRole('dialog',{name:'Archive Contractor?'});
@@ -367,6 +377,7 @@ test('security policies: explicit null-versus-empty choices, validation, default
 test('spend limits: blank means no limit, overrides add/edit/remove, and only changed rows are sent',async t=>{
   reset();const page=await pageFor(t,'#settings/spend-limits');
   await page.getByText('$1,234.56').first().waitFor();await page.getByText('$3,765.44').waitFor();
+  const spendReads=()=>state.requests.filter(req=>req.path==='/api/admin/spend-limits'&&req.method==='GET').length,reads=spendReads();
   assert.equal(await page.getByRole('button',{name:'Save limits'}).isDisabled(),true);
   await page.getByRole('textbox',{name:'Organization monthly limit'}).fill('6000');
   await page.getByRole('textbox',{name:'Limit per session'}).fill('25.5');
@@ -375,6 +386,7 @@ test('spend limits: blank means no limit, overrides add/edit/remove, and only ch
   await page.getByRole('textbox',{name:'Default monthly limit per person'}).fill('200.00');
   await page.getByRole('button',{name:'Save limits'}).click();await page.getByText('Limits saved.').waitFor();
   assert.deepEqual(last('/api/admin/spend-limits','PUT').body,{changes:[{id:'organization',limit_usd:6000,revision:3},{id:'session-default',limit_usd:25.5,revision:0}]});
+  await page.getByText(/Current: \$6,000\.00/).waitFor();await page.getByText('$4,765.44').waitFor();
   await page.getByRole('button',{name:'Add override'}).click();const add=page.getByRole('dialog',{name:'Add a per-person override'});
   await add.getByRole('textbox',{name:'Work email'}).fill('Dan@Example.test');await add.getByRole('textbox',{name:'Monthly limit (USD)'}).fill('0');
   await add.getByRole('button',{name:'Add override'}).click();await add.waitFor({state:'hidden'});
@@ -386,10 +398,15 @@ test('spend limits: blank means no limit, overrides add/edit/remove, and only ch
   await page.getByRole('button',{name:'Remove override for carol@example.test'}).click();const remove=page.getByRole('dialog',{name:'Remove the override for carol@example.test?'});
   await remove.getByText(/They return to the default monthly limit \(\$200\.00\)/).waitFor();await remove.getByRole('button',{name:'Remove override'}).click();await remove.waitFor({state:'hidden'});
   assert.equal(last('/api/admin/spend-limits/user:carol@example.test','DELETE').query,'?revision=3');
-  assert.ok(state.requests.some(req=>req.method==='DELETE'&&req.path.startsWith('/api/admin/spend-limits/user')));
+  await table.getByText('carol@example.test').waitFor({state:'detached'});
+  assert.equal(spendReads(),reads,'saves that return the full listing replace it without another read');
+  state.configOnly=true;
+  await page.getByRole('button',{name:'Edit limit for dan@example.test'}).click();const bare=page.getByRole('dialog',{name:'Edit limit for dan@example.test'});
+  await bare.getByRole('textbox',{name:'Monthly limit (USD)'}).fill('40');await bare.getByRole('button',{name:'Save limit'}).click();await bare.waitFor({state:'hidden'});
+  await waitFor(()=>spendReads()===reads+1,'a configuration-only response is read again');await table.getByText('$40.00').waitFor();
 });
 
-test('audit log: filters, date validation, cursor paging and export links',async t=>{
+test('audit log: filters, date validation, cursor paging and exports',async t=>{
   reset();const page=await pageFor(t,'#settings/audit-log');
   const table=page.getByRole('region',{name:'Audit log entries'});await table.getByText('Role created',{exact:true}).waitFor();
   await page.getByText('3 entries shown; more are available.').waitFor();
@@ -405,10 +422,33 @@ test('audit log: filters, date validation, cursor paging and export links',async
   assert.equal(query.get('action'),'scim_token.revoked');assert.equal(query.get('actor'),'admin@example.test');
   assert.equal(query.get('after'),'2026-10-01T00:00:00Z');assert.equal(query.get('before'),'2026-10-16T00:00:00Z');assert.equal(query.get('cursor'),null);
   await page.getByText('1 entry shown.').waitFor();assert.equal(await table.getByText('Role created',{exact:true}).count(),0);
-  const csv=new URL(await page.getByRole('link',{name:'Export CSV'}).getAttribute('href'),base);
-  assert.equal(csv.pathname,'/api/admin/governance/audit/export');assert.equal(csv.searchParams.get('format'),'csv');assert.equal(csv.searchParams.get('action'),'scim_token.revoked');
-  assert.equal(new URL(await page.getByRole('link',{name:'Export NDJSON'}).getAttribute('href'),base).searchParams.get('format'),'ndjson');
+  await page.evaluate(()=>{const revoke=URL.revokeObjectURL.bind(URL);window.revoked=[];URL.revokeObjectURL=url=>{window.revoked.push(url);revoke(url);};});
+  for(const [label,format,content] of [['Export CSV','csv','id,action\na2,scim_token.revoked\n'],['Export NDJSON','ndjson','{"id":"a2","action":"scim_token.revoked"}\n']]) {
+    const [file]=await Promise.all([page.waitForEvent('download'),page.getByRole('button',{name:label}).click()]);
+    assert.equal(file.suggestedFilename(),`governance.${format}`);assert.equal(fs.readFileSync(await file.path(),'utf8'),content);
+    const request=last('/api/admin/governance/audit/export'),exported=new URLSearchParams(request.query);
+    assert.equal(request.csrf,'fixture-csrf');assert.equal(exported.get('format'),format);assert.equal(exported.get('action'),'scim_token.revoked');assert.equal(exported.get('after'),'2026-10-01T00:00:00Z');
+  }
+  await page.waitForFunction(()=>window.revoked.length===2&&window.revoked.every(url=>url.startsWith('blob:')));
+  state.exportError='Exports are limited to 50,000 entries. Narrow the date range.';
+  let downloads=0;page.on('download',()=>downloads++);
+  await page.getByRole('button',{name:'Export CSV'}).click();await page.getByRole('alert').getByText(state.exportError).waitFor();
+  assert.equal(downloads,0,'a failed export downloads nothing');assert.equal(await page.getByRole('button',{name:'Export CSV'}).isEnabled(),true);
   await page.getByRole('button',{name:'Clear filters'}).first().click();await page.getByText('3 entries shown; more are available.').waitFor();
+  assert.equal(await page.getByText(state.exportError).count(),0,'new filters clear the export error');
+});
+
+test('load more with an empty final page stops paging instead of returning to the first cursor',async t=>{
+  reset({emptyNextPage:true});const page=await pageFor(t,'#settings/audit-log');
+  const cursorReads=(pathname,cursor)=>state.requests.filter(req=>req.path===pathname&&new URLSearchParams(req.query).get('cursor')===cursor).length;
+  await page.getByText('3 entries shown; more are available.').waitFor();
+  await page.getByRole('button',{name:'Load more'}).click();await page.getByText('3 entries shown.').waitFor();
+  assert.equal(await page.getByRole('button',{name:'Load more'}).count(),0);assert.equal(cursorReads('/api/admin/governance/audit','audit-2'),1);
+  await page.evaluate(()=>{location.hash='settings/provisioning';});
+  const users=page.getByRole('region',{name:'Directory users'});await users.getByText('Dana Former').waitFor();
+  await page.getByRole('button',{name:'Load more users'}).click();await waitFor(()=>cursorReads('/api/admin/scim','users-2')===1,'second directory page');
+  await page.getByRole('button',{name:'Loading users…'}).waitFor({state:'detached'});
+  assert.equal(await page.getByRole('button',{name:'Load more users'}).count(),0);assert.equal(await users.getByRole('row').count(),3);
 });
 
 test('Users shows custom roles and replacing one needs explicit confirmation',async t=>{

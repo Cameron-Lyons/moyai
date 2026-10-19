@@ -56,7 +56,7 @@ const ProductHistoryPrefix = React.lazy(() => import("./product-history").then(m
 type PRSummary = NonNullable<SidebarSession["pull_requests"]>[number]
 type WorkspaceRequest = { sessionId: string; sequence: number; tab: "computer" | "pull-request" | "side-chat"; url?: string; child?: { id: string; title: string } }
 
-type Me = { user: { id: string; name: string; role: string; individual?: boolean ; permissions?: string[]; access_role?: { id: string; name: string } | null }; csrf: string; models: string[]; default_model: string; product_mode?: "standalone" | "existing"; preferences?: GeneralPreferences; permissions?: string[]; access_role?: { id: string; name: string } | null }
+type Me = { user: { id: string; name: string; role: string; individual?: boolean; permissions?: string[]; access_role?: { id: string; name: string } | null }; csrf: string; models: string[]; default_model: string; product_mode?: "standalone" | "existing"; preferences?: GeneralPreferences; permissions?: string[]; access_role?: { id: string; name: string } | null }
 type SessionInventory = { sessions: Session[]; ancestors?: Session[]; has_more: boolean; next_cursor?: string | null; notice?: string | null }
 type Connection = { id: string; name: string; kind: string; owner_id: string; read_only: boolean; enabled: boolean; shared: boolean; revision?: number }
 type Plan = { id: string; content: string; status: string }
@@ -364,7 +364,7 @@ function App() {
           onSession={session => { setCurrentSession(session); setInitialConversation(previous => previous?.value.session.id === (session?.id ?? nativeSelected) ? null : previous) }} />
         : selected
         ? <div className="center" role={routeError ? "alert" : "status"}>{routeError || "Opening conversation…"}{routeError && <Button variant="outline" onClick={() => setRouteRevision(value => value + 1)}>Retry</Button>}</div>
-        : <Home preferences={me.preferences} models={me.models} defaultModel={me.default_model} individual={me.user.individual !== false} productMode={me.product_mode} connectionVersion={connectionVersion} securityPolicies={me.product_mode === "existing" && can({role: me.user.role, permissions: me.permissions ?? me.user.permissions}, "security.manage")} onCreated={refresh}
+        : <Home preferences={me.preferences} models={me.models} defaultModel={me.default_model} individual={me.user.individual !== false} productMode={me.product_mode} connectionVersion={connectionVersion} securityPolicies={me.product_mode === "existing" && access !== null && can(access, "security.manage")} onCreated={refresh}
           onStarted={value => { setInitialConversation({ scope: scopeKey, value }); setSelected(value.session.id); location.hash = value.session.id }} />}
     </main>
     <AppCommandPalette open={paletteOpen} onOpenChange={setPaletteOpen} scopeKey={`${scopeKey}:${selected}`} role={me.user.role} productMode={me.product_mode} permissions={me.permissions ?? me.user.permissions}

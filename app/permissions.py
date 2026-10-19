@@ -22,7 +22,6 @@ PERMISSIONS = {
     'automations.read': 'View workflows and their run history',
     'automations.manage': 'Create and manage owned workflows',
     'environments.read': 'Use prepared project environments',
-    'environments.manage': 'Create, build and change organization environments',
     'skills.read': 'Discover and read authorized skills',
     'skills.manage': 'Create and manage personal skills',
     'skills.publish': 'Publish and manage organization skills',
@@ -38,7 +37,6 @@ PERMISSIONS = {
     'spend.read': 'View organization spend, adoption and spend limits',
     'spend.manage': 'Manage spend limits, infrastructure billing and spend identity links',
     'runtime.manage': 'View performance, capacity, pull-request and deployment details; configure session titles',
-    'organization.manage': 'Change organization settings',
     'audit.read': 'Read enterprise governance audit history',
     'security.manage': 'Manage security profiles and policies',
     'scim.manage': 'View directory provisioning and revoke provisioning credentials',
@@ -67,8 +65,6 @@ def route_permission(request):
         return 'security.manage'
     if path.startswith('/api/admin/governance'):
         return 'audit.read'
-    if path.startswith('/api/admin/spend-limits'):
-        return 'spend.read' if read else 'spend.manage'
     if path.startswith('/api/admin/spend'):
         return 'spend.read' if read else 'spend.manage'
     if path == '/api/spend':
@@ -99,7 +95,7 @@ def route_permission(request):
         return 'sessions.create'
     if path == '/api/sessions':
         return 'sessions.read' if read else 'sessions.create'
-    if path.startswith(('/api/sessions/', '/api/turns/', '/api/folders', '/api/uploads', '/api/artifacts', '/api/computer', '/api/goals', '/api/swarms')):
+    if path.startswith(('/api/sessions/', '/api/turns/', '/api/folders', '/api/artifacts', '/api/computer', '/api/goals', '/api/swarms')):
         return 'sessions.read' if read else 'sessions.manage'
     if path.startswith('/api/connections'):
         return 'connections.read' if read else 'connections.manage'
@@ -124,7 +120,6 @@ def route_permission(request):
 # Display label and group per permission. The UI groups by `group` in order of first appearance.
 LABELS = {
     'workspace.read': ('View workspace settings', 'Workspace'),
-    'organization.manage': ('Change organization settings', 'Workspace'),
     'sessions.read': ('View sessions', 'Sessions'),
     'sessions.create': ('Start sessions', 'Sessions'),
     'sessions.manage': ('Steer and organize sessions', 'Sessions'),
@@ -134,7 +129,6 @@ LABELS = {
     'automations.read': ('View automations', 'Automations'),
     'automations.manage': ('Manage automations', 'Automations'),
     'environments.read': ('Use environments', 'Environments'),
-    'environments.manage': ('Manage environments', 'Environments'),
     'skills.read': ('Use skills', 'Skills'),
     'skills.manage': ('Manage personal skills', 'Skills'),
     'skills.publish': ('Publish organization skills', 'Skills'),

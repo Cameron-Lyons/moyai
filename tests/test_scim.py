@@ -20,10 +20,11 @@ from app.enterprise_roles import (
     GovernanceInvalid,
     GroupRoleChange,
     RoleCreate,
+    scim_state_in,
 )
 from app.governance_audit import timestamp
 from app.permissions import MEMBER_PERMISSIONS
-from app.scim import API, CORE, MEDIA, Scim, ScimError, active_for_email_in, scim_router
+from app.scim import API, CORE, MEDIA, Scim, ScimError, scim_router
 from app.user_roles import UserRoles
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -87,7 +88,7 @@ def statements(monkeypatch):
 
 def active(provision, email):
     with provision.store.connect() as conn:
-        return active_for_email_in(conn, email)
+        return scim_state_in(conn, email) is not False
 
 
 def scim_events(provision):

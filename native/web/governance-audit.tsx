@@ -3,10 +3,11 @@ import { Download } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { TableCell, TableRow } from "@/components/ui/table"
-import { api, csrfToken } from "./api"
+import { api, apiDownload, csrfToken } from "./api"
+import { saveBlob } from "./debug-trace"
 import { Choice, RecordTable, dateTime, errorText } from "./settings"
-import { actionLabel, auditExportUrl, auditParams, auditPath, emptyAuditFilters } from "./governance-data"
-import { AuditDetails, LoadGate, PageActions, useGovResource } from "./governance-shared"
+import { actionLabel, auditExportPath, auditParams, auditPath, emptyAuditFilters } from "./governance-data"
+import { AuditDetails, LoadGate, MutationError, PageActions, useGovMutation, useGovResource } from "./governance-shared"
 import type { AuditEntry, AuditFilters, AuditPage as AuditResponse } from "./governance-types"
 
 const ALL = "__all__"
@@ -31,16 +32,22 @@ export function AuditLogPage() {
   const [formError, setFormError] = useState("")
   const resource = useGovResource<AuditResponse>(auditPath(applied))
   const [facets, setFacets] = useState<AuditResponse["facets"]>({ actions: [], resource_types: [] })
-  const [pages, setPages] = useState<{ base?: AuditResponse; entries: AuditEntry[]; next: string | null; loading: boolean; error: string }>({ entries: [], next: null, loading: false, error: "" })
+  const [pages, setPages] = useState<{ base?: AuditResponse; entries: AuditEntry[]; next: string | null; loaded: boolean; loading: boolean; error: string }>({ entries: [], next: null, loaded: false, loading: false, error: "" })
   const loadMore = useRef<AbortController | null>(null)
+  const exporter = useGovMutation(), [format, setFormat] = useState<"csv" | "ndjson">("csv")
   useEffect(() => { if (resource.data?.facets) setFacets(resource.data.facets) }, [resource.data])
   // New filters or a refresh discard pages loaded for the previous result.
-  useEffect(() => { loadMore.current?.abort(); setPages({ base: resource.data, entries: [], next: null, loading: false, error: "" }) }, [resource.data])
+  useEffect(() => { loadMore.current?.abort(); setPages({ base: resource.data, entries: [], next: null, loaded: false, loading: false, error: "" }) }, [resource.data])
   useEffect(() => () => loadMore.current?.abort(), [])
   const change = (patch: Partial<AuditFilters>) => { setFormError(""); setDraft(previous => ({ ...previous, ...patch })) }
   const apply = (next: AuditFilters) => {
     try { auditParams(next) } catch (reason) { setFormError(reason instanceof Error ? reason.message : "Check the filters."); return }
-    setFormError(""); setApplied(next)
+    setFormError(""); exporter.reset(); setApplied(next)
+  }
+  const download = (value: "csv" | "ndjson") => {
+    let file: { blob: Blob; filename: string }
+    setFormat(value)
+    void exporter.run(async () => { file = await apiDownload(auditExportPath(applied, value)) }, () => saveBlob(file.blob, file.filename || `governance.${value}`))
   }
   const clear = () => { setDraft(emptyAuditFilters); apply(emptyAuditFilters) }
   const options = (values: string[], current: string, all: string, label: (value: string) => string) =>
@@ -57,14 +64,15 @@ export function AuditLogPage() {
     </form>
     <div className="ns-gov-export" role="group" aria-label="Export the filtered audit log">
       <span className="ns-muted">Export {filtered(applied) ? "the filtered" : "the full"} history, up to 50,000 entries:</span>
-      <Button asChild variant="outline" size="sm"><a href={auditExportUrl(applied, "csv")} download><Download />Export CSV</a></Button>
-      <Button asChild variant="outline" size="sm"><a href={auditExportUrl(applied, "ndjson")} download><Download />Export NDJSON</a></Button>
+      <Button variant="outline" size="sm" disabled={exporter.busy} onClick={() => download("csv")}><Download />{exporter.busy && format === "csv" ? "Exporting…" : "Export CSV"}</Button>
+      <Button variant="outline" size="sm" disabled={exporter.busy} onClick={() => download("ndjson")}><Download />{exporter.busy && format === "ndjson" ? "Exporting…" : "Export NDJSON"}</Button>
       <PageActions resource={resource} />
     </div>
+    <MutationError mutation={exporter} />
     <LoadGate resource={resource} label="the audit log">{data => {
       const current = pages.base === data
       const entries = [...data.entries, ...(current ? pages.entries : [])]
-      const next = current && pages.entries.length ? pages.next : data.next_cursor
+      const next = current && pages.loaded ? pages.next : data.next_cursor
       const more = () => {
         if (!next || pages.loading) return
         const controller = new AbortController(), auth = csrfToken()
@@ -72,7 +80,7 @@ export function AuditLogPage() {
         setPages(previous => ({ ...previous, loading: true, error: "" }))
         void api<AuditResponse>(auditPath(applied, next), "GET", undefined, controller.signal).then(page => {
           if (controller.signal.aborted || auth !== csrfToken()) return
-          setPages(previous => previous.base === data ? { base: data, entries: [...previous.entries, ...page.entries], next: page.next_cursor, loading: false, error: "" } : previous)
+          setPages(previous => previous.base === data ? { base: data, entries: [...previous.entries, ...page.entries], next: page.next_cursor, loaded: true, loading: false, error: "" } : previous)
         }, reason => { if (!controller.signal.aborted) setPages(previous => ({ ...previous, loading: false, error: errorText(reason) })) })
       }
       return <>

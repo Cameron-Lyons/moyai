@@ -7,6 +7,7 @@ import { ProvisioningPage } from "./governance-provisioning"
 import { SecurityPoliciesPage } from "./governance-policies"
 import { SpendLimitsPage } from "./governance-spend"
 import { AuditLogPage } from "./governance-audit"
+import "./governance.css"
 
 export function GovernancePage({ page, user }: { page: string; user: SettingsUser }) {
   return <div className="ns-gov">{page === "roles" ? <RolesPage />
@@ -16,10 +17,10 @@ export function GovernancePage({ page, user }: { page: string; user: SettingsUse
           : page === "audit-log" ? <AuditLogPage /> : null}</div>
 }
 
+// Re-exported for tests/test_native_governance.cjs.
 export * from "./governance-data"
-export { RoleRows, AssignmentRows, GroupGrantRows, RoleEditor } from "./governance-roles"
-export { TokenRows, DirectoryUserRows, DirectoryGroupRows, TokenDialog, tokenStatus } from "./governance-provisioning"
-export { ProfileRows, PolicyEditor } from "./governance-policies"
+export { RoleRows } from "./governance-roles"
+export { TokenRows, DirectoryUserRows } from "./governance-provisioning"
+export { ProfileRows } from "./governance-policies"
 export { SpendSummary, OverrideRows } from "./governance-spend"
 export { AuditRows } from "./governance-audit"
-export { ActivityList, AuditDetails, CopyField } from "./governance-shared"

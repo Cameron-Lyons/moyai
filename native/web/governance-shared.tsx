@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useRef, useState } from "react"
-import { Check, Copy, RefreshCw, Shield } from "lucide-react"
+import { Check, Copy, RefreshCw } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog"
@@ -11,21 +11,23 @@ import type { AuditEntry } from "./governance-types"
 export const STALE_MESSAGE = "This changed elsewhere. Reload and try again."
 export type GovResource<T> = { data: T | undefined; loading: boolean; error: string; status: number; refresh: () => void }
 
-const accessChanged = () => window.dispatchEvent(new Event("moyai:access-changed"))
+export const accessChanged = () => window.dispatchEvent(new Event("moyai:access-changed"))
 
-/** Path-keyed GET that drops responses from an earlier path, actor or refresh. */
-export function useGovResource<T>(path: string | null): GovResource<T> {
+/** Path-keyed GET that drops responses from an earlier path, actor, refresh or replacement. */
+export function useGovResource<T>(path: string | null): GovResource<T> & { replace: (data: T) => void } {
   const [revision, setRevision] = useState(0)
   const [state, setState] = useState<{ key: string; data?: T; loading: boolean; error: string; status: number }>({ key: "", loading: Boolean(path), error: "", status: 0 })
+  const replaced = useRef(0)
   const key = path ? `${path}#${csrfToken()}` : ""
   useEffect(() => {
     if (!path) { setState({ key, loading: false, error: "", status: 0 }); return }
-    const controller = new AbortController()
+    const controller = new AbortController(), generation = replaced.current
+    const stale = () => controller.signal.aborted || replaced.current !== generation
     setState(previous => ({ key, data: previous.key === key ? previous.data : undefined, loading: true, error: "", status: 0 }))
     void api<T>(path, "GET", undefined, controller.signal).then(
-      data => { if (!controller.signal.aborted) setState({ key, data, loading: false, error: "", status: 200 }) },
+      data => { if (!stale()) setState({ key, data, loading: false, error: "", status: 200 }) },
       reason => {
-        if (controller.signal.aborted) return
+        if (stale()) return
         const status = reason instanceof ApiError ? reason.status : 0
         // Protected data is discarded on every failure, not only on 403.
         setState({ key, loading: false, error: errorText(reason), status })
@@ -35,8 +37,10 @@ export function useGovResource<T>(path: string | null): GovResource<T> {
     return () => controller.abort()
   }, [key, path, revision])
   const refresh = useCallback(() => setRevision(value => value + 1), [])
+  // A mutation that returns the full listing supersedes any read still in flight.
+  const replace = useCallback((data: T) => { replaced.current++; setState({ key, data, loading: false, error: "", status: 200 }) }, [key])
   const current = state.key === key
-  return { data: current ? state.data : undefined, loading: !current || state.loading, error: current ? state.error : "", status: current ? state.status : 0, refresh }
+  return { data: current ? state.data : undefined, loading: !current || state.loading, error: current ? state.error : "", status: current ? state.status : 0, refresh, replace }
 }
 
 export type GovMutation = { busy: boolean; error: string; conflict: boolean; reset: () => void; run: (action: () => Promise<unknown>, done?: () => void) => Promise<boolean> }
@@ -125,17 +129,13 @@ export function LoadGate<T>({ resource, label, children }: { resource: GovResour
   return <div aria-busy={resource.loading}>{children(resource.data)}</div>
 }
 
-export function NoAccess({ permission, onBack }: { permission: string; onBack: () => void }) {
-  return <div className="ns-empty" role="alert"><Shield size={24} aria-hidden="true" /><h2>Permission required</h2>
-    <p>This page requires the <code>{permission}</code> permission. Ask a workspace administrator to update your role.</p>
-    <Button variant="outline" onClick={onBack}>Back to overview</Button></div>
-}
-
 export function CopyField({ id, label, value, hint, secret = false, autoFocus = false }: { id: string; label: string; value: string; hint?: string; secret?: boolean; autoFocus?: boolean }) {
   const [status, setStatus] = useState("")
-  const input = useRef<HTMLInputElement>(null)
+  const input = useRef<HTMLInputElement>(null), reset = useRef(0)
+  useEffect(() => () => window.clearTimeout(reset.current), [])
   const copy = async () => {
-    try { await navigator.clipboard.writeText(value); setStatus("Copied to the clipboard.") }
+    window.clearTimeout(reset.current)
+    try { await navigator.clipboard.writeText(value); setStatus("Copied to the clipboard."); reset.current = window.setTimeout(() => setStatus(""), 3000) }
     catch { input.current?.select(); setStatus("Clipboard access is unavailable. The text is selected; copy it with your keyboard.") }
   }
   return <div className="ns-field ns-gov-copy">
@@ -144,7 +144,7 @@ export function CopyField({ id, label, value, hint, secret = false, autoFocus = 
       aria-describedby={hint ? `${id}-hint` : undefined} onFocus={event => event.currentTarget.select()} />
       <Button type="button" variant="outline" onClick={() => void copy()}>{status.startsWith("Copied") ? <Check /> : <Copy />}Copy<span className="visually-hidden"> {label}</span></Button></div>
     {hint && <p id={`${id}-hint`} className="ns-field-hint">{hint}</p>}
-    <p className="ns-field-hint" role="status">{status}</p>
+    <p className={status ? "ns-field-hint" : "visually-hidden"} role="status">{status}</p>
   </div>
 }
 

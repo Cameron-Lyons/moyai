@@ -52,7 +52,12 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from .database import INTEGRITY_ERRORS, DatabaseBusyError, DatabaseError
 from .db import database
-from .enterprise_roles import GovernanceForbidden, GovernanceInvalid, GovernanceNotFound, scim_state_in
+from .enterprise_roles import (
+    GovernanceForbidden,
+    GovernanceInvalid,
+    GovernanceNotFound,
+    narrow_group_in,
+)
 from .governance_audit import record_event_in, timestamp
 from .schema_initializers import initialize_scim as initialize_schema
 
@@ -691,7 +696,7 @@ class Scim:
             if data['active']:
                 raise ScimError(400, 'userName cannot be changed; deactivate the old identity and provision a new one.', 'mutability')
             data['userName'] = saved['user_name']
-        if external and conn.execute("SELECT 1 FROM scim_users WHERE external_id=? AND deleted_at='' AND id<>?",
+        if external and conn.execute("SELECT 1 FROM scim_users WHERE external_id=? AND external_id!='' AND deleted_at='' AND id<>?",
                                      (external, identity)).fetchone():
             raise ScimError(409, 'externalId must be unique for this resource type.', 'uniqueness')
         if created and conn.execute("SELECT 1 FROM scim_users WHERE user_name=? AND deleted_at=''",
@@ -769,7 +774,7 @@ class Scim:
 
     def _save_group_in(self, conn, identity, display, external, added, removed, token, *, created):
         """Upsert the group row and change only the membership delta, in batches."""
-        if external and conn.execute("SELECT 1 FROM scim_groups WHERE external_id=? AND deleted_at='' AND id<>?",
+        if external and conn.execute("SELECT 1 FROM scim_groups WHERE external_id=? AND external_id!='' AND deleted_at='' AND id<>?",
                                      (external, identity)).fetchone():
             raise ScimError(409, 'externalId must be unique for this resource type.', 'uniqueness')
         if conn.execute("SELECT 1 FROM scim_groups WHERE display_key=? AND deleted_at='' AND id<>?",
@@ -875,7 +880,8 @@ class Scim:
                 value = value.lower()
             elif field == 'displayname':
                 value = value.casefold()
-            predicate += ' AND ' + fields[field] + '=?'
+            # The literal lets externalId lookups use their partial unique index.
+            predicate += ' AND ' + fields[field] + ('=? AND external_id!=\'\'' if field == 'externalid' else '=?')
             args.append(int(value) if isinstance(value, bool) else value)
         total = conn.execute(f'SELECT COUNT(*) AS n FROM {table} WHERE {predicate}', args).fetchone()['n']
         # The offset is below the row count, so it always fits the database integer.
@@ -957,6 +963,9 @@ class Scim:
             else:
                 conn.execute('UPDATE scim_groups SET deleted_at=?,updated_at=?,revision=revision+1 WHERE id=?',
                              (stamp, stamp, identity))
+                if conn.execute('SELECT 1 FROM enterprise_group_roles WHERE group_id=? AND role_id IS NOT NULL',
+                                (identity,)).fetchone():
+                    narrow_group_in(conn, identity)
                 conn.execute('DELETE FROM scim_group_members WHERE group_id=?', (identity,))
             self.guard_admins_in(conn, before)
             record_event_in(conn, f'scim_{kind.lower()}.deleted', token['label'], f'scim_{kind.lower()}', identity,
@@ -1211,7 +1220,3 @@ def _resource_routes(router, service, kind):
                                     (collection + '/{identity}', deleting, ['DELETE'])]:
         router.add_api_route(path, endpoint, methods=methods, name='scim_' + kind.lower() + '_' + endpoint.__name__)
 
-
-def active_for_email_in(conn, email: str) -> bool:
-    """Unmanaged people keep existing access; deactivated or deleted SCIM emails fail closed."""
-    return scim_state_in(conn, email) is not False

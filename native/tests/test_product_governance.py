@@ -225,7 +225,7 @@ async def test_spend_limits_block_actual_paid_dispatch_at_each_scope(inference, 
     assert len(ctx.calls) == len(await requests(ctx)) == 1
 
 
-async def test_zero_budget_and_pending_cost_block_before_provider_call(inference):
+async def test_zero_budget_and_unpriced_cost_block_before_provider_call(inference):
     ctx = inference
     attach(ctx.product)
     await source_write(ctx.product, "INSERT INTO moyai.spend_limits VALUES('organization','organization','',0,1,'owner','now')")
@@ -244,12 +244,17 @@ async def test_zero_budget_and_pending_cost_block_before_provider_call(inference
     first = asyncio.create_task(perform(ctx, logical='first', handler=provider))
     await asyncio.wait_for(entered.wait(), 5)
     try:
-        with pytest.raises(HTTPException, match='spend limit'):
-            await perform(ctx, logical='concurrent')
+        # An in-flight request neither counts nor serializes other budgeted work.
+        await perform(ctx, logical='concurrent')
     finally:
         release.set()
         await first
-    assert len(ctx.calls) == 1
+    assert len(ctx.calls) == 2
+    # A finished request without a reported cost makes the limit fail closed.
+    await perform(ctx, logical='unpriced', cost=None)
+    with pytest.raises(HTTPException, match='spend limit'):
+        await perform(ctx, logical='after')
+    assert len(ctx.calls) == 3
 
 
 async def test_governance_schema_adds_receipt_without_changing_v22(product_database):
@@ -377,3 +382,33 @@ async def test_spend_management_without_read_permission_does_not_return_usage(go
         response = await client.delete('/api/admin/spend-limits/user:person@example.test?revision=1')
         assert response.status_code == 200 and response.json() == {'limits': []}
         assert (await client.get('/api/admin/spend-limits')).status_code == 403
+
+
+async def test_audit_feed_and_export_apply_the_requested_window(governed):
+    import httpx
+    from fastapi import APIRouter, FastAPI
+
+    from moyai.product_governance_routes import routes
+    product = governed
+    seen = []
+    class Recording:
+        def listing(self, filters, cursor, limit):
+            seen.append(filters)
+            return {'events': [], 'next_cursor': None}
+        def export(self, filters, format):
+            seen.append(filters)
+            return iter(())
+    resources = product.database.governance.product
+    resources.scim = SimpleNamespace(router=lambda: APIRouter())
+    resources.audit = Recording()
+    app = FastAPI()
+    app.include_router(routes(SimpleNamespace(product=resources, database=product.database)))
+    cookie, csrf = google_cookie(product.adapter, sub=product.subject)
+    window = {'after': '2026-10-01T00:00:00Z', 'before': '2026-10-16T00:00:00Z'}
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://127.0.0.1:8787',
+                                headers={'origin': 'http://127.0.0.1:8787', 'x-csrf-token': csrf}) as client:
+        client.cookies.set('workspace_session', cookie)
+        assert (await client.get('/api/admin/governance/audit', params=window)).status_code == 200
+        assert (await client.get('/api/admin/governance/audit/export', params=window)).status_code == 200
+    assert [(f.after.isoformat(), f.before.isoformat()) for f in seen] == [
+        ('2026-10-01T00:00:00+00:00', '2026-10-16T00:00:00+00:00')] * 2

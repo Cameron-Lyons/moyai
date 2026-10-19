@@ -604,7 +604,7 @@ class Store:
             row['swarm'] = public_mission(mission[0])
         return row
 
-    def create_run(self, prompt: str, repo_url: str, mode: str, plugins: list[str], *, chat_enabled=False, model='', user_id='', attachment_ids=None, client_id=None, environment_id='auto', side_chat_of='', harness='hermes', github_repository_id=None, sandbox_provider=None, metadata_request=False, swarm_budget_seconds=None, durable_submit=None, swarm_bootstrap=None, received_at=None, private_owner_id='', security_fields=None, requested_profile_id='', replay=False):
+    def create_run(self, prompt: str, repo_url: str, mode: str, plugins: list[str], *, chat_enabled=False, model='', user_id='', attachment_ids=None, client_id=None, environment_id='auto', side_chat_of='', harness='hermes', github_repository_id=None, sandbox_provider=None, metadata_request=False, swarm_budget_seconds=None, durable_submit=None, swarm_bootstrap=None, received_at=None, private_owner_id=''):
         if private_owner_id:
             owners = self.rows('SELECT kind FROM users WHERE id=?', (private_owner_id,))
             if private_owner_id != user_id or not owners or owners[0]['kind'] not in {'google', 'cloudflare'}:
@@ -621,13 +621,6 @@ class Store:
         validate_harness(harness, model)
         with self.connect() as conn:
             conn.begin_write()
-            if security_fields is not None and getattr(self, 'user_roles', None):
-                # Public admission may await provider/environment metadata. A
-                # revocation before this transaction must prevent the session
-                # and any durable wake from being committed together.
-                self.user_roles.require_actor(user_id, 'sessions.create', connection=conn)
-                if side_chat_of:
-                    self.user_roles.require_actor(user_id, 'sessions.read', connection=conn)
             if client_id:
                 previous = conn.execute("SELECT m.*,r.repo_url,r.github_repository_id,r.mode,r.plugins,r.environment_id,r.side_chat_of,r.harness,r.sandbox_provider,r.deleted_at,r.deletion_requested_at,r.private_owner_id FROM messages m JOIN runs r ON r.id=m.run_id WHERE m.client_id=? AND m.user_id=? AND m.role='user'", ('new:' + client_id, user_id)).fetchone()
                 if previous:
@@ -640,32 +633,11 @@ class Store:
                                       else mission['budget_seconds'] if mission else None)
                     if initial_budget != swarm_budget_seconds:
                         raise ValueError('That submission ID was already used for different content.')
-                    # Only an explicit selection conflicts. Defaults may change before a retry.
-                    if requested_profile_id:
-                        saved = conn.execute('SELECT security_profile_id FROM runs WHERE id=?', (previous['run_id'],)).fetchone()
-                        if saved['security_profile_id'] != requested_profile_id:
-                            raise ValueError('That submission ID was already used with a different security profile.')
                     if (previous['private_owner_id'] != private_owner_id or previous['sandbox_provider'] != sandbox_provider or previous['harness'] != harness or previous['content'] != prompt or previous['model'] != model or (previous['github_repository_id'] != github_repository_id if github_repository_id else previous['repo_url'] != repo_url)
                             or previous['mode'] != mode or json.loads(previous['plugins']) != plugins or previous['environment_id'] != environment_id or previous['side_chat_of'] != side_chat_of
                             or self.attachments.message_ids(conn, previous['id']) != set(attachment_ids or [])):
                         raise ValueError('That submission ID was already used for different content.')
                     return self.run(previous['run_id'], connection=conn)
-            if replay:
-                # The earlier admission's policy snapshot never admits a new session.
-                raise ValueError('This session was deleted. Start a new session.')
-            if security_fields is not None and requested_profile_id and getattr(self, 'user_roles', None):
-                # Recheck a new explicit selection under the writer lock. An
-                # idempotent replay above returns its existing binding instead.
-                self.user_roles.require_actor(user_id, 'security.manage', connection=conn)
-            if security_fields is not None:
-                # Preflight can await external metadata. Resolve the new binding
-                # again under the writer lock so a changed default, profile or
-                # parent ceiling cannot admit work using stale restrictions.
-                profiles = self.security_profiles
-                security_fields = profiles.binding(requested_profile_id, provider=sandbox_provider,
-                                                   parent_run_id=side_chat_of, conn=conn)
-                profiles.require_selection(json.loads(security_fields['security_policy']), plugins=plugins,
-                                           repository=bool(repo_url or github_repository_id))
             context = ''
             if side_chat_of:
                 parent = conn.execute("SELECT prompt,summary,private_owner_id FROM runs WHERE id=? AND deleted_at='' AND deletion_requested_at=''", (side_chat_of,)).fetchone()
@@ -691,10 +663,6 @@ class Store:
                 (run_id, prompt, repo_url, mode, "queued", json.dumps(plugins), stamp, stamp, chat_enabled, model, model, user_id, user_id, environment_id, harness, github_repository_id, private_owner_id),
             )
             conn.execute('UPDATE runs SET sandbox_provider=? WHERE id=?', (sandbox_provider, run_id))
-            if security_fields is not None:
-                conn.execute('UPDATE runs SET security_profile_id=?,security_profile_revision=?,security_policy=? WHERE id=?',
-                             (security_fields['security_profile_id'], security_fields['security_profile_revision'],
-                              security_fields['security_policy'], run_id))
             if side_chat_of:
                 conn.execute('UPDATE runs SET side_chat_of=?,side_chat_context=?,agent_label=? WHERE id=?', (side_chat_of, context, 'Side chat · ' + prompt[:70], run_id))
             if chat_enabled:
@@ -717,13 +685,6 @@ class Store:
         if not metadata_request:
             self.event(run_id, "status", "Task queued")
         return self.run(run_id)
-
-    def admitted_security(self, client_id, user_id):
-        """The policy snapshot admitted with an earlier submission of this client ID."""
-        rows = self.rows("""SELECT r.security_profile_id,r.security_profile_revision,r.security_policy FROM messages m
-            JOIN runs r ON r.id=m.run_id WHERE m.client_id=? AND m.user_id=? AND m.role='user'""", ('new:' + client_id, user_id))
-        # Sessions admitted before security profiles have no snapshot to reuse.
-        return rows[0] if rows and rows[0]['security_policy'] not in ('', '{}') else None
 
     def create_slack_run(self, event_id, prompt, plugins, channel, thread_ts, user_id, mention_ts=None, team_id='', file_ids=(), *, harness='hermes', model=None):
         # Slack retries deliveries. Reserve the event and its run in the same

@@ -368,10 +368,6 @@ class GitHub(GitHubCoding, GitHubCI, GitHubWriteAccess, GitHubRepositories):
                 'url': repo['html_url'], 'private': repo['private']}
 
     async def call(self, run, name, arguments):
-        profiles = getattr(self.store, 'security_profiles', None)
-        if profiles:
-            tool = TOOLS.get(name)
-            profiles.require_tool(run, name, 'github', tool[1] if tool else False)
         if name in CODING_TOOLS:
             return await self.coding_call(run, name, arguments)
         if name in CONTEXT_TOOLS:

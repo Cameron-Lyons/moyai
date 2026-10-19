@@ -219,12 +219,8 @@ class Connectors:
         row = rows[0] if rows else {"enabled": True, "read_only": False, "checked_at": None, "check_status": None}
         return {**row, "enabled": bool(row["enabled"]), "read_only": bool(row["read_only"])}
 
-    def allowed(self, name, run=None, *, as_bot=False, policy=None):
+    def allowed(self, name, run=None, *, as_bot=False):
         provider, write, _, _ = TOOLS[name]
-        profiles = getattr(self.store, 'security_profiles', None)
-        # A catalog passes its once-resolved effective session policy.
-        if run is not None and profiles and not profiles.allowed_tool(run, name, provider, write, policy=policy):
-            return False
         policy = self.policy(provider)
         if run is not None and not as_bot and name in {'slack_search', 'slack_thread', 'slack_channel'}:
             try:

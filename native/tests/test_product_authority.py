@@ -385,7 +385,8 @@ async def test_submit_waiting_on_canonical_writer_rechecks_before_creating_work(
             await asyncio.gather(pending, return_exceptions=True)
 
 
-async def test_product_grant_and_canonical_memory_run_in_real_temporal_and_replay(admitted_product, tmp_path):
+@pytest.mark.parametrize("governed", [False, True])
+async def test_product_grant_and_canonical_memory_run_in_real_temporal_and_replay(admitted_product, tmp_path, governed):
     """Controlled model with real PG stores/worker; not provider or actual-app proof."""
     product = admitted_product
     # Inject the adapter at its documented assembly boundary. This fixture only
@@ -401,6 +402,16 @@ async def test_product_grant_and_canonical_memory_run_in_real_temporal_and_repla
         product.adapter.settings, product.source, schema="moyai", native_engine=runtime.database.engine,
     )
     runtime.database.product_identity = runtime.product_identity
+    if governed:
+        from types import SimpleNamespace
+
+        from app.security_profiles import SecurityProfiles
+
+        from moyai.product_governance import ProductGovernance
+        # Every tool call crosses the governed durable check, which must replay.
+        runtime.database.governance = ProductGovernance(SimpleNamespace(
+            identity=runtime.product_identity, profiles=SecurityProfiles(SimpleNamespace(schema_updates=False)),
+        ), runtime.database)
     workspace = tmp_path / "computer"
     workspace.mkdir()
     shutil.copytree(Path(__file__).parents[1] / "skills", workspace / "skills")

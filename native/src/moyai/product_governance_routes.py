@@ -146,7 +146,7 @@ def routes(runtime):
         from app.security_profiles import validated
         return validated(AuditFilters, {'action': request.query_params.get('action'), 'actor': request.query_params.get('actor'),
                                        'resource_type': request.query_params.get('resource_type'),
-                                       'after': request.query_params.get('from'), 'before': request.query_params.get('to')})
+                                       'after': request.query_params.get('after'), 'before': request.query_params.get('before')})
 
     @router.get('/api/admin/governance/audit')
     async def audit(request: Request, cursor: str | None = None, limit: int = Query(50, ge=1, le=100), user=Depends(principal)):

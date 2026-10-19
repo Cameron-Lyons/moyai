@@ -28,6 +28,8 @@ populated database cannot acquire a new pin without a separate namespace migrati
 Organization deployments require their own provisioned Temporal namespace. Source
 resource names and native task queues/object prefixes are scoped idempotently to
 the organization. This is deployment isolation, not request-selected multitenancy.
+Scoping renames resources inside the configured accounts; separate cloud
+credentials, buckets, and accounts remain the operator's responsibility.
 
 ## Roles and provisioning
 
@@ -58,7 +60,7 @@ provisioning credential without deleting the provisioned directory.
 | --- | --- |
 | `users.read` / `users.manage` | User directory / built-in role assignments |
 | `roles.manage` | Custom roles, email assignments, group grants |
-| `scim.manage` | Provisioning directory and token management |
+| `scim.manage` | Provisioning directory and token revocation; only built-in administrators create tokens |
 | `security.manage` | Policy configuration and explicit profile selection |
 | `spend.read` / `spend.manage` | Organization spend / limit configuration |
 | `audit.read` | Audit feed and exports |
@@ -98,10 +100,10 @@ controls Moyai-managed GitHub operations; it does not inspect arbitrary shell te
 or files already present on a session computer.
 
 **Current Modal and Lambda computer adapters cannot enforce outbound network
-allowlists.** Native admission therefore refuses any policy with a non-null
-`network_domains` value before launching the computer. This includes an empty
-list. Restricted network policies remain configurable for an enforcing provider;
-this release does not claim machine-level egress support.
+allowlists.** Native admission, tool checks, and model admission therefore refuse
+any policy with a non-null `network_domains` value, including an empty list. A
+default or mandatory profile with network restrictions stops new and running
+native sessions. This release does not claim machine-level egress support.
 
 ## Spend limits
 
@@ -111,14 +113,15 @@ blocks new paid model requests. Per-email totals include all canonical actors
 with that email. A session's total includes its delegated descendants, and a
 child must also remain below every ancestor's session budget.
 
-The actual inference admission transaction serializes the budget check with the
-durable request receipt. Pending or missing costs fail closed whenever a relevant
-limit is configured. Requests known not to have dispatched do not consume budget.
-Reported final USD costs come from the native inference ledger; no prices are
-invented for missing receipts. A request admitted below a threshold can exceed
-it: these are admission limits, not provider-side prepaid reservations. Already
-dispatched work is not cancelled by a limit change. Removing a limit allows
-admission without requiring a known total for that scope.
+The inference admission transaction that records the durable request receipt
+checks the budget. Requests still in flight neither count nor block concurrent
+admission, so concurrent work can cross a limit by its in-flight cost. A finished
+request without a reported cost fails closed for every limited scope it counts
+toward until receipt recovery settles it. Requests known not to have dispatched
+do not consume budget. Reported final USD costs come from the native inference
+ledger; no prices are invented for missing receipts. These are admission limits,
+not provider-side prepaid reservations. Already dispatched work is not cancelled
+by a limit change. Without a configured limit, admission reads no usage.
 
 ## Audit and API
 

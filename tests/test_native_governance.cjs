@@ -92,7 +92,7 @@ test('spend amounts: blank is no limit, zero blocks, and only changed rows are s
   assert.equal(gov.limitText(null),'No limit');assert.equal(gov.limitText(0),'Blocked ($0.00)');assert.equal(gov.usd(1234.5),'$1,234.50');
 });
 
-test('audit filters use whole UTC days, a 100-day window, normalized actors and matching export URLs',()=>{
+test('audit filters use whole UTC days, a 100-day window, normalized actors and matching export paths',()=>{
   const filters={action:'role.created',actor:' Admin@Example.test ',resource_type:'role',from:'2026-07-08',to:'2026-10-15'};
   const params=gov.auditParams(filters);
   assert.equal(params.get('after'),'2026-07-08T00:00:00Z');assert.equal(params.get('before'),'2026-10-16T00:00:00Z');assert.equal(params.get('actor'),'admin@example.test');
@@ -101,8 +101,8 @@ test('audit filters use whole UTC days, a 100-day window, normalized actors and 
   assert.throws(()=>gov.auditParams({...filters,from:'07/08/2026'}),/YYYY-MM-DD/);
   assert.equal(gov.auditPath(gov.emptyAuditFilters),'/admin/governance/audit?limit=50');
   assert.match(gov.auditPath(gov.emptyAuditFilters,'opaque/cursor+1'),/cursor=opaque%2Fcursor%2B1$/);
-  const exported=new URL(gov.auditExportUrl(filters,'ndjson'),'https://moyai.test');
-  assert.equal(exported.pathname,'/api/admin/governance/audit/export');assert.equal(exported.searchParams.get('format'),'ndjson');assert.equal(exported.searchParams.get('action'),'role.created');
+  const exported=new URL(gov.auditExportPath(filters,'ndjson'),'https://moyai.test');
+  assert.equal(exported.pathname,'/admin/governance/audit/export');assert.equal(exported.searchParams.get('after'),'2026-07-08T00:00:00Z');assert.equal(exported.searchParams.get('format'),'ndjson');assert.equal(exported.searchParams.get('action'),'role.created');
   assert.equal(gov.actionLabel('scim_token.revoked'),'SCIM token revoked');assert.equal(gov.actionLabel(''),'Change recorded');
   assert.equal(gov.detailText(['a','b']),'a, b');assert.equal(gov.detailText(null),'None');
 });

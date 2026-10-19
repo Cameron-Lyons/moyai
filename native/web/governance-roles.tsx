@@ -8,7 +8,7 @@ import { TableCell, TableRow } from "@/components/ui/table"
 import { api } from "./api"
 import { Choice, Empty, RecordTable, Toolbar, contains, dateTime } from "./settings"
 import { assignmentBody, groupRoleBody, permissionGroups, permissionLabel, roleBody, roleIdFromName, roleUsage, type RoleDraft } from "./governance-data"
-import { DialogActions, GovConfirm, GovDialog, LoadGate, MutationError, PageActions, Section, StatusBadge, useGovMutation, useGovResource } from "./governance-shared"
+import { DialogActions, GovConfirm, GovDialog, LoadGate, MutationError, PageActions, Section, StatusBadge, accessChanged, useGovMutation, useGovResource } from "./governance-shared"
 import type { DirectoryGroup, GroupRole, PermissionCatalog, PermissionInfo, Role, RoleAssignment, RolesAdmin } from "./governance-types"
 
 const NO_ROLE = "__none__"
@@ -67,6 +67,8 @@ export function RolesPage() {
   const catalog = useGovResource<PermissionCatalog>("/permissions")
   const resource = useGovResource<RolesAdmin>("/admin/roles")
   const refresh = () => { catalog.refresh(); resource.refresh() }
+  // Any of these changes can alter the signed-in person's own permissions.
+  const saved = () => { resource.refresh(); accessChanged() }
   const both = { data: catalog.data && resource.data ? { catalog: catalog.data, admin: resource.data } : undefined, loading: catalog.loading || resource.loading,
     error: catalog.error || resource.error, status: catalog.error ? catalog.status : resource.status, refresh }
   const [search, setSearch] = useState(""), [state, setState] = useState("active"), [people, setPeople] = useState("")
@@ -104,15 +106,15 @@ export function RolesPage() {
         {admin.groups.length ? <GroupGrantRows groups={admin.groups} grants={admin.group_roles} roles={admin.roles} onChange={setGrant} />
           : <p className="ns-muted">No directory groups yet. Groups appear after your identity provider provisions them; see <a className="ns-link" href="#settings/provisioning">Provisioning</a>.</p>}
       </Section>
-      {editor && <RoleEditor role={editor === "new" ? undefined : editor} catalog={permissions.catalog} grantable={admin.grantable} onClose={() => setEditor(null)} onSaved={resource.refresh} onReload={refresh} />}
+      {editor && <RoleEditor role={editor === "new" ? undefined : editor} catalog={permissions.catalog} grantable={admin.grantable} onClose={() => setEditor(null)} onSaved={saved} onReload={refresh} />}
       {archive && <GovConfirm title={`Archive ${archive.name}?`} label="Archive role" onReload={refresh} onClose={() => setArchive(null)}
         description={<ArchiveEffect role={archive} admin={admin} />}
-        onConfirm={async () => { await api(`/admin/roles/${encodeURIComponent(archive.id)}?revision=${archive.revision}`, "DELETE"); resource.refresh() }} />}
-      {assign && <AssignmentEditor existing={assign === "new" ? undefined : assign} roles={active} onClose={() => setAssign(null)} onSaved={resource.refresh} onReload={refresh} />}
+        onConfirm={async () => { await api(`/admin/roles/${encodeURIComponent(archive.id)}?revision=${archive.revision}`, "DELETE"); saved() }} />}
+      {assign && <AssignmentEditor existing={assign === "new" ? undefined : assign} roles={active} onClose={() => setAssign(null)} onSaved={saved} onReload={refresh} />}
       {remove && <GovConfirm title={`Remove the custom role from ${remove.email}?`} label="Remove custom role" onReload={refresh} onClose={() => setRemove(null)}
         description="They return to the built-in Member permissions on their next request, plus any directory group grants. Administrator access is unchanged."
-        onConfirm={async () => { await api("/admin/role-assignments", "PUT", assignmentBody(remove.email, "member", remove)); resource.refresh() }} />}
-      {grant && <GroupGrantEditor group={grant} existing={admin.group_roles.find(row => row.group_id === grant.id)} roles={active} onClose={() => setGrant(null)} onSaved={resource.refresh} onReload={refresh} />}
+        onConfirm={async () => { await api("/admin/role-assignments", "PUT", assignmentBody(remove.email, "member", remove)); saved() }} />}
+      {grant && <GroupGrantEditor group={grant} existing={admin.group_roles.find(row => row.group_id === grant.id)} roles={active} onClose={() => setGrant(null)} onSaved={saved} onReload={refresh} />}
     </>
   }}</LoadGate>
 }

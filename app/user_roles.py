@@ -134,9 +134,6 @@ class UserRoles:
                 return self.permissions_in(conn, row['email']) & BUILTIN_PERMISSIONS['member']
         return frozenset()
 
-    def active_actor_in(self, conn, actor_id):
-        return bool(self.permissions_for_actor_in(conn, actor_id))
-
     def require_actor(self, actor_id, permission, *, connection=None):
         if connection is None:
             with self.store.connect() as conn:
@@ -156,9 +153,10 @@ class UserRoles:
         """Unmanaged emails stay active; SCIM-deactivated or deleted emails do not."""
         return scim_state_in(conn, email) is not False
 
-    def access_in(self, conn, email):
+    def access_in(self, conn, email, role=None):
+        """Governance state; role is the already-read built-in role of this email."""
         email = email.strip().lower()
-        return resolve_access(canonical_fetch(conn), email, self.role_in(conn, email))
+        return resolve_access(canonical_fetch(conn), email, role or self.role_in(conn, email))
 
     def permissions_in(self, conn, email):
         email = email.strip().lower()

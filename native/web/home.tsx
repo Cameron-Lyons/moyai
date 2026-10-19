@@ -83,20 +83,21 @@ export function Home({ models, defaultModel, individual = true, productMode = "s
   }
 
   useEffect(() => {
-    setPolicies(null)
-    if (!securityPolicies) { setPolicyId(""); return }
+    const unavailable = () => { setPolicies(null); setPolicyId("") }
+    if (!securityPolicies) { unavailable(); return }
     const controller = new AbortController()
     // Without a catalog the server applies the organization default, so a failed
-    // read hides the selector instead of blocking the session.
+    // read hides the selector and clears the choice instead of blocking the session.
     void api<SessionProfileCatalog>("/security-profiles", "GET", undefined, controller.signal).then(value => {
-      if (controller.signal.aborted || !Array.isArray(value?.profiles)) return
+      if (controller.signal.aborted) return
+      if (!Array.isArray(value?.profiles)) { unavailable(); return }
       setPolicies(value)
       if (policyNow.current && !value.profiles.some(profile => profile.id === policyNow.current)) {
         setPolicyId("")
       }
-    }, () => { if (!controller.signal.aborted) setPolicies(null) })
+    }, () => { if (!controller.signal.aborted) unavailable() })
     return () => controller.abort()
-  }, [securityPolicies, accountsVersion])
+  }, [securityPolicies])
 
   async function submit(prompt: string): Promise<void> {
     const action = goalCommandAction(prompt)

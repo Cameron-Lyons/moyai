@@ -52,15 +52,16 @@ class AuthorizedActivity(ActivityInboundInterceptor):
                 # Admission owns both original-identity receipt recovery and
                 # live authorization for NEW work. Prechecking a retry here
                 # would discard a child committed before steering or Stop.
-                if name != "agent__moyai__capability__moyai_interactive_delegation__start":
-                    await self.database.authorize_scope(scope, input_id=input_id)
-                governance = getattr(self.database, 'governance', None)
-                if governance is not None and name.endswith('__call_tool'):
-                    wire = input.args[0]
-                    definition = getattr(wire, 'tool_def', None)
-                    metadata = getattr(definition, 'metadata', None) or {}
-                    await governance.check_tool(scope, wire.name,
-                                                read_only=metadata.get('annotations', {}).get('readOnlyHint'))
+                async with self.database.sessions() as db:
+                    if name != "agent__moyai__capability__moyai_interactive_delegation__start":
+                        await self.database.authorize_scope(scope, input_id=input_id, db=db)
+                    governance = self.database.governance
+                    if governance is not None and name.endswith('__call_tool'):
+                        wire = input.args[0]
+                        definition = getattr(wire, 'tool_def', None)
+                        metadata = getattr(definition, 'metadata', None) or {}
+                        await governance.check_tool(scope, wire.name, db=db,
+                                                    read_only=metadata.get('annotations', {}).get('readOnlyHint'))
             except (PermissionError, HTTPException) as error:
                 raise ApplicationError(
                     "Execution authority changed before this activity attempt.",
