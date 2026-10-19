@@ -8,8 +8,9 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, PrivateAttr, model_validator
 
+from .inbound_events import InboundEvent
 from .product_identity import ProductGrant
 
 
@@ -27,6 +28,14 @@ class Grant:
     policy: dict[str, Any] = field(default_factory=dict)
 
 
+@dataclass(frozen=True)
+class ExecutionContext:
+    """Policy context, independent of the conversation's display/ACL context."""
+
+    visibility: str = "private"
+    surface: str = "web"
+
+
 @dataclass
 class RunScope:
     session_id: str
@@ -37,6 +46,27 @@ class RunScope:
     visibility: str = "private"
     surface: str = "web"
     product_grant: ProductGrant | None = None
+    swarm_id: str | None = None
+    swarm_name: str | None = None
+    delegation_depth: int = 0
+    delegation_generated: bool = False
+    # Chosen by the workflow and carried into tool activities. Old payloads
+    # must retain SDK delegation and its shared parent computer.
+    interactive_delegation: bool = False
+    execution_context: ExecutionContext | None = None
+    history_segment: int = 0
+    # Recorded by the workflow, so old activity inputs keep the original stream.
+    workflow_public_events: bool = False
+    goal_generation: int | None = None
+
+    @property
+    def root_run_id(self) -> str:
+        """One logical turn can contain several SDK runs across Temporal histories."""
+        return self.turn_id if not self.history_segment else f"{self.turn_id}:segment:{self.history_segment}"
+
+    @property
+    def authority(self) -> ExecutionContext:
+        return self.execution_context or ExecutionContext(self.visibility, self.surface)
 
     @property
     def grants_key(self) -> str:
@@ -59,9 +89,9 @@ class RunScope:
         actor_segment = self.actor_id if re.fullmatch(
             r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}", self.actor_id,
         ) else "identity-" + hashlib.sha256(self.actor_id.encode()).hexdigest()
-        if self.surface == "slack":
+        if self.authority.surface == "slack":
             return f"slack/{self.session_id}/{actor_segment}/{self.grants_key}"
-        return f"{self.visibility}/{actor_segment}/{self.grants_key}"
+        return f"{self.authority.visibility}/{actor_segment}/{self.grants_key}"
 
     @property
     def workspace_key(self) -> str:
@@ -117,17 +147,56 @@ class CompletedTurn:
 
 class NewSession(BaseModel):
     title: str = Field(default="New conversation", max_length=300)
-    visibility: Literal["private", "shared"] = "private"
+    visibility: Literal["private", "shared"] = "shared"
     model: str | None = None
+    security_profile_id: str = Field(default='', pattern=r'^([0-9a-f]{32})?$')
 
 
 class NewMessage(BaseModel):
+    # Transport provenance is assigned only by verified server ingress. It is
+    # deliberately not a request field, even when a client submits these names.
+    _event: InboundEvent | None = PrivateAttr(default=None)
+
+    @property
+    def authored_text(self) -> str:
+        return self.prompt if self._event is None else self._event.text
+
+    @property
+    def source(self) -> dict[str, Any]:
+        return {"kind": "web"} if self._event is None else self._event.source_data()
+
+    @classmethod
+    def from_event(
+        cls, event: InboundEvent, *, connections: list[str] | None = None,
+        model: str | None = None, mode: Literal["asap", "when_idle"] = "asap",
+        reply_to: str | None = None,
+    ) -> NewMessage:
+        body = cls(prompt=event.prompt, request_key=event.request_key, attachments=list(event.attachments),
+                   connections=connections or [], model=model, mode=mode, reply_to=reply_to)
+        body._event = event.model_copy(deep=True)
+        return body
+
+    def validate_event(self, actor_id: str) -> None:
+        event = self._event
+        if event is not None and (
+            event.sender_id != actor_id or event.request_key != self.request_key
+            or event.prompt != self.prompt or event.attachments != tuple(self.attachments)
+        ):
+            raise ValueError("Inbound event does not match the admitted sender or message.")
+
+    def with_model_input(self, prompt: str, *, context_status: str | None = None) -> NewMessage:
+        body = self.model_copy(update={"prompt": prompt})
+        if self._event is not None:
+            body._event = self._event.with_model_input(prompt, context_status=context_status)
+        return body
+
     prompt: str = Field(default="", max_length=500_000)
     request_key: str = Field(min_length=1, max_length=200)
     model: str | None = None
     mode: Literal["asap", "when_idle"] = "when_idle"
     connections: list[str] = Field(default_factory=list, max_length=30)
     attachments: list[str] = Field(default_factory=list, max_length=8)
+    reply_to: str | None = Field(default=None, min_length=1, max_length=36)
 
     @model_validator(mode="after")
     def nonblank_prompt(self) -> NewMessage:
@@ -159,6 +228,7 @@ class ApprovalReply(BaseModel):
     request_key: str = Field(min_length=1, max_length=200)
     approvals: dict[str, bool] = Field(default_factory=dict)
     answers: dict[str, Any] = Field(default_factory=dict)
+    browser_logins: dict[str, Literal["signed_in", "cancelled"]] = Field(default_factory=dict)
 
 
 class QueuedEdit(BaseModel):

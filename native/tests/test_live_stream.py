@@ -81,3 +81,61 @@ async def test_cancelled_consumer_closes_waiting_sdk_reader():
     with pytest.raises(asyncio.CancelledError):
         await consumer
     assert closed.is_set()
+
+
+@pytest.mark.asyncio
+async def test_stream_checks_each_delivery_once_and_still_checks_idle_revocation():
+    checks = 0
+    revoked = False
+
+    async def source():
+        for index in range(3):
+            yield str(index)
+        await asyncio.Event().wait()
+
+    async def authorize():
+        nonlocal checks
+        checks += 1
+        if revoked:
+            raise HTTPException(401)
+
+    async def disconnected():
+        return False
+
+    stream = authorized_events(source(), authorize, disconnected, interval=0.01)
+    assert [await anext(stream) for _ in range(3)] == ["0", "1", "2"]
+    assert checks == 4  # Admission plus one fresh check for each delivered event.
+    assert await anext(stream) == ": keepalive\n\n"
+    assert checks == 5
+    revoked = True
+    assert "access_revoked" in await anext(stream)
+    with pytest.raises(StopAsyncIteration):
+        await anext(stream)
+
+
+async def test_planned_reconnect_preserves_cursor_and_closes_only_the_reader():
+    reconnect, waiting, closed = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+    async def source():
+        try:
+            yield 'id: 73\ndata: {"text":"saved"}\n\n'
+            waiting.set()
+            await asyncio.Event().wait()
+        finally:
+            closed.set()
+
+    async def authorize():
+        pass
+
+    async def disconnected():
+        return False
+
+    stream = authorized_events(source(), authorize, disconnected, interval=30, reconnect=reconnect)
+    assert (await anext(stream)).startswith("id: 73")
+    pull = asyncio.create_task(anext(stream))
+    await waiting.wait()
+    reconnect.set()
+    assert await asyncio.wait_for(pull, 1) == "retry: 250\n\n"
+    with pytest.raises(StopAsyncIteration):
+        await anext(stream)
+    assert closed.is_set()

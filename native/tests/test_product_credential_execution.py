@@ -10,7 +10,7 @@ from types import SimpleNamespace
 import pytest
 import pytest_asyncio
 import test_product_authority as authority
-from app.credentials import CredentialRequest, ListCredentials, Resolve
+from app.credentials import CredentialRequest, ListCredentials, Materialize, Resolve
 from fastapi import HTTPException
 from pydantic import SecretStr
 from pydantic_ai import Agent, Conversation, ConversationTypeAdapter, DeferredToolRequests
@@ -54,7 +54,7 @@ async def credentials(admitted_product):
         ),
     )
     vault = ProductSecrets(runtime)
-    session, turn, prepared = await authority.active_turn(product)
+    session, turn, prepared = await authority.active_turn(product, private=True)
     return SimpleNamespace(product=product, service=vault.execution, vault=vault, scope=prepared.scope,
                            session=session, turn=turn, runtime=runtime)
 
@@ -64,6 +64,13 @@ def request_body(**overrides):
         provider="generic", name="webhook-signing-secret", reason="Configure the authorized webhook receiver.",
         request_key="webhook-access", input_fields=[{"name": "WEBHOOK_SECRET", "label": "Signing secret"}],
         **overrides,
+    )
+
+
+def test_materialize_request_ids_explain_saved_credential_handle_flow():
+    assert Materialize.model_fields["request_ids"].description == (
+        "IDs returned by credentials_request. To use saved access, first call credentials_request with "
+        "secret_id set to the credential id from credentials_list; credential ids are not request IDs."
     )
 
 
@@ -116,6 +123,21 @@ async def test_native_request_resolves_once_and_resumes_with_only_handle(credent
         value = await f.service.webhook_secret(resumed.scope, resumed.scope.turn_id, result["request_id"], db=db)
         assert value.get_secret_value() == "synthetic-signing-material-123456"
         assert "synthetic-signing-material" not in repr(value)
+
+
+@pytest.mark.parametrize("private_parent", [False, True])
+async def test_private_child_does_not_expand_personal_credential_visibility(credentials, private_parent):
+    from moyai.delegation import DelegationService
+
+    f = credentials
+    _, _, prepared = await authority.active_turn(f.product, private=private_parent)
+    child = await DelegationService(f.product.database).start(prepared.scope, "child", "Bounded work")
+    secret = {"lifetime": "persistent", "scope": "personal", "owner_id": f.product.actor.id}
+    async with f.product.database.sessions() as db:
+        assert await f.service.visible(db, secret, f.product.actor.id, child["session_id"]) is private_parent
+        assert await f.service.visible(
+            db, {**secret, "scope": "organization"}, f.product.actor.id, child["session_id"],
+        )
 
 
 async def test_resolution_rejects_stale_generation_changed_input_and_stopped_turn(credentials):
@@ -205,6 +227,9 @@ async def test_shared_and_slack_sessions_cannot_use_personal_agent_credentials(c
             session = await db.get(Session, prepared.scope.session_id)
             session.visibility, session.surface = "shared", surface
         shared = replace(prepared.scope, visibility="shared", surface=surface)
+        if surface == "slack":
+            from test_product_automations import bind_slack_test_session
+            await bind_slack_test_session(f.product.database, session.id, f.product.actor)
         assert not (await f.service.inventory(shared, ListCredentials()))["credentials"]
         with pytest.raises(HTTPException):
             await f.service.materialize(shared, [pending["request_id"]])

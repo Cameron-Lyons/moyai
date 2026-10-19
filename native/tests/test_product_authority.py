@@ -7,11 +7,9 @@ import os
 import shutil
 from dataclasses import replace
 from pathlib import Path
-from types import SimpleNamespace
-from urllib.parse import urlsplit, urlunsplit
 from uuid import uuid4
 
-import asyncpg
+import product_database_fixtures as database_fixtures
 import pytest
 import pytest_asyncio
 from fastapi import HTTPException
@@ -25,10 +23,12 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import create_async_engine
 from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Replayer
-from test_product_identity import SCHEMA, google_cookie, request, settings_for
+from test_delegation_temporal import dispatching
+from test_product_identity import google_cookie, request
 
 from moyai.contracts import NewMessage, NewSession, PreparedTurn
 from moyai.database import Database
+from moyai.delegation_models import DelegatedSession
 from moyai.models import Message, ProductTurnAuthority, Session, Turn, User
 from moyai.product_identity import ProductIdentityAdapter
 from moyai.product_schema import (
@@ -42,73 +42,23 @@ from moyai.product_schema import (
     verify_product_schema,
 )
 from moyai.runtime import Runtime
-from moyai.security import Security
-from moyai.settings import Settings
 from moyai.settings_runtime import SettingsSkills
 from moyai.storage import encrypted_converter
 from moyai.stores import NativeStores
 from moyai.worker import make_worker
+from moyai.worker_capacity import ActivityCapacity
 from moyai.workflow import TurnWorkflow
 
 pytestmark = pytest.mark.skipif(
     not os.getenv("MOYAI_TEST_POSTGRES"), reason="Set a disposable local PostgreSQL URL.",
 )
+product_database = database_fixtures.product_database
 
 
 @pytest_asyncio.fixture
-async def product_database(tmp_path):
-    base = urlsplit(os.environ["MOYAI_TEST_POSTGRES"])
-    assert base.hostname in {"localhost", "127.0.0.1", "::1"}
-    name = "moyai_authority_" + uuid4().hex
-    admin = await asyncpg.connect(urlunsplit(base))
-    source = database = None
-    created = False
-    try:
-        await admin.execute(f"CREATE DATABASE {name} ENCODING 'UTF8' TEMPLATE template0")
-        created = True
-        url = urlunsplit(base._replace(path="/" + name))
-        source = create_async_engine("postgresql+asyncpg://" + url.split("://", 1)[1])
-        # Deliberately long enough to exercise SQLAlchemy's PG index-name hash.
-        schema = "moyai_product_authority_regression_execution_schema"
-        subject = "long-" + "x" * 240 + "用户" * 10
-        user_id = "google:" + subject
-        async with source.begin() as connection:
-            await connection.execute(text("CREATE SCHEMA moyai"))
-            for statement in SCHEMA[:2]:
-                await connection.execute(text(statement.replace("CREATE TABLE ", "CREATE TABLE moyai.", 1)))
-            await connection.execute(text(
-                "INSERT INTO moyai.users VALUES (:id,'google','admin@example.test','Product admin',NULL,'c','u')"
-            ), {"id": user_id})
-        settings = Settings(
-            _env_file=None, data_dir=tmp_path / "never-bootstrap", database_url=url,
-            database_schema=schema, product_mode="existing", native_schema_mode="verify",
-            encryption_key="synthetic-native-authority-key-no-production", default_model="test",
-            workspace_password="must-not-bootstrap-an-admin",
-        )
-        database = Database(settings, Security(settings.master_key))
-        adapter = ProductIdentityAdapter(
-            settings_for(tmp_path), source, schema="moyai", native_engine=database.engine,
-            allow_shared_identities=True,
-        )
-        database.product_identity = adapter
-        yield SimpleNamespace(
-            database=database, adapter=adapter, source=source, schema=schema,
-            settings=settings, user_id=user_id, subject=subject,
-        )
-    finally:
-        if database:
-            await database.close()
-        if source:
-            await source.dispose()
-        if created:
-            await admin.execute(f"DROP DATABASE {name} WITH (FORCE)")
-        await admin.close()
-
-
-@pytest_asyncio.fixture
-async def admitted_product(product_database):
-    product = product_database
-    await migrate_product_schema(product.source, schema=product.schema, source_schema="moyai")
+async def admitted_product(prepared_product_database):
+    product = prepared_product_database
+    # Exercise real schema verification and identity projection for every case.
     await product.database.start()
     cookie, _ = google_cookie(product.adapter, sub=product.subject)
     principal = await product.adapter.authenticate(request(cookie))
@@ -118,9 +68,11 @@ async def admitted_product(product_database):
     return product
 
 
-async def active_turn(product):
+async def active_turn(product, *, private=False):
     database = product.database
-    session = await database.create_session(product.actor, NewSession())
+    session = await database.create_session(
+        product.actor, NewSession(visibility="private") if private else NewSession(),
+    )
     turn = await database.submit(product.actor, session.id, NewMessage(prompt="Work", request_key=str(uuid4())))
     assert (await database.claim_next()).id == turn.id
     prepared = await database.prepare(turn.id)
@@ -224,11 +176,17 @@ async def test_explicit_width_migration_preserves_existing_rows_and_foreign_keys
         assert (await db.get(User, "old-native-id")).display_name == "Existing"
         widths = (await db.execute(text(
             "SELECT character_maximum_length FROM information_schema.columns "
-            "WHERE table_schema=:schema AND "
+            "WHERE table_schema=:schema AND table_name<>'moyai_billing_records' AND "
             "((table_name='moyai_users' AND column_name='id') OR column_name IN "
             "('actor_id','owner_id','author_id','user_id','last_actor_id','scope_key'))"
         ), {"schema": product.schema})).scalars().all()
         assert widths and all(width == 512 for width in widths)
+        # Historical billing identities were unrestricted text. They are not
+        # native authorization identities and must not be truncated at import.
+        assert await db.scalar(text(
+            "SELECT data_type FROM information_schema.columns WHERE table_schema=:schema "
+            "AND table_name='moyai_billing_records' AND column_name='actor_id'"
+        ), {"schema": product.schema}) == "text"
 
 
 async def test_rendered_long_index_names_verify_but_wrong_columns_do_not(admitted_product):
@@ -346,9 +304,9 @@ async def test_private_session_denied_for_shared_principal(admitted_product):
     async with product.database.sessions.begin() as db:
         actor = await product.adapter.project_native_user(db, principal)
     with pytest.raises(HTTPException) as denied:
-        await product.database.create_session(actor, NewSession())
+        await product.database.create_session(actor, NewSession(visibility="private"))
     assert denied.value.status_code == 403
-    shared = await product.database.create_session(actor, NewSession(visibility="shared"))
+    shared = await product.database.create_session(actor, NewSession())
     assert shared.owner_id == principal.id and shared.visibility == "shared"
 
 
@@ -458,7 +416,7 @@ async def test_product_grant_and_canonical_memory_run_in_real_temporal_and_repla
         )
         async with environment:
             runtime.client = environment.client
-            async with make_worker(runtime):
+            async with make_worker(runtime), dispatching(runtime):
                 execution = await runtime.client.start_workflow(
                     TurnWorkflow.run, turn.id, id=turn.workflow_id, task_queue=settings.temporal_queue,
                 )
@@ -466,6 +424,7 @@ async def test_product_grant_and_canonical_memory_run_in_real_temporal_and_repla
                 assert result["status"] == "completed"
                 history = await execution.fetch_history()
             await Replayer(
+                interceptors=[ActivityCapacity()],
                 workflows=[TurnWorkflow], plugins=[PydanticAIPlugin()], data_converter=converter,
             ).replay_workflow(history)
         memory = await runtime.stores.memory.read(
@@ -475,9 +434,9 @@ async def test_product_grant_and_canonical_memory_run_in_real_temporal_and_repla
         assert "native capability proof succeeded" in memory.content
         assert (workspace / "proof.txt").is_file()
         assert len(await runtime.stores.plan(session.id).get_items()) == 1
-        children = await runtime.stores.steps.list_runs(parent_run_id=turn.id)
-        assert len(children) == 1 and ":" in children[0].run_id
-        assert children[0].parent_run_id == turn.id
+        async with runtime.database.sessions() as db:
+            children = list(await db.scalars(select(DelegatedSession).where(DelegatedSession.parent_turn_id == turn.id)))
+        assert len(children) == 1
         async with product.database.sessions() as db:
             saved = await db.get(Turn, turn.id)
             assert saved.result_accepted is True

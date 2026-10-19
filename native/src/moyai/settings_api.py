@@ -25,6 +25,7 @@ from temporalio.service import RPCError
 
 from .analytics_service import report as analytics_report
 from .contracts import PreparedTurn, RunScope
+from .general_preferences import GeneralPreferences, general_preferences, preference_document
 from .models import Connection, Turn, User, now
 from .pull_requests import PullRequestService
 from .security import password_hash
@@ -266,10 +267,12 @@ async def analytics(
     runtime: Any, user: User, start: str | None, end: str | None, model: str | None,
     status: str | None, user_id: str | None, limit: int, offset: int, format: str,
     *, preset: str = "7d", export: str = "turns", service: PullRequestService | None = None,
+    unified_billing: bool = False,
 ) -> Any:
     return await analytics_report(
         runtime, user, start, end, model, status, user_id, limit, offset, format,
         preset=preset, export=export, service=service,
+        billing=getattr(runtime, "product_billing", None) if unified_billing else None,
     )
 
 
@@ -314,6 +317,24 @@ def routes(runtime: Any, actor: Any) -> APIRouter:
             return checked
 
     router = APIRouter(prefix="/api/settings", tags=["settings"], route_class=RuntimeSettingsRoute)
+
+    @router.get("/general")
+    async def general(user: User = Depends(actor)):
+        return general_preferences(user.preferences)
+
+    @router.patch("/general")
+    async def update_general(body: GeneralPreferences, user: User = Depends(actor)):
+        async with runtime.database.sessions.begin() as db:
+            await lock_actor(db, user)
+            row = await db.get(User, user.id)
+            document = preference_document(row.preferences)
+            current = document.get("general", {})
+            document["general"] = {
+                **(current if isinstance(current, dict) else {}),
+                **body.model_dump(exclude_unset=True),
+            }
+            row.preferences = json.dumps(document)
+            return general_preferences(row.preferences)
 
     def capabilities(user: User) -> dict[str, Any]:
         return {
@@ -413,7 +434,7 @@ def routes(runtime: Any, actor: Any) -> APIRouter:
             ))
             return {"secrets": [secret_view(row, user) for row in rows],
                     "capabilities": capabilities(user)["secrets"],
-                    "reason": "Values are encrypted and never returned. Agent access is not enabled."}
+                    "reason": ""}
 
     @router.post("/secrets", status_code=201)
     async def create_secret(body: SecretInput, user: User = Depends(actor)):
@@ -568,7 +589,10 @@ def routes(runtime: Any, actor: Any) -> APIRouter:
             session = await runtime.database.allowed_session(db, body.session_id, user)
             if session.owner_id != user.id or session.visibility != "private" or session.surface != "web":
                 raise HTTPException(403, "Choose your own private web conversation for an automation.")
-            await runtime.database.resolve_grants(db, user.id, body.connections, shared_session=False)
+            context = await runtime.database.execution_context(db, session)
+            await runtime.database.resolve_grants(
+                db, user.id, body.connections, shared_session=context.visibility == "shared", surface=context.surface,
+            )
             model = body.model or session.model
             if model not in runtime.settings.models:
                 raise HTTPException(422, "Choose an enabled model.")
@@ -630,6 +654,7 @@ def routes(runtime: Any, actor: Any) -> APIRouter:
     @router.get("/usage")
     @router.get("/performance")
     async def report(
+        request: Request,
         start: str | None = None, end: str | None = None,
         model: str | None = Query(default=None, max_length=200),
         status: str | None = Query(default=None, max_length=30),
@@ -642,6 +667,7 @@ def routes(runtime: Any, actor: Any) -> APIRouter:
         return await analytics(
             runtime, user, start, end, model, status, user_id, limit, offset, format,
             preset=preset, export=export, service=analytics_pr_service,
+            unified_billing=request.url.path == "/api/settings/usage",
         )
 
     return router

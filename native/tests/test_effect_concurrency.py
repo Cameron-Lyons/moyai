@@ -8,12 +8,14 @@ import os
 import shutil
 from datetime import timedelta
 from pathlib import Path
+from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 from uuid import uuid4
 
 import asyncpg
 import pytest
 from pydantic_ai import Agent, RunContext
+from pydantic_ai.capabilities import durable_operation
 from pydantic_ai.durable_exec.temporal import PydanticAIPlugin, TemporalDurability
 from pydantic_ai.messages import ModelResponse, TextPart, ToolCallPart, ToolReturnPart, UserPromptPart
 from pydantic_ai.models.function import DeltaToolCall, FunctionModel
@@ -28,19 +30,32 @@ from temporalio.worker import Replayer
 
 from moyai.agent import HarnessActivityContext
 from moyai.contracts import NewMessage, NewSession, RunScope
-from moyai.effects import EffectReceipts, requires_receipt
+from moyai.effects import EffectReceipts, PendingEffectError, requires_receipt
 from moyai.live_events import root_event_stream
 from moyai.models import Effect, User
 from moyai.runtime import Runtime
 from moyai.settings import Settings
 from moyai.storage import encrypted_converter
 from moyai.worker import make_worker
+from moyai.worker_capacity import ActivityCapacity
 from moyai.workflow import TurnWorkflow
 
 
 class BeforeSiblingGate(EffectReceipts):
     async def wrap_tool_execute(self, ctx, *, call, tool_def, args, handler):
         return await handler(args)
+
+    @durable_operation("reserve")
+    async def reserve(
+        self, scope: RunScope, identity: str, name: str, args: dict[str, Any],
+        shell_readiness: bool = False,
+    ) -> None:
+        try:
+            await super().reserve(scope, identity, name, args, shell_readiness)
+        except PendingEffectError as error:
+            # Preserve the original activity failure in the legacy replay
+            # fixture, before pending reservations became recoverable tool errors.
+            raise PermissionError(str(error)) from error
 
 
 class ParallelChildren:
@@ -188,6 +203,7 @@ async def qualify_parallel_children(runtime, active, *, legacy=False):
         TurnWorkflow.__pydantic_ai_agents__ = [runtime.agent]
         count = len(scenario.executed)
         await Replayer(
+            interceptors=[ActivityCapacity()],
             workflows=[TurnWorkflow], plugins=[PydanticAIPlugin()], data_converter=converter,
         ).replay_workflow(history)
         assert len(scenario.executed) == count
@@ -231,6 +247,7 @@ async def test_cancel_waiting_children_leaves_only_dispatched_effect_uncertain(r
             await receipts.reserve(admitted.scope, "never-replay-unknown", "shell", {"child": 99})
         assert [r.state for r in await effect_rows(runtime, session.id)] == expected
         await Replayer(
+            interceptors=[ActivityCapacity()],
             workflows=[TurnWorkflow], plugins=[PydanticAIPlugin()], data_converter=converter,
         ).replay_workflow(history)
         assert len(scenario.executed) == len(expected)

@@ -44,6 +44,7 @@ from moyai.settings_runtime import (
 )
 from moyai.storage import EncryptedPayloadCodec
 from moyai.worker import make_worker
+from moyai.worker_capacity import ActivityCapacity
 from moyai.workflow import TurnWorkflow
 
 
@@ -88,7 +89,7 @@ async def member(runtime, *, role="member"):
 
 
 async def automation(runtime, user, *, paused=False):
-    session = await runtime.database.create_session(user, NewSession())
+    session = await runtime.database.create_session(user, NewSession(visibility="private"))
     async with runtime.database.sessions.begin() as db:
         row = SettingAutomation(
             id=new_id(), owner_id=user.id, owner_auth_version=user.auth_version,
@@ -309,7 +310,9 @@ async def test_saved_skills_are_native_deferred_capabilities_with_correct_scopes
 
 async def test_analytics_uses_actual_rows_and_never_private_content_or_fabricated_cost(runtime, actor):
     other = await member(runtime)
-    session = await runtime.database.create_session(other, NewSession(title="Never disclose this private title"))
+    session = await runtime.database.create_session(other, NewSession(
+        title="Never disclose this private title", visibility="private",
+    ))
     first = await runtime.database.submit(other, session.id, NewMessage(
         prompt="Never disclose this private prompt", request_key="analytics-first",
     ))
@@ -478,7 +481,7 @@ async def test_real_temporal_schedule_pause_delete_and_durable_admission(runtime
                     break
                 await asyncio.sleep(0.1)
             assert (await automation_readiness(runtime))["create"]
-            session = await runtime.database.create_session(actor, NewSession())
+            session = await runtime.database.create_session(actor, NewSession(visibility="private"))
             async with client_for(runtime, actor) as client:
                 created = await client.post("/api/settings/automations", json={
                     "name": "Real schedule", "prompt": "Synthetic task", "session_id": session.id,
@@ -504,7 +507,7 @@ async def test_real_temporal_schedule_pause_delete_and_durable_admission(runtime
                 )
                 assert (await execution.result())["status"] == "admitted"
                 history = await execution.fetch_history()
-                await Replayer(workflows=SETTINGS_WORKFLOWS, data_converter=converter).replay_workflow(history)
+                await Replayer(interceptors=[ActivityCapacity()], workflows=SETTINGS_WORKFLOWS, data_converter=converter).replay_workflow(history)
                 assert (await client.delete(f"/api/settings/automations/{identity}")).status_code == 200
                 with pytest.raises(RPCError) as missing:
                     await handle.describe()
@@ -669,9 +672,44 @@ async def test_saved_skill_runs_through_integrated_native_temporal_agent_and_rep
             assert result["status"] == "completed"
             history = await execution.fetch_history()
         await Replayer(
+            interceptors=[ActivityCapacity()],
             workflows=[TurnWorkflow], plugins=[PydanticAIPlugin()], data_converter=converter,
         ).replay_workflow(history)
     async with runtime.database.sessions() as db:
         recorded = await db.get(Turn, turn.id)
         assert runtime.security.unseal(recorded.result).decode() == "Stored skill loaded in native Temporal execution."
     assert len(await runtime.stores.steps.list_runs(conversation_id=prepared.scope.conversation_id)) == 1
+
+
+async def test_general_preferences_persist_partially_and_are_user_scoped(runtime, actor):
+    other = await member(runtime)
+    async with runtime.database.sessions.begin() as db:
+        row = await db.get(User, actor.id)
+        row.preferences = json.dumps({"unrelated": {"keep": True}, "general": {"future": "preserve"}})
+    async with client_for(runtime, actor) as client:
+        defaults = {"delivery_mode": "when_idle", "connection_ids": None}
+        assert (await client.get("/api/settings/general")).json() == defaults
+        # Concurrent partial changes must merge under the user-row lock.
+        responses = await asyncio.gather(
+            client.patch("/api/settings/general", json={"delivery_mode": "asap"}),
+            client.patch("/api/settings/general", json={"connection_ids": ["selected"]}),
+        )
+        assert all(response.status_code == 200 for response in responses)
+        saved = {"delivery_mode": "asap", "connection_ids": ["selected"]}
+        assert (await client.get("/api/settings/general")).json() == saved
+        assert (await client.get("/api/me")).json()["preferences"] == saved
+        async with runtime.database.sessions() as db:
+            document = json.loads((await db.get(User, actor.id)).preferences)
+            assert document["unrelated"] == {"keep": True}
+            assert document["general"]["future"] == "preserve"
+        async with client_for(runtime, other) as other_client:
+            assert (await other_client.get("/api/settings/general")).json() == defaults
+        assert (await client.patch("/api/settings/general", json={"connection_ids": []})).json()["connection_ids"] == []
+        assert (await client.patch("/api/settings/general", json={"connection_ids": None})).json()["connection_ids"] is None
+        for invalid in ({"delivery_mode": None}, {"delivery_mode": "invalid"}, {"unknown": True},
+                        {"connection_ids": [""]}, {"connection_ids": ["x"] * 31}):
+            assert (await client.patch("/api/settings/general", json=invalid)).status_code == 422
+        client.headers.pop("X-Moyai-CSRF")
+        assert (await client.patch("/api/settings/general", json={"delivery_mode": "when_idle"})).status_code == 403
+        client.cookies.clear()
+        assert (await client.get("/api/settings/general")).status_code == 401

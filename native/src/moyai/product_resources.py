@@ -4,8 +4,9 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
-from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncEngine
 
+from .postgres import create_engine
 from .product_files import ProductFilesAdapter
 from .product_history import ProductHistoryAdapter
 from .product_identity import ProductIdentityAdapter
@@ -36,9 +37,10 @@ class ProductResources:
             raise ValueError("Existing-product execution requires the canonical PostgreSQL database.")
         self.settings, self.native_engine = settings, native_engine
         url = settings.moyai_database_url
-        self.engine = create_async_engine(
+        self.engine = create_engine(
             "postgresql+asyncpg://" + url.split("://", 1)[1],
             pool_pre_ping=True,
+            pool_size=settings.moyai_database_pool_size, max_overflow=0, pool_timeout=10,
             connect_args={"server_settings": {"statement_timeout": "5000"}},
         )
         from app.blob_storage import ObjectStorage
@@ -51,6 +53,14 @@ class ProductResources:
         self.objects = ObjectStorage(settings)
         self.store_proxy = _StoreProxy(self)
         self.roles = UserRoles(self.store_proxy, settings)
+        from app.governance_audit import GovernanceAudit
+        from app.scim import Scim
+        from app.security_profiles import SecurityProfiles
+        from app.spend_limits import SpendLimits
+        self.profiles = SecurityProfiles(self.store_proxy, roles=self.roles.enterprise)
+        self.scim = Scim(self.store_proxy, self.roles, base_url=settings.public_url.rstrip('/') + '/scim/v2')
+        self.audit = GovernanceAudit(self.store_proxy, settings.session_secret)
+        self.spend_limits = SpendLimits(self.store_proxy, roles=self.roles.enterprise)
         self.security = Security(settings, self.roles)
         self.google = GoogleSignIn(settings, self.security, self.store_proxy)
         self.identity = ProductIdentityAdapter(
@@ -81,6 +91,8 @@ class ProductResources:
                 application_instance=settings.moyai_runtime_role != "standalone",
                 runtime_role=settings.moyai_runtime_role, runtime_settings=settings,
             )
+            from app.organization_scope import OrganizationScope
+            OrganizationScope(self.store, settings)
         await source_io(construct)
         self.files.artifacts = self.store.artifacts
 

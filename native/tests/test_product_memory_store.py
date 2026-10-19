@@ -8,11 +8,12 @@ from dataclasses import replace
 import pytest
 import test_product_memory as memory_fixtures
 from fastapi import HTTPException
-from pydantic_ai import Agent
+from pydantic_ai import Agent, RunContext, RunUsage
 from pydantic_ai.durable_exec.temporal import PydanticAIPlugin, TemporalDurability
 from pydantic_ai.exceptions import ToolFailed
 from pydantic_ai.messages import ModelResponse, TextPart, ToolCallPart, ToolReturnPart
 from pydantic_ai.models.function import DeltaToolCall, FunctionModel
+from pydantic_ai.models.test import TestModel
 from pydantic_ai_harness import StepPersistence
 from pydantic_ai_harness.memory import InMemoryStore, MemoryOperation, MemoryOperationConflictError
 from sqlalchemy import select, text, update
@@ -30,6 +31,7 @@ from moyai.runtime import Runtime
 from moyai.storage import encrypted_converter
 from moyai.stores import NativeStores
 from moyai.worker import make_worker
+from moyai.worker_capacity import ActivityCapacity
 from moyai.workflow import TurnWorkflow
 
 pytestmark = pytest.mark.skipif(not os.getenv("MOYAI_TEST_POSTGRES"), reason="Set a disposable local PostgreSQL URL.")
@@ -123,6 +125,35 @@ async def test_native_operation_replay_and_changed_arguments_do_not_duplicate_no
         assert await db.scalar(text("SELECT count(*) FROM moyai.memory_operations")) == 1
 
 
+async def test_memory_mutations_follow_promoted_guidance_not_message_creation_time(memory_product):
+    product = memory_product
+    session, turn, scope, _ = await memory_execution(product)
+    older = await product.database.submit(product.actor, session.id, NewMessage(
+        prompt="Please remember: Prefer pytest for focused backend tests.", request_key="older",
+    ))
+    newer = await product.database.submit(product.actor, session.id, NewMessage(
+        prompt="Do not save that preference yet.", request_key="newer", mode="asap",
+    ))
+    await product.database.steering_receipt(newer.id, "newer")
+    await product.database.steer_queued(product.actor, older.id)
+    await product.database.steering_receipt(older.id, "promoted")
+    async with product.database.sessions() as db:
+        message = await db.scalar(select(Message.id).where(Message.turn_id == older.id))
+    context = RunContext(
+        deps=scope, model=TestModel(), usage=RunUsage(), run_id=turn.id, metadata={"moyai_input_id": newer.id},
+    )
+    store = ProductMemoryStore(product.memory, scope, turn.id, context=context)
+    path = store.prefix + "personal-backend-testing.md"
+    with pytest.raises(ToolFailed, match="guidance"):
+        await store.write(path, captured_note(message), expected_version=None,
+                          operation=MemoryOperation("stale", "a" * 64))
+    context.metadata = {"moyai_input_id": older.id}
+    assert not (await store.write(path, captured_note(message), expected_version=None,
+                                 operation=MemoryOperation("current", "b" * 64))).replayed
+    async with product.source.connect() as db:
+        assert await db.scalar(text("SELECT count(*) FROM moyai.personal_memories")) == 1
+
+
 async def test_native_manual_mode_failure_is_not_presented_as_success(memory_product):
     product = memory_product
     await product.memory.preferences(product.principal.grant, Preferences(enabled=True, auto_save=False, revision=0))
@@ -147,12 +178,16 @@ async def test_native_manual_mode_failure_is_not_presented_as_success(memory_pro
         assert await db.scalar(text("SELECT count(*) FROM moyai.personal_memories")) == 0
 
 
-@pytest.mark.parametrize("forbidden", ["foreign_message", "missing_quote", "root_file", "other_namespace", "child", "automation"])
+@pytest.mark.parametrize("forbidden", [
+    "foreign_message", "missing_quote", "root_file", "other_namespace", "child", "delegated_session", "automation",
+])
 async def test_untrusted_evidence_paths_and_nonhuman_mutations_fail_closed(memory_product, forbidden):
     product = memory_product
     _, turn, scope, message_id = await memory_execution(
         product, surface="automation" if forbidden == "automation" else "web",
     )
+    if forbidden == "delegated_session":
+        scope = replace(scope, delegation_generated=True)
     store = ProductMemoryStore(product.memory, scope, "temporal:child" if forbidden == "child" else turn.id)
     path = store.prefix + "personal-backend-testing.md"
     changes = {}
@@ -454,6 +489,7 @@ async def test_canonical_capture_in_real_temporal_replays_without_rewriting_memo
                 assert (await asyncio.wait_for(execution.result(), 45))["status"] == "completed"
                 history = await execution.fetch_history()
             await Replayer(
+                interceptors=[ActivityCapacity()],
                 workflows=[TurnWorkflow], plugins=[PydanticAIPlugin()], data_converter=converter,
             ).replay_workflow(history)
         view = await product.memory.listing(product.principal.grant)
@@ -464,3 +500,142 @@ async def test_canonical_capture_in_real_temporal_replays_without_rewriting_memo
             assert len(receipts) == 1 and receipts[0].source_revision == 1
     finally:
         await runtime.close()
+
+
+@pytest.mark.parametrize("native_files,max_tokens", [(0, 2000), (3, 2000), (110, 20), (110, 2000)])
+async def test_batched_snapshot_matches_harness_bounds_with_half_the_live_views(
+    memory_product, monkeypatch, native_files, max_tokens,
+):
+    from pydantic_ai_harness import Memory
+
+    product = memory_product
+    await product.memory.save(product.principal.grant, memory_fixtures.note())
+    await product.memory.save(product.principal.grant, memory_fixtures.note(
+        key="other-repo", kind="project", repo_url="https://github.com/other/repo",
+        request_id="other-repo", content="Keep repository-specific facts in their repository.",
+    ))
+    _, turn, scope, _ = await memory_execution(product)
+    prefix = scope.memory_namespace + "/main/"
+    backend = InMemoryStore({prefix + f"note-{index:03d}.md": "Native note" for index in range(native_files)})
+    ctx = RunContext(deps=scope, model=TestModel(), usage=RunUsage(), run_id=turn.id)
+    calls = []
+    original = ProductMemoryStore._view
+
+    async def view(self, **kwargs):
+        calls.append(kwargs.get("content", True))
+        return await original(self, **kwargs)
+
+    monkeypatch.setattr(ProductMemoryStore, "_view", view)
+    legacy = Memory(
+        store_resolver=lambda ctx: ProductMemoryStore(product.memory, scope, turn.id, native_store=backend),
+        namespace=scope.memory_namespace, max_tokens=max_tokens, injection_errors="raise",
+    )
+    expected = await legacy._load_snapshot(ctx)
+    assert calls == [True, True, True, True]
+    calls.clear()
+    current = memory_capability(product.memory, native_store=backend)
+    current.max_tokens = max_tokens
+    actual = await current._load_snapshot(ctx)
+    assert actual == expected
+    assert calls == [False, True]
+    assert actual[0] is not None
+    assert "other-repo" not in actual[0].content
+    # Existing on-demand listing includes repository filenames, not contents.
+    if max_tokens == 2000:
+        assert "personal-other-repo.md" in actual[1]
+
+
+@pytest.mark.parametrize("change", ["forget", "disable", "private", "revoke", "stop"])
+async def test_batched_snapshot_rechecks_mutations_during_native_read(memory_product, change):
+    from moyai.models import Session, Turn
+
+    product = memory_product
+    saved = await product.memory.save(product.principal.grant, memory_fixtures.note())
+    session, turn, scope, _ = await memory_execution(product)
+    prefix = scope.memory_namespace + "/main/"
+
+    class ChangingNativeStore(InMemoryStore):
+        async def read(self, path, *, max_chars):
+            result = await super().read(path, max_chars=max_chars)
+            if change == "forget":
+                await product.memory.forget(product.principal.grant, saved["id"], 1)
+            elif change == "disable":
+                await product.memory.preferences(product.principal.grant, Preferences(enabled=False, revision=0))
+            else:
+                async with product.database.sessions.begin() as db:
+                    if change == "private":
+                        (await db.get(Session, session.id)).visibility = "private"
+                    elif change == "revoke":
+                        (await db.get(User, scope.actor_id)).auth_version += 1
+                    else:
+                        (await db.get(Turn, turn.id)).status = "stopped"
+            return result
+
+    backend = ChangingNativeStore({prefix + "MEMORY.md": "native-private-marker"})
+    capability = memory_capability(product.memory, native_store=backend)
+    ctx = RunContext(deps=scope, model=TestModel(), usage=RunUsage(), run_id=turn.id)
+    if change in {"revoke", "stop"}:
+        with pytest.raises((HTTPException, ToolFailed)):
+            await capability._load_snapshot(ctx)
+    else:
+        main, names, _, _ = await capability._load_snapshot(ctx)
+        assert main is not None
+        assert "Use the existing formatter." not in main.content
+        assert "personal-editor-preference.md" not in names
+        if change != "forget":
+            assert "native-private-marker" not in main.content
+            assert names == []
+
+
+async def test_batched_snapshot_reloads_each_step_after_note_edits_and_forget(memory_product):
+    product = memory_product
+    saved = await product.memory.save(product.principal.grant, memory_fixtures.note())
+    _, turn, scope, _ = await memory_execution(product)
+    capability = memory_capability(product.memory, native_store=InMemoryStore())
+    ctx = RunContext(deps=scope, model=TestModel(), usage=RunUsage(), run_id=turn.id)
+    first = await capability._load_snapshot(ctx)
+    await product.memory.save(product.principal.grant, memory_fixtures.note(
+        content="Updated between model steps.", revision=1, request_id="step-update",
+    ), note_id=saved["id"])
+    second = await capability._load_snapshot(ctx)
+    assert first[0] is not None and second[0] is not None
+    assert "Updated between model steps." in second[0].content
+    assert second[0].version != first[0].version
+    await product.memory.forget(product.principal.grant, saved["id"], 2)
+    third = await capability._load_snapshot(ctx)
+    assert third[0] is not None
+    assert "Updated between model steps." not in third[0].content
+    assert "personal-editor-preference.md" not in third[1]
+
+
+@pytest.mark.parametrize("change", ["deleted", "edited_after_start"])
+async def test_batched_snapshot_filters_slack_input_changed_during_native_read(memory_product, change):
+    from moyai.models import MessageSource
+
+    product = memory_product
+    note_content = "Pytest tracks fixture setup."
+    await product.memory.save(product.principal.grant, memory_fixtures.note(
+        key="execution-guide", title="Execution guide", kind="reference", content=note_content,
+    ))
+    _, turn, scope, message_id = await memory_execution(product)
+    store = ProductMemoryStore(product.memory, scope, turn.id)
+    before, _ = await store.snapshot(max_chars=32000, path_limit=100)
+    assert note_content in before.content
+    async with product.database.sessions() as db:
+        original = (await db.get(Message, message_id)).content
+
+    class ChangingNativeStore(InMemoryStore):
+        async def read(self, path, *, max_chars):
+            async with product.database.sessions.begin() as db:
+                source = await db.get(MessageSource, f"user:{turn.id}")
+                source.kind = "slack"
+                source.data = product.database.security.seal({"kind": "slack", change: True})
+            return await super().read(path, max_chars=max_chars)
+
+    store.native_store = ChangingNativeStore()
+    after, _ = await store.snapshot(max_chars=32000, path_limit=100)
+    explicit = await store.read(store.prefix + "MEMORY.md", max_chars=32000)
+    assert note_content not in after.content
+    assert explicit is not None and note_content not in explicit.content
+    async with product.database.sessions() as db:
+        assert (await db.get(Message, message_id)).content == original

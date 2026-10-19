@@ -6,18 +6,17 @@ It never imports app.main, constructs clients, or starts application lifecycles.
 """
 import argparse
 import base64
-import importlib
 import json
 
 from .database import DatabaseError, identifier
 
-SCHEMA_REVISION = 22
+SCHEMA_REVISION = 23
 # Physical additive expansions can keep this contract after a reviewed online
 # manifest step. Incompatible changes advance it and require maintenance.
-SCHEMA_COMPATIBILITY_REVISION = 22
+SCHEMA_COMPATIBILITY_REVISION = 23
 # Dependency order; optional features are prepared even when disabled at runtime.
 COMPONENTS = (
-    'organization_scope', 'session_privacy', 'personal_slack', 'enterprise_roles', 'user_roles', 'scim', 'governance_audit', 'sandbox_settings', 'github_repositories', 'github_write_access',
+    'organization_scope', 'session_privacy', 'personal_slack', 'user_roles', 'sandbox_settings', 'github_repositories', 'github_write_access',
     'github', 'repository_context', 'session_pull_requests', 'durable_runner', 'prepared_sandboxes',
     'user_preferences', 'environments', 'infrastructure_costs', 'spend', 'agents',
     'tracing', 'credentials', 'skills', 'memory', 'memory_review', 'skill_learning', 'lens_feedback',
@@ -26,7 +25,8 @@ COMPONENTS = (
     'coordinator_handoff',
     'broker_ownership', 'performance',
     'session_journal', 'goals', 'slack_sources', 'published_artifacts', 'computer_operations', 'broker_payloads',
-    'session_events', 'slack_notifications', 'security_profiles',
+    'session_events', 'slack_notifications',
+    'enterprise_roles', 'scim', 'security_profiles', 'spend_limits', 'governance_audit',
 )
 
 
@@ -55,11 +55,11 @@ def prepare_schema(owner, schema, mode):
 
 
 def initialize_components(store):
+    from . import schema_initializers
     for name in COMPONENTS:
-        importlib.import_module('.' + name, __package__).initialize_schema(store)
-    from .trace_outbox import TABLES, initialize_schema
-    for table in sorted(TABLES):
-        initialize_schema(store, table)
+        getattr(schema_initializers, 'initialize_' + name)(store)
+    for table in sorted(schema_initializers.TABLES):
+        schema_initializers.initialize_trace_outbox(store, table)
 
 
 def initialize_defaults(store, settings):

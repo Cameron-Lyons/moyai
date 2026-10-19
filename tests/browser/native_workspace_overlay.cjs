@@ -33,11 +33,13 @@ function Fixture() {
         <header className="topbar">
           <WorkspaceOverlayTrigger asChild><Button type="button">Workspace</Button></WorkspaceOverlayTrigger>
         </header>
-        <section className="chat"><button type="button">Chat outside</button></section>
+        <section className="chat"><div className="chat-layout">
+        <div className="chat-content"><button type="button">Chat outside</button></div>
         <WorkspaceOverlayContent>
           <WorkspaceOverview id="overlay-fixture" pullRequests={[]} onUpdated={() => {}}
             onPullRequest={() => setOpen(false)} onSubagent={() => setOpen(false)} onOutput={() => setOpen(false)} />
         </WorkspaceOverlayContent>
+        </div></section>
         {panel && <><div className="divider" /><aside className="details-panel">
           <button type="button" onClick={() => setComputerClicks(n => n + 1)}>Computer outside</button>
           <output aria-label="Computer clicks">{computerClicks}</output>
@@ -82,7 +84,7 @@ before(async () => {
   server = await createServer({
     configFile: false, root, cacheDir: cache, logLevel: 'error',
     resolve: { alias: { '@': path.join(root, 'frontend') } },
-    server: { host: '127.0.0.1', port: 0, strictPort: true },
+    server: { host: '127.0.0.1', port: 0, strictPort: false },
     plugins: [{
       name: 'isolated-workspace-overlay-regression',
       resolveId(id) { if (id === moduleUrl) return entry; },
@@ -91,7 +93,10 @@ before(async () => {
         vite.middlewares.use((request, response, next) => {
           const url = new URL(request.url, 'http://localhost');
           if (url.pathname === '/') {
-            response.setHeader('Content-Type', 'text/html'); response.end(html); return;
+            void vite.transformIndexHtml(url.pathname, html).then(document => {
+              response.setHeader('Content-Type', 'text/html'); response.end(document);
+            }).catch(next);
+            return;
           }
           if (url.pathname === '/api/sessions/overlay-fixture/workspace') {
             response.setHeader('Content-Type', 'application/json');
@@ -111,6 +116,10 @@ before(async () => {
     }],
   });
   await server.listen();
+  // This virtual entry cannot be found by Vite's file-system dependency scan.
+  // Finish its cold import discovery before testing layout and focus behavior.
+  await server.transformRequest(moduleUrl);
+  await server.waitForRequestsIdle();
   address = `http://127.0.0.1:${server.httpServer.address().port}`;
   browser = await chromium.launch({ headless: true });
 });
@@ -124,12 +133,17 @@ after(async () => {
 async function pageFor(t, options = {}, query = '') {
   const page = await browser.newPage({ viewport: { width: 1440, height: 900 }, ...options });
   const errors = [];
+  const loadingErrors = [];
   page.on('pageerror', error => errors.push(error.message));
+  page.on('requestfailed', request => loadingErrors.push(`${request.url()}: ${request.failure()?.errorText}`));
+  page.on('console', message => { if (message.type() === 'error') loadingErrors.push(message.text()); });
   await page.route('**/*', route =>
     new URL(route.request().url()).origin === address ? route.continue() : route.abort());
   t.after(async () => { await page.close(); assert.deepEqual(errors, [], 'No browser runtime errors'); });
   await page.goto(address + '/' + query);
-  await page.getByRole('button', { name: 'Workspace', exact: true }).waitFor();
+  await page.getByRole('button', { name: 'Workspace', exact: true }).waitFor().catch(error => {
+    throw new Error(`Workspace fixture failed to load: ${loadingErrors.join('\n')}`, { cause: error });
+  });
   return page;
 }
 
@@ -148,12 +162,12 @@ async function geometry(page) {
       const box = document.querySelector(selector).getBoundingClientRect();
       return { left: box.left, right: box.right, top: box.top, bottom: box.bottom, width: box.width };
     };
-    return { chat: rect('.chat'), host: rect('.workspace-overlay-host'), content: rect('.workspace-overlay-content'),
+    return { chat: rect('.chat'), body: rect('.chat-content'), host: rect('.workspace-overlay-host'), content: rect('.workspace-overlay-content'),
       workspace: rect('.workspace'), panel: document.querySelector('.details-panel') ? rect('.details-panel') : null };
   });
 }
 
-test('overlay follows chat column across live ratio changes, never the computer edge', async t => {
+test('workspace floats within chat across live ratio changes without resizing it', async t => {
   const page = await pageFor(t);
   const content = await opened(page);
   for (const size of ['65%', '380px', '820px']) {
@@ -166,6 +180,7 @@ test('overlay follows chat column across live ratio changes, never the computer 
     assert(box.content.bottom <= box.chat.bottom);
     assert(box.content.right < box.panel.left);
     assert(box.content.right < box.workspace.right - 100, 'Not anchored to workspace/viewport far right');
+    assert.deepEqual(box.body, box.chat, 'The floating menu must not reserve chat space');
   }
   assert.deepEqual(await content.locator('section').evaluateAll(nodes => nodes.map(node => node.getAttribute('aria-label'))),
     ['Pull requests', 'Subagents', 'Outputs']);
@@ -224,10 +239,12 @@ test('existing attach-link dialog consumes Escape before the workspace overlay',
 for (const width of [768, 320]) {
   test(`closed resource panel leaves overlay inside the ${width}px main chat`, async t => {
     const page = await pageFor(t, { viewport: { width, height: 800 } }, '?panel=closed');
+    const before = await page.locator('.chat-content').boundingBox();
     await opened(page);
     const box = await geometry(page);
     assert(box.content.left >= box.chat.left && box.content.right <= box.chat.right);
     assert(box.content.bottom <= box.chat.bottom && box.content.width <= 360.1);
+    assert.deepEqual(await page.locator('.chat-content').boundingBox(), before, 'Compact menu must not resize chat');
     assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth), false);
   });
 }
@@ -246,11 +263,28 @@ test('resource panel taking over chat closes the overlay without reopening after
   await content.waitFor({ state: 'detached' });
 });
 
+test('workspace shortcut toggles the menu and leaves a nested dialog in control', async t => {
+  const page = await pageFor(t);
+  await page.keyboard.press('Control+.');
+  const content = page.getByRole('dialog', { name: 'Workspace resources', exact: true });
+  await content.waitFor();
+  await content.getByRole('button', { name: 'Add pull requests', exact: true }).click();
+  const nested = page.getByRole('dialog', { name: 'Attach pull request', exact: true });
+  await nested.waitFor();
+  await page.keyboard.press('Control+.');
+  assert.equal(await nested.isVisible(), true);
+  await page.keyboard.press('Escape');
+  await nested.waitFor({ state: 'detached' });
+  await page.keyboard.press('Control+.');
+  await content.waitFor({ state: 'detached' });
+});
+
 test('reduced motion removes both animations without losing keyboard dismissal', async t => {
   const page = await pageFor(t, { reducedMotion: 'reduce' });
   const content = await opened(page);
   assert.equal(await content.evaluate(element => getComputedStyle(element).animationName), 'none');
   await page.keyboard.press('Escape');
   await content.waitFor({ state: 'detached' });
+  await page.waitForFunction(() => document.activeElement?.textContent === 'Workspace');
   assert(await page.getByRole('button', { name: 'Workspace', exact: true }).evaluate(element => element === document.activeElement));
 });

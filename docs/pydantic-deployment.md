@@ -1,36 +1,19 @@
-# Pydantic core deployment boundary
+# Pydantic runtime deployment contract
 
-`MOYAI_CORE=legacy` remains the default. `MOYAI_CORE=pydantic` selects the
-separately locked `native/.venv` interpreter. The image contains both environments
-during migration; the old OpenAI/Agents dependencies are not installed into the
-native environment. Root `app` modules remain importable there for product
-configuration, identity, storage and accounting. Selecting the native core never
-imports `app.main` or invokes the legacy checkpoint bootstrap.
+Current images run only `MOYAI_CORE=pydantic` (the default), using `/app/.venv`.
+The root `uv.lock` pins the runtime and shared product services together. The
+canonical `app` package contains identity, storage, accounting, schema setup and
+historical formats; it contains no executable legacy engine.
 
-The **Deploy production** workflow explicitly defaults to `maintenance` with
-`execution_core=pydantic`. The running source still defaults to `legacy` when
-`MOYAI_CORE` is absent. Preflight loads the candidate's real role admission checks;
-it never overrides `require_startable`, invents a qualification flag, or treats a
-provisioned schema as deployment readiness. Production role qualification and the
-actual before/after application rehearsal must pass before this cutover is
-accepted. The release uses the existing machinery described in
-[production-deploy.md](production-deploy.md),
-[rolling-deploy.md](rolling-deploy.md) and
-[schema-migrations.md](schema-migrations.md).
-
-The code now admits the reviewed existing-product `api`, `coordinator`, `broker`
-and `worker` roles, while retaining explicit role selection, configuration,
-dependency, schema, source-fence, ownership and drain checks. There is no
-operator-controlled qualification bypass. Schema commands report
-`deployment_readiness=not_checked`; role admission and migration receipts are
-not deployment approval. Final product acceptance still blocks on the reported
-deferred/cold-workspace expiry issue until its fix and actual recovery proof
-are complete.
+This guide describes the public runtime interfaces for self-hosted installations.
+Managed deployment workflows and operator runbooks live in a private repository. See
+[Docker installation](../deploy/docker/README.md) for self-hosting and
+[schema migrations](schema-migrations.md) for canonical receipts.
 
 ## Configuration contract
 
 `moyai.product_config.load_product_config(environment)` reads only the supplied
-environment snapshot. It returns `None` for the legacy core, or `ProductConfig`.
+environment snapshot. It returns `ProductConfig` and rejects any retired core selector.
 It does not connect to a database, create files, initialize keys, or load `.env`.
 
 ```python
@@ -72,13 +55,19 @@ a separate execution schema and explicit native key. The native data directory i
 | `MOYAI_SEPARATE_BROKER`, `MOYAI_COORDINATOR_HANDOFF` | `true` for distributed roles |
 
 `config.core_identity` is the code-owned `pydantic-v1`, not an operator-selected
-compatibility claim. A candidate role fingerprint extends the existing role
-fingerprint with core/dependency versions, native schema, queue, key and object
-formats. Only ordinary coordinator activation publishes these contracts, after
-the release has verified that all four source owners retired. The release never
-edits policy rows directly. Native releases currently use maintenance, including
-same-core upgrades; API-only, coordinated and rolling release paths reject a
-native source until their native migration/drain semantics are qualified.
+compatibility claim. Role fingerprints include core/dependency versions, native
+schema, queue, key and object formats. Normal coordinator activation publishes
+these contracts. Incompatible schema, framework or protocol changes require a
+coordinated maintenance window with all previous runtime owners retired.
+Compatible replacements must preserve the activated contracts and schema receipts.
+
+Native execution protocol 2 records split activity queues, bundled skill startup,
+and on-demand workspace acquisition. It retains the `pydantic-v1` core identity
+but changes every native role fingerprint. The v14 application migration
+(`2026-10-16-product-execution-v14`) adds only an execution-compatibility receipt;
+it performs no physical DDL and preserves the v1–v13 receipts and application data.
+All runtime owners must retire before native provisioning, and every replacement
+role must verify the new receipt before execution resumes.
 
 Legacy raw objects (`s3:<destination-id>:<sha256>`) remain readable through the
 product adapter. Native encrypted/HMAC-addressed objects use their separate
@@ -86,221 +75,52 @@ prefix and explicit key. These formats are not interchangeable. Changing a
 destination or key requires the existing verified migration procedure, not a
 configuration fallback. See [object-storage.md](object-storage.md).
 
-## Prepare the first production cutover
-
-The workflow does not generate or derive any encryption key, object prefix,
-schema name or Temporal queue. Before dispatch, the release operator must:
-
-1. Preserve the original PostgreSQL URL/schema, raw `ENCRYPTION_KEY`,
-   `SESSION_SECRET`, S3 bucket/prefix/credentials, public URL, Temporal destination
-   and original task queues on all four services. Keep the existing recovery
-   point and source build receipt.
-2. Prepare identical explicit `MOYAI_PRODUCT_MODE=existing`,
-   `MOYAI_NATIVE_SCHEMA`, `MOYAI_NATIVE_SCHEMA_MODE=verify`,
-   `MOYAI_NATIVE_ENCRYPTION_KEY`, `MOYAI_NATIVE_KEY_FORMAT=sha256-text-fernet-v1`,
-   `MOYAI_NATIVE_OBJECT_PREFIX`,
-   `MOYAI_NATIVE_OBJECT_FORMAT=fernet-hmac-sha256-v1` and
-   `MOYAI_NATIVE_TASK_QUEUE` on each service. Use a separately named native
-   schema, nonoverlapping object prefix and versioned native queue. For an existing
-   native destination, retain its exact key and formats; never infer them from
-   the source key or bucket. Keep local rehearsal disabled.
-3. Make those prepared values part of each **running source process**
-   environment while its core remains `legacy`. Merely editing Render's saved
-   environment is insufficient: the source process digest must match it. Use a
-   reviewed source-build restart/operations window, preserving all original
-   runtime settings, and return to four healthy matching source deployments
-   before dispatch. Do not set the source `MOYAI_CORE=pydantic` manually.
-4. Review the native destination. An empty schema is an explicit provisioning
-   plan. A populated schema needs both known application migration receipts and
-   a Harness receipt matching the installed SDK versions and current
-   columns/indexes/sequences. Partial or unknown installations require recovery;
-   the release refuses to stamp them as valid. Provisioning never copies source
-   sessions, credentials, objects or Temporal histories.
-   Candidate preflight also checks PostgreSQL's rendered index identifiers:
-   some long schema names cause distinct generated indexes to shorten to the
-   same name. Such a configuration fails before source drain. Select a different
-   verified-empty namespace during preparation. A populated destination requires
-   a reviewed index migration; do not rename its schema or change its receipts
-   to bypass the check.
-5. Pause existing source automations through the existing application before
-   switching cores. Let the original coordinator confirm the current definition
-   revision and installed schedule format with an empty synchronization error,
-   and let its pending event inbox settle while the old worker remains
-   available. The release never pauses or cancels these on the operator's behalf.
-   The source definitions/history remain available for their explicit native
-   migration and re-enablement after cutover.
-6. Dispatch the existing workflow on the selected `main` commit with
-   `release_type=maintenance`, `execution_core=pydantic`, `preflight_only=true`.
-   Inspect `core_migration`, `schema_migration`, `native_migration` and the source
-   identities in the saved release receipt. First adoption requires the native
-   CI workflow to have succeeded on that exact main commit, alongside the
-   existing Docker, runtime and release CI.
-
-After review, dispatch the same selected candidate with `preflight_only=false`.
-A newer main commit is a new candidate and must pass its own checks. For
-compatible legacy deployments, select `execution_core=preserve` and the existing
-release type explicitly.
-
-The underlying entrypoint is:
-
-```sh
-.venv/bin/python -m scripts.release.deploy \
-  --release-type maintenance --core pydantic --preflight --receipt release-receipt.json
-```
-
-It retains the existing GitHub-main, Render topology and credential checks.
-Do not run it against production during local qualification.
-
-## Maintenance ordering and drain
-
-For a legacy source, the controller redeploys the source worker with drain enabled
-using its original core and `AGENT_HARNESS`. For a native source, it first writes
-a generation-bound in-place pause and keeps the original worker polling until
-the SDK reaches verified safe boundaries; only then does it replace that worker.
-During a core switch, it also requires every unfinished
-source run—including queued work and saved waiting phases—to settle. Native
-counts include waiting/unknown turns, unresolved effects and pending or
-unknown inference attempts. Queued native requests remain preserved during a
-same-core deployment. Pre-existing `native_queued` and `native_parked` work must
-reach zero before a core switch; a legacy worker cannot execute those native
-histories. Once the candidate native policy owns admission, new native inputs can
-queue while waiting for the final explicit resume.
-Long-running work or uncertain external outcomes
-can block the window; the release never cancels, replays or declares them settled.
-Core retirement also checks canonical automation inbox rows with
-`native_pending`/`native_dispatched` status (or an unknown `native_` status),
-plus native automation bindings.
-A binding's pause is confirmed only when its state is `paused` or `deleted`,
-`sync_state=ready`, and `synced_generation=generation`.
-
-The current automation protocol does **not** persist every Temporal sync, tick
-and event workflow/run identity. A confirmed schedule pause and zero SQL work
-therefore do not establish that earlier control workflows ended. Until the
-producer fence and exact workflow-drain receipt are qualified,
-`native_automation_history` counts retained bindings and blocks retiring the
-native core whenever any exist. Same-core maintenance preserves them. The
-release does not erase history, cancel workflows, pause schedules automatically,
-or treat a visibility-list result as a quiescence receipt.
-
-The runtime drain contract is explicit: redeploying the worker with
-`MAINTENANCE_DRAIN=true` must stop new native execution cluster-wide while
-permitting admitted work to settle. Coordinator dispatch and scheduled admission
-must observe that boundary; skipping worker startup alone is insufficient.
-`native_runs` counts all turn states except `queued`, `completed`, `failed`,
-`stopped`, and `resumed`, less starting/running/saving turns with a matching
-current-generation, paused, unresumed `parked` receipt for that exact workflow.
-Those receipts are counted separately as `native_parked`; they remain forbidden
-when retiring the native core. A waiting turn can park only at the qualified
-`deferred_waiting` boundary, with an accepted result and a nonempty saved
-conversation as well as the same generation/workflow checks. The runtime
-establishes that receipt after checking the completed Temporal result. Other
-waiting and unknown states block.
-The release does not manufacture a drain receipt or turn a runtime failure into
-zero work. Qualification must exercise this worker-to-coordinator drain handoff,
-including preserving queued input through worker replacement.
-
-For original Temporal schedules, `scripts/release/automation_probe.py` runs in
-the legacy interpreter. It reads the tracked schedule IDs and source pause
-metadata in a bounded read-only transaction, verifies each schedule is remotely
-paused and still targets `AutomationWorkflow` on the original queue, and checks
-the metadata and source process identity again. The controller repeats that
-check after all source owners retire and before candidate activation; a changed
-receipt or unknown remote response stops the release.
-
-This establishes **paused admission with preserved original control histories**,
-not terminal retirement of every old Temporal execution. The original API is
-staged before its other roles, all source producers then lose ownership, and
-the canonical paused/revision checks reject late scheduled admission. Existing
-control histories stay on their original queue; the new core never polls or
-replays them. The release receipt records
-`legacy_control_disposition=preserved_on_original_queue_with_paused_admission`.
-The actual application qualification must prove that late old/current-revision
-control executions cannot create a run after the source pause.
-
-Staging proceeds API, worker, broker and coordinator in that order. Each candidate
-receives the explicit `MOYAI_CORE` selection only after its stage/build flags are
-saved and the drain has been verified. Its previous selector value (including
-absence) is recorded before the one PUT. `AGENT_HARNESS` is preserved for a
-Pydantic cutover and a Pydantic-to-legacy switch. The old process keeps its
-independent environment snapshot until it retires.
-
-After all four owners retire, any required source offline migration runs through
-the existing guard. Native provisioning then acquires the canonical **exclusive
-runtime ownership lock** and rechecks source revision, policy, role contracts,
-all four ownership inventories and source/native drain counts. That lock stays
-held across the native application's and Harness's separate transactions and
-the subsequent verification command. A receipt change after preflight stops
-the migration. The native migration lock alone is not used as proof of drain.
-
-Activation remains coordinator → broker → drained worker → API → final worker
-undrain. Native worker startup with `MAINTENANCE_DRAIN=false` never automatically
-resumes a paused generation. After the final worker is healthy and the old
-maintenance worker has retired, the controller issues one explicit resume CAS.
-Active native health must return exactly `{"status":"ok"}`, the existing
-build/role/owner/rolling headers and `X-Moyai-Core: pydantic-v1`; coordinator and
-broker leadership headers retain their existing meanings. Staged health owns no
-runtime and retains `{"status":"ok","mode":"migration_staging"}`.
-
-Native ORM and Harness transactions retain the canonical shared `726940`
-runtime fence. A subordinate connection binds a shared session marker
-`(726948, canonical_owner_pid)` before acquiring that fence. The runtime verifies
-the parent's exact backend start, live shared owner lock and admitted policy;
-it does not mark the canonical owner or rebind a connection to another parent.
-The release probe reports valid subordinate fences separately from process
-owners. An unmarked holder remains an owner; orphan, self, chained, ambiguous,
-wrong-namespace and role-owning markers fail the observation. A subordinate
-cannot supply HTTP process identity. The exclusive migration guard still sees
-every raw fence, including a child transaction whose parent has retired.
+For the v21 Slack message/provenance cutover, encrypted inbox compatibility and
+legacy transcript repair, follow [Slack messages in Moyai](slack-message-integrity.md#upgrade-and-repair).
 
 ## Native maintenance control contract
 
-`scripts/release/native_control.py` invokes the installed native interpreter:
+The installed runtime provides the following maintenance interface:
 
 ```sh
-/app/native/.venv/bin/python -m moyai.product_drain request
-/app/native/.venv/bin/python -m moyai.product_drain status
-/app/native/.venv/bin/python -m moyai.product_drain resume
+python -m moyai.product_drain request
+python -m moyai.product_drain status
+python -m moyai.product_drain resume
 ```
 
 Each command reads at most 16 KiB of JSON from stdin. The request includes
 `protocol=1`, `core=pydantic-v1`, `native_schema`, `task_queue`, and for writes:
 `expected_worker` (PID, timezone-aware backend start, actual source policy,
 worker policy), `expected_generation`, and a bounded unique `request_key`.
-The release records this intent before requesting a write. A compatible
+Callers must record this intent before requesting a write. A compatible
 coordinator replacement can retain the previous cluster policy; the request
 uses that actual admitted policy, not a recomputed Settings fingerprint.
 
 Write receipts bind the new generation, paused state, request fingerprint,
 requester identity and source policy. Status additionally reports queued,
 parked, unsafe-turn, effect and inference-request counts and the exact live
-registered workers. The legacy SQL probes independently verify the generation
-and safe-park receipts in their read-only snapshot. An unknown response stops;
-it is never converted into a successful pause/resume or automatically retried.
+registered workers. An unknown response does not establish a successful
+pause/resume; inspect the persisted state before deciding whether to retry.
 
-The reviewed native migration seeds generation zero paused. At the first
-cutover, the release verifies that bootstrap while all roles are staged, before
+The native migration seeds generation zero paused. Verify that bootstrap before
 activating the coordinator. An in-place pause retains the old worker until work
 parks; an explicit resume rejects a live draining worker or unresolved effects
-and requests. A native-to-legacy switch leaves native maintenance paused and
-preserves its data and original workflow queue.
+and requests.
 
 ## Explicit schema provisioning
 
-The release transport runs these existing commands with
-`/app/native/.venv/bin/python`, from `/app`, in the staged coordinator. The image
-and workflow install the separately locked environment with the `product` extra.
-Direct operator use requires the same reviewed maintenance/ownership boundary;
-these commands alone are not a deployment controller.
+Install the root workspace environment with product support, then run these
+commands only after draining work and stopping every runtime owner. Provisioning
+requires exclusive canonical runtime ownership; these commands do not coordinate
+an application deployment.
 
-Canonical `app.schema_migrations.migrate` remains in `/app/.venv/bin/python`,
-through the existing maintenance migration transport. Its component registry
-imports legacy agent packages, including the session-title service. Do not run
-that migrator in the native environment or install legacy agents into the native
-lock to make it importable.
+Canonical `app.schema_migrations.migrate` uses the same workspace interpreter. Its
+centralized `app/schema_initializers.py` registry preserves the original component
+identities, revision 21 and historical manifest digest.
 
 ```sh
-native/.venv/bin/python -m moyai.product_start provision --apply
-native/.venv/bin/python -m moyai.product_start verify
+.venv/bin/python -m moyai.product_start provision --apply
+.venv/bin/python -m moyai.product_start verify
 ```
 
 The first command checks the source product's migration receipt in a bounded
@@ -322,7 +142,7 @@ SDK flag to disable this and no private-method monkeypatch. Runtime credentials
 therefore still need the permissions required by that SDK behavior. Provisioning
 and shape verification are not a claim of strict no-DDL operation.
 
-The CLI contract consumed by `scripts/release/native_migration.py` is:
+The public CLI success contract is:
 
 | Command | Required JSON fields on successful exit |
 | --- | --- |
@@ -330,37 +150,18 @@ The CLI contract consumed by `scripts/release/native_migration.py` is:
 | `verify` | `core="pydantic-v1"`, configured `native_schema`, `app_schema="verified"`, `harness_schema="verified"` |
 
 Additional fields such as `deployment_readiness` do not grant readiness.
-Failures exit nonzero without secrets. The wrapper captures output, never retries
-a potentially applied command, and returns a receipt only after both manifests
-match the candidate and the guarded source state is unchanged. Public maintenance
-probes run in `/app/.venv/bin/python`; they use psycopg/SQL and do not import the
-native SDK or depend on `scripts/` being installed inside the image.
+Failures exit nonzero without secrets. Callers must verify both manifests and
+preserve the maintenance boundary before allowing startup. A lost command response
+requires inspection; it does not prove that provisioning was rolled back.
 
-## Failure and rollback
+## Recovery compatibility
 
-All ambiguous PUT/POST/SSH outcomes stop at their recorded intent. A fresh run
-rejects a partially staged baseline. Reconcile the receipt and actual processes
-before recovery; do not retry a failed provisioning call just because the staged
-HTTP listener is healthy. The source and native receipts remain separate, so a
-partially provisioned Harness cannot hide behind a successful application receipt.
-
-Before native work is admitted, the current dual-runtime image can select
-`legacy` again while retaining original keys, cookies, source schema and object
-readers. Recovery must still account for any source schema upgrade; an older
-binary that cannot read that revision is not a safe rollback.
-
-After native work is admitted, a new clean-baseline maintenance release may
-select `execution_core=legacy` only after all native turns, effects and inference
-requests drain and the automation/core-retirement barriers above pass.
-An installation that adopted native automations currently requires roll-forward
-until its control-workflow drain contract is qualified. It does not convert
-native work into legacy work. Native data, keys,
-object prefix and Temporal namespace/queue remain preserved for later access or
-roll-forward. Historical native sessions may need the native reader even while
-new work uses legacy; verify the intended product visibility before approving
-that rollback. Unsettled effects or uncertain billing receipts require
-reconciliation or roll-forward. Never replay old Temporal histories through the
-new queue, delete native data to satisfy a probe, or rotate keys to recover.
+Application and Harness receipts remain separate, so a partially provisioned
+Harness cannot hide behind a successful application receipt. Inspect both before
+retrying provisioning. Never delete or rewrite a receipt to admit an older binary.
+Earlier images are suitable for recovery only when their schemas, histories and
+ownership protocols remain compatible. See the private operations runbooks for
+managed deployment recovery.
 
 ## Local existing-product rehearsal
 
@@ -376,7 +177,7 @@ export MOYAI_SEPARATE_BROKER=false
 export MOYAI_COORDINATOR_HANDOFF=false
 export TEMPORAL_TLS=false
 # Supply the remaining required source/native configuration above.
-native/.venv/bin/python -m moyai.product_start serve --host 127.0.0.1 --port 8896
+.venv/bin/python -m moyai.product_start serve --host 127.0.0.1 --port 8896
 ```
 
 This path requires loopback PostgreSQL, Temporal, public URL and S3 endpoints,
@@ -401,30 +202,17 @@ creates the local Temporal directory, with mode `0700`. In existing mode,
 `moyai user` rejects native account creation, and direct `moyai serve`/`worker`
 direct callers to `product_start` so role flags cannot be bypassed.
 
-## Application qualification and focused release checks
+## Local runtime checks
 
-- Wire native authority into the broker admission/accounting contract. A native
-  RunScope cannot be passed to legacy `/broker/{run}` routes as a fabricated run.
-- Map the original model selection, concurrency and unlimited iteration policy
-  explicitly; prototype model-call limits are not equivalent.
-- Preserve coordinator leader ownership, broker maintenance ownership, API
-  owner identity, health headers, admission fences and drain behavior.
-- Rehearse the integrated release path through actual source and candidate
-  application deployments, including mixed-version boundaries and rollback.
-- Verify restoration, old object reads, authorization revocation and native
-  workflow recovery through the actual locally deployed application.
-
-Run focused supplementary tests with a disposable PostgreSQL URL:
+Run focused checks with disposable PostgreSQL databases configured through
+`MOYAI_TEST_POSTGRES_URL` and `MOYAI_TEST_POSTGRES`:
 
 ```sh
-uv sync --project native --frozen --python 3.13 --extra product
-MOYAI_TEST_POSTGRES_URL=postgresql://... \
-  uv run --frozen --python 3.13 pytest -q tests/release
+uv run --frozen pytest -q tests/test_render.py tests/test_render_shutdown.py tests/test_online_migrations.py
+uv run --frozen pytest -q native/tests/test_product_execution_version.py native/tests/test_product_drain.py
 ```
 
-These tests exercise the real release controller with simulated Render responses,
-real PostgreSQL guard/drain queries, and (when the native interpreter is installed)
-the real Harness schema receipt across interpreters. They do not replace the
-required baseline/final locally deployed Moyai UI/service proof, real configured
-model/Modal execution, recording and screenshot. The parent application
-qualification must provide that evidence before PR handoff.
+These tests cover runtime admission, maintenance generations, preserved migration
+receipts, startup and shutdown. Qualify provider execution, authorization, object
+reads and workflow recovery through the actual self-hosted application as well;
+see [verification](verification.md).

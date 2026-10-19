@@ -25,6 +25,9 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from pydantic import BaseModel, Field, ValidationError
 from sqlalchemy import func, or_, select
 
+from .contracts import ExecutionContext
+from .delegation_authority import saved_authority
+from .delegation_models import DelegatedSession
 from .links import PR_MENTION, LinkInput
 from .models import Connection, Message, Session, SessionLink, User
 
@@ -155,19 +158,27 @@ class PullRequestService:
         if fresh.auth_version != user.auth_version:
             raise HTTPException(401, "Sign in to continue.")
         async with self.runtime.database.sessions() as db:
-            sessions = list(await db.scalars(select(Session).where(
+            sessions = (await db.execute(select(Session, DelegatedSession).outerjoin(
+                DelegatedSession, DelegatedSession.session_id == Session.id,
+            ).where(
                 Session.id.in_(ids), Session.deleted.is_(False),
                 or_(Session.owner_id == user.id, Session.visibility == "shared"),
-            )))
+            ))).all()
             connections = list(await db.scalars(select(Connection).where(
                 Connection.kind == "github", Connection.enabled.is_(True),
                 or_(Connection.owner_id == user.id, Connection.shared.is_(True)),
             ).order_by(Connection.id)))
+            contexts = {
+                session.id: (await saved_authority(self.runtime.database, db, link)).context
+                if link is not None else ExecutionContext(session.visibility, session.surface)
+                for session, link in sessions
+            }
         result = {}
-        for session in sessions:
+        for session, _ in sessions:
+            context = contexts[session.id]
             permitted = []
             for connection in connections:
-                if session.surface == "slack" or (session.visibility == "shared" and not connection.shared):
+                if context.surface == "slack" or (context.visibility == "shared" and not connection.shared):
                     continue
                 try:
                     policy = json.loads(connection.policy)
@@ -203,22 +214,23 @@ class PullRequestService:
             ).where(SessionLink.session_id.in_(ids), SessionLink.kind == "pull_request").subquery()
             links = (await db.execute(select(links_ranked).where(links_ranked.c.position <= 100))).all()
             ranked = select(
-                Message.session_id, Message.content,
+                Message.id,
                 func.row_number().over(
                     partition_by=Message.session_id, order_by=Message.id.desc(),
                 ).label("position"),
             ).where(
                 Message.session_id.in_(ids), Message.role.in_(["user", "assistant"]),
             ).subquery()
-            messages = (await db.execute(select(ranked).where(ranked.c.position <= 100))).all()
+            messages = list(await db.scalars(select(Message).join(ranked, ranked.c.id == Message.id).where(ranked.c.position <= 100)))
+            from .message_sources import public_message
+            public_messages = [(row.session_id, (await public_message(self.runtime.database, db, row))[0]) for row in messages]
         for row in links:
             try:
                 pr = parse_pr_url(row.url)
                 discovered[row.session_id][pr.url] = {"url": pr.url, "origin": "attached"}
             except HTTPException:
                 continue
-        for row in messages:
-            content = self.runtime.security.unseal(row.content).decode()
+        for session_id, content in public_messages:
             for match in PR_MENTION.finditer(content):
                 # Do not treat a malicious longer path or identifier as a PR.
                 suffix = content[match.end():match.end() + 1]
@@ -228,7 +240,7 @@ class PullRequestService:
                     pr = parse_pr_url(match.group())
                 except HTTPException:
                     continue
-                found = discovered[row.session_id]
+                found = discovered[session_id]
                 if pr.url not in found and sum(x["origin"] == "mentioned" for x in found.values()) < 30:
                     found[pr.url] = {"url": pr.url, "origin": "mentioned"}
         return {sid: list(found.values()) for sid, found in discovered.items()}

@@ -1,7 +1,7 @@
 import React, { useEffect, useRef, useState } from "react"
 import { FileText, LoaderCircle, Paperclip, Upload, X } from "lucide-react"
 import { Button } from "@/components/ui/button"
-import { csrfToken } from "./api"
+import { apiRequest } from "./api"
 import { isFileDrag, isInlineImage, receiveFileDrop } from "./attachment-files"
 import { AttachmentUploads, type DraftFile, type UploadedFile } from "./attachment-uploads"
 import "./attachments.css"
@@ -9,17 +9,10 @@ import "./attachments.css"
 export type { UploadedFile } from "./attachment-uploads"
 
 async function uploadFile(file: File, signal: AbortSignal): Promise<UploadedFile> {
-  const auth = csrfToken()
-  const response = await fetch(`/api/uploads?name=${encodeURIComponent(file.name || "clipboard.png")}`, {
-    method: "POST", headers: { "X-Moyai-CSRF": auth, "X-CSRF-Token": auth, "Content-Type": file.type || "application/octet-stream" },
+  return apiRequest<UploadedFile>(`/uploads?name=${encodeURIComponent(file.name || "clipboard.png")}`, {
+    method: "POST", headers: { "Content-Type": file.type || "application/octet-stream" },
     body: file, signal,
   })
-  const result = await response.json()
-  if (!response.ok) {
-    if (response.status === 401 && auth === csrfToken()) window.dispatchEvent(new Event("moyai:signed-out"))
-    throw new Error(typeof result.detail === "string" ? result.detail : "File upload failed.")
-  }
-  return result as UploadedFile
 }
 
 export function useAttachments(onError: (message: string) => void) {
@@ -35,7 +28,7 @@ export function useAttachments(onError: (message: string) => void) {
     try { await queue.current!.add(files) } catch (error) { onError(String(error)) }
   }
 
-  function paste(event: React.ClipboardEvent<HTMLTextAreaElement>) {
+  function paste(event: React.ClipboardEvent<HTMLElement>) {
     const files = Array.from(event.clipboardData.items)
       .filter(item => item.kind === "file" && item.type.startsWith("image/"))
       .map(item => item.getAsFile()).filter((file): file is File => file !== null)
@@ -114,10 +107,10 @@ export function FileDropOverlay() {
   return <div className="file-drop-overlay" role="status"><Upload size={28} /><strong>Drop files to attach</strong><span>Up to 8 files · 20 MB each · Images up to 8 MB</span></div>
 }
 
-export function AttachButton({ add, disabled }: { add: (files: File[]) => Promise<void>; disabled?: boolean }) {
+export function AttachButton({ add, disabled, compact = false }: { add: (files: File[]) => Promise<void>; disabled?: boolean; compact?: boolean }) {
   const input = useRef<HTMLInputElement>(null)
   return <>
     <input ref={input} className="visually-hidden" type="file" multiple disabled={disabled} aria-label="Attach files" onChange={event => { void add(Array.from(event.target.files ?? [])); event.target.value = "" }} />
-    <Button type="button" variant="ghost" size="sm" disabled={disabled} onClick={() => input.current?.click()}><Paperclip size={16} />Attach</Button>
+    <Button type="button" variant="ghost" size={compact ? "icon-sm" : "sm"} aria-label="Attach" title="Attach files" disabled={disabled} onClick={() => input.current?.click()}><Paperclip size={16} />{!compact && <span className="composer-optional-label">Attach</span>}</Button>
   </>
 }

@@ -292,6 +292,9 @@ class ProductWorkspaceCompatibility:
             context = json.loads(self.runtime.security.unseal(row.descriptor))
             if fingerprint(context) != row.fingerprint:
                 raise PermissionError("The project context failed integrity verification.")
+            governance = getattr(self.runtime.database, 'governance', None)
+            if governance is not None:
+                await governance.workspace(db, scope, context)
             if context.get("environment_build_id"):
                 current = (await db.execute(text(
                     f"SELECT {BUILD_COLUMNS} FROM {self.table('environment_builds')} WHERE id=:id"
@@ -416,7 +419,7 @@ class ProductWorkspaceCompatibility:
                     ):
                         raise PermissionError("The repository receipt belongs to a different task authority.")
                     await self.runtime.database._check_product_turn(db, turn, grant)
-                    if prepared.workspace and prepared.workspace.get("provider") == "modal":
+                    if prepared.workspace and prepared.workspace.get("provider") in {"modal", "lambda"}:
                         # The current session computer may belong to a later
                         # turn. Historical memory reads use this exact receipt.
                         receipt = await connections.repository_receipt(

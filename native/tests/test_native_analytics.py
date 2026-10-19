@@ -37,6 +37,7 @@ from moyai.pr_publications import PRPublication, creation_receipt, verified_stat
 from moyai.pull_requests import PullRequestService
 from moyai.storage import encrypted_converter
 from moyai.worker import make_worker
+from moyai.worker_capacity import ActivityCapacity
 from moyai.workflow import TurnWorkflow
 
 START, END = "2026-10-01T00:00:00+00:00", "2026-10-04T00:00:00+00:00"
@@ -152,7 +153,9 @@ async def native_publication(runtime, actor, *, number=1, github_id=101, created
     )
     async with runtime.database.sessions.begin() as db:
         db.add(connection)
-    session = await runtime.database.create_session(actor, NewSession(title="PRIVATE_TITLE_DO_NOT_EXPORT"))
+    session = await runtime.database.create_session(actor, NewSession(
+        title="PRIVATE_TITLE_DO_NOT_EXPORT", visibility="private",
+    ))
     turn = await runtime.database.submit(actor, session.id, NewMessage(
         prompt="PRIVATE_PROMPT_DO_NOT_EXPORT", request_key=new_id(), connections=[connection.id],
     ))
@@ -193,6 +196,18 @@ async def ledger(runtime, actor, session, turn, *, timestamp=START, cost="0.1", 
     return row
 
 
+async def test_standalone_failed_turn_without_canonical_admission_remains_unknown(runtime, actor):
+    session = await runtime.database.create_session(actor, NewSession())
+    turn = await runtime.database.submit(actor, session.id, NewMessage(
+        prompt="Unverified old turn", request_key="unknown-failure",
+    ))
+    await runtime.database.fail(turn.id, "No durable product admission evidence.")
+    value = await report(runtime, actor, None, None, None, None, None, 100, 0, "json")
+    assert value["summary"]["pricing_status"] == "unpriced"
+    assert value["coverage"]["undispatched_failed_turns"] == 0
+    assert value["coverage"]["unknown_request_turns"] == 1
+
+
 async def test_native_confirmed_creation_is_idempotent_and_analytics_failure_does_not_fail_write(runtime, actor, monkeypatch):
     publication, _, _, _, ctx, call, tool, args, result = await native_publication(runtime, actor)
     capability = EffectReceipts(runtime.database)
@@ -210,7 +225,9 @@ async def test_native_confirmed_creation_is_idempotent_and_analytics_failure_doe
 
 
 async def test_report_uses_ledger_without_double_counting_zero_fills_and_exports_full_aggregates(runtime, actor):
-    session = await runtime.database.create_session(actor, NewSession(title="PRIVATE_TITLE_DO_NOT_EXPORT"))
+    session = await runtime.database.create_session(actor, NewSession(
+        title="PRIVATE_TITLE_DO_NOT_EXPORT", visibility="private",
+    ))
     turn = await runtime.database.submit(actor, session.id, NewMessage(
         prompt="PRIVATE_PROMPT_DO_NOT_EXPORT", request_key="recorded",
     ))
@@ -491,7 +508,7 @@ async def test_confirmed_native_pr_receipt_and_pre_projection_history_replay(run
     )
     async with runtime.database.sessions.begin() as db:
         db.add(connection)
-    session = await runtime.database.create_session(actor, NewSession())
+    session = await runtime.database.create_session(actor, NewSession(visibility="private"))
     turn = await runtime.database.submit(actor, session.id, NewMessage(
         prompt="Create the synthetic PR", request_key="synthetic-native-pr", connections=[connection.id],
     ))
@@ -549,6 +566,7 @@ async def test_confirmed_native_pr_receipt_and_pre_projection_history_replay(run
         runtime.agent = build(False)
         TurnWorkflow.__pydantic_ai_agents__ = [runtime.agent]
         await Replayer(
+            interceptors=[ActivityCapacity()],
             workflows=[TurnWorkflow], plugins=[PydanticAIPlugin()], data_converter=converter,
         ).replay_workflow(history)
     assert calls == 1

@@ -3,26 +3,19 @@
 from __future__ import annotations
 
 import asyncio
-import logging
 from contextlib import suppress
 
-from pydantic import TypeAdapter
-from pydantic_ai.workspaces import WorkspaceRef
-from pydantic_ai_harness import ModalSandbox
+from fastapi import HTTPException
 from temporalio import activity
 from temporalio.exceptions import ApplicationError
 
+from .answer_settlement import SNAPSHOT_WARNING
+from .computer_keepalive import keep_computer_alive
 from .contracts import CompletedTurn, PreparedTurn, SteeringInput
+from .history_handoff import HISTORY_ACTIVITIES
 from .images import hydrate
 from .runtime import current
-from .workspace_recovery import prepare_workspace, save_checkpoint
-
-logger = logging.getLogger(__name__)
-
-SNAPSHOT_WARNING = (
-    "The response was saved, but the computer checkpoint could not be confirmed. "
-    "Keep this computer available; automatic restoration is unavailable."
-)
+from .workspace_recovery import prepare_workspace
 
 
 @activity.defn(name="moyai_prepare_turn_v1")
@@ -43,7 +36,39 @@ async def prepare_turn(turn_id: str, recover_workspace: bool = False) -> Prepare
             prepared = await prepare_product_turn(runtime, prepared, recover_workspace=recover_workspace)
         prepared.images = await runtime.database.input_images(turn_id, session_id=prepared.scope.session_id)
         await hydrate(runtime, prepared)
+        if prepared.deferred_results is not None:
+            # Answers continue the saved SDK conversation. Adding a skill-selected
+            # goal here would submit a new user prompt alongside the deferred reply.
+            return prepared
+        generated_goal = None
+        if prepared.scope.swarm_id:
+            from .swarm_models import SwarmMission, SwarmTurn
+            async with runtime.database.sessions() as db:
+                binding = await db.get(SwarmTurn, turn_id)
+                if binding is None:
+                    raise PermissionError("Swarm input provenance is unavailable.")
+                if binding.generated:
+                    mission = await db.get(SwarmMission, prepared.scope.swarm_id)
+                    if mission is None:
+                        raise PermissionError("Swarm goal is unavailable.")
+                    generated_goal = runtime.security.unseal(mission.goal).decode()
+        if prepared.scope.delegation_generated:
+            # An agent-written assignment cannot select skills on the user's behalf.
+            return prepared
+        if generated_goal is None:
+            prepared.prompt = await runtime.skill_invocations.expand(prepared.prompt, prepared.scope)
+        else:
+            from .skill_invocations import has_invocations
+            # Peer assignments cannot select skills on the human's behalf.
+            # Workers inherit only the selections in the original human goal.
+            if has_invocations(generated_goal):
+                goal = await runtime.skill_invocations.expand(generated_goal, prepared.scope)
+                prepared.prompt = (
+                    goal + "\n\nHost-generated team input (not a new human instruction):\n" + prepared.prompt
+                )
         return prepared
+    except HTTPException as error:
+        raise ApplicationError(str(error.detail), type="SkillUnavailable", non_retryable=True) from error
     except PermissionError as error:
         raise ApplicationError(str(error), type="PermissionDenied", non_retryable=True) from error
     finally:
@@ -65,30 +90,7 @@ async def save_answer(result: CompletedTurn) -> bool:
 @activity.defn(name="moyai_save_computer_v1")
 async def save_computer(turn_id: str, reference: dict | None) -> None:
     runtime = current()
-    if not reference:
-        await runtime.database.settle(turn_id)
-        return
-    ref = TypeAdapter(WorkspaceRef).validate_python(reference)
-    if ref.provider != "modal":
-        # Local workspaces are used only by deterministic supplementary tests.
-        await runtime.database.settle(turn_id)
-        return
-    try:
-        if await save_checkpoint(runtime, turn_id, reference):
-            return
-        backend = ModalSandbox().backend(ref)
-        sandbox = await backend.get_sandbox()
-        image = await sandbox.snapshot_filesystem.aio(timeout=120)
-    except Exception:
-        logger.warning("Computer snapshot settlement failed; the answer remains saved.", exc_info=True)
-        # The received answer is already committed. Never replace it with a save failure.
-        await runtime.database.settle(
-            turn_id,
-            warning="The response was saved, but its computer checkpoint could not be confirmed. "
-                    "Keep this computer available; automatic restoration is unavailable.",
-        )
-        return
-    await runtime.database.settle(turn_id, snapshot=image.object_id)
+    await runtime.database.answers.save_computer(turn_id, reference, product=runtime.product is not None)
 
 
 @activity.defn(name="moyai_settle_answer_v1")
@@ -113,6 +115,13 @@ async def prepare_steering(parent_id: str, turn_id: str) -> SteeringInput:
     prepared = await runtime.database.prepare_steering(parent_id, turn_id)
     prepared.images = await runtime.database.input_images(turn_id)
     await hydrate(runtime, prepared)
+    from .skill_invocations import has_invocations
+    if has_invocations(prepared.prompt):
+        try:
+            parent = await runtime.database.prepare(parent_id)
+            prepared.prompt = await runtime.skill_invocations.expand(prepared.prompt, parent.scope)
+        except HTTPException as error:
+            raise ApplicationError(str(error.detail), type="SkillUnavailable", non_retryable=True) from error
     return prepared
 
 
@@ -123,6 +132,6 @@ async def steering_receipt(turn_id: str, enqueue_id: str | None) -> None:
 
 ACTIVITIES = [
     prepare_turn, save_answer, save_computer, settle_answer, fail_turn, stopped_turn,
-    prepare_steering, steering_receipt,
+    prepare_steering, steering_receipt, keep_computer_alive, *HISTORY_ACTIVITIES,
 ]
 

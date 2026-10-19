@@ -19,13 +19,13 @@ import modal
 from pydantic import TypeAdapter
 from sqlalchemy import select, text
 from sqlalchemy.dialects.postgresql import insert
-from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.pool import NullPool
 from temporalio.client import WorkflowExecutionStatus
 from temporalio.service import RPCError, RPCStatusCode
 
 from .contracts import PreparedTurn, RunScope
 from .models import Session, Turn
+from .postgres import create_engine
 from .product_continuation_errors import preparation_blocked
 from .product_continuation_guest import MAX_BYTES, MAX_ENTRIES, archive_manifest, digest_file
 from .product_continuation_models import (
@@ -57,18 +57,26 @@ def repository_requested(context: dict[str, Any], plan: dict | None) -> bool:
 def runtime_image(base: Any = None):
     """Overlay native runtime resources on a validated *environment* image."""
     from .agent import PACKAGE_ROOT
+    from .tools import WORKSPACE_TOOLS
 
     image = base or modal.Image.debian_slim(python_version="3.13")
-    return (
+    image = (
         image.apt_install(
             "git", "ripgrep", "curl", "jq", "util-linux", "nodejs", "npm", "python3", "python3-pip",
             "xvfb", "openbox", "xterm", "xdotool", "chromium", "tint2", "x11vnc",
             "x11-xserver-utils", "fonts-dejavu-core",
         )
         .pip_install("uv", "pytest", "pillow==12.3.0", "websockify==0.13.0", "playwright==1.63.0")
+    )
+    for tool in WORKSPACE_TOOLS:
+        image = tool.install(image)
+    return (
+        image
         .add_local_dir(PACKAGE_ROOT / "skills", "/opt/moyai/skills", copy=True)
         .add_local_file(PACKAGE_ROOT / "desktop.py", "/opt/moyai/desktop.py", copy=True)
         .add_local_file(PACKAGE_ROOT / "browser_guest.py", "/opt/moyai/browser_guest.py", copy=True)
+        .add_local_file(PACKAGE_ROOT / "browser_driver.py", "/opt/moyai/browser_driver.py", copy=True)
+        .add_local_file(PACKAGE_ROOT / "ocu_guest.py", "/opt/moyai/ocu_guest.py", copy=True)
         .add_local_file(GUEST, "/opt/moyai/product_restore.py", copy=True)
     )
 
@@ -96,13 +104,9 @@ class ModalRecoveryTransport:
             block_network=True, timeout=600, idle_timeout=300,
         )
         try:
-            from .agent import PACKAGE_ROOT
+            from app import legacy_artifacts
 
-            collector = PACKAGE_ROOT / "legacy_artifacts.py"
-            if not collector.is_file():
-                collector = Path(__file__).resolve().parents[3] / "sandbox" / "artifacts.py"
-            if not collector.is_file():
-                raise ValueError("Package the reviewed sandbox/artifacts.py recovery collector.")
+            collector = Path(legacy_artifacts.__file__)
             await sandbox.filesystem.write_bytes.aio(GUEST.read_bytes(), "/tmp/moyai-product-restore.py")
             await sandbox.filesystem.write_bytes.aio(collector.read_bytes(), "/tmp/moyai-product-collector.py")
             process = await sandbox.exec.aio(
@@ -173,6 +177,21 @@ class ModalRecoveryTransport:
                 raise ValueError("The old execution owner could not be verified; native work is blocked.") from None
 
     async def native(self, scope: RunScope, context: dict[str, Any], reference: dict | None) -> Any:
+        provider = reference.get("provider") if reference else self.runtime.settings.sandbox_provider
+        if provider == "lambda":
+            from .lambda_control import LambdaControl
+            from .lambda_workspace import LambdaProductComputer
+            if context.get("environment_snapshot_id"):
+                raise ValueError("This prepared environment is a Modal image; select Modal or a plain repository.")
+            control = LambdaControl(self.runtime.settings)
+            vm = (
+                await control.get(reference["id"]) if reference else
+                await control.create("product-" + scope.session_id + "-" + scope.workspace_key[:12])
+            )
+            await vm.running()
+            computer = LambdaProductComputer(self.runtime.settings, vm.id)
+            await computer.filesystem.write_bytes.aio(GUEST.read_bytes(), "/opt/moyai/product_restore.py")
+            return computer
         if reference:
             if reference.get("provider") != "modal":
                 raise ValueError("Product restoration requires the native Modal workspace.")
@@ -220,11 +239,14 @@ class ModalRecoveryTransport:
             await process.wait.aio()
 
 
+RESTORE_CONCURRENCY = 2
+
+
 class ProductWorkspaceRestorer:
     def __init__(self, runtime: Any, *, transport: Any = None):
         self.runtime = runtime
         self.transport = transport or ModalRecoveryTransport(runtime)
-        self.slots = asyncio.Semaphore(2)
+        self.slots = asyncio.Semaphore(RESTORE_CONCURRENCY)
 
     async def authorize(self, scope: RunScope, source_id: str | None = None) -> None:
         await self.runtime.database.authorize_scope(scope)
@@ -240,7 +262,7 @@ class ProductWorkspaceRestorer:
         # A dedicated unpooled connection holds ONLY this advisory transaction,
         # never product data or an ACL lock. Consuming a normal pool slot here
         # could deadlock live reauthorization when the application's pool is full.
-        engine = create_async_engine(self.runtime.database.engine.url, poolclass=NullPool)
+        engine = create_engine(self.runtime.database.engine.url, poolclass=NullPool)
         try:
             async with engine.begin() as connection:
                 if not await connection.scalar(text("SELECT pg_try_advisory_xact_lock(:key)"), {"key": key}):
@@ -355,7 +377,12 @@ class ProductWorkspaceRestorer:
                 raise ValueError("The workspace transition plan failed integrity verification.")
         if plan is None and not context.get("environment_snapshot_id") and not context.get("repo_url"):
             return prepared
-        async with self.slots, self.lock(scope):
+        from .performance import computer_timing
+        mode = "reuse" if prepared.workspace else "restore" if plan else "cold"
+        async with (
+            computer_timing(self.runtime.database, scope, mode, preparation=True),
+            self.slots, self.lock(scope),
+        ):
             with tempfile.TemporaryDirectory(prefix="moyai-continuation-") as temporary:
                 return await self._prepare_locked(prepared, context, plan, Path(temporary))
 
@@ -422,7 +449,7 @@ class ProductWorkspaceRestorer:
                 raise ValueError("Repository preparation is unavailable. Select a validated environment.")
             await service.prepare_repository(scope, sandbox, context)
             await self.authorize(scope)
-        reference = {"provider": "modal", "id": sandbox.object_id}
+        reference = {"provider": getattr(sandbox, "provider", "modal"), "id": sandbox.object_id}
         digest = fingerprint({"plan": plan, "captures": [item.get("manifest_fingerprint") for item in captures],
                               "context": context.get("context_fingerprint")})
         async with self.runtime.database.sessions() as db:

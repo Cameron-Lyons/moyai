@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from uuid import uuid4
 
-from sqlalchemy import Boolean, ForeignKey, Index, Integer, String, Text, UniqueConstraint, text
+from sqlalchemy import Boolean, Double, ForeignKey, Index, Integer, String, Text, UniqueConstraint, text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -46,7 +46,7 @@ class Session(Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
     owner_id: Mapped[str] = mapped_column(ForeignKey("moyai_users.id"), index=True)
     title: Mapped[str] = mapped_column(String(300), default="New conversation")
-    visibility: Mapped[str] = mapped_column(String(20), default="private")
+    visibility: Mapped[str] = mapped_column(String(20), default="shared")
     surface: Mapped[str] = mapped_column(String(20), default="web")
     model: Mapped[str] = mapped_column(String(200))
     status: Mapped[str] = mapped_column(String(30), default="idle")
@@ -142,6 +142,17 @@ class Message(Base):
     content: Mapped[str] = mapped_column(Text)
     created_at: Mapped[str] = mapped_column(String(40), default=now)
     identity: Mapped[str] = mapped_column(String(200), unique=True)
+
+
+class MessageSource(Base):
+    """Encrypted, server-authored transport provenance, separate from human text."""
+
+    __tablename__ = "moyai_message_sources"
+    message_identity: Mapped[str] = mapped_column(ForeignKey("moyai_messages.identity", onupdate="CASCADE", ondelete="CASCADE"), primary_key=True)
+    kind: Mapped[str] = mapped_column(String(20), default="web", index=True)
+    revision: Mapped[int] = mapped_column(Integer, default=0)
+    mirror: Mapped[bool] = mapped_column(Boolean, default=False)
+    data: Mapped[str] = mapped_column(Text)
 
 
 class Event(Base):
@@ -267,6 +278,20 @@ class SlackInbox(Base):
     created_at: Mapped[str] = mapped_column(String(40), default=now)
 
 
+class SlackActivity(Base):
+    """Retryable native status, independent of non-replayable message deliveries."""
+
+    __tablename__ = "moyai_slack_activity"
+    thread_id: Mapped[str] = mapped_column(ForeignKey("moyai_slack_threads.id"), primary_key=True)
+    status: Mapped[str] = mapped_column(String(200), default="")
+    delivery_version: Mapped[str] = mapped_column(String(64), default="")
+    refreshed_at: Mapped[float] = mapped_column(Double, default=0)
+    retry_at: Mapped[float] = mapped_column(Double, default=0)
+    checked_at: Mapped[float] = mapped_column(Double, default=0)
+    claim_id: Mapped[str] = mapped_column(String(36), default="")
+    claim_until: Mapped[float] = mapped_column(Double, default=0)
+
+
 class Delivery(Base):
     __tablename__ = "moyai_deliveries"
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
@@ -279,6 +304,15 @@ class Delivery(Base):
     receipt: Mapped[str | None] = mapped_column(Text, nullable=True)
     claimed_at: Mapped[str | None] = mapped_column(String(40), nullable=True)
     created_at: Mapped[str] = mapped_column(String(40), default=now)
+
+
+class DeliverySchedule(Base):
+    """Fair retry/reconciliation scheduling; never evidence that a send is safe."""
+
+    __tablename__ = "moyai_delivery_schedule"
+    delivery_id: Mapped[str] = mapped_column(ForeignKey("moyai_deliveries.id", ondelete="CASCADE"), primary_key=True)
+    next_attempt: Mapped[float] = mapped_column(Double, default=0, index=True)
+    checked_at: Mapped[float] = mapped_column(Double, default=0)
 
 
 class Effect(Base):

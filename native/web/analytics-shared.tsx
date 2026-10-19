@@ -5,8 +5,8 @@ import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
-import { analyticsChart, analyticsLegend, analyticsMetrics } from "../../app/static/analytics.js?native-analytics"
-import type { ChartOptions, ChartRow, ChartSeries } from "../../app/static/analytics.js?native-analytics"
+import { analyticsChart, analyticsLegend, analyticsMetrics } from "./analytics-render.js"
+import type { ChartOptions, ChartRow, ChartSeries } from "./analytics-render.js"
 import { analyticsPresets, customAnalyticsRange, presetAnalyticsRange, rangeDates, rangeLabel } from "./analytics-dates"
 import type { AnalyticsRange } from "./analytics-dates"
 import { dollars, finiteValue, spendCount } from "./analytics-format"
@@ -48,6 +48,12 @@ export function AnalyticsDatePicker({ value, onChange, disabled = false }: {
 export function AnalyticsMetrics({ items }: { items: [string, string, string?][] }) {
   // The existing helper escapes every label, value, and note.
   return <>{parse(analyticsMetrics(items))}</>
+}
+
+export function ReportTable({ label, columns, children }: { label: string; columns: React.ReactNode[]; children: React.ReactNode }) {
+  return <div className="analytics-table-frame" role="region" aria-label={label} tabIndex={0}><Table>
+    <TableHeader><TableRow>{columns.map((column, index) => <TableHead scope="col" key={index}>{column}</TableHead>)}</TableRow></TableHeader><TableBody>{children}</TableBody>
+  </Table></div>
 }
 
 export function AnalyticsLegend({ series, cumulative = false }: { series: ChartSeries[]; cumulative?: boolean }) {

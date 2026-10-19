@@ -19,10 +19,12 @@ from pydantic_ai_harness.step_persistence import ContinuableSnapshot, RunRecord,
 from sqlalchemy import func, select
 from temporalio.testing import WorkflowEnvironment
 from test_application_boundaries import sign_in
+from test_delegation_temporal import dispatching
 from test_images_and_computer import image_bytes
 from test_sidebar import member_client
 
 from moyai.contracts import NewMessage, NewSession
+from moyai.delegation_models import DelegatedSession
 from moyai.models import Session, SessionLink, SubagentLabel, Turn, User, new_id
 from moyai.storage import encrypted_converter
 from moyai.worker import make_worker
@@ -90,7 +92,7 @@ async def native_run(runtime, parent_id, *, terminal="run_completed", run_id=Non
 
 async def test_nested_colon_ids_follow_requester_ancestry_and_keep_stable_public_names(runtime, actor):
     shared = await runtime.database.create_session(actor, NewSession(visibility="shared"))
-    private = await runtime.database.create_session(actor, NewSession())
+    private = await runtime.database.create_session(actor, NewSession(visibility="private"))
     async with sign_in(runtime) as owner, member_client(runtime) as (member, requester):
         owner_turn = await prepared_turn(runtime, actor, shared)
         member_turn = await prepared_turn(runtime, requester, shared)
@@ -277,7 +279,7 @@ async def test_unicode_link_limit_counts_utf8_bytes(runtime, actor, kind, byte_l
 
 async def test_parallel_link_attachment_is_idempotent_and_remove_is_author_or_owner_only(runtime, actor):
     session = await runtime.database.create_session(actor, NewSession(visibility="shared"))
-    private = await runtime.database.create_session(actor, NewSession())
+    private = await runtime.database.create_session(actor, NewSession(visibility="private"))
     async with (
         sign_in(runtime) as owner,
         member_client(runtime) as (author, _),
@@ -349,7 +351,7 @@ async def test_native_reads_recheck_authority_after_store_await(
             await asyncio.gather(request, return_exceptions=True)
 
 
-@pytest.mark.parametrize("runtime", ["tools"], indirect=True)
+@pytest.mark.parametrize("runtime", ["workspace"], indirect=True)
 async def test_real_temporal_delegate_is_inspectable_through_workspace_api(runtime, active):
     """Real native execution with a deterministic model, not real-provider E2E proof."""
     session, turn, _ = active
@@ -358,22 +360,24 @@ async def test_real_temporal_delegate_is_inspectable_through_workspace_api(runti
     )
     async with environment:
         runtime.client = environment.client
-        async with make_worker(runtime):
+        async with make_worker(runtime), dispatching(runtime):
             result = await asyncio.wait_for(runtime.client.execute_workflow(
                 TurnWorkflow.run, turn.id, id=turn.workflow_id,
                 task_queue=runtime.settings.temporal_queue,
             ), 45)
     assert result["status"] == "completed"
-    children = await runtime.stores.steps.list_runs(parent_run_id=turn.id)
-    assert len(children) == 1 and ":" in children[0].run_id
+    async with runtime.database.sessions() as db:
+        children = list(await db.scalars(select(DelegatedSession).where(DelegatedSession.parent_turn_id == turn.id)))
+    assert len(children) == 1
     async with sign_in(runtime) as client:
         path = f"/api/sessions/{session.id}"
         overview = (await client.get(f"{path}/workspace")).json()
-        assert overview["subagents"][0]["id"] == children[0].run_id
-        assert overview["subagents"][0]["status"] == "completed"
-        detail = await client.get(f"{path}/subagents/{children[0].run_id}")
+        assert overview["subagents"][0]["id"] == children[0].initial_turn_id
+        assert overview["subagents"][0]["status"] == "idle"
+        assert overview["subagents"][0]["session_id"] == children[0].session_id
+        detail = await client.get(f"/api/sessions/{children[0].session_id}/messages")
         assert detail.status_code == 200, detail.text
-        assert detail.json()["output"] == "native-child-result"
+        assert detail.json()[-1]["content"] == "native-child-result"
         assert overview["files"][0]["name"] == "proof.txt"
         assert (await client.get(overview["files"][0]["url"])).content == (
             b"Written by the native file capability.\n"

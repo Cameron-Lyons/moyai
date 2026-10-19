@@ -77,11 +77,13 @@ class ProductCredentialExecution:
         self, db: AsyncSession, scope: RunScope, run_id: str | None = None, *, direct: bool = False,
     ) -> ProductPrincipal:
         principal = await self.identity.authorize_admission(db, scope.product_grant)
+        principal.require('credentials.read')
         actor, turn = await db.get(User, scope.actor_id), await db.get(Turn, scope.turn_id)
         if actor is None or not actor.enabled or turn is None:
             raise HTTPException(403, "This credential execution is unavailable.")
         await self.database._check_product_turn(db, turn, scope.product_grant)
-        session = await self.database.allowed_session(db, scope.session_id, actor)
+        cast(Any, actor).product_grant = scope.product_grant
+        session = await self.database.execution_session(db, scope.session_id, actor)
         if (
             principal.id != scope.actor_id or turn.actor_id != principal.id or turn.session_id != session.id
             or session.active_turn != turn.id or session.status != "running" or turn.status != "running"
@@ -89,10 +91,7 @@ class ProductCredentialExecution:
             or (direct and (run_id != turn.id or turn.parent_turn is not None))
         ):
             raise HTTPException(403, "The original requester no longer owns this execution.")
-        grants = await self.database.resolve_grants(
-            db, actor.id, [grant.id for grant in scope.grants],
-            shared_session=session.visibility == "shared", surface=session.surface,
-        )
+        grants = await self.database.scope_grants(db, scope, session)
         if [(grant.id, grant.revision) for grant in grants] != [(grant.id, grant.revision) for grant in scope.grants]:
             raise HTTPException(403, "Connected account authority changed.")
         return principal
@@ -120,7 +119,8 @@ class ProductCredentialExecution:
         if secret["scope"] == "organization":
             return True
         session = await db.get(Session, session_id)
-        return bool(session and session.visibility == "private" and session.surface == "web") and await self.equivalent(
+        context = await self.database.execution_context(db, session) if session else None
+        return bool(context and context.visibility == "private" and context.surface == "web") and await self.equivalent(
             db, secret["owner_id"], actor_id,
         )
 
@@ -343,7 +343,8 @@ class ProductCredentialExecution:
                     db, dict(secret), principal.id, row.session_id,
                 ):
                     choices.append(self.vault.credentials.metadata(secret, principal.id, principal.role == "admin"))
-            private = session.visibility == "private" and session.surface == "web"
+            context = await self.database.execution_context(db, session)
+            private = context.visibility == "private" and context.surface == "web"
             scopes = (["personal"] if private and own and (principal.individual or self.vault.security.local_preview()) else [])
             if principal.role == "admin":
                 scopes.append("organization")
@@ -396,7 +397,8 @@ class ProductCredentialExecution:
                             raise HTTPException(403, "Only the requester may supply personal credentials.")
                         if body.scope is None:
                             raise HTTPException(422, "Choose credential sharing before saving.")
-                        if body.scope != "organization" and (session.visibility != "private" or session.surface != "web"):
+                        context = await self.database.execution_context(db, session)
+                        if body.scope != "organization" and (context.visibility != "private" or context.surface != "web"):
                             raise HTTPException(403, "Personal credentials are restricted to private web sessions.")
                         from .product_secrets import ProductSaveSecret
 
@@ -433,8 +435,9 @@ class ProductCredentialExecution:
         return await self.resume_resolved(turn_id, session_id)
 
     async def insert_secret(self, db, principal, session_id, body) -> dict:
-        if body.scope == "organization" and principal.role != "admin":
-            raise HTTPException(403, "Only an administrator may save organization credentials.")
+        principal.require('credentials.manage')
+        if body.scope == "organization":
+            principal.require('credentials.publish')
         if body.scope != "organization" and not (principal.individual or self.vault.security.local_preview()):
             raise HTTPException(403, "Sign in individually to save personal credentials.")
         value = self.vault.credentials.validated_value(body)

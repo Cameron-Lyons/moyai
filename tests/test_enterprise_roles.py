@@ -1,764 +1,771 @@
-"""Custom roles must affect existing sessions and survive every access path."""
-from concurrent.futures import ThreadPoolExecutor
-from threading import Barrier, get_ident
+"""Permission catalog, native tool permissions and custom-role rules on SQLite or --postgres-backend."""
+import ast
+import inspect
+import json
+import os
+import textwrap
+from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
-from fastapi import HTTPException
-from starlette.requests import Request
+from app import enterprise_roles
+from app.config import Settings
+from app.db import Store
+from app.enterprise_roles import (
+    ACCESS_QUERIES,
+    ADMIN_ONLY,
+    AMPLIFY,
+    DEACTIVATED,
+    FORBIDDEN,
+    HELD_GRANT,
+    HELD_PERSON,
+    HELD_ROLE,
+    OWN_GROUP,
+    SELF,
+    STALE,
+    GovernanceActor,
+    GovernanceConflict,
+    GovernanceError,
+    GovernanceForbidden,
+    GovernanceInvalid,
+    GovernanceNotFound,
+    GroupRoleChange,
+    RoleAssignment,
+    RoleCreate,
+    RoleUpdate,
+    canonical_fetch,
+    qualified_fetch,
+    resolve_access,
+)
+from app.permissions import (
+    BUILTIN_PERMISSIONS,
+    DEFAULT_TOOL_PERMISSION,
+    MEMBER_PERMISSIONS,
+    NATIVE_TOOL_NAMES,
+    PERMISSIONS,
+    TOOL_PERMISSIONS,
+    catalog,
+    connector_tool,
+    tool_permission,
+)
+from app.scim import CORE, Scim
+from app.user_roles import UserRoles
+from pydantic import ValidationError
 
-from app.enterprise_roles import ADMIN_ONLY, RoleAssignment, RoleDefinition
-from app.permissions import BUILTIN_PERMISSIONS, MEMBER_PERMISSIONS
-from test_user_roles import directory_write, sign_as, users_app
-
-AMPLIFY = 'You can only grant permissions you hold.'
+ROOT = Path(__file__).resolve().parents[1]
+ALL = BUILTIN_PERMISSIONS['admin']
+READER = ['sessions.read', 'workspace.read']
 
 
-def create_role(client, identity='reader', permissions=None):
-    response = client.post('/api/admin/roles', json={
-        'id': identity, 'name': identity.title(), 'description': 'Reviewed workspace role',
-        'permissions': permissions if permissions is not None else ['workspace.read', 'sessions.read'], 'revision': 0})
-    assert response.status_code == 201, response.text
-    return response.json()
+def person(email, role='member', permissions=None, **extra):
+    return GovernanceActor(id='google:' + email.split('@')[0], email=email, builtin_role=role,
+                           permissions=permissions, kind='individual', **extra)
 
 
-def assign(client, email='maya@berri.ai', role_id='reader', revision=0):
-    return client.put('/api/admin/role-assignments', json={'email': email, 'role_id': role_id, 'revision': revision})
+OWNER = person('owner@example.com', 'admin')
 
 
-def test_role_handlers_query_the_database_off_the_event_loop(users_app, monkeypatch):
-    import asyncio
-    from contextvars import ContextVar
-    app, client = users_app
-    sign_as(app, client, 'tin@berri.ai')
-    group = directory_write(app, 'Group', {'displayName': 'Off-loop reviewers'})
-    current_request = ContextVar('governance_database_request', default=None)
-    borrows, original_require, original_connect = [], app.state.security.require, app.state.store.connect
+@pytest.fixture
+def governance(tmp_path):
+    settings = Settings(_env_file=None, data_dir=tmp_path, public_url='http://localhost:8787',
+                        google_allowed_domains='example.com', google_admin_emails='owner@example.com')
+    store = Store(tmp_path)
+    try:
+        roles = UserRoles(store, settings)
+        scim = Scim(store, roles, base_url='http://localhost:8787/scim/v2')
+        _, token = scim.create_token('Directory', OWNER)
+        yield SimpleNamespace(store=store, settings=settings, roles=roles, enterprise=roles.enterprise,
+                              scim=scim, header='Bearer ' + token)
+    finally:
+        store.close()
 
-    def require(request, *args, **kwargs):
-        current_request.set((request.method, request.scope['path']))
-        return original_require(request, *args, **kwargs)
 
-    def connect(*args, **kwargs):
-        if identity := current_request.get():
-            try:
-                running = bool(asyncio.get_running_loop())
-            except RuntimeError:
-                running = False
-            borrows.append((identity, running))
-        return original_connect(*args, **kwargs)
+def role(service, identity='reader', permissions=READER, actor=OWNER):
+    return service.enterprise.create(RoleCreate(id=identity, name=identity.title(), permissions=permissions), actor)
 
-    monkeypatch.setattr(app.state.security, 'require', require)
-    monkeypatch.setattr(app.state.store, 'connect', connect)
-    definition = {'id': 'off-loop', 'name': 'Off-loop', 'permissions': ['workspace.read'], 'revision': 0}
-    requests = [
-        ('GET', '/api/permissions', {}, 200),
-        ('GET', '/api/admin/roles', {}, 200),
-        ('POST', '/api/admin/roles', {'json': definition}, 201),
-        ('PUT', '/api/admin/roles/off-loop', {'json': {**definition, 'revision': 1}}, 200),
-        ('PUT', '/api/admin/role-assignments', {'json': {'email': 'maya@berri.ai', 'role_id': 'off-loop', 'revision': 0}}, 200),
-        ('PUT', '/api/admin/group-roles/' + group['id'], {'json': {'role_id': 'off-loop', 'revision': 0}}, 200),
-        ('DELETE', '/api/admin/roles/off-loop?revision=2', {}, 200),
+
+def assign(service, email, role_id, revision=0, actor=OWNER, role_revision=None):
+    return service.enterprise.assign(RoleAssignment(email=email, role_id=role_id, revision=revision,
+                                                    role_revision=role_revision), actor)
+
+
+def provision(service, email, *, active=True):
+    return service.scim.write(service.header, {}, 'User', 'POST',
+                              {'schemas': [CORE + 'User'], 'userName': email, 'active': active})['id']
+
+
+def directory_group(service, name, members=()):
+    return service.scim.write(service.header, {}, 'Group', 'POST',
+                              {'displayName': name, 'members': [{'value': member} for member in members]})['id']
+
+
+def access(service, email):
+    with service.store.connect() as conn:
+        return service.roles.access_in(conn, email)
+
+
+def denied(error, status, detail):
+    assert error.value.status_code == status and error.value.detail == detail, (error.value.status_code, error.value.detail)
+
+
+def events(service, action=None):
+    rows = service.store.rows('SELECT action,actor,resource_type,resource_id,details FROM governance_audit_events ORDER BY created_at,id')
+    return [row for row in rows if action is None or row['action'] == action]
+
+
+def test_catalog_lists_every_permission_once_with_labels_and_groups():
+    entries = catalog()
+    assert [entry['id'] for entry in entries].count('roles.manage') == 1
+    assert {entry['id'] for entry in entries} == set(PERMISSIONS) and len(entries) == len(PERMISSIONS)
+    assert all(entry['label'] and entry['group'] and entry['description'] == PERMISSIONS[entry['id']] for entry in entries)
+    assert BUILTIN_PERMISSIONS['admin'] == frozenset(PERMISSIONS) and MEMBER_PERMISSIONS < ALL
+    assert len(MEMBER_PERMISSIONS) == 16 and len(PERMISSIONS) == 30
+
+
+def tool_names_of(capability):
+    from pydantic_ai.toolsets import AbstractToolset
+
+    found = set()
+
+    def names(toolset):
+        if isinstance(getattr(toolset, 'tools', None), dict):
+            found.update(toolset.tools)
+        for inner in (getattr(toolset, 'wrapped', None), *getattr(toolset, 'toolsets', ())):
+            if isinstance(inner, AbstractToolset):
+                names(inner)
+
+    def visit(item):
+        toolset = item.get_toolset() if hasattr(item, 'get_toolset') else item
+        if isinstance(toolset, AbstractToolset):
+            names(toolset)
+        return item
+
+    if hasattr(capability, 'visit_and_replace'):
+        capability.visit_and_replace(visit)
+    else:
+        visit(capability)
+    return found
+
+
+def test_every_native_tool_has_an_explicit_permission():
+    import warnings
+
+    from pydantic_ai_harness import Coder
+    from pydantic_ai_harness.ask_user import AskUser
+    from pydantic_ai_harness.conversation_search import ConversationSearch
+    from pydantic_ai_harness.memory import Memory
+    from pydantic_ai_harness.planning import Planning
+
+    from moyai import product_automation_tools, product_credential_tools, product_github_publication
+    from moyai.artifacts import artifact_capability
+    from moyai.browser import browser_capability
+    from moyai.contracts import Grant
+    from moyai.input_attachments import attachment_capability
+
+    grant = Grant(id='a' * 36, kind='github', revision=1, credential='', read_only=False,
+                  policy={'product': {'repository_id': 1}})
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore')
+        sources = [
+            # make_agent's capabilities in native/src/moyai/agent.py, plus product tool capabilities.
+            artifact_capability(None, None), browser_capability(None), attachment_capability(None, None),
+            Coder(), Planning(enable_subtasks=True), AskUser(answerer=None), Memory(), ConversationSearch(None),
+            product_credential_tools.CredentialTools(SimpleNamespace(enabled=False)),
+            product_automation_tools.toolset(SimpleNamespace(credentials=object())),
+            product_github_publication.toolset(SimpleNamespace(database=None), None, grant),
+        ]
+    exposed = set().union(*(tool_names_of(source) for source in sources))
+    assert {'shell', 'delegate_task', 'credentials_run', 'automation_retire', 'create_pull_request'} <= exposed
+    # The framework's deferred-capability loader serves saved and bundled skills.
+    exposed.add('load_capability')
+    assert exposed - NATIVE_TOOL_NAMES == set()
+    # Static net: any tool a native module registers must be explicit too.
+    registered = set()
+    for path in (ROOT / 'native/src/moyai').glob('*.py'):
+        for node in ast.walk(ast.parse(path.read_text())):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and any(
+                    isinstance(target := (item.func if isinstance(item, ast.Call) else item), ast.Attribute)
+                    and target.attr == 'tool' for item in node.decorator_list):
+                registered.add(node.name)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in {'Capability', 'Tool'}:
+                arguments = [*node.args[:1]] if node.func.id == 'Tool' else [
+                    *next((keyword.value.elts for keyword in node.keywords
+                           if keyword.arg == 'tools' and isinstance(keyword.value, ast.List)), [])]
+                for argument in arguments:
+                    argument = argument.args[0] if isinstance(argument, ast.Call) and argument.args else argument
+                    if isinstance(argument, ast.Name):
+                        registered.add(argument.id)
+    assert {'save_artifact', 'browser_open', 'automation_list', 'credentials_list', 'publication_status'} <= registered
+    assert registered - NATIVE_TOOL_NAMES == set()
+    assert set(TOOL_PERMISSIONS) == NATIVE_TOOL_NAMES
+    assert all(TOOL_PERMISSIONS[name] in PERMISSIONS and tool_permission(name) == TOOL_PERMISSIONS[name]
+               for name in NATIVE_TOOL_NAMES)
+
+
+def test_connector_tools_follow_the_canonical_read_write_catalog():
+    from app.connectors import TOOLS
+    for name, (provider, write, _, _) in TOOLS.items():
+        expected = 'connections.write' if write else 'connections.read'
+        assert tool_permission(name) == expected, name
+        # Product toolsets strip the provider prefix, then connection_tools adds the grant prefix.
+        prefixed = f'{provider}_0a1b2c3d_{name.removeprefix(provider + "_")}'
+        assert connector_tool(prefixed) == (provider, name.removeprefix(provider + '_'))
+        assert tool_permission(prefixed) == expected, prefixed
+    assert tool_permission('github_0a1b2c3d_create_pull_request') == 'connections.write'
+    assert tool_permission('github_0a1b2c3d_request_pull_request_write_access') == 'connections.write'
+    assert tool_permission('github_0a1b2c3d_publication_status') == 'connections.read'
+    # Provider tools outside the canonical catalog are writes unless their server-built definition is read-only.
+    assert tool_permission('github_0a1b2c3d_get_file_contents') == 'connections.write'
+    assert tool_permission('github_0a1b2c3d_get_file_contents', read_only=True) == 'connections.read'
+    assert tool_permission('notion_0a1b2c3d_future_write', read_only=False) == 'connections.write'
+    # Unknown names are session work, never "no check".
+    for name in ('future_unknown_capability', 'github_not_a_grant_prefix', '', None, 7):
+        assert tool_permission(name) == DEFAULT_TOOL_PERMISSION
+
+
+def test_resolution_is_pure_and_matches_named_queries(governance):
+    import sqlalchemy
+    from sqlalchemy import text
+    service = governance
+    role(service)
+    role(service, 'operator', ['connections.manage', 'workspace.read'])
+    assign(service, 'bob@example.com', 'reader')
+    team = directory_group(service, 'Ops', [provision(service, 'bob@example.com')])
+    service.enterprise.set_group_role(team, GroupRoleChange(role_id='operator'), OWNER)
+    with service.store.connect() as conn:
+        canonical = resolve_access(canonical_fetch(conn), 'bob@example.com', 'member')
+    assert canonical.permissions == {'sessions.read', 'workspace.read', 'connections.manage'}
+    assert canonical.groups == ((team, 1, 'operator'),) and canonical.role_id == 'reader' and not canonical.default
+    # The native adapter's form: SQLAlchemy text(), :named parameters and qualified quoted tables.
+    if service.store.database:
+        schema = service.store.database.schema
+        engine = sqlalchemy.create_engine('postgresql+psycopg://' + os.environ['MOYAI_TEST_POSTGRES_URL'].split('://', 1)[1])
+        table = lambda name: f'"{schema}"."{name}"'
+    else:
+        engine = sqlalchemy.create_engine(f'sqlite:///{service.store.path}')
+        table = lambda name: f'"main"."{name}"'
+    try:
+        with engine.connect() as session:
+            fetch = qualified_fetch(lambda sql, params: session.execute(text(sql), params).mappings().all(), table)
+            assert resolve_access(fetch, 'bob@example.com', 'member') == canonical
+            assert resolve_access(fetch, 'nobody@example.com', 'member').default
+    finally:
+        engine.dispose()
+    assert all('{' in sql and ':' in sql for name, sql in ACCESS_QUERIES.items() if name != 'scim_any')
+
+
+def test_default_state_and_member_rows_never_change_governance(governance):
+    service = governance
+    plain = access(service, 'plain@example.com')
+    assert plain.default and plain.permissions == MEMBER_PERMISSIONS and plain.authority_entry() is None
+    assert plain.scim_active is None and plain.role_id is None and plain.groups == ()
+    admin = access(service, 'owner@example.com')
+    assert admin.default and admin.permissions == ALL and admin.authority_entry() is None
+    # A built-in 'member' row equals no row for access: same permissions, still default (Slack and web
+    # alike). Its revision still keeps an authority entry, so the reset never revalidates the pre-change version.
+    role(service)
+    assign(service, 'maya@example.com', 'reader')
+    assign(service, 'maya@example.com', 'member', revision=1)
+    reset = access(service, 'maya@example.com')
+    assert reset.default and reset.role_id is None and reset.permissions == MEMBER_PERMISSIONS
+    assert reset.assignment_revision == 2 and reset.authority_entry() == {
+        'role_id': None, 'role_revision': 0, 'assignment_revision': 2, 'groups': [],
+        'permissions': sorted(MEMBER_PERMISSIONS)}
+    # Provisioned but otherwise unchanged people stay default, with no entry.
+    provision(service, 'plain@example.com')
+    provisioned = access(service, 'plain@example.com')
+    assert provisioned.default and provisioned.scim_active is True and provisioned.authority_entry() is None
+
+
+def test_custom_archived_group_and_deactivated_resolution(governance):
+    service = governance
+    role(service)
+    role(service, 'operator', ['connections.manage', 'workspace.read'])
+    role(service, 'subset', ['workspace.read'])
+    assign(service, 'bob@example.com', 'reader')
+    state = access(service, 'bob@example.com')
+    assert state.permissions == set(READER) and state.role_name == 'Reader' and state.role_revision == 1
+    assert state.authority_entry() == {'role_id': 'reader', 'role_revision': 1, 'assignment_revision': 1,
+                                       'groups': [], 'permissions': READER}
+    bob = provision(service, 'bob@example.com')
+    team = directory_group(service, 'Ops', [bob])
+    service.enterprise.set_group_role(team, GroupRoleChange(role_id='operator'), OWNER)
+    assert access(service, 'bob@example.com').permissions == {*READER, 'connections.manage'}
+    # An archived direct role grants nothing (no member fallback); group grants still add.
+    service.enterprise.archive('reader', 1, OWNER)
+    assert access(service, 'bob@example.com').permissions == {'connections.manage', 'workspace.read'}
+    # A subset group grant leaves a member's state default; a built-in admin never needs group grants.
+    carol = provision(service, 'carol@example.com')
+    owner = provision(service, 'owner@example.com')
+    small = directory_group(service, 'Small', [carol, owner])
+    service.enterprise.set_group_role(small, GroupRoleChange(role_id='subset'), OWNER)
+    assert access(service, 'carol@example.com').default and access(service, 'carol@example.com').groups
+    assert access(service, 'owner@example.com').permissions == ALL and access(service, 'owner@example.com').default
+    # Deactivation and deletion remove every permission, even a built-in administrator's.
+    service.scim.write(service.header, {}, 'User', 'PATCH', {'schemas': ['urn:ietf:params:scim:api:messages:2.0:PatchOp'],
+                       'Operations': [{'op': 'replace', 'path': 'active', 'value': False}]}, bob)
+    inactive = access(service, 'bob@example.com')
+    assert inactive.scim_active is False and inactive.permissions == frozenset() and not inactive.default
+    service.scim.delete(service.header, 'User', carol)
+    assert access(service, 'carol@example.com').scim_active is False
+    assert not access(service, 'carol@example.com').permissions
+    provision(service, 'carol@example.com')
+    assert access(service, 'carol@example.com').scim_active is True
+
+
+def test_role_lifecycle_revisions_and_one_audit_event_per_change(governance):
+    service = governance
+    created = role(service, 'operator', ['workspace.read', 'connections.read', 'connections.manage'])
+    assert created['revision'] == 1 and created['permissions'] == ['connections.manage', 'connections.read', 'workspace.read']
+    with pytest.raises(GovernanceConflict) as error:
+        role(service, 'operator')
+    denied(error, 409, 'A role with this ID already exists.')
+    update = RoleUpdate(name='Operator', description='Ops', permissions=['workspace.read'], revision=1)
+    assert service.enterprise.update('operator', update, OWNER)['revision'] == 2
+    with pytest.raises(GovernanceConflict) as error:
+        service.enterprise.update('operator', update, OWNER)
+    denied(error, 409, STALE)
+    with pytest.raises(GovernanceNotFound):
+        service.enterprise.update('missing', update, OWNER)
+    with pytest.raises(GovernanceConflict) as error:
+        service.enterprise.archive('operator', 1, OWNER)
+    denied(error, 409, STALE)
+    archived = service.enterprise.archive('operator', 2, OWNER)
+    assert archived['archived'] and archived['revision'] == 3
+    assert service.enterprise.archive('operator', 3, OWNER) == archived  # Idempotent, no second event.
+    with pytest.raises(GovernanceConflict) as error:
+        service.enterprise.update('operator', update.model_copy(update={'revision': 3}), OWNER)
+    denied(error, 409, 'Archived roles cannot be edited.')
+    with pytest.raises(GovernanceConflict):
+        role(service, 'operator')  # Archived ids stay reserved.
+    with pytest.raises(GovernanceInvalid):
+        assign(service, 'bob@example.com', 'operator')
+    with pytest.raises(GovernanceInvalid):
+        service.enterprise.archive('admin', 0, OWNER)
+    with pytest.raises(ValidationError):
+        RoleCreate(id='member', name='Member', permissions=[])
+    with pytest.raises(ValidationError):
+        RoleCreate(id='reader', name='Reader', permissions=['invented.permission'])
+    assert [row['action'] for row in events(service) if row['resource_type'] == 'role'] == [
+        'role.created', 'role.updated', 'role.archived']
+    detail = json.loads(events(service, 'role.updated')[0]['details'])
+    assert detail == {'previous': ['connections.manage', 'connections.read', 'workspace.read'],
+                      'permissions': ['workspace.read'], 'revision': 2}
+    assert {row['actor'] for row in events(service) if row['resource_type'] == 'role'} == {'owner@example.com'}
+
+
+def test_failed_mutation_leaves_no_event_and_no_change(governance, monkeypatch):
+    service = governance
+    role(service)
+
+    def fail(*args, **kwargs):
+        raise RuntimeError('synthetic failure after the write')
+
+    original = enterprise_roles.record_event_in
+    monkeypatch.setattr(enterprise_roles, 'record_event_in', lambda *a, **k: (original(*a, **k), fail()))
+    with pytest.raises(RuntimeError):
+        assign(service, 'bob@example.com', 'reader')
+    assert not service.store.rows('SELECT * FROM enterprise_role_assignments')
+    assert not events(service, 'role_assignment.updated')
+
+
+def test_admin_is_granted_only_on_the_users_page_and_never_to_groups(governance):
+    service = governance
+    role(service)
+    with pytest.raises(GovernanceInvalid) as error:
+        assign(service, 'bob@example.com', 'admin')
+    denied(error, 422, 'Grant administrator access on the Users page.')
+    team = directory_group(service, 'Ops', [provision(service, 'bob@example.com')])
+    for role_id, detail in (('admin', 'Administrator access cannot be granted to a group.'),
+                            ('member', 'Choose a custom role or no additional role.')):
+        with pytest.raises(GovernanceInvalid) as error:
+            service.enterprise.set_group_role(team, GroupRoleChange(role_id=role_id), OWNER)
+        denied(error, 422, detail)
+    # A custom role would not narrow a built-in administrator; refuse instead of silently demoting.
+    with pytest.raises(GovernanceConflict) as error:
+        assign(service, 'owner@example.com', 'reader')
+    assert 'administrator' in error.value.detail
+    with pytest.raises(GovernanceInvalid) as error:
+        assign(service, 'outside@elsewhere.test', 'reader')
+    with pytest.raises(GovernanceNotFound):
+        service.enterprise.set_group_role('f' * 32, GroupRoleChange(role_id='reader'), OWNER)
+
+
+def delegated(service, email, permissions, *, via_group=()):
+    """email holds `permissions` directly, plus via_group through a directory group grant."""
+    identity = email.split('@')[0] + '-direct'
+    role(service, identity, sorted(permissions))
+    assign(service, email, identity)
+    if via_group:
+        role(service, identity + '-group', sorted(via_group))
+        team = directory_group(service, identity + ' group', [provision(service, email)])
+        service.enterprise.set_group_role(team, GroupRoleChange(role_id=identity + '-group'), OWNER)
+        return team
+    return None
+
+
+def test_group_derived_authority_cannot_become_a_direct_assignment(governance):
+    """Regression: delegates copied group-only roles.manage into a direct row that outlived the group."""
+    service = governance
+    team = delegated(service, 'dee@example.com', READER,
+                     via_group={'roles.manage', 'users.read', 'audit.read', 'workspace.read'})
+    role(service, 'access-admins', ['audit.read', 'roles.manage', 'users.read', 'workspace.read'])
+    dee = person('dee@example.com')
+    assert 'roles.manage' in access(service, 'dee@example.com').permissions
+    with pytest.raises(GovernanceForbidden) as error:
+        assign(service, 'dee@example.com', 'access-admins', revision=1, actor=dee)
+    denied(error, 403, SELF)
+    # Granting to a colleague is bounded by what dee holds directly, not through the group.
+    assign(service, 'pal@example.com', 'dee-direct')
+    with pytest.raises(GovernanceForbidden) as error:
+        assign(service, 'pal@example.com', 'access-admins', revision=1, actor=dee)
+    denied(error, 403, AMPLIFY)
+    # Member defaults exceed dee's direct permissions, so dee cannot restore them either.
+    with pytest.raises(GovernanceForbidden) as error:
+        assign(service, 'pal@example.com', 'member', revision=1, actor=dee)
+    denied(error, 403, AMPLIFY)
+    with pytest.raises(GovernanceForbidden) as error:
+        role(service, 'auditor', ['audit.read'], actor=dee)
+    denied(error, 403, AMPLIFY)
+    # The delegate's own group grant cannot be changed by that delegate either.
+    with pytest.raises(GovernanceForbidden) as error:
+        service.enterprise.set_group_role(team, GroupRoleChange(role_id=None, revision=1), dee)
+    denied(error, 403, OWN_GROUP)
+    listing = service.enterprise.listing(dee)
+    assert listing['grantable'] == READER and listing['builtin_admin'] is False
+    assert service.enterprise.listing(OWNER)['grantable'] is None
+    # Leaving the group removes the authority; nothing direct was copied.
+    service.scim.write(service.header, {}, 'Group', 'PUT', {'displayName': 'dee-direct group', 'members': []}, team)
+    assert access(service, 'dee@example.com').permissions == set(READER)
+    with pytest.raises(GovernanceForbidden) as error:
+        service.enterprise.listing(dee)
+    denied(error, 403, FORBIDDEN)
+
+
+def test_delegates_cannot_redefine_roles_that_reach_them(governance):
+    """Regression: a delegate widened the role granted to their own directory group, which kept a
+    group-derived copy of their direct authority after the direct role was revoked."""
+    service = governance
+    engineering = directory_group(service, 'Engineering', [provision(service, 'dee@example.com'),
+                                                           provision(service, 'other@example.com')])
+    role(service, 'eng-base', ['workspace.read'])
+    service.enterprise.set_group_role(engineering, GroupRoleChange(role_id='eng-base'), OWNER)
+    authority = ['audit.read', 'roles.manage', 'security.manage', 'sessions.read', 'workspace.read']
+    role(service, 'access-admin', authority)
+    assign(service, 'dee@example.com', 'access-admin')
+    dee = person('dee@example.com')
+    with pytest.raises(GovernanceForbidden) as error:
+        service.enterprise.set_group_role(engineering, GroupRoleChange(role_id='access-admin', revision=1), dee)
+    denied(error, 403, OWN_GROUP)
+    # Every direction is refused, as for the group grant itself: widening, narrowing and archiving.
+    attempts = [
+        (lambda: service.enterprise.update('eng-base', RoleUpdate(name='Eng base', permissions=authority, revision=1),
+                                           dee), OWN_GROUP),
+        (lambda: service.enterprise.update('eng-base', RoleUpdate(name='Eng base', permissions=[], revision=1), dee),
+         OWN_GROUP),
+        (lambda: service.enterprise.archive('eng-base', 1, dee), OWN_GROUP),
+        # The delegate's own direct role is their own access too.
+        (lambda: service.enterprise.update('access-admin', RoleUpdate(name='Access admin', permissions=authority,
+                                                                      description='Mine', revision=1), dee), SELF),
+        (lambda: service.enterprise.archive('access-admin', 1, dee), SELF),
     ]
-    for method, path, kwargs, status in requests:
-        response = client.request(method, path, **kwargs)
-        assert response.status_code == status, response.text
-    assert {identity for identity, _ in borrows} == {(method, path.split('?')[0]) for method, path, _, _ in requests}
-    assert not any(running for _, running in borrows)
+    for attempt, detail in attempts:
+        with pytest.raises(GovernanceForbidden) as error:
+            attempt()
+        denied(error, 403, detail)
+    assert [(row['id'], row['permissions'], row['revision'], row['archived']) for row in service.store.rows(
+        "SELECT id,permissions,revision,archived FROM enterprise_roles WHERE id IN ('eng-base','access-admin') ORDER BY id")] == [
+        ('access-admin', json.dumps(authority), 1, 0), ('eng-base', '["workspace.read"]', 1, 0)]
+    assert not events(service, 'role.updated') and not events(service, 'role.archived')
+    # Roles that reach neither the delegate nor their groups stay editable within the direct set.
+    role(service, 'helper', ['workspace.read'], actor=dee)
+    assert service.enterprise.update('helper', RoleUpdate(name='Helper', permissions=['sessions.read', 'workspace.read'],
+                                                          revision=1), dee)['revision'] == 2
+    # Revoking the direct role leaves neither dee nor the group with copied authority.
+    assign(service, 'dee@example.com', 'member', revision=1)
+    for email in ('dee@example.com', 'other@example.com'):
+        held = access(service, email).permissions
+        assert held == MEMBER_PERMISSIONS | {'workspace.read'} and not held & {'roles.manage', 'security.manage'}
+    with pytest.raises(GovernanceForbidden) as error:
+        service.enterprise.listing(dee)
+    denied(error, 403, FORBIDDEN)
 
 
-def test_custom_assignment_updates_existing_cookie_and_is_an_allowlist(users_app):
-    app, client = users_app
-    sign_as(app, client, 'maya@berri.ai')
-    member_cookie = dict(client.cookies)
-    assert set(client.get('/api/session').json()['permissions']) == MEMBER_PERMISSIONS
-    sign_as(app, client, 'tin@berri.ai')
-    create_role(client)
-    assert assign(client).status_code == 200
-    client.cookies.clear(); client.cookies.update(member_cookie)
-    assert client.get('/api/session').json()['role'] == 'member'
-    assert set(client.get('/api/permissions').json()['permissions']) == {'workspace.read', 'sessions.read'}
-    assert client.get('/api/runs').status_code == 200
-    assert client.get('/api/runs?scope=all').status_code == 403
-    assert client.get('/api/connections').status_code == 403
-    assert client.post('/api/runs', json={'prompt': 'Do work', 'mode': 'demo'}).status_code == 403
-    assert client.get('/api/admin/users').status_code == 403
-    assert client.get('/api/admin/spend').status_code == 403
-    assert client.get('/api/skills').status_code == 403
+def test_returning_to_default_never_restores_an_earlier_authority_entry(governance):
+    """Regression: a reset to 'member', SCIM reactivation or reprovisioning, rejoining a granted group and
+    re-widening a granted role each restored the exact pre-revocation entry, reviving saved authority."""
+    service = governance
+    patch_op = 'urn:ietf:params:scim:api:messages:2.0:PatchOp'
+
+    def entries(email, *changes):
+        seen = [access(service, email).authority_entry()]
+        for change in changes:
+            change()
+            seen.append(access(service, email).authority_entry())
+        keys = [json.dumps(entry, sort_keys=True) for entry in seen]
+        assert len(set(keys)) == len(keys), seen
+        return seen
+
+    role(service)
+    maya = entries('maya@example.com', lambda: assign(service, 'maya@example.com', 'reader'),
+                   lambda: assign(service, 'maya@example.com', 'member', revision=1),
+                   lambda: assign(service, 'maya@example.com', 'reader', revision=2),
+                   lambda: assign(service, 'maya@example.com', 'member', revision=3))
+    assert maya[0] is None and maya[-1]['assignment_revision'] == 4
+
+    pat = provision(service, 'pat@example.com')
+
+    def active(value):
+        return lambda: service.scim.write(service.header, {}, 'User', 'PATCH', {'schemas': [patch_op], 'Operations': [
+            {'op': 'replace', 'path': 'active', 'value': value}]}, pat)
+
+    pats = entries('pat@example.com', active(False), active(True), active(False), active(True))
+    assert pats[0] is None and pats[2]['directory'] == [pat, 1] and pats[4]['directory'] == [pat, 2]
+    assert access(service, 'pat@example.com').default  # Same access as before, but no earlier entry.
+
+    sam = provision(service, 'sam@example.com')
+    replacements = []
+    sams = entries('sam@example.com', lambda: service.scim.delete(service.header, 'User', sam),
+                   lambda: replacements.append(provision(service, 'sam@example.com')),
+                   lambda: service.scim.delete(service.header, 'User', replacements[0]),
+                   lambda: replacements.append(provision(service, 'sam@example.com')))
+    assert sams[0] is None and sams[2]['directory'] == [replacements[0], 1]
+    assert sams[4]['directory'] == [replacements[1], 1] and sams[4]['permissions'] == sorted(MEMBER_PERMISSIONS)
+
+    role(service, 'operator', ['connections.manage', 'workspace.read'])
+    lee = provision(service, 'lee@example.com')
+    ops = directory_group(service, 'Ops', [lee])
+    service.enterprise.set_group_role(ops, GroupRoleChange(role_id='operator'), OWNER)
+
+    def operator(permissions, revision):
+        return lambda: service.enterprise.update('operator', RoleUpdate(name='Operator', permissions=permissions,
+                                                                        revision=revision), OWNER)
+
+    lees = entries('lee@example.com',
+                   lambda: service.scim.write(service.header, {}, 'Group', 'PATCH', {'schemas': [patch_op], 'Operations': [
+                       {'op': 'remove', 'path': f'members[value eq "{lee}"]'}]}, ops),
+                   lambda: service.scim.write(service.header, {}, 'Group', 'PUT', {'displayName': 'Ops',
+                                                                                  'members': [{'value': lee}]}, ops),
+                   lambda: service.scim.write(service.header, {}, 'Group', 'PUT', {'displayName': 'Ops', 'members': []}, ops),
+                   lambda: service.scim.write(service.header, {}, 'Group', 'PATCH', {'schemas': [patch_op], 'Operations': [
+                       {'op': 'add', 'path': 'members', 'value': [{'value': lee}]}]}, ops),
+                   operator(['workspace.read'], 1), operator(['connections.manage', 'workspace.read'], 2))
+    assert lees[0]['grant_roles'] == [['operator', 1]] and 'directory' not in lees[0]
+    assert lees[2]['directory'] == [lee, 1] and lees[4]['directory'] == [lee, 2]
+    assert lees[-1]['grant_roles'] == [['operator', 3]] and lees[-1]['permissions'] == lees[0]['permissions']
+
+    # People governance never touched keep no entry: provisioning, grantless groups, joining and leaving them.
+    kim = provision(service, 'kim@example.com')
+    readers = directory_group(service, 'Readers', [kim])
+    service.scim.write(service.header, {}, 'Group', 'PUT', {'displayName': 'Readers', 'members': []}, readers)
+    assert access(service, 'kim@example.com').authority_entry() is None
 
 
-def test_delegated_permission_opens_only_its_admin_surface(users_app):
-    app, client = users_app
-    sign_as(app, client, 'tin@berri.ai')
-    create_role(client, 'directory-reader', ['workspace.read', 'users.read'])
-    assert assign(client, role_id='directory-reader').status_code == 200
-    sign_as(app, client, 'maya@berri.ai')
-    assert client.get('/api/admin/users').status_code == 200
-    assert client.put('/api/admin/users/role', json={'email': 'maya@berri.ai', 'role': 'admin', 'revision': 1}).status_code == 403
-    assert client.get('/api/admin/roles').status_code == 403
-    assert client.get('/api/admin/spend').status_code == 403
-    # A future, unmapped admin endpoint must retain the original admin boundary.
-    request = Request({'type': 'http', 'method': 'GET', 'path': '/api/admin/future-feature',
-                       'headers': [(b'cookie', ('workspace_session=' + client.cookies['workspace_session']).encode())]})
-    with pytest.raises(HTTPException) as error:
-        app.state.security.require(request, admin=True)
-    assert error.value.status_code == 403
+def test_delegates_cannot_strip_or_archive_access_they_do_not_hold(governance):
+    """Regression: the delegation bound covered additions only, so delegates removed others' access."""
+    service = governance
+    delegated(service, 'del@example.com', {'roles.manage', 'workspace.read'})
+    delegate = person('del@example.com')
+    role(service, 'secops', ['audit.read', 'scim.manage', 'security.manage', 'workspace.read'])
+    assign(service, 'sec@example.com', 'secops')
+    team = directory_group(service, 'Security', [provision(service, 'sec2@example.com')])
+    service.enterprise.set_group_role(team, GroupRoleChange(role_id='secops'), OWNER)
+    role(service, 'empty', [])
+    attempts = [
+        (lambda: service.enterprise.archive('secops', 1, delegate), HELD_ROLE),
+        (lambda: service.enterprise.update('secops', RoleUpdate(name='Secops', permissions=['workspace.read'],
+                                                                revision=1), delegate), HELD_ROLE),
+        (lambda: assign(service, 'sec@example.com', 'empty', revision=1, actor=delegate), HELD_PERSON),
+        (lambda: service.enterprise.set_group_role(team, GroupRoleChange(role_id=None, revision=1), delegate), HELD_GRANT),
+        # Member defaults exceed this delegate's direct permissions too.
+        (lambda: assign(service, 'plain@example.com', 'empty', actor=delegate), HELD_PERSON),
+    ]
+    for attempt, detail in attempts:
+        with pytest.raises(GovernanceForbidden) as error:
+            attempt()
+        denied(error, 403, detail)
+    assert access(service, 'sec@example.com').permissions == {'audit.read', 'scim.manage', 'security.manage', 'workspace.read'}
+    assert not events(service, 'role.archived')
+    # Within its direct set a delegate may act on others.
+    broad = person('broad@example.com')
+    delegated(service, 'broad@example.com', MEMBER_PERMISSIONS | {'roles.manage'})
+    role(service, 'helper', ['sessions.read', 'workspace.read'], actor=broad)
+    assert assign(service, 'plain@example.com', 'helper', actor=broad)['revision'] == 1
+    assert assign(service, 'plain@example.com', 'member', revision=1, actor=broad)['role_id'] == 'member'
+    with pytest.raises(GovernanceForbidden) as error:
+        assign(service, 'owner@example.com', 'member', actor=broad)
+    denied(error, 403, ADMIN_ONLY)
+    # The built-in administrator is unrestricted.
+    assert service.enterprise.archive('secops', 1, OWNER)['archived']
 
 
-@pytest.mark.parametrize('permissions,expected', [
-    (['sessions.read'], 403),
-    (['connections.read'], 403),
-    (['sessions.read', 'connections.read'], 200),
-])
-def test_native_pr_reader_requires_session_and_connection_read(users_app, monkeypatch, permissions, expected):
-    app, client = users_app
-    sign_as(app, client, 'maya@berri.ai')
-    run = app.state.store.create_run('Read a delivered PR', '', 'demo', [], user_id='google:maya')
-    sign_as(app, client, 'tin@berri.ai')
-    create_role(client, 'pr-reader', permissions)
-    assert assign(client, role_id='pr-reader').status_code == 200
-    sign_as(app, client, 'maya@berri.ai')
-    calls = []
-
-    async def read(*args, **kwargs):
-        calls.append((args, kwargs))
-        return {'number': 100, 'files': [{'filename': 'private.py', 'patch': 'private code'}]}
-
-    monkeypatch.setattr(app.state.session_pull_requests, 'read', read)
-    response = client.get(f"/api/runs/{run['id']}/pull-request", params={'url': 'https://github.com/org/repo/pull/100'})
-    assert response.status_code == expected, response.text
-    assert len(calls) == int(expected == 200)
-    if expected != 200:
-        assert 'private code' not in response.text
-
-
-@pytest.mark.parametrize('revocation', ['sessions.read', 'connections.read', 'deactivate'])
-def test_native_pr_reader_discards_data_when_access_is_revoked_during_read(users_app, monkeypatch, revocation):
-    app, client = users_app
-    sign_as(app, client, 'maya@berri.ai')
-    run = app.state.store.create_run('Read a delivered PR', '', 'demo', [], user_id='google:maya')
-    sign_as(app, client, 'tin@berri.ai')
-    role = create_role(client, 'pr-reader', ['sessions.read', 'connections.read'])
-    assert assign(client, role_id='pr-reader').status_code == 200
-    sign_as(app, client, 'maya@berri.ai')
-    calls = []
-
-    async def read(*args, **kwargs):
-        calls.append((args, kwargs))
-        if revocation == 'deactivate':
-            directory_write(app, 'User', {'userName': 'maya@berri.ai', 'active': False})
-        else:
-            app.state.user_roles.enterprise.save(RoleDefinition(
-                id=role['id'], name=role['name'], description=role['description'],
-                permissions=[permission for permission in role['permissions'] if permission != revocation],
-                revision=role['revision']),
-                {'method': 'google', 'identity': {'email': 'tin@berri.ai'}}, role['id'])
-        return {'number': 100, 'files': [{'filename': 'private.py', 'patch': 'private code'}]}
-
-    monkeypatch.setattr(app.state.session_pull_requests, 'read', read)
-    response = client.get(f"/api/runs/{run['id']}/pull-request", params={'url': 'https://github.com/org/repo/pull/100'})
-    assert response.status_code == (401 if revocation == 'deactivate' else 403), response.text
-    assert len(calls) == 1
-    assert 'private code' not in response.text
+def test_assignment_revisions_cover_both_pages(governance):
+    """Regression: the roles tab and users page could not see each other's revisions."""
+    from app.user_roles import RoleChange
+    service = governance
+    role(service)
+    role(service, 'contractor', ['workspace.read'])
+    first = assign(service, 'ava@example.com', 'reader', role_revision=0)
+    assert first['revision'] == 1 and first['role_revision'] == 0
+    with pytest.raises(GovernanceConflict) as error:
+        assign(service, 'ava@example.com', 'contractor', revision=0)
+    denied(error, 409, STALE)
+    # The users page replaces the custom role; a roles tab that still shows it is stale.
+    service.roles.change(RoleChange(email='ava@example.com', role='member', revision=0,
+                                    replace_custom_role=True, access_revision=1), OWNER)
+    with pytest.raises(GovernanceConflict) as error:
+        assign(service, 'ava@example.com', 'contractor', revision=1)
+    denied(error, 409, STALE)
+    # The resulting member row reads as no assignment (revision 0) and is accepted as such.
+    assert assign(service, 'ava@example.com', 'contractor', revision=0)['revision'] == 3
+    # Built-in role changes bump the user_roles revision the roles tab sent.
+    service.roles.change(RoleChange(email='bob@example.com', role='admin', revision=0), OWNER)
+    service.roles.change(RoleChange(email='bob@example.com', role='member', revision=1), OWNER)
+    with pytest.raises(GovernanceConflict) as error:
+        assign(service, 'bob@example.com', 'reader', role_revision=0)
+    denied(error, 409, STALE)
+    assert assign(service, 'bob@example.com', 'reader', role_revision=2)['role_revision'] == 2
+    assert [json.loads(row['details'])['replacement'] for row in events(service, 'role_assignment.updated')] == [
+        'reader', 'member', 'contractor', 'reader']
 
 
-def test_delegated_spend_reader_gets_organization_report_and_live_revocation(users_app):
-    from test_spend import active
-    app, client = users_app
-    sign_as(app, client, 'maya@berri.ai')
-    for user, cost in [('google:maya', '2'), ('google:tin', '3')]:
-        run = active(app, user)
-        identity = app.state.spend.begin(run, run['model'])
-        app.state.store.execute("UPDATE model_requests SET cost=?,status='completed' WHERE id=?", (cost, identity))
-    personal = client.get('/api/spend').json()
-    assert personal['total']['spend'] == '2'
-    sign_as(app, client, 'tin@berri.ai')
-    role = create_role(client, 'finance-reader', ['workspace.read', 'spend.read'])
-    assert assign(client, role_id='finance-reader').status_code == 200
-    sign_as(app, client, 'maya@berri.ai')
-    assert client.get('/api/session').json()['role'] == 'member'
-    for route in ('/api/spend', '/api/admin/spend'):
-        response = client.get(route)
-        assert response.status_code == 200, response.text
-        assert response.json()['total']['spend'] == '5'
-        assert {row['id'] for row in response.json()['users']} >= {'google:maya', 'google:tin'}
-    assert client.get('/api/admin/roles').status_code == 403
-    sign_as(app, client, 'tin@berri.ai')
-    update = {key: role[key] for key in ('id', 'name', 'description', 'permissions', 'revision')}
-    update['permissions'] = ['workspace.read']
-    assert client.put('/api/admin/roles/finance-reader', json=update).status_code == 200
-    sign_as(app, client, 'maya@berri.ai')
-    assert client.get('/api/spend').status_code == 403
-    assert client.get('/api/admin/spend').status_code == 403
+def test_actor_snapshots_are_rechecked_in_the_writer(governance):
+    service = governance
+    delegated(service, 'mgr@example.com', MEMBER_PERMISSIONS | {'roles.manage'})
+    # A stale principal that no longer holds roles.manage cannot write, whatever the database says.
+    stale = person('mgr@example.com', permissions=MEMBER_PERMISSIONS)
+    with pytest.raises(GovernanceForbidden):
+        role(service, 'reader', actor=stale)
+    # Revocation after authentication wins over the principal's snapshot.
+    snapshot = person('mgr@example.com', permissions=MEMBER_PERMISSIONS | {'roles.manage'})
+    assign(service, 'mgr@example.com', 'member', revision=1)
+    with pytest.raises(GovernanceForbidden):
+        role(service, 'reader', actor=snapshot)
+    # A principal claiming administrator authority is still checked against the canonical role.
+    with pytest.raises(GovernanceForbidden):
+        role(service, 'reader', actor=person('mgr@example.com', 'admin', ALL))
+    # Deactivated, foreign-domain, Slack and unauthenticated actors fail closed.
+    provision(service, 'mgr@example.com', active=False)
+    for actor, error_type in ((person('mgr@example.com', permissions=ALL), GovernanceForbidden),
+                              (person('x@elsewhere.test', 'admin'), GovernanceForbidden),
+                              (GovernanceActor(id='slack:T:U', email='owner@example.com', builtin_role='admin'),
+                               GovernanceForbidden),
+                              (None, GovernanceError)):
+        with pytest.raises(error_type):
+            role(service, 'reader', actor=actor)
+    with pytest.raises(GovernanceForbidden) as error:
+        role(service, 'reader', actor=person('mgr@example.com'))
+    denied(error, 403, DEACTIVATED)
+    # ProductPrincipal-shaped objects and legacy session dicts are accepted.
+    principal = SimpleNamespace(id='google:owner', kind='google', method='google', email='owner@example.com',
+                                role='admin', permissions=ALL)
+    assert role(service, 'reader', actor=principal)['updated_by'] == 'owner@example.com'
+    legacy = {'method': 'google', 'role': 'admin', 'identity': {'email': 'Owner@Example.com', 'sub': 'owner'}}
+    assert role(service, 'second', actor=legacy)['revision'] == 1
+    # Legacy dicts without a role claim defer to the canonical role; malformed actors fail closed.
+    assert role(service, 'third', actor={'method': 'google', 'identity': {'email': 'owner@example.com'}})
+    for actor in ({'id': 'google:x', 'email': None}, {'id': None}, {'method': 'invented', 'role': 'admin'}):
+        with pytest.raises(GovernanceForbidden):
+            role(service, 'fourth', actor=actor)
 
 
-def test_builtin_member_permissions_do_not_bypass_scope_specific_admin_checks(users_app):
-    app, client = users_app
-    sign_as(app, client, 'maya@berri.ai')
-    assert client.get('/api/runs').status_code == 200
-    assert client.get('/api/runs?scope=all').status_code == 403
-    assert client.get('/api/admin/spend').status_code == 403
-    assert client.get('/api/connections/slack/personal').status_code == 200
-
-
-def test_custom_role_revision_archive_and_builtin_reset_revoke_immediately(users_app):
-    app, client = users_app
-    sign_as(app, client, 'tin@berri.ai')
-    role = create_role(client, 'operator', ['workspace.read', 'connections.read', 'connections.manage'])
-    assert assign(client, role_id='operator').status_code == 200
-    assert assign(client, role_id='member').status_code == 409
-    update = {key: role[key] for key in ('id', 'name', 'description', 'permissions', 'revision')}
-    update['permissions'] = ['workspace.read']
-    assert client.put('/api/admin/roles/operator', json=update).status_code == 200
-    assert client.put('/api/admin/roles/operator', json=update).status_code == 409
-    assert app.state.user_roles.permissions('maya@berri.ai') == {'workspace.read'}
-    assert client.delete('/api/admin/roles/operator?revision=1').status_code == 409
-    assert client.delete('/api/admin/roles/operator?revision=2').status_code == 200
-    assert app.state.user_roles.permissions('maya@berri.ai') == set()
-    # The legacy built-in role editor can deliberately remove a custom assignment.
-    assert client.put('/api/admin/users/role', json={'email': 'maya@berri.ai', 'role': 'member', 'revision': 1}).status_code == 200
-    assert app.state.user_roles.permissions('maya@berri.ai') == MEMBER_PERMISSIONS
-    assert assign(client, role_id='operator', revision=2).status_code == 422
-    audit = app.state.store.rows('SELECT action,actor FROM enterprise_role_audit')
-    assert {'role.created', 'role.updated', 'role.archived', 'assignment.updated'} <= {row['action'] for row in audit}
-    assert {row['actor'] for row in audit} == {'tin@berri.ai'}
-
-
-def test_catalog_validation_csrf_and_reserved_roles(users_app):
-    app, client = users_app
-    sign_as(app, client, 'tin@berri.ai')
-    body = {'id': 'admin', 'name': 'Bad', 'permissions': ['sessions.read']}
-    assert client.post('/api/admin/roles', json=body).status_code == 422
-    body.update(id='reader', permissions=['invented.permission'])
-    assert client.post('/api/admin/roles', json=body).status_code == 422
-    body['permissions'] = []
-    client.headers['X-CSRF-Token'] = 'invalid'
-    assert client.post('/api/admin/roles', json=body).status_code == 403
-    assert not app.state.store.rows('SELECT * FROM enterprise_roles')
-    sign_as(app, client, 'tin@berri.ai')
-    assert client.delete('/api/admin/roles/admin?revision=0').status_code == 422
-    assert assign(client, email='outside@example.com', role_id='member').status_code == 422
-
-
-def test_custom_assignment_preserves_last_admin_even_with_concurrent_demotions(users_app):
-    app, client = users_app
-    sign_as(app, client, 'tin@berri.ai')
-    create_role(client)
-    barrier = Barrier(2)
-
-    def demote(email):
-        barrier.wait(timeout=5)
-        try:
-            app.state.user_roles.enterprise.assign(RoleAssignment(email=email, role_id='reader'),
-                {'method': 'google', 'identity': {'email': email}})
-            return 200
-        except HTTPException as error:
-            return error.status_code
-
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        outcomes = list(pool.map(demote, ['tin@berri.ai', 'ishaan@berri.ai']))
-    assert sorted(outcomes) == [200, 409]
-    with app.state.store.connect() as conn:
-        assert len(app.state.user_roles.admins_in(conn)) == 1
-
-
-def test_group_grants_use_active_directory_membership_and_revoke_live(users_app):
-    from app.scim import Scim
-    app, client = users_app
-    directory = Scim(app.state.store, app.state.security, app.state.user_roles)
-    sign_as(app, client, 'tin@berri.ai')
-    create_role(client)
-    create_role(client, 'connection-manager', ['connections.read', 'connections.manage'])
-    assert assign(client).status_code == 200
-    with app.state.store.connect() as conn:
-        conn.begin_write()
-        user = directory.write_in(conn, 'User', {'userName': 'maya@berri.ai', 'active': True})
-        group = directory.write_in(conn, 'Group', {'displayName': 'Connection managers', 'members': [{'value': user['id']}]})
-    mapped = client.put('/api/admin/group-roles/' + group['id'], json={'role_id': 'connection-manager', 'revision': 0})
-    assert mapped.status_code == 200, mapped.text
-    assert app.state.user_roles.permissions('maya@berri.ai') == {'workspace.read', 'sessions.read', 'connections.read', 'connections.manage'}
-    assert client.put('/api/admin/group-roles/' + group['id'], json={'role_id': 'admin', 'revision': 1}).status_code == 422
-    with app.state.store.connect() as conn:
-        conn.begin_write()
-        directory.write_in(conn, 'Group', {'displayName': 'Connection managers', 'members': []}, group['id'])
-    assert app.state.user_roles.permissions('maya@berri.ai') == {'workspace.read', 'sessions.read'}
-    with app.state.store.connect() as conn:
-        conn.begin_write()
-        directory.write_in(conn, 'User', {'userName': 'maya@berri.ai', 'active': False}, user['id'])
-    assert app.state.user_roles.permissions('maya@berri.ai') == set()
-    sign_as(app, client, 'maya@berri.ai')
-    assert client.get('/api/runs').status_code == 401
-
-
-def test_agent_skill_publishing_uses_custom_permissions_and_revocation(users_app):
-    from test_spend import active
-    from test_skill_saving import call, form
-    app, client = users_app
-    sign_as(app, client, 'maya@berri.ai')
-    run = active(app, 'google:maya')
-    sign_as(app, client, 'tin@berri.ai')
-    create_role(client, 'skill-publisher', sorted(MEMBER_PERMISSIONS | {'skills.publish'}))
-    assert assign(client, role_id='skill-publisher').status_code == 200
-    assert call(client, run, **form(scope='organization', request_id='custom-publisher')).json().get('saved')
-    role = next(row for row in client.get('/api/admin/roles').json()['roles'] if row['id'] == 'skill-publisher')
-    update = {key: role[key] for key in ('id', 'name', 'description', 'permissions', 'revision')}
-    update['permissions'] = sorted(MEMBER_PERMISSIONS)
-    assert client.put('/api/admin/roles/skill-publisher', json=update).status_code == 200
-    denied = call(client, run, **form(scope='organization', request_id='revoked-publisher'))
-    assert denied.status_code == 200 and denied.json()['status_code'] == 403
-
-
-def test_delegated_actor_cannot_keep_stale_role_manager_authority(users_app):
-    app, client = users_app
-    sign_as(app, client, 'tin@berri.ai')
-    create_role(client, 'role-manager', ['workspace.read', 'roles.manage'])
-    assert assign(client, role_id='role-manager').status_code == 200
-    stale = {'method': 'google', 'identity': {'email': 'maya@berri.ai'}}
-    assert assign(client, role_id='member', revision=1).status_code == 200
-    with pytest.raises(HTTPException) as error:
-        app.state.user_roles.enterprise.save(RoleDefinition(id='unapproved', name='Bad', permissions=[]), stale)
-    assert error.value.status_code == 403
-    assert app.state.user_roles.permissions('tin@berri.ai') == BUILTIN_PERMISSIONS['admin']
-
-
-def test_shared_runtime_actors_follow_current_auth_configuration(users_app):
-    app, _ = users_app
-    roles = app.state.user_roles
-    settings = roles.settings
-    settings.password_login_enabled = True
-    settings.workspace_password = 'test-only-shared-admin-password'
-    settings.workspace_member_password = 'test-only-shared-member-password'
-    with roles.store.connect() as conn:
-        assert roles.permissions_for_actor_in(conn, 'shared:password:admin') == BUILTIN_PERMISSIONS['admin']
-        assert roles.permissions_for_actor_in(conn, 'shared:password:member') == MEMBER_PERMISSIONS
-        assert not roles.permissions_for_actor_in(conn, 'shared:invented:admin')
-        assert not roles.permissions_for_actor_in(conn, 'shared:password:owner')
-        assert not roles.permissions_for_actor_in(conn, 'shared:password:extra:admin')
+def test_shared_actors_follow_the_current_sign_in_configuration(governance):
+    service = governance
+    settings = service.settings
+    settings.password_login_enabled, settings.workspace_password = True, 'test-only-shared-admin-password'
+    shared = GovernanceActor(id='shared:password:admin', builtin_role='admin')
+    assert role(service, 'reader', actor=shared)['updated_by'] == 'Shared password admin'
+    for actor in (GovernanceActor(id='shared:password:member', builtin_role='admin'),
+                  GovernanceActor(id='shared:invented:admin', builtin_role='admin')):
+        with pytest.raises(GovernanceForbidden):
+            role(service, 'other', actor=actor)
     settings.password_login_enabled = False
-    with roles.store.connect() as conn:
-        assert not roles.permissions_for_actor_in(conn, 'shared:password:admin')
-        assert not roles.permissions_for_actor_in(conn, 'shared:password:member')
-        assert not roles.permissions_for_actor_in(conn, 'shared:local:admin')
-    settings.public_url = 'http://127.0.0.1:8787'
-    settings.workspace_password = ''
-    settings.google_client_id = ''
-    settings.google_client_secret = ''
-    with roles.store.connect() as conn:
-        assert roles.permissions_for_actor_in(conn, 'shared:local:admin') == BUILTIN_PERMISSIONS['admin']
-    settings.public_url = 'https://workspace.example'
-    with roles.store.connect() as conn:
-        assert not roles.permissions_for_actor_in(conn, 'shared:local:admin')
+    with pytest.raises(GovernanceForbidden):
+        role(service, 'other', actor=shared)
 
 
-def test_custom_all_permissions_do_not_grant_builtin_ownership_override(users_app):
-    app, client = users_app
-    sign_as(app, client, 'maya@berri.ai')
-    sign_as(app, client, 'tin@berri.ai')
-    create_role(client, 'all-capabilities', sorted(BUILTIN_PERMISSIONS['admin']))
-    assert assign(client, role_id='all-capabilities').status_code == 200
-    with app.state.store.connect() as conn:
-        assert app.state.user_roles.is_admin_actor_in(conn, 'google:tin')
-        assert not app.state.user_roles.is_admin_actor_in(conn, 'google:maya')
-        assert not app.state.user_roles.is_admin_actor_in(conn, 'google:unknown')
-        assert not app.state.user_roles.is_admin_actor_in(conn, 'shared:invented:admin')
+def statements(monkeypatch):
+    import sqlite3
+
+    from app.database import PostgresConnection, SQLiteConnection
+    executed = []
+    for kind, execute in ((SQLiteConnection, sqlite3.Connection.execute), (PostgresConnection, PostgresConnection.execute)):
+        monkeypatch.setattr(kind, 'execute', lambda conn, *args, execute=execute: executed.append(args[0]) or execute(conn, *args))
+    return executed
 
 
-def test_delegates_cannot_grant_administrator_or_permissions_they_lack(users_app):
-    app, client = users_app
-    for email in ('maya@berri.ai', 'ops@berri.ai'):
-        sign_as(app, client, email)
-    sign_as(app, client, 'tin@berri.ai')
-    create_role(client)
-    create_role(client, 'user-admin', ['workspace.read', 'users.read', 'users.manage'])
-    create_role(client, 'role-manager', sorted(MEMBER_PERMISSIONS | {'roles.manage'}))
-    assert assign(client, role_id='user-admin').status_code == 200
-    assert assign(client, email='ops@berri.ai', role_id='role-manager').status_code == 200
-    sign_as(app, client, 'maya@berri.ai')
-    for email, role, revision in [('maya@berri.ai', 'admin', 1), ('ishaan@berri.ai', 'member', 0)]:
-        denied = client.put('/api/admin/users/role', json={'email': email, 'role': role, 'revision': revision})
-        assert denied.status_code == 403 and denied.json()['detail'] == ADMIN_ONLY
-    denied = client.put('/api/admin/users/role', json={'email': 'new@berri.ai', 'role': 'member', 'revision': 0})
-    assert denied.status_code == 403 and denied.json()['detail'] == AMPLIFY
-    sign_as(app, client, 'ops@berri.ai')
-    for email, role_id, revision in [('ops@berri.ai', 'admin', 1), ('tin@berri.ai', 'reader', 0)]:
-        denied = assign(client, email=email, role_id=role_id, revision=revision)
-        assert denied.status_code == 403 and denied.json()['detail'] == ADMIN_ONLY
-    denied = client.post('/api/admin/roles', json={'id': 'auditor', 'name': 'Auditor', 'permissions': ['audit.read']})
-    assert denied.status_code == 403 and denied.json()['detail'] == AMPLIFY
-    own = next(row for row in client.get('/api/admin/roles').json()['roles'] if row['id'] == 'role-manager')
-    widened = {key: own[key] for key in ('id', 'name', 'description', 'revision')} | {'permissions': own['permissions'] + ['spend.read']}
-    assert client.put('/api/admin/roles/role-manager', json=widened).json()['detail'] == AMPLIFY
-    assert assign(client, email='new@berri.ai', role_id='user-admin').json()['detail'] == AMPLIFY
-    assert assign(client, email='new@berri.ai').status_code == 200
-    assert assign(client, email='new@berri.ai', role_id='member', revision=1).status_code == 200
-    assert {app.state.user_roles.role(email) for email in ('maya@berri.ai', 'ops@berri.ai', 'new@berri.ai')} == {'member'}
-    assert app.state.user_roles.role('tin@berri.ai') == app.state.user_roles.role('ishaan@berri.ai') == 'admin'
-    with app.state.store.connect() as conn:
-        assert not app.state.user_roles.is_admin_actor_in(conn, 'google:maya')
-        assert not app.state.user_roles.is_admin_actor_in(conn, 'google:ops')
+def test_listing_shape_and_constant_statement_count(governance, monkeypatch):
+    service = governance
+    role(service)
+    role(service, 'zeta', ['workspace.read'])
+    assign(service, 'bob@example.com', 'reader')
+    assign(service, 'carl@example.com', 'reader')
+    assign(service, 'carl@example.com', 'member', revision=1)
+    people = [provision(service, f'p{index}@example.com') for index in range(3)]
+    team = directory_group(service, 'Engineering', people)
+    directory_group(service, 'alumni')
+    service.scim.write(service.header, {}, 'User', 'PATCH', {'schemas': ['urn:ietf:params:scim:api:messages:2.0:PatchOp'],
+                       'Operations': [{'op': 'replace', 'path': 'active', 'value': False}]}, people[0])
+    service.enterprise.set_group_role(team, GroupRoleChange(role_id='zeta'), OWNER)
+    listing = service.enterprise.listing(OWNER)
+    assert [row['id'] for row in listing['roles']] == ['reader', 'zeta']
+    assert [(row['email'], row['role_id'], row['role_name']) for row in listing['assignments']] == [
+        ('bob@example.com', 'reader', 'Reader')]
+    assert listing['group_roles'][0] | {'updated_at': None} == {
+        'group_id': team, 'group_name': 'Engineering', 'role_id': 'zeta', 'role_name': 'Zeta', 'revision': 1,
+        'updated_at': None, 'updated_by': 'owner@example.com'}
+    assert [(row['display_name'], row['member_count']) for row in listing['groups']] == [('alumni', 0), ('Engineering', 2)]
+    assert listing['grantable'] is None and listing['builtin_admin'] is True
+    executed = statements(monkeypatch)
+    service.enterprise.listing(OWNER)
+    baseline = len(executed)
+    for index in range(5):
+        directory_group(service, f'extra {index}', people[1:])
+        assign(service, f'more{index}@example.com', 'reader')
+    executed.clear()
+    service.enterprise.listing(OWNER)
+    assert len(executed) == baseline
 
 
-def test_group_granted_governance_cannot_become_administrator(users_app):
-    app, client = users_app
-    sign_as(app, client, 'tin@berri.ai')
-    create_role(client, 'finance-reader', ['workspace.read', 'spend.read'])
-    create_role(client, 'governance-ops', ['workspace.read', 'users.read', 'users.manage', 'roles.manage'])
-    person = directory_write(app, 'User', {'userName': 'maya@berri.ai'})
-    group = directory_write(app, 'Group', {'displayName': 'IT', 'members': [{'value': person['id']}]})
-    assert client.put('/api/admin/group-roles/' + group['id'], json={'role_id': 'governance-ops', 'revision': 0}).status_code == 200
-    sign_as(app, client, 'maya@berri.ai')
-    assert {'users.manage', 'roles.manage'} <= set(client.get('/api/permissions').json()['permissions'])
-    denied = client.put('/api/admin/users/role', json={'email': 'maya@berri.ai', 'role': 'admin', 'revision': 0})
-    assert denied.status_code == 403 and denied.json()['detail'] == ADMIN_ONLY
-    denied = assign(client, role_id='admin')
-    assert denied.status_code == 403 and denied.json()['detail'] == ADMIN_ONLY
-    # A group grant cannot be widened beyond what the granting delegate holds.
-    denied = client.put('/api/admin/group-roles/' + group['id'], json={'role_id': 'finance-reader', 'revision': 1})
-    assert denied.status_code == 403 and denied.json()['detail'] == AMPLIFY
-    assert client.get('/api/session').json()['role'] == 'member'
-    assert app.state.store.rows('SELECT role_id FROM enterprise_group_roles')[0]['role_id'] == 'governance-ops'
+def test_services_are_synchronous_libraries_without_routes():
+    """Regression: governance handlers blocked the event loop; the native HTTP layer owns threading."""
+    from app import user_roles
+    for service in (enterprise_roles.EnterpriseRoles, user_roles.UserRoles):
+        for name, method in inspect.getmembers(service, inspect.isfunction):
+            assert not inspect.iscoroutinefunction(method), name
+        assert not hasattr(service, 'routes')
 
 
-def test_role_listing_exposes_live_groups_to_role_managers(users_app):
-    app, client = users_app
-    sign_as(app, client, 'tin@berri.ai')
-    assert client.get('/api/admin/roles').json()['groups'] == []
-    create_role(client)
-    create_role(client, 'role-manager', ['workspace.read', 'sessions.read', 'roles.manage'])
-    assert assign(client, role_id='role-manager').status_code == 200
-    people = [directory_write(app, 'User', {'userName': name + '@berri.ai'}) for name in ('ava', 'ben')]
-    engineering = directory_write(app, 'Group', {'displayName': 'Engineering', 'members': [{'value': row['id']} for row in people]})
-    alumni = directory_write(app, 'Group', {'displayName': 'alumni'})
-    removed = directory_write(app, 'Group', {'displayName': 'Removed', 'members': [{'value': people[0]['id']}]})
-    app.state.store.execute('UPDATE scim_groups SET deleted_at=? WHERE id=?', ('2026-01-01T00:00:00Z', removed['id']))
-    sign_as(app, client, 'maya@berri.ai')
-    listing = client.get('/api/admin/roles')
-    assert listing.status_code == 200
-    assert listing.json()['groups'] == [{'id': alumni['id'], 'display_name': 'alumni', 'members': 0},
-                                        {'id': engineering['id'], 'display_name': 'Engineering', 'members': 2}]
-    assert client.get('/api/admin/scim').status_code == 403
-    granted = client.put('/api/admin/group-roles/' + engineering['id'], json={'role_id': 'reader', 'revision': 0})
-    assert granted.status_code == 200, granted.text
-    assert client.get('/api/admin/roles').json()['group_roles'] == [
-        {'group_id': engineering['id'], 'role_id': 'reader', 'revision': 1}]
+def test_actor_labels_match_across_governance_writers():
+    """Security profiles and spend limits label changes with the same text as roles and SCIM tokens."""
+    from app.enterprise_roles import actor_label
+    assert actor_label(person('Owner@Example.com', 'admin')) == 'owner@example.com'
+    assert actor_label(GovernanceActor(id='shared:local:admin')) == 'Local preview admin'
+    assert actor_label({'method': 'password', 'role': 'member'}) == 'Shared password member'
+    assert actor_label({'method': 'google', 'identity': {'email': 'A@Example.com', 'sub': '1'}}) == 'a@example.com'
+    google = SimpleNamespace(id='google:1', kind='google', method='google', email='Owner@Example.com', individual=True)
+    assert actor_label(google) == 'owner@example.com'
+    # A Slack-claimed profile email never labels a governance change.
+    slack = SimpleNamespace(id='slack:T1:U1', kind='slack', method='slack', email='owner@example.com', individual=False)
+    assert actor_label(slack) == 'slack:T1:U1'
+    assert actor_label(GovernanceActor(id='shared:invented:admin')) == 'shared:invented:admin'
+    for actor in (None, object(), 'owner@example.com', GovernanceActor(id=''), GovernanceActor(id='x' * 513),
+                  GovernanceActor(id='google:\x00'), {'method': 'invented'}):
+        with pytest.raises(TypeError):
+            actor_label(actor)
 
 
-def test_users_editor_keeps_custom_roles_unless_actor_manages_roles(users_app):
-    app, client = users_app
-    sign_as(app, client, 'tin@berri.ai')
-    create_role(client)
-    create_role(client, 'user-admin', sorted(MEMBER_PERMISSIONS | {'users.read', 'users.manage'}))
-    create_role(client, 'access-admin', sorted(MEMBER_PERMISSIONS | {'users.read', 'users.manage', 'roles.manage'}))
-    assert assign(client).status_code == 200
-    assert assign(client, email='ops@berri.ai', role_id='user-admin').status_code == 200
-    assert assign(client, email='lead@berri.ai', role_id='access-admin').status_code == 200
-    unchanged = {'email': 'maya@berri.ai', 'role': 'member', 'revision': 1}
-    sign_as(app, client, 'ops@berri.ai')
-    denied = client.put('/api/admin/users/role', json=unchanged)
-    assert denied.status_code == 403
-    assert denied.json()['detail'] == 'This person has a custom workspace role. Change it under Governance → Roles.'
-    assert app.state.user_roles.permissions('maya@berri.ai') == {'workspace.read', 'sessions.read'}
-    assert client.put('/api/admin/users/role', json={'email': 'new@berri.ai', 'role': 'member', 'revision': 0}).status_code == 200
-    sign_as(app, client, 'lead@berri.ai')
-    assert client.put('/api/admin/users/role', json=unchanged).status_code == 200
-    assert app.state.user_roles.permissions('maya@berri.ai') == MEMBER_PERMISSIONS
-
-
-def test_directory_matches_live_permission_resolution_in_bulk(users_app, monkeypatch):
-    from app import db
-    app, client = users_app
-    roles = app.state.user_roles
-    for email in ('maya@berri.ai', 'mo@berri.ai', 'old@berri.ai', 'grace@berri.ai', 'dan@berri.ai'):
-        sign_as(app, client, email)
-    sign_as(app, client, 'tin@berri.ai')
-    create_role(client)
-    create_role(client, 'retired', ['workspace.read', 'spend.read'])
-    create_role(client, 'connection-manager', ['connections.read', 'connections.manage'])
-    assert assign(client).status_code == 200
-    assert assign(client, email='old@berri.ai', role_id='retired').status_code == 200
-    assert client.delete('/api/admin/roles/retired?revision=1').status_code == 200
-    grace, dan, ishaan = (directory_write(app, 'User', {'userName': name + '@berri.ai'}) for name in ('grace', 'dan', 'ishaan'))
-    group = directory_write(app, 'Group', {'displayName': 'Connectors', 'members': [{'value': grace['id']}, {'value': dan['id']}]})
-    assert client.put('/api/admin/group-roles/' + group['id'], json={'role_id': 'connection-manager', 'revision': 0}).status_code == 200
-    for person in (dan, ishaan):
-        directory_write(app, 'User', {'userName': person['userName'], 'active': False}, person['id'])
-    rows = {row['email']: row for row in roles.directory()['users']}
-    with app.state.store.connect() as conn:
-        for email, row in rows.items():
-            assert set(row['permissions']) == roles.permissions_in(conn, email), email
-            assert (row['role'], row['active']) == (roles.role_in(conn, email), roles.active_email_in(conn, email)), email
-    assert set(rows['grace@berri.ai']['permissions']) == MEMBER_PERMISSIONS | {'connections.manage'}
-    assert rows['ishaan@berri.ai']['role'] == 'admin' and not rows['ishaan@berri.ai']['permissions']
-    assert rows['old@berri.ai']['access_role_id'] == 'retired' and not rows['old@berri.ai']['permissions']
-    assert not rows['dan@berri.ai']['active'] and set(rows['tin@berri.ai']['permissions']) == BUILTIN_PERMISSIONS['admin']
-    statements, caller, connect = [], get_ident(), db.sqlite_connection
-
-    def traced(path):
-        conn = connect(path)
-        # Background workers share the store; count only this thread's directory reads.
-        if get_ident() == caller:
-            conn.set_trace_callback(statements.append)
-        return conn
-
-    monkeypatch.setattr(db, 'sqlite_connection', traced)
-
-    def cost():
-        statements.clear()
-        roles.directory()
-        return len(statements)
-
-    baseline = cost()
-    for index in range(20):
-        app.state.store.execute('INSERT INTO user_roles VALUES(?,?,?,?,?)', (f'p{index}@berri.ai', 'member', 1, 'test', 'now'))
-    assert cost() == baseline
-
-
-def test_every_current_broker_tool_has_an_explicit_permission():
-    from app.agents import TOOLS as AGENTS
-    from app.automation_tools import SPECS as AUTOMATIONS
-    from app.connectors import TOOLS as CONNECTORS
-    from app.credentials import TOOLS as CREDENTIALS
-    from app.media_shares import TOOLS as MEDIA
-    from app.memory import TOOL_NAMES as MEMORY
-    from app.model_tools import SPECS as MODELS
-    from app.permissions import PERMISSIONS, tool_permission
-    from app.published_artifacts import SPECS as ARTIFACTS
-    from app.skills import TOOL_NAMES as SKILLS
-    names = (set(AGENTS) | set(AUTOMATIONS) | set(CONNECTORS) | set(CREDENTIALS)
-             | set(MEDIA) | MEMORY | set(MODELS) | set(ARTIFACTS) | SKILLS
-             | {'sessions_read', 'sessions_search', 'history_read', 'goal',
-                'workspace_diagnostics', 'computer_handoff', 'computer_operation_read',
-                'automation_claim_item', 'slack_context', 'slack_participation'})
-    assert {name for name in names if tool_permission(name) not in PERMISSIONS} == set()
-    assert tool_permission('future_unknown_capability') is None
-
-
-def test_runtime_capability_does_not_restore_removed_role_permissions(users_app):
-    from test_spend import active
-    app, client = users_app
-    sign_as(app, client, 'maya@berri.ai')
-    run = active(app, 'google:maya')
-    headers = {'Authorization': 'Bearer capability'}
-    route = f"/broker/{run['id']}/tools"
-    baseline = {tool['name'] for tool in client.get(route, headers=headers).json()}
-    assert {'sessions_search', 'automation_create', 'model_list', 'history_read'} <= baseline
-    sign_as(app, client, 'tin@berri.ai')
-    role = create_role(client, 'runner', ['sessions.create'])
-    assert assign(client, role_id='runner').status_code == 200
-    removed = {'sessions_read', 'sessions_search', 'history_read', 'model_list',
-               'model_switch', 'workspace_diagnostics', 'goal', 'computer_handoff',
-               'artifact_publish', 'artifacts_list', 'media_list', 'media_share',
-               'automation_list', 'automation_create', 'automation_environments',
-               'skills_search', 'skills_save', 'memory_search', 'memory_save',
-               'credentials_list', 'linear_comment', 'slack_personal_search'}
-    listed = client.get(route, headers=headers)
-    assert listed.status_code == 200, listed.text
-    assert not removed & {tool['name'] for tool in listed.json()}
-    for name in sorted(removed):
-        denied = client.post(route + '/call', headers=headers, json={'name': name, 'arguments': {}})
-        assert denied.status_code == 403, (name, denied.text)
-    update = {key: role[key] for key in ('id', 'name', 'description', 'permissions', 'revision')}
-    update['permissions'] = ['sessions.create', 'sessions.read']
-    role = client.put('/api/admin/roles/runner', json=update).json()
-    assert 'sessions_search' in {tool['name'] for tool in client.get(route, headers=headers).json()}
-    result = client.post(route + '/call', headers=headers,
-                         json={'name': 'sessions_search', 'arguments': {'query': 'nonexistent-fixture-keyword'}})
-    assert result.status_code == 200 and result.json()['sessions'] == []
-    update.update(permissions=['sessions.create'], revision=role['revision'])
-    assert client.put('/api/admin/roles/runner', json=update).status_code == 200
-    assert client.post(route + '/call', headers=headers,
-        json={'name': 'sessions_search', 'arguments': {'query': 'nonexistent-fixture-keyword'}}).status_code == 403
-
-
-def test_durable_dispatch_revalidates_named_role_before_recording_receipt(users_app):
-    from types import SimpleNamespace
-    from app.tool_dispatch import ToolDispatch, ToolRejected
-    from test_spend import active
-    app, client = users_app
-    sign_as(app, client, 'maya@berri.ai')
-    run = active(app, 'google:maya')
-    sign_as(app, client, 'tin@berri.ai')
-    role = create_role(client, 'reader-runner', ['sessions.create', 'sessions.read'])
-    assert assign(client, role_id='reader-runner').status_code == 200
-    dispatch = ToolDispatch(app.state.store, run, SimpleNamespace(
-        name='sessions_search', arguments={'query': 'fixture'},
-        request_id='a' * 32, input_id=run['active_message_id']))
-    update = {key: role[key] for key in ('id', 'name', 'description', 'permissions', 'revision')}
-    update['permissions'] = ['sessions.create']
-    assert client.put('/api/admin/roles/reader-runner', json=update).status_code == 200
-    with pytest.raises(ToolRejected) as error:
-        dispatch.claim()
-    assert error.value.status_code == 403
-    assert app.state.store.rows("SELECT 1 FROM events WHERE run_id=? AND kind='tool_dispatch'", (run['id'],)) == []
-
-
-def test_raw_broker_routes_obey_the_same_role_permissions(users_app, monkeypatch):
-    from test_spend import active
-    app, client = users_app
-    sign_as(app, client, 'maya@berri.ai')
-    run = active(app, 'google:maya')
-    app.state.store.execute('UPDATE runs SET plugins=? WHERE id=?', ('["github"]', run['id']))
-    monkeypatch.setattr(app.state.connectors, 'allowed', lambda *a, **kw: True)
-
-    async def unauthorized_target(*args, **kwargs):
-        pytest.fail('A role without connections.read reached GitHub repository resolution.')
-
-    monkeypatch.setattr(app.state.connectors.github, 'selected_target', unauthorized_target)
-    sign_as(app, client, 'tin@berri.ai')
-    create_role(client, 'only-run', ['sessions.create'])
-    assert assign(client, role_id='only-run').status_code == 200
-    headers = {'Authorization': 'Bearer capability'}
-    base = f"/broker/{run['id']}"
-    for suffix in ('/artifacts/transfer', '/goal'):
-        response = client.post(base + suffix, headers=headers, json={})
-        assert response.status_code == 403, (suffix, response.text)
-    # The Deep Agents runtime reads goal state every turn; that is not steering.
-    assert client.post(base + '/goal', headers=headers, json={'action': 'get'}).status_code == 200
-    response = client.get(base + '/github.git/info/refs?service=git-upload-pack', headers=headers)
-    assert response.status_code == 403, response.text
-
-
-def connection_role_run(users_app, monkeypatch):
-    from test_spend import active
-    app, client = users_app
-    sign_as(app, client, 'maya@berri.ai')
-    run = active(app, 'google:maya')
-    app.state.store.execute('UPDATE runs SET plugins=? WHERE id=?',
-                            ('["github","notion","linear","slack"]', run['id']))
-    run = app.state.store.run(run['id'])
-    sign_as(app, client, 'tin@berri.ai')
-    role = create_role(client, 'app-user', ['sessions.create', 'connections.read', 'connections.write'])
-    assert assign(client, role_id='app-user').status_code == 200
-    monkeypatch.setattr(app.state.connectors, 'allowed', lambda *a, **kw: True)
-
-    def revoke_write():
-        app.state.user_roles.enterprise.save(RoleDefinition(
-            id=role['id'], name=role['name'], description=role['description'],
-            permissions=['sessions.create', 'connections.read'], revision=role['revision']),
-            {'method': 'google', 'identity': {'email': 'tin@berri.ai'}}, role['id'])
-
-    return app, client, run, revoke_write
-
-
-def test_custom_app_reader_cannot_invoke_external_write_tools(users_app, monkeypatch):
-    app, client, run, revoke = connection_role_run(users_app, monkeypatch)
-    revoke()
-    headers = {'Authorization': 'Bearer capability'}
-    route = f"/broker/{run['id']}/tools"
-    catalog = client.get(route, headers=headers)
-    assert catalog.status_code == 200, catalog.text
-    names = {tool['name'] for tool in catalog.json()}
-    assert {'notion_search', 'linear_search', 'github_repository', 'slack_search'} <= names
-    writes = {'notion_append', 'linear_comment', 'github_create_issue', 'slack_send'}
-    assert not names & writes
-    for name in writes:
-        response = client.post(route + '/call', headers=headers, json={'name': name, 'arguments': {}})
-        assert response.status_code == 403, (name, response.text)
-
-
-async def test_connector_write_revoked_while_waiting_for_credentials(users_app, monkeypatch):
-    import asyncio
-    from app.connector_errors import ConnectorError
-    app, _, run, revoke = connection_role_run(users_app, monkeypatch)
-    entered, release = asyncio.Event(), asyncio.Event()
-    calls = []
-
-    async def credentials(provider):
-        entered.set()
-        await release.wait()
-        return {'access_token': 'test-only-provider-token'}
-
-    async def request(*args, **kwargs):
-        calls.append((args, kwargs))
-        return {'results': []}
-
-    monkeypatch.setattr(app.state.connectors, 'credentials', credentials)
-    monkeypatch.setattr(app.state.connectors, 'request', request)
-    task = asyncio.create_task(app.state.connectors.call('notion_append',
-        {'page_id': 'a' * 32, 'text': 'Authorized before waiting.'}, run=run))
-    await asyncio.wait_for(entered.wait(), 3)
-    revoke()
-    release.set()
-    with pytest.raises(ConnectorError) as error:
-        await task
-    assert error.value.code == 'access_denied' and error.value.dispatched is False
-    assert calls == []
-
-
-async def test_role_revocation_between_notion_parts_preserves_acknowledged_writes(users_app, monkeypatch):
-    app, _, run, revoke = connection_role_run(users_app, monkeypatch)
-    calls = []
-
-    async def credentials(provider):
-        return {'access_token': 'test-only-provider-token'}
-
-    async def request(*args, **kwargs):
-        calls.append((args, kwargs))
-        revoke()
-        return {'results': [{'id': 'saved-first-part'}]}
-
-    monkeypatch.setattr(app.state.connectors, 'credentials', credentials)
-    monkeypatch.setattr(app.state.connectors, 'request', request)
-    result = await app.state.connectors.call('notion_append',
-        {'page_id': 'a' * 32, 'text': 'x' * 210000}, run=run)
-    assert len(calls) == 1
-    assert result['acknowledged_results'] == [{'id': 'saved-first-part'}]
-    assert result['completed_characters'] == 200000
-    assert result['dispatched'] is True and result['outcome'] == 'failed'
-    assert result['outcome_uncertain'] is False
-
-
-async def test_github_revocation_after_blob_preserves_uncertain_publication(users_app, monkeypatch):
-    from app.connector_errors import ConnectorError
-    from app.github import Publish
-    from test_github import GitHubAPI, PAYLOAD, select
-    app, _, run, revoke = connection_role_run(users_app, monkeypatch)
-    github = app.state.connectors.github
-    select(app)
-    api = GitHubAPI(github, monkeypatch)
-
-    def on_call(method, path):
-        if method == 'POST' and path.endswith('/git/blobs'):
-            revoke()
-
-    api.on_call = on_call
-    with pytest.raises(ConnectorError) as error:
-        await github.create_change_commit(run, Publish.model_validate(PAYLOAD), 'test-only-token',
-                                         api.repository_id, github.connection_version(), 'github_create_pull_request')
-    assert [path for method, path, _ in api.calls if method == 'POST'] == [
-        f'/repositories/{api.repository_id}/git/blobs']
-    receipt = error.value.receipt(write=True)
-    assert receipt['code'] == 'access_denied' and receipt['dispatched'] is None
-    assert receipt['outcome'] == 'unknown' and receipt['outcome_uncertain']
-
-
-def test_explicit_organizations_isolate_every_signing_context_with_shared_raw_keys(tmp_path):
-    from cryptography.fernet import Fernet
-    from itsdangerous import BadSignature
-    from app.config import Settings
-    from app.governance_audit import GovernanceAudit
-    from app.security import Security
-    key = Fernet.generate_key().decode()
-    settings = Settings(_env_file=None, data_dir=tmp_path, public_url='http://127.0.0.1:8787',
-        session_secret='test-only-raw-session-secret', encryption_key=key)
-    legacy = Security(settings.model_copy(update={'moyai_organization_id': ''}))
-    first = Security(settings.model_copy(update={'moyai_organization_id': 'first-org'}))
-    second = Security(settings.model_copy(update={'moyai_organization_id': 'second-org'}))
-    assert legacy.secret == settings.session_secret
-    assert first.secret != second.secret != legacy.secret
-    cookie = first.signer.dumps({'sid': 'shared-sid', 'role': 'admin', 'method': 'local'})
-    assert first.signer.loads(cookie)['sid'] == 'shared-sid'
-    for verifier in (legacy, second):
-        with pytest.raises(BadSignature):
-            verifier.signer.loads(cookie)
-    assert first.csrf('shared-sid') != second.csrf('shared-sid')
-    # Explicit signer salts must also use the organization-scoped key.
-    token = first.signer.dumps({'state': 'oauth-test'}, salt='oauth-state-v1')
-    with pytest.raises(BadSignature):
-        second.signer.loads(token, salt='oauth-state-v1')
-    cursor = GovernanceAudit.__new__(GovernanceAudit)
-    cursor.security = first
-    signed = cursor.cursor(10, 9)
-    cursor.security = second
-    with pytest.raises(HTTPException) as error:
-        cursor.read_cursor(signed)
-    assert error.value.status_code == 422
+def test_every_governance_service_keeps_database_work_off_the_event_loop():
+    """Only Scim.body is a coroutine, and it reaches the database only through app.db.database."""
+    from app import governance_audit, scim, security_profiles, spend_limits
+    for service in (governance_audit.GovernanceAudit, security_profiles.SecurityProfiles, spend_limits.SpendLimits,
+                    scim.Scim):
+        coroutines = {name for name, method in inspect.getmembers(service, inspect.isfunction)
+                      if inspect.iscoroutinefunction(method)}
+        assert coroutines == ({'body'} if service is scim.Scim else set()), service
+    tree = ast.parse(textwrap.dedent(inspect.getsource(scim.Scim.body)))
+    awaited = [node.value for node in ast.walk(tree) if isinstance(node, ast.Await)]
+    assert [call.func.id for call in awaited if isinstance(call, ast.Call) and isinstance(call.func, ast.Name)] == [
+        'database']
+    for module in (security_profiles, spend_limits):
+        assert module.actor_label is enterprise_roles.actor_label

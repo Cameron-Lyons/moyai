@@ -5,6 +5,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from unittest.mock import AsyncMock
 from urllib.parse import urlsplit, urlunsplit
 from uuid import uuid4
 
@@ -62,9 +63,27 @@ def configured(env):
     return config
 
 
-def test_legacy_default_and_standalone_remain_usable_without_product_sources(tmp_path):
-    assert select_core({}) == "legacy"
-    assert load_product_config({"MOYAI_DATABASE_URL": "invalid"}) is None
+def test_worker_versions_share_a_contract_but_require_explicit_adoption(environment):
+    from app.native_contract import core_contract
+
+    unversioned = core_contract(configured(environment).legacy_settings())
+    environment.update(MOYAI_WORKER_DEPLOYMENT="moyai-release", MOYAI_WORKER_BUILD_ID="blue")
+    blue = configured(environment)
+    native = Settings(_env_file=None, **blue.native_overrides())
+    assert (native.worker_deployment, native.worker_build_id) == ("moyai-release", "blue")
+    blue_contract = core_contract(blue.legacy_settings())
+    environment["MOYAI_WORKER_BUILD_ID"] = "green"
+    green_contract = core_contract(configured(environment).legacy_settings())
+    assert blue_contract == green_contract
+    assert blue_contract != unversioned
+    environment["MOYAI_WORKER_DEPLOYMENT"] = "different-fleet"
+    assert core_contract(configured(environment).legacy_settings()) != blue_contract
+
+
+def test_pydantic_default_and_standalone_remain_usable_without_product_sources(tmp_path):
+    assert select_core({}) == "pydantic"
+    with pytest.raises(ProductConfigurationError):
+        load_product_config({"MOYAI_DATABASE_URL": "invalid"})
     standalone = configured({"MOYAI_CORE": "pydantic"})
     assert standalone.product_mode == "standalone"
     assert standalone.native_schema_mode == "bootstrap"
@@ -283,55 +302,59 @@ def test_native_product_extra_imports_real_product_modules_without_old_agent_sdk
     assert json.loads(result.stdout) == versions
 
 
-def test_root_selector_preserves_legacy_and_uses_separate_native_interpreter(monkeypatch):
+def test_root_selector_uses_one_interpreter_and_rejects_retired_engines(monkeypatch):
     import docker_start
 
     monkeypatch.setattr(os, "environ", {"PORT": "12345"})
-    legacy = docker_start.server_command()
-    assert legacy[0] == sys.executable and "app.main:app" in legacy
+    default = docker_start.server_command()
+    assert default[:4] == [sys.executable, "-m", "moyai.product_start", "serve"]
     monkeypatch.setenv("MOYAI_CORE", "pydantic")
     native = docker_start.server_command()
-    assert native[:4] == [str(ROOT / "native/.venv/bin/python"), "-m", "moyai.product_start", "serve"]
+    assert native[:4] == [sys.executable, "-m", "moyai.product_start", "serve"]
     assert native[-1] == "12345"
     monkeypatch.setenv("RENDER_SERVICE_ID", "synthetic")
     rendered = docker_start.server_command()
-    assert rendered[0] == str(ROOT / "native/.venv/bin/python")
+    assert rendered[0] == sys.executable
     assert Path(rendered[1]).resolve() == ROOT / "render_start.py"
     monkeypatch.setenv("MOYAI_CORE", "typo")
     with pytest.raises(ValueError):
         docker_start.server_command()
 
 
-def test_missing_native_environment_never_falls_back_to_legacy(monkeypatch, tmp_path):
+@pytest.mark.parametrize("core", ["legacy", "typo", ""])
+def test_retired_core_never_falls_back(monkeypatch, core):
     import docker_start
-
-    monkeypatch.setattr(docker_start, "__file__", str(tmp_path / "docker_start.py"))
-    monkeypatch.setattr(os, "environ", {"MOYAI_CORE": "pydantic"})
-    with pytest.raises(RuntimeError, match="locked native interpreter"):
+    monkeypatch.setattr(os, "environ", {"MOYAI_CORE": core})
+    with pytest.raises(ValueError, match="Only MOYAI_CORE=pydantic"):
         docker_start.server_command()
+    with pytest.raises(ProductConfigurationError, match="Only MOYAI_CORE=pydantic"):
+        load_product_config()
 
 
-def test_render_native_selection_does_not_call_legacy_bootstrap(environment, monkeypatch):
+@pytest.mark.parametrize("control_socket", [None, "", "/tmp/moyai-release/control.sock"])
+def test_render_starts_the_selected_product_role(environment, monkeypatch, control_socket):
     from types import SimpleNamespace
-    from unittest.mock import AsyncMock
 
-    import docker_start
     import render_start
 
     from moyai import product_start
 
     monkeypatch.setattr(os, "environ", {**environment, "RENDER_MIGRATION_STAGE": "false",
+                                      **({"MOYAI_ROLE_CONTROL_SOCKET": control_socket} if control_socket is not None else {}),
                                       "MOYAI_PUBLIC_URL": "https://synthetic.example.test"})
-    monkeypatch.setattr(docker_start, "ensure_selected_interpreter", lambda: None)
-    bootstrap = AsyncMock()
-    monkeypatch.setattr(render_start, "bootstrap", bootstrap)
     application = SimpleNamespace(state=SimpleNamespace(product_lifecycle=None))
     calls = []
-    monkeypatch.setattr(product_start, "create_application", lambda *a, **kw: application)
+    def create(config, **kwargs):
+        assert config.role == "api"
+        selected = render_start.ROLE_CONTROL_SOCKET if control_socket is None else control_socket
+        assert kwargs == {"host": "0.0.0.0", "control_socket": Path(selected) if selected else None}
+        return application
+    monkeypatch.setattr(product_start, "create_application", create)
 
     class Server:
         def __init__(self, config, **kwargs):
             assert config.app is application
+            assert config.timeout_graceful_shutdown == 240
             calls.append("native")
 
         def run(self):
@@ -340,7 +363,61 @@ def test_render_native_selection_does_not_call_legacy_bootstrap(environment, mon
     monkeypatch.setattr(render_start, "RenderOverlapServer", Server)
     render_start.main()
     assert calls == ["native", "served"]
-    bootstrap.assert_not_awaited()
+
+
+@pytest.mark.parametrize("invalid_socket", [True, False])
+async def test_control_socket_binds_before_role_admission_and_closes_after_drain(
+    environment, monkeypatch, invalid_socket,
+):
+    import tempfile
+    from contextlib import asynccontextmanager
+    from types import SimpleNamespace
+
+    from fastapi import FastAPI
+
+    from moyai import api, product_lifecycle, product_start
+
+    config = configured({**environment, "MOYAI_RUNTIME_ROLE": "worker"})
+    events = []
+    with tempfile.TemporaryDirectory(prefix="moyai-start-") as directory:
+        path = Path("relative.sock") if invalid_socket else Path(directory) / "control.sock"
+
+        async def start():
+            events.append("runtime-start")
+
+        async def close():
+            assert not path.exists()
+            events.append("runtime-close")
+
+        runtime = SimpleNamespace(
+            product_config=config, product=SimpleNamespace(),
+            start=start, close=close,
+        )
+
+        @asynccontextmanager
+        async def role_lifespan(self):
+            assert path.exists()
+            events.append("worker-polling")
+            try:
+                yield
+            finally:
+                assert path.exists()
+                events.append("role-drained")
+
+        monkeypatch.setattr(product_start, "_runtime", lambda _: runtime)
+        monkeypatch.setattr(product_start, "verify_product_schema", lambda _: None)
+        monkeypatch.setattr(api, "create_app", lambda *a, **kw: FastAPI())
+        monkeypatch.setattr(product_lifecycle.ProductRoleLifecycle, "lifespan", role_lifespan)
+        app = product_start.create_application(config, control_socket=path)
+        if invalid_socket:
+            with pytest.raises(ValueError, match="absolute"):
+                async with app.router.lifespan_context(app):
+                    pytest.fail("An invalid control socket must not start the application.")
+            assert events == ["runtime-start", "runtime-close"]
+        else:
+            async with app.router.lifespan_context(app):
+                assert events == ["runtime-start", "worker-polling"]
+            assert events == ["runtime-start", "worker-polling", "role-drained", "runtime-close"]
 
 
 @pytest.mark.parametrize("command", ["user", "dev", "serve", "worker"])
@@ -390,7 +467,6 @@ async def test_cli_dev_uses_effective_native_settings_and_creates_only_its_local
     from argparse import Namespace
     from contextlib import asynccontextmanager
     from types import SimpleNamespace
-    from unittest.mock import AsyncMock
 
     from fastapi import FastAPI
 
@@ -538,3 +614,15 @@ async def test_explicit_native_provision_and_verify_use_real_postgres_stores(iso
         assert connection.execute(
             "SELECT to_regclass(%s)", (f"{config.native_schema}.agent_memory",),
         ).fetchone()[0] is None
+
+
+def test_native_organization_namespaces_are_scoped_and_idempotent(environment):
+    from app.organization_scope import scoped_name, scoped_prefix
+    env = {**environment, 'MOYAI_ORGANIZATION_ID': 'acme'}
+    config = load_product_config(env)
+    assert config.native_task_queue == scoped_name(environment['MOYAI_NATIVE_TASK_QUEUE'], 'acme', 200)
+    assert config.native_object_prefix == scoped_prefix(environment['MOYAI_NATIVE_OBJECT_PREFIX'], 'acme')
+    second = load_product_config({**env, 'MOYAI_NATIVE_TASK_QUEUE': config.native_task_queue,
+                                  'MOYAI_NATIVE_OBJECT_PREFIX': config.native_object_prefix})
+    assert second.native_task_queue == config.native_task_queue
+    assert second.native_object_prefix == config.native_object_prefix

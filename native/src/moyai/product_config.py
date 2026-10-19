@@ -33,11 +33,11 @@ class ProductConfigurationError(ValueError):
     """Safe operator-facing error; never includes configuration values."""
 
 
-def select_core(environment: Mapping[str, str] | None = None) -> Literal["legacy", "pydantic"]:
+def select_core(environment: Mapping[str, str] | None = None) -> Literal["pydantic"]:
     env = os.environ if environment is None else environment
-    value = env.get("MOYAI_CORE", "legacy").strip()
-    if value not in {"legacy", "pydantic"}:
-        raise ProductConfigurationError("MOYAI_CORE must be legacy or pydantic.")
+    value = env.get("MOYAI_CORE", "pydantic").strip()
+    if value != "pydantic":
+        raise ProductConfigurationError("Only MOYAI_CORE=pydantic is supported; retired engines require an earlier image.")
     return value  # type: ignore[return-value]
 
 
@@ -139,6 +139,13 @@ class ProductConfig:
                 temporal_namespace=source.temporal_namespace,
                 temporal_api_key=SecretStr(source.temporal_api_key),
                 temporal_tls=source.temporal_tls,
+                database_pool_size=source.moyai_database_pool_size,
+                temporal_worker_activities=source.temporal_worker_activities,
+                temporal_workflow_cache_size=source.temporal_workflow_cache_size,
+                temporal_dispatch_concurrency=source.temporal_dispatch_concurrency,
+                temporal_dispatch_batch_size=source.temporal_dispatch_batch_size,
+                worker_deployment=source.moyai_worker_deployment,
+                worker_build_id=source.moyai_worker_build_id,
                 public_url=source.public_url,
                 secure_cookies=urlsplit(source.public_url).scheme == "https",
                 gateway_url=source.litellm_api_base,
@@ -154,15 +161,24 @@ class ProductConfig:
                 artifact_access_key_id=SecretStr(source.object_storage_access_key_id),
                 artifact_secret_access_key=SecretStr(source.object_storage_secret_access_key),
                 artifact_session_token=SecretStr(source.object_storage_session_token),
+                sandbox_provider=source.sandbox_provider,
+                lambda_region=source.lambda_region,
+                lambda_profile=source.lambda_profile,
+                lambda_image=source.lambda_image,
+                lambda_image_version=source.lambda_image_version,
+                lambda_checkpoint_bucket=source.lambda_checkpoint_bucket,
+                lambda_checkpoint_prefix=source.lambda_checkpoint_prefix,
+                lambda_execution_role_arn=source.lambda_execution_role_arn,
+                lambda_egress_connector=source.lambda_egress_connector,
+                lambda_checkpoint_timeout=source.snapshot_timeout_seconds,
             )
         return result
 
 
-def load_product_config(environment: Mapping[str, str] | None = None) -> ProductConfig | None:
-    """Legacy is the default. Existing mode is explicit and fails closed."""
+def load_product_config(environment: Mapping[str, str] | None = None) -> ProductConfig:
+    """One execution core; existing identity/storage stays explicit and fails closed."""
     env = dict(os.environ if environment is None else environment)
-    if select_core(env) == "legacy":
-        return None
+    select_core(env)
     mode = env.get("MOYAI_PRODUCT_MODE", "standalone")
     if mode not in {"standalone", "existing"}:
         raise ProductConfigurationError("MOYAI_PRODUCT_MODE must be standalone or existing.")
@@ -187,10 +203,21 @@ def load_product_config(environment: Mapping[str, str] | None = None) -> Product
             raise ProductConfigurationError(
                 "Select an explicit product mode; existing product schema settings cannot bootstrap standalone."
             )
+        native_schema = env.get("MOYAI_NATIVE_DATABASE_SCHEMA", "")
+        schema_mode = env.get("MOYAI_NATIVE_SCHEMA_MODE", "bootstrap")
+        if schema_mode not in {"bootstrap", "verify"}:
+            raise ProductConfigurationError("Standalone schema mode must be bootstrap or verify.")
+        if native_schema and (
+            not re.fullmatch(r"[a-z][a-z0-9_]{0,62}", native_schema)
+            or native_schema in {"public", "information_schema"} or native_schema.startswith("pg_")
+        ):
+            raise ProductConfigurationError("Select a dedicated native PostgreSQL schema.")
+        if schema_mode == "verify" and (not native_schema or not env.get("MOYAI_DATABASE_URL")):
+            raise ProductConfigurationError("Standalone schema verification requires PostgreSQL and its native schema.")
         return ProductConfig(
             product_mode="standalone", role="standalone",
             database_url=env.get("MOYAI_DATABASE_URL", ""), product_schema=None,
-            native_schema=None, native_schema_mode="bootstrap",
+            native_schema=native_schema or None, native_schema_mode=cast(Literal["bootstrap", "verify"], schema_mode),
             native_encryption_key=SecretStr(env.get("ENCRYPTION_KEY", "")),
             native_task_queue=env.get("TEMPORAL_TASK_QUEUE", "moyai-pydantic-v1"),
             native_key_format=NATIVE_KEY_FORMAT, native_object_prefix="moyai",
@@ -252,6 +279,12 @@ def load_product_config(environment: Mapping[str, str] | None = None) -> Product
     }:
         raise ProductConfigurationError("MOYAI_NATIVE_TASK_QUEUE must be separate from both legacy queues.")
     source = _source_settings(env)
+    if source.moyai_organization_id:
+        from app.organization_scope import scoped_name, scoped_prefix
+        queue = scoped_name(queue, source.moyai_organization_id, 200)
+        prefix = scoped_prefix(prefix, source.moyai_organization_id)
+        if len(prefix) > 200:
+            raise ProductConfigurationError('Native object prefix is too long after organization scoping.')
     try:
         origin = urlsplit(source.public_url)
         valid_origin = (

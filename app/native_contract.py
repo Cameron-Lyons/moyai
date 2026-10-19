@@ -9,7 +9,8 @@ import hashlib
 import re
 
 CORE_IDENTITY = "pydantic-v1"
-NATIVE_PROTOCOL_REVISION = 1
+# Interactive delegation tools and their admission schema require coordinated owners.
+NATIVE_PROTOCOL_REVISION = 5
 FRAMEWORK_VERSIONS = {
     "pydantic-ai": "2.55.0",
     "pydantic-ai-harness": "0.55.0",
@@ -35,7 +36,7 @@ def core_contract(settings):
         or settings.moyai_native_object_format != "fernet-hmac-sha256-v1"
     ):
         raise ValueError("The native execution/storage contract is incomplete or incompatible.")
-    return {
+    contract = {
         "core": CORE_IDENTITY,
         "protocol": NATIVE_PROTOCOL_REVISION,
         "frameworks": dict(FRAMEWORK_VERSIONS),
@@ -45,3 +46,11 @@ def core_contract(settings):
         "object_format": settings.moyai_native_object_format,
         "object_prefix": prefix,
     }
+    deployment = getattr(settings, "moyai_worker_deployment", "")
+    if deployment:
+        # The fleet identity and handoff protocol must agree across roles.
+        # Build IDs intentionally differ during a reviewed release overlap.
+        contract["worker_deployment"] = {
+            "name": deployment, "protocol": "moyai-deployment-checkpoint-v1",
+        }
+    return contract

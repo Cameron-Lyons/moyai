@@ -19,6 +19,8 @@ class RoleEdit(BaseModel):
     email: str = Field(min_length=3, max_length=254)
     role: Literal["admin", "member"]
     revision: int = Field(ge=0)
+    replace_custom_role: bool = False
+    access_revision: int | None = Field(default=None, ge=0)
 
 
 async def password_login(runtime: Runtime, password: str, request: Request, response: Response):
@@ -50,7 +52,8 @@ def routes(runtime: Runtime, actor) -> APIRouter:
 
     @router.get("/api/settings/users")
     async def users(user: User = Depends(actor)):
-        if user.role != "admin":
+        from .product_governance import permission_for_user
+        if not permission_for_user(user, 'users.read'):
             raise HTTPException(403, "An organization administrator must perform this action.")
         directory = await asyncio.to_thread(product.roles.directory)
         return {
@@ -67,7 +70,8 @@ def routes(runtime: Runtime, actor) -> APIRouter:
 
     @router.put("/api/settings/users/role")
     async def role(body: RoleEdit, request: Request, user: User = Depends(actor)):
-        if user.role != "admin":
+        from .product_governance import permission_for_user
+        if not permission_for_user(user, 'users.manage'):
             raise HTTPException(403, "An organization administrator must perform this action.")
         from app.user_roles import RoleChange
         # Reuse the product's optimistic revision, last-admin protection, audit,

@@ -69,14 +69,57 @@ def integration_model(scenario: str, *, gates: tuple[asyncio.Event, asyncio.Even
             part.tool_name for message in messages for part in message.parts
             if isinstance(part, ToolReturnPart)
         }
-        if scenario == "question":
+        if scenario == "history_retry":
+            return ModelResponse(parts=[ToolCallPart(
+                "retry_target", {}, tool_call_id=f"retry-{len(messages)}",
+            )])
+        if scenario == "history":
+            if "NEW GUIDANCE" in prompts:
+                return ModelResponse(parts=[TextPart("Guidance preserved after handoff.")])
+            if "load_capability" not in completed:
+                loader = next(tool for tool in info.function_tools if tool.name == "load_capability")
+                key = next(iter(loader.parameters_json_schema["properties"]))
+                return ModelResponse(parts=[ToolCallPart(
+                    "load_capability", {key: "coding"}, tool_call_id="history-load",
+                )])
+            count = sum(
+                isinstance(part, ToolReturnPart) and part.tool_name == "shell"
+                for message in messages for part in message.parts
+            )
+            if count < 6:
+                return ModelResponse(parts=[ToolCallPart(
+                    "shell", {"command": f"printf '{count + 1}\\n' >> handoff-ledger.txt"},
+                    tool_call_id=f"history-append-{count + 1}",
+                )])
+            return ModelResponse(parts=[TextPart("Six effects completed exactly once.")])
+        if scenario == "swarm":
+            offered = {tool.name for tool in info.function_tools}
+            assert {"swarm_board", "swarm_claim_lead", "swarm_publish", "swarm_assign"} <= offered
+            assert "delegate_task" not in offered
+            board = next((
+                part.content for message in messages for part in message.parts
+                if isinstance(part, ToolReturnPart) and part.tool_name == "swarm_board"
+            ), None)
+            if board is None:
+                calls = [("swarm_board", {})]
+            elif not board["you"]["coordinator"]:
+                calls = [
+                    ("swarm_claim_lead", {"plan": "Coordinate the independent checks."}),
+                    ("swarm_publish", {"message": "Observed and verified the native test result."}),
+                ]
+            else:
+                calls = []
+        elif scenario in {"question", "optional_question"}:
             calls = [("ask_user_question", {
                 "questions": [{
                     "header": "Choice", "question": "Which output should I create?",
                     "options": [{"label": "Text"}, {"label": "JSON"}],
-                }]
+                }],
+                **({"required": False} if scenario == "optional_question" else {}),
             })]
-        elif scenario == "tools":
+        elif scenario == "stream":
+            calls = [("delegate_task", {"agent_name": "self", "task": "Return the phrase native-child-result."})]
+        elif scenario in {"tools", "workspace"}:
             loader = next(tool for tool in info.function_tools if tool.name == "load_capability")
             loader_key = next(iter(loader.parameters_json_schema["properties"]))
             calls = [
@@ -87,6 +130,9 @@ def integration_model(scenario: str, *, gates: tuple[asyncio.Event, asyncio.Even
                 ("write_memory", {"content": "The native capability proof succeeded."}),
                 ("delegate_task", {"agent_name": "self", "task": "Return the phrase native-child-result."}),
             ]
+            if scenario == "workspace":
+                calls = [(name, arguments) for name, arguments in calls
+                         if name in {"load_capability", "write_file", "save_artifact", "delegate_task"}]
         elif scenario == "stop":
             calls = [("shell", {
                 "command": "printf started > started.txt; sleep 30; printf finished > forbidden.txt",

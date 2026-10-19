@@ -4,24 +4,37 @@ import re
 
 from .file_links import file_link
 
-# Literal examples are context, not recipients. Preserve them in the prompt.
-# re.M anchors quote prefixes; \Z keeps fences open across line endings.
-QUOTED_TEXT = re.compile(r'```[\s\S]*?(?:```|\Z)|`[^`\n]*(?:`|$)|^[ \t]*>>>[\s\S]*|^[ \t]*>[^\n]*', re.MULTILINE)
+ID = re.compile(r"^[A-Z][A-Z0-9]{7,30}$")
+STAMP = re.compile(r"^\d{10,16}\.\d{1,9}$")
+ASIDE_PREFIXES = ("!aside", "(aside)")
+CODE_SPAN = re.compile(r'(`[^`\n]+`)')
+FENCED_CODE = re.compile(r'(```[\s\S]*?(?:```|\Z))')
 
 
-def routing_text(text: str, mention: str) -> tuple[str, str]:
-    parts, visible = [], []
-    end = 0
-    for match in QUOTED_TEXT.finditer(text):
-        plain = text[end:match.start()]
-        visible.append(plain)
-        parts.extend((plain.replace(mention, ''), match[0]))
-        visible.append('\n')
-        end = match.end()
-    plain = text[end:]
-    visible.append(plain)
-    parts.append(plain.replace(mention, ''))
-    return ''.join(visible), ''.join(parts).strip()
+def slack_markdown_blocks(text):
+    """Adapt block syntax before inline formatting, leaving code bodies literal."""
+    pieces = FENCED_CODE.split(text)
+    for index, piece in enumerate(pieces):
+        if index % 2:
+            # mrkdwn has no fence info string; Slack displays it as code.
+            pieces[index] = re.sub(r'\A```[^`\r\n]*\r?\n', '```\n', piece, count=1)
+            continue
+
+        def heading(match):
+            # Format the complete heading, including inline code. Avoid nested
+            # bold delimiters when the model also emphasizes heading words.
+            spans = CODE_SPAN.split(match[1].strip())
+            markers = [
+                (span_index, marker.start())
+                for span_index in range(0, len(spans), 2)
+                for marker in re.finditer(r'\*\*', spans[span_index])
+            ]
+            for span_index, offset in reversed(markers[:len(markers) // 2 * 2]):
+                spans[span_index] = spans[span_index][:offset] + spans[span_index][offset + 2:]
+            return '*' + ''.join(spans) + '*'
+
+        pieces[index] = re.sub(r'^#{1,6}[ \t]+(\S[^\r\n]*)', heading, piece, flags=re.MULTILINE)
+    return ''.join(pieces)
 
 
 def slack_text(text, mentions=frozenset(), *, public_url='', run_id=''):
@@ -30,7 +43,7 @@ def slack_text(text, mentions=frozenset(), *, public_url='', run_id=''):
     Only user IDs in ``mentions`` (already mentioned by people in the thread)
     may render as mentions; broadcasts and every other ID stay literal text.
     """
-    text = html.escape(text, quote=False)
+    text = slack_markdown_blocks(html.escape(text, quote=False))
     def mention(match):
         return f'<@{match[1]}>' if match[1] in mentions else match[0]
     def link(match):
@@ -44,12 +57,19 @@ def slack_text(text, mentions=frozenset(), *, public_url='', run_id=''):
             return label
         return '<' + url + '|' + label.replace('|', '¦') + '>'
     # Preserve fenced examples; standalone inline Markdown filenames are links.
-    pieces = re.split(r'(```[\s\S]*?```|`[^`\n]+`)', text)
+    pieces = re.split(r'(```[\s\S]*?(?:```|\Z)|`[^`\n]+`)', text)
     for i in range(0, len(pieces), 2):
         value = re.sub(r'!?\[([^\]\n]+)\]\(([^\s)<>]+)\)', link, pieces[i])
         value = re.sub(r'&lt;@([UW][A-Z0-9]{7,30})&gt;', mention, value)
-        value = re.sub(r'^#{1,6}\s+(.+)$', r'*\1*', value, flags=re.MULTILINE)
-        pieces[i] = re.sub(r'\*\*(.+?)\*\*', r'*\1*', value)
+        pieces[i] = value
+    markers = [
+        (index, match.start())
+        for index in range(0, len(pieces), 2)
+        for match in re.finditer(r'\*\*', pieces[index])
+    ]
+    paired_markers = markers[: len(markers) // 2 * 2]
+    for index, offset in sorted(paired_markers, reverse=True):
+        pieces[index] = pieces[index][:offset] + '*' + pieces[index][offset + 2 :]
     for i in range(1, len(pieces), 2):
         if pieces[i].startswith('```'):
             continue

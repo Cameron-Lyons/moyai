@@ -341,6 +341,8 @@ class ProductContinuationService:
             FROM {self.table('messages')} WHERE run_id=:id AND role IN ('user','assistant') AND status!='deleted'
             ORDER BY COALESCE(NULLIF(started_at,''),created_at) DESC,id DESC LIMIT :limit
         """), {"id": source_id, "chars": MAX_HISTORY_BYTES, "limit": MAX_HISTORY_MESSAGES})).mappings()]
+        if self.history.decorate_messages is not None:
+            await self.history.decorate_messages(db, principal, source_id, rows)
         chosen, total = [], 0
         for row in rows:
             size = len(row["content"].encode())
@@ -456,6 +458,7 @@ class ProductContinuationService:
 
     async def continue_session(
         self, principal: ProductPrincipal, actor: User, source_id: str, request: ContinuationRequest,
+        *, received_at: str | None = None,
     ) -> dict[str, Any]:
         async with self.runtime.database.sessions.begin() as db:
             return await self.continue_for_admission(
@@ -464,6 +467,7 @@ class ProductContinuationService:
                 accept_recent_history=request.accept_recent_history,
                 accept_workspace_omissions=request.accept_workspace_omissions,
                 drain_idle_workspace=request.drain_idle_workspace,
+                received_at=received_at,
             )
 
     async def continue_for_admission(
@@ -471,6 +475,7 @@ class ProductContinuationService:
         surface: str, provenance: dict[str, Any], expected_source_fingerprint: str | None = None,
         accept_recent_history: bool = False, accept_workspace_omissions: bool = False,
         drain_idle_workspace: bool = False,
+        received_at: str | None = None,
     ) -> dict[str, Any]:
         if actor.id != principal.id or not db.in_transaction() or db.get_bind().dialect.name != "postgresql":
             raise HTTPException(403, "Continuation needs the same canonical requester and PostgreSQL admission.")
@@ -483,7 +488,9 @@ class ProductContinuationService:
         setattr(actor, "product_grant", principal.grant)  # noqa: B010 -- transient authenticated projection
         binding = await self.lookup(db, source_id, current)
         if binding is not None:
-            turn = await self.runtime.database.submit(actor, binding.native_session_id, body, db=db)
+            turn = await self.runtime.database.submit(
+                actor, binding.native_session_id, body, db=db, received_at=received_at,
+            )
             return self.result(binding, turn.id)
         inspected = await self._inspect(db, source_id, current, lock=True)
         if inspected["blockers"]:
@@ -527,7 +534,17 @@ class ProductContinuationService:
             created_at=root["created_at"], updated_at=now(),
         )
         db.add(target)
+        governance = getattr(self.runtime.database, 'governance', None)
+        if governance is not None:
+            from app.security_profiles import load_policy
+            saved_policy = root.get('security_policy')
+            await governance.bind(db, target, current, ceiling=load_policy(saved_policy) if saved_policy else None)
         await db.flush()
+        if target_surface == "slack":
+            slack = self.runtime.product_slack
+            if slack is None:
+                raise HTTPException(503, "Slack must be connected before continuing this conversation.")
+            await slack.events.conversations.bind_history(db, target, source_id, actor, provenance)
         grants = await self.runtime.database.resolve_grants(
             db, actor.id, body.connections, shared_session=visibility == "shared", surface=target_surface,
         )
@@ -548,7 +565,7 @@ class ProductContinuationService:
                 db.add(SessionFolder(user_id=actor.id, name=metadata["folder"]))
         db.add(SessionPreference(user_id=actor.id, session_id=target.id,
                                  pinned=bool(metadata["pinned"]), folder=metadata["folder"] or ""))
-        turn = await self.runtime.database.submit(actor, target.id, body, db=db)
+        turn = await self.runtime.database.submit(actor, target.id, body, db=db, received_at=received_at)
         await self.workspace.bind_automation_turn(db, target, turn, context)
         # Invalidate old broker capabilities before publishing the immutable
         # mapping. The trigger then refuses every later source admission/write.

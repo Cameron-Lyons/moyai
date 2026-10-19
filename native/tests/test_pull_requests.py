@@ -102,7 +102,7 @@ def test_outgoing_links_reject_any_userinfo_even_empty_username(userinfo):
 async def test_status_batch_acl_public_messages_links_and_no_private_context(runtime, actor):
     session = await runtime.database.create_session(actor, NewSession())
     other = await teammate(runtime)
-    private = await runtime.database.create_session(other, NewSession())
+    private = await runtime.database.create_session(other, NewSession(visibility="private"))
     turn = await runtime.database.submit(actor, session.id, NewMessage(
         prompt=URL, request_key="public-pr",
     ))
@@ -170,8 +170,35 @@ async def test_link_discovery_updates_without_updated_at_and_deduplicates_across
     assert len(calls) == 1
 
 
+async def test_delegated_pr_contexts_are_batched_and_keep_shared_account_restrictions(runtime, actor):
+    from moyai.delegation import DelegationService
+
+    await add_connection(runtime, actor)
+    parent = await runtime.database.create_session(actor, NewSession(visibility="shared"))
+    turn = await runtime.database.submit(actor, parent.id, NewMessage(prompt="Delegate", request_key="parent"))
+    await runtime.database.claim_next()
+    prepared = await runtime.database.prepare(turn.id)
+    children = [
+        await DelegationService(runtime.database).start(prepared.scope, str(i), "Shared task")
+        for i in range(3)
+    ]
+    statements = []
+
+    def track(_conn, _cursor, statement, _parameters, _context, _many):
+        statements.append(statement)
+
+    event.listen(runtime.database.engine.sync_engine, "before_cursor_execute", track)
+    try:
+        scopes = await PullRequestService(runtime).contexts(actor, [child["session_id"] for child in children])
+    finally:
+        event.remove(runtime.database.engine.sync_engine, "before_cursor_execute", track)
+    assert len(scopes) == 3
+    assert all(scope.credentials == () for scope in scopes.values())
+    assert len(statements) == 3  # Actor, joined session/authority, connection batch.
+
+
 async def test_available_connections_shared_session_rules_and_rotation(runtime, actor):
-    private = await runtime.database.create_session(actor, NewSession())
+    private = await runtime.database.create_session(actor, NewSession(visibility="private"))
     shared = await runtime.database.create_session(actor, NewSession(visibility="shared"))
     other = await teammate(runtime)
     await add_connection(runtime, other)  # Never usable by this actor.
@@ -205,7 +232,7 @@ async def test_available_connections_shared_session_rules_and_rotation(runtime, 
 async def test_ineligible_credentials_are_never_sent(runtime, actor, restriction):
     owner = await teammate(runtime) if restriction == "other_user" else actor
     connection = await add_connection(runtime, owner)
-    session = await runtime.database.create_session(actor, NewSession())
+    session = await runtime.database.create_session(actor, NewSession(visibility="private"))
     async with runtime.database.sessions.begin() as db:
         if restriction == "policy":
             (await db.get(Connection, connection.id)).policy = '{"allowed_tools":["search_code"]}'
@@ -223,7 +250,7 @@ async def test_ineligible_credentials_are_never_sent(runtime, actor, restriction
 
 @pytest.mark.parametrize("revoke", ["connection", "session", "user"])
 async def test_access_revoked_during_request_never_returns_old_private_response(runtime, actor, revoke):
-    session = await runtime.database.create_session(actor, NewSession())
+    session = await runtime.database.create_session(actor, NewSession(visibility="private"))
     connection = await add_connection(runtime, actor)
     entered, release = asyncio.Event(), asyncio.Event()
 
@@ -341,7 +368,7 @@ async def test_explicit_ttl_overrides_public_default(runtime, monkeypatch, ttl):
 async def test_authenticated_revalidation_does_not_repeat_anonymous_probe(runtime, actor, monkeypatch):
     clock = [0.0]
     monkeypatch.setattr(pull_requests, "time", SimpleNamespace(monotonic=lambda: clock[0]))
-    session = await runtime.database.create_session(actor, NewSession())
+    session = await runtime.database.create_session(actor, NewSession(visibility="private"))
     connection = await add_connection(runtime, actor)
     calls = []
 

@@ -9,15 +9,15 @@ import asyncio
 import hashlib
 import json
 import time
-from typing import TYPE_CHECKING, Literal
-from uuid import NAMESPACE_URL, uuid5
+from typing import TYPE_CHECKING, Any, Literal
 
 import modal
 from pydantic import BaseModel, ConfigDict, TypeAdapter, ValidationError
-from sqlalchemy import delete, select, update
+from sqlalchemy import select, update
 
 from .contracts import PreparedTurn, RunScope
 from .models import ComputerLease, ComputerOperation, Effect, Session, Turn, User
+from .performance import ComputerTiming, computer_timing
 from .product_continuation_errors import preparation_blocked
 
 if TYPE_CHECKING:
@@ -66,9 +66,15 @@ def pending_checkpoint(
 
 
 async def locked_scope(
-    database: Database, db: AsyncSession, scope: RunScope, *, status: str,
+    database: Database, db: AsyncSession, scope: RunScope, *, status: str | tuple[str, ...],
 ) -> tuple[Session, Turn]:
-    """Use the same source → actor → session lock order as turn admission."""
+    """Fence current authority and phases in source → actor → session lock order.
+
+    Operations valid across a lifecycle transition may admit multiple phases.
+    Check that set in the locking write, never against an earlier unlocked read.
+    Preparation and checkpoint publication still require their single phase.
+    """
+    statuses = (status,) if isinstance(status, str) else status
     turn = await db.get(Turn, scope.turn_id)
     if turn is None or turn.actor_id != scope.actor_id or turn.session_id != scope.session_id:
         raise PermissionError("The workspace task changed.")
@@ -80,7 +86,7 @@ async def locked_scope(
         raise PermissionError("The workspace requester no longer has access.")
     locked = await db.scalar(update(Session).where(
         Session.id == scope.session_id, Session.active_turn == scope.turn_id,
-        Session.status == status, Session.deleted.is_(False),
+        Session.status.in_(statuses), Session.deleted.is_(False),
     ).values(revision=Session.revision).returning(Session.id))
     if locked is None:
         raise PermissionError("The workspace task stopped or was superseded.")
@@ -88,15 +94,12 @@ async def locked_scope(
     await db.refresh(turn)
     assert session is not None
     if (
-        turn.status != status or session.visibility != scope.visibility
+        turn.status != session.status or session.visibility != scope.visibility
         or session.surface != scope.surface
         or (session.visibility == "private" and session.owner_id != scope.actor_id)
     ):
         raise PermissionError("The workspace authority changed.")
-    current = await database.resolve_grants(
-        db, scope.actor_id, [grant.id for grant in scope.grants],
-        shared_session=scope.visibility == "shared", surface=scope.surface,
-    )
+    current = await database.scope_grants(db, scope, session)
     if [(g.id, g.revision) for g in current] != [(g.id, g.revision) for g in scope.grants]:
         raise PermissionError("Workspace account access changed.")
     return session, turn
@@ -124,71 +127,6 @@ async def product_bindings(db: AsyncSession, scope: RunScope, reference: dict) -
         context.fingerprint if context else None,
         restoration.manifest_fingerprint if restoration else None,
     )
-
-
-async def save_checkpoint(runtime: Runtime, turn_id: str, reference: dict) -> bool:
-    """Return False for an older workflow, whose existing settlement stays valid."""
-    database = runtime.database
-    async with database.sessions() as db:
-        turn = await db.get(Turn, turn_id)
-        if turn is None or turn.preparation is None:
-            return False
-        prepared = TypeAdapter(PreparedTurn).validate_json(runtime.security.unseal(turn.preparation))
-        if not prepared.checkpoint_workspace:
-            return False
-    identity = str(uuid5(NAMESPACE_URL, "moyai-checkpoint:" + turn_id))
-    async with database.sessions.begin() as db:
-        session, turn = await locked_scope(database, db, prepared.scope, status="saving")
-        saved = checkpoint(session.snapshot)
-        if (
-            saved is None or saved.workspace != reference or saved.turn_id != turn_id
-            or saved.session_id != session.id or session.workspace_scope != prepared.scope.workspace_key
-            or saved.scope != prepared.scope.workspace_key
-            or saved.result_fingerprint != turn.result_fingerprint
-            or json.loads(session.workspace or "null") != reference
-        ):
-            raise PermissionError("The checkpoint source changed before capture.")
-        await require_settled(db, session.id)
-        if runtime.product is not None:
-            context, manifest = await product_bindings(db, prepared.scope, reference)
-            saved = saved.model_copy(update={"product_context": context, "restoration_manifest": manifest})
-            session.snapshot = saved.model_dump_json()
-        await db.execute(delete(ComputerOperation).where(ComputerOperation.session_id == session.id))
-        db.add(ComputerOperation(session_id=session.id, identity=identity, expires_at=int(time.time()) + 240))
-        expected, revision = session.snapshot, session.revision
-    try:
-        async with asyncio.timeout(150):
-            sandbox = await modal.Sandbox.from_id.aio(reference["id"])
-            if await sandbox.poll.aio() is not None:
-                raise preparation_blocked("workspace_checkpoint_missing")
-            # Keep the existing Modal image retention policy (30 days in the
-            # pinned SDK); a missing image is a refusal, never a blank fallback.
-            image = await sandbox.snapshot_filesystem.aio(timeout=120)
-        # A returned image is evidence, but publication still needs current
-        # authority and the exact source. Stop/revocation cannot resurrect it.
-        async with database.sessions.begin() as db:
-            session, turn = await locked_scope(database, db, prepared.scope, status="saving")
-            operation = await db.get(ComputerOperation, session.id)
-            if (
-                session.snapshot != expected or session.revision != revision
-                or json.loads(session.workspace or "null") != reference
-                or operation is None or operation.identity != identity
-                or operation.expires_at <= time.time()
-            ):
-                raise PermissionError("The computer changed while it was being saved.")
-            if runtime.product is not None and await product_bindings(db, prepared.scope, reference) != (
-                saved.product_context, saved.restoration_manifest,
-            ):
-                raise PermissionError("The computer's project context changed during capture.")
-            session.snapshot = saved.model_copy(update={"image_id": image.object_id}).model_dump_json()
-            database._settle_answer(turn, session)
-        return True
-    finally:
-        async with database.sessions.begin() as db:
-            await db.execute(delete(ComputerOperation).where(
-                ComputerOperation.session_id == prepared.scope.session_id,
-                ComputerOperation.identity == identity,
-            ))
 
 
 async def live_sandbox(reference: dict) -> bool:
@@ -275,8 +213,15 @@ async def preserve_restoration(db: AsyncSession, session_id: str, old_id: str, n
 
 async def prepare_workspace(runtime: Runtime, prepared: PreparedTurn) -> PreparedTurn:
     reference = prepared.workspace
-    if not reference or reference.get("provider") != "modal":
+    if not reference or reference.get("provider") not in {"modal", "lambda"}:
         return prepared
+    async with computer_timing(runtime.database, prepared.scope, "reuse", preparation=True) as timing:
+        return await _prepare_workspace(runtime, prepared, reference, timing)
+
+
+async def _prepare_workspace(
+    runtime: Runtime, prepared: PreparedTurn, reference: dict[str, Any], timing: ComputerTiming,
+) -> PreparedTurn:
     database, scope = runtime.database, prepared.scope
     await database.authorize_scope(scope)
     async with database.sessions.begin() as db:
@@ -285,9 +230,19 @@ async def prepare_workspace(runtime: Runtime, prepared: PreparedTurn) -> Prepare
             raise PermissionError("The computer changed before preparation.")
         preparation, revision = turn.preparation, session.revision
     async with asyncio.timeout(30):
-        alive = await live_sandbox(reference)
+        if reference["provider"] == "lambda":
+            from pydantic_ai.workspaces import WorkspaceUnavailableError
+
+            from .lambda_control import LambdaControl
+            try:
+                alive = await (await LambdaControl(runtime.settings).get(reference["id"])).alive()
+            except WorkspaceUnavailableError:
+                alive = False
+        else:
+            alive = await live_sandbox(reference)
     saved, expected = None, None
     if not alive:
+        timing.mode = "restore"
         async with database.sessions.begin() as db:
             session, _ = await locked_scope(database, db, scope, status="running")
             if json.loads(session.workspace or "null") != reference:
@@ -296,11 +251,19 @@ async def prepare_workspace(runtime: Runtime, prepared: PreparedTurn) -> Prepare
                 raise RuntimeError("Preparation changed before restore; retry the authorized preparation.")
             saved = await validate_checkpoint(database, db, session, scope, reference)
             expected = session.snapshot
-        async with asyncio.timeout(180):
-            sandbox = await restored_sandbox(runtime, scope, saved)
-            if await sandbox.poll.aio() is not None:
-                raise preparation_blocked("workspace_checkpoint_missing")
-        replacement = {"provider": "modal", "id": sandbox.object_id}
+        if reference["provider"] == "lambda":
+            from .lambda_control import LambdaControl
+            name = "native-restore:" + hashlib.sha256(
+                f"{scope.workspace_key}:{scope.turn_id}:{saved.image_id}:{reference['id']}".encode()
+            ).hexdigest()
+            restored = await LambdaControl(runtime.settings).create(name, checkpoint=saved.image_id)
+            replacement = {"provider": "lambda", "id": restored.id}
+        else:
+            async with asyncio.timeout(180):
+                sandbox = await restored_sandbox(runtime, scope, saved)
+                if await sandbox.poll.aio() is not None:
+                    raise preparation_blocked("workspace_checkpoint_missing")
+            replacement = {"provider": "modal", "id": sandbox.object_id}
     else:
         replacement = reference
     async with database.sessions.begin() as db:

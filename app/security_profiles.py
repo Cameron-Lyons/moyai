@@ -1,409 +1,668 @@
-"""Revisioned session policies and fail-closed broker/provider enforcement.
+"""Session security profiles and the organization default and mandatory profile.
 
-Policies constrain managed connected apps and GitHub operations. Domain egress
-is enforced by Substrate's actor policy, never by agent instructions. Session
-snapshots and every ancestor remain ceilings; the current organization floor
-can further restrict them. Network floor changes require releasing live VMs.
+A policy narrows what a session may use: connected_apps (managed connectors),
+tools (tool names offered to the agent), git_access and network_domains (the
+Modal outbound_domain_allowlist). For each list, null is unrestricted, [] allows
+nothing and a list allows only its entries. intersect() never widens: lists meet
+by intersection, git access takes the minimum and null is the identity.
+
+Domains are exact hostnames or '*.' plus a hostname. Modal matches TLS SNI on
+port 443: '*.example.com' covers example.com and every subdomain depth, and an
+exact entry covers only itself. Intersection and redundancy removal follow those
+semantics exactly. Hostnames are lowercase A-labels. Unicode input is converted
+with UTS #46 non-transitional (IDNA2008) mapping, the form clients send in SNI,
+never the stdlib IDNA 2003 codec, which rewrites 'straße.de' to 'strasse.de'.
+IP literals in any spelling, ports, schemes, paths, user names, single-label
+names and single-label wildcards such as '*.com' are rejected.
+
+Profiles are revisioned and never deleted. Disabling one keeps its revisions,
+so native session bindings (moyai_product_session_policies) stay auditable. This
+module keeps no legacy run lineage. A new session binds its profile intersected
+with the mandatory profile of that moment, so a later loosening of the mandatory
+profile never widens an existing session. Execution intersects the binding with
+the current mandatory profile again (effective()).
+
+Writers take the canonical exclusive writer lock and record exactly one
+governance audit event in the same transaction (profile id, name, revision and
+enabled state; never policy bodies). Routes enforce security.manage, and
+SecurityProfiles(store, roles=...) rechecks it inside each writer. Actors are
+GovernanceActor values (or anything enterprise_roles.actor_label accepts); the
+audit label is the same text the other governance writers record: the email,
+the shared sign-in name, or the id.
+
+Schema lives in the canonical initializers; keep the import alias below instead
+of defining initialize_schema here.
 """
 import ipaddress
 import json
 import re
-from typing import Literal
-from urllib.parse import urlsplit
+from collections.abc import Iterable, Mapping
+from typing import Annotated, Literal, NamedTuple
 from uuid import uuid4
 
-from fastapi import APIRouter, HTTPException, Request
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+import idna
+from fastapi import HTTPException
+from fastapi.exceptions import RequestValidationError
+from pydantic import AfterValidator, BaseModel, ConfigDict, Field, ValidationError, field_validator
+from pydantic_core import PydanticCustomError
 
-from .db import now
+from .enterprise_roles import actor_label
+from .governance_audit import initialize_schema as initialize_audit
+from .governance_audit import record_event_in, timestamp
+from .schema_initializers import initialize_security_profiles as initialize_schema
+
+CONNECTED_APPS = {'github': 'GitHub', 'linear': 'Linear', 'slack': 'Slack', 'notion': 'Notion'}
+GIT_LEVELS = {'none': 0, 'read': 1, 'write': 2}
+POLICY_FIELDS = frozenset({'connected_apps', 'tools', 'git_access', 'network_domains'})
+PROFILE_ID = re.compile(r'[0-9a-f]{32}')
+PROFILE_ID_PATTERN = r'^([0-9a-f]{32})?$'
+TOOL_NAME = re.compile(r'[a-z][a-z0-9_]{0,127}')
+MAX_DOMAINS = 200
+MAX_TOOLS = 500
+MAX_PROFILES = 500
+STALE = 'This changed elsewhere. Reload and try again.'
+
+_LABEL = re.compile(r'[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?')
+# WHATWG URL parsing and inet_aton read a name whose last label is a number as
+# IPv4 (127.1, 2130706433, 0x7f.1, 0177.0.0.1). No top-level domain is numeric.
+_NUMERIC_LABEL = re.compile(r'[0-9]+|0x[0-9a-f]*')
+_INVALID_HOST = 'Use valid DNS hostnames such as api.example.com.'
+_IP_HOST = 'Use DNS hostnames, not IP addresses.'
+
+
+class ProfileError(HTTPException):
+    """A refused security-profile operation. The detail is one fixed sentence."""
+    status = 409
+    message = 'This security policy change was refused.'
+
+    def __init__(self, detail: str | None = None):
+        super().__init__(self.status, detail or self.message)
+
+
+class StaleRevision(ProfileError):
+    message = STALE
+
+
+class ProfileNotFound(ProfileError):
+    status, message = 404, 'Security policy not found.'
+
+
+class ProfileInUse(ProfileError):
+    message = 'This policy is an organization default. Change the defaults first.'
+
+
+class DefaultsUnavailable(ProfileError):
+    message = 'Choose an enabled security policy.'
+
+
+class ProfileUnavailable(ProfileError):
+    message = 'This security policy is no longer available. Choose another policy.'
+
+
+class OrganizationPolicyUnavailable(ProfileError):
+    message = 'An organization security policy is unavailable. Ask an administrator to update the defaults.'
+
+
+class ProfileLimit(ProfileError):
+    message = f'At most {MAX_PROFILES} security policies are supported. Edit or re-enable an existing policy.'
+
+
+class CorruptPolicy(ProfileError):
+    message = 'A saved security policy is invalid. Restore it from a backup.'
+
+
+class InvalidPolicy(ValueError):
+    """Stored policy text is not a complete, valid policy document."""
+
+
+def _domain_error(message):
+    return PydanticCustomError('network_domain', message)
+
+
+def _ip_literal(value):
+    if '[' in value or ']' in value or value.count(':') > 1:
+        return True  # Bracketed or bare IPv6, with or without a port or zone.
+    try:
+        ipaddress.ip_address(value)
+    except ValueError:
+        return False
+    return True
+
+
+def _a_labels(name):
+    if not name.isascii():
+        try:
+            name = idna.encode(name, uts46=True, std3_rules=True, transitional=False).decode('ascii')
+        except (UnicodeError, ValueError):
+            raise _domain_error(_INVALID_HOST) from None
+    name = name.lower()
+    labels = name.split('.')
+    # Plain LDH labels are valid DNS names even where IDNA2008 forbids '--' in
+    # positions 3-4 (for example r3---sn-x.googlevideo.com); A-labels must be
+    # canonical Punycode so a fake 'xn--' spelling cannot alias another name.
+    if len(name) > 253 or not all(_LABEL.fullmatch(label) for label in labels):
+        raise _domain_error(_INVALID_HOST)
+    for label in labels:
+        if label.startswith('xn--'):
+            try:
+                idna.ulabel(label)
+            except (UnicodeError, ValueError):
+                raise _domain_error(_INVALID_HOST) from None
+    return name
+
+
+def normalize_domain(value: str) -> str:
+    """Return the canonical allowlist entry for one hostname or '*.' wildcard.
+
+    Raises PydanticCustomError (a ValueError) with a fixed sentence that never
+    echoes the input.
+    """
+    value = value.strip()
+    if not value:
+        raise _domain_error('Enter a hostname for each network domain.')
+    if len(value) > 255:
+        raise _domain_error(_INVALID_HOST)
+    if '://' in value:
+        raise _domain_error('Use hostnames without a scheme such as https://.')
+    if any(character in value for character in '/?#\\'):
+        raise _domain_error('Use hostnames without paths.')
+    if '@' in value:
+        raise _domain_error('Use hostnames without user names.')
+    if _ip_literal(value):
+        raise _domain_error(_IP_HOST)
+    if ':' in value:
+        raise _domain_error('Use hostnames without ports.')
+    wildcard = value.startswith('*.')
+    base = value[2:] if wildcard else value
+    if '*' in base:
+        raise _domain_error('Use one *. prefix only, such as *.example.com.')
+    host = _a_labels(base.removesuffix('.'))  # Drop one FQDN root dot.
+    if _ip_literal(host) or _NUMERIC_LABEL.fullmatch(host.rpartition('.')[2]):
+        raise _domain_error(_IP_HOST)
+    if '.' not in host:
+        raise _domain_error('Use a wildcard under a domain, such as *.example.com.' if wildcard
+                            else 'Use a full hostname such as api.example.com.')
+    return '*.' + host if wildcard else host
+
+
+def _base(entry):
+    return entry.removeprefix('*.')
+
+
+def _under(host, base):
+    return host == base or host.endswith('.' + base)
+
+
+def _covers(wildcard, entry):
+    """Whether a distinct wildcard matches every host the entry matches."""
+    return wildcard != entry and wildcard.startswith('*.') and _under(_base(entry), _base(wildcard))
+
+
+def reduce_domains(entries: Iterable[str]) -> tuple[str, ...]:
+    """Sorted, deduplicated entries without any entry another wildcard covers."""
+    entries = set(entries)
+    wildcards = [entry for entry in entries if entry.startswith('*.')]
+    return tuple(sorted(entry for entry in entries if not any(_covers(other, entry) for other in wildcards)))
+
+
+def _meet(first, second):
+    """The single entry matching exactly the hosts both entries match, or None."""
+    if first.startswith('*.') and second.startswith('*.'):
+        if _under(_base(first), _base(second)):
+            return first
+        return second if _under(_base(second), _base(first)) else None
+    if first.startswith('*.'):
+        first, second = second, first
+    if second.startswith('*.'):
+        return first if _under(first, _base(second)) else None
+    return first if first == second else None
+
+
+def intersect_domains(first: Iterable[str], second: Iterable[str]) -> tuple[str, ...]:
+    """Normalized entries matching exactly the hosts both normalized allowlists match."""
+    second = tuple(second)
+    return reduce_domains(entry for one in first for other in second if (entry := _meet(one, other)))
+
+
+def domain_allows(entries: Iterable[str] | None, host: str) -> bool:
+    """Whether a normalized allowlist (None is unrestricted) admits one lowercase A-label host."""
+    return entries is None or any(_under(host, _base(entry)) if entry.startswith('*.') else host == entry
+                                  for entry in entries)
+
+
+def _no_controls(value: str) -> str:
+    if any(ord(character) < 32 or ord(character) == 127 for character in value):
+        raise PydanticCustomError('name', 'Use a name without control characters.')
+    return value
+
+
+AppName = Literal['github', 'linear', 'slack', 'notion']
 
 
 class ProfilePolicy(BaseModel):
-    model_config = ConfigDict(extra='forbid')
-    network_domains: list[str] | None = None
-    connected_apps: list[Literal['github', 'linear', 'slack', 'notion']] | None = None
-    tools: list[str] | None = None
-    git_access: Literal['none', 'read', 'write'] = 'write'
+    """One policy: null is unrestricted, [] allows nothing, a list allows only its entries.
 
-    @field_validator('network_domains')
-    @classmethod
-    def domains(cls, values):
-        if values is None:
-            return None
-        if len(values) > 200:
-            raise ValueError('At most 200 domain names are supported.')
-        result = set()
-        for value in values:
-            host = value.strip().rstrip('.').lower().encode('idna').decode('ascii')
-            if len(host) > 253 or not re.fullmatch(r'[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?', host):
-                raise ValueError('Use exact DNS hostnames, without URLs, ports or wildcards.')
-            if any(not label or len(label) > 63 or label.startswith('-') or label.endswith('-') for label in host.split('.')):
-                raise ValueError('Invalid DNS hostname.')
-            try:
-                ipaddress.ip_address(host)
-            except ValueError:
-                pass
-            else:
-                raise ValueError('Use DNS hostnames, not IP addresses.')
-            result.add(host)
-        return sorted(result)
-
-    @field_validator('tools')
-    @classmethod
-    def tool_names(cls, values):
-        if values is not None and (len(values) > 500 or any(not re.fullmatch(r'[A-Za-z][A-Za-z0-9_]{0,99}', value) for value in values)):
-            raise ValueError('Use valid tool names.')
-        return sorted(set(values)) if values is not None else None
+    Values are canonical after validation (sorted, deduplicated tuples; domains
+    normalized and reduced), so equal policies compare and serialize equally.
+    """
+    model_config = ConfigDict(extra='forbid', str_strip_whitespace=True, frozen=True)
+    connected_apps: Annotated[tuple[AppName, ...], Field(max_length=16)] | None = None
+    tools: Annotated[tuple[str, ...], Field(max_length=MAX_TOOLS)] | None = None
+    git_access: Literal['write', 'read', 'none'] = 'write'
+    network_domains: Annotated[tuple[str, ...], Field(max_length=MAX_DOMAINS)] | None = None
 
     @field_validator('connected_apps')
     @classmethod
-    def app_names(cls, values):
-        return sorted(set(values)) if values is not None else None
+    def _apps(cls, values):
+        return None if values is None else tuple(sorted(set(values)))
+
+    @field_validator('tools')
+    @classmethod
+    def _tools(cls, values):
+        if values is None:
+            return None
+        if not all(TOOL_NAME.fullmatch(value) for value in values):
+            raise PydanticCustomError('tool_name', 'Use tool names of lowercase letters, digits and underscores.')
+        return tuple(sorted(set(values)))
+
+    @field_validator('network_domains')
+    @classmethod
+    def _domains(cls, values):
+        return None if values is None else reduce_domains(normalize_domain(value) for value in values)
+
+
+UNRESTRICTED = ProfilePolicy()
+
+
+def _policy(value):
+    if isinstance(value, ProfilePolicy):
+        return value
+    if isinstance(value, Mapping):
+        return ProfilePolicy.model_validate(value)
+    raise TypeError('Security policies must be ProfilePolicy values, mappings or None.')
+
+
+def intersect(*policies: ProfilePolicy | Mapping | None) -> ProfilePolicy:
+    """The narrowest policy every argument allows; None arguments are unrestricted.
+
+    Commutative, associative and idempotent. Mappings are validated (partial
+    mappings take unrestricted defaults); other values raise TypeError, so a
+    corrupt falsy document can never pass as an unrestricted policy.
+    """
+    apps = tools = domains = None
+    git = 'write'
+    for value in policies:
+        if value is None:
+            continue
+        policy = _policy(value)
+        if policy.connected_apps is not None:
+            apps = policy.connected_apps if apps is None else tuple(sorted(set(apps) & set(policy.connected_apps)))
+        if policy.tools is not None:
+            tools = policy.tools if tools is None else tuple(sorted(set(tools) & set(policy.tools)))
+        if policy.network_domains is not None:
+            domains = policy.network_domains if domains is None else intersect_domains(domains, policy.network_domains)
+        if GIT_LEVELS[policy.git_access] < GIT_LEVELS[git]:
+            git = policy.git_access
+    # Every component is already canonical, so skip re-normalizing domains.
+    return ProfilePolicy.model_construct(connected_apps=apps, tools=tools, git_access=git, network_domains=domains)
+
+
+def effective(session_policy: ProfilePolicy | Mapping | None,
+              mandatory_policy: ProfilePolicy | Mapping | None) -> ProfilePolicy:
+    """Execution policy: a session's bound policy narrowed by the current mandatory one."""
+    return intersect(session_policy, mandatory_policy)
+
+
+def dump_policy(policy: ProfilePolicy | Mapping) -> str:
+    """Canonical compact JSON for storage, bindings and comparisons."""
+    return json.dumps(_policy(policy).model_dump(mode='json'), sort_keys=True, separators=(',', ':'))
+
+
+def load_policy(text: str) -> ProfilePolicy:
+    """Parse stored policy JSON. It must be an object holding exactly the four fields.
+
+    Raises InvalidPolicy otherwise, including for 'null', '[]', '{}' and partial
+    objects, so a truncated or foreign document never reads as unrestricted.
+    """
+    try:
+        document = json.loads(text)
+    except (TypeError, ValueError):
+        raise InvalidPolicy('The security policy is not valid JSON.') from None
+    if not isinstance(document, dict) or document.keys() != POLICY_FIELDS:
+        raise InvalidPolicy('The security policy must hold exactly its four fields.')
+    try:
+        return ProfilePolicy.model_validate(document)
+    except ValidationError:
+        raise InvalidPolicy('The security policy is invalid.') from None
+
+
+def _stored(text):
+    try:
+        return load_policy(text)
+    except InvalidPolicy:
+        raise CorruptPolicy() from None
 
 
 class SaveProfile(BaseModel):
     model_config = ConfigDict(extra='forbid', str_strip_whitespace=True)
-    name: str = Field(min_length=1, max_length=80)
-    revision: int = Field(default=0, ge=0, strict=True)
-    enabled: bool = True
+    name: Annotated[str, Field(min_length=1, max_length=80), AfterValidator(_no_controls)]
+    enabled: bool = Field(default=True, strict=True)
     policy: ProfilePolicy = Field(default_factory=ProfilePolicy)
+    revision: int = Field(default=0, ge=0, strict=True)
 
 
 class ProfileDefaults(BaseModel):
-    model_config = ConfigDict(extra='forbid')
+    model_config = ConfigDict(extra='forbid', str_strip_whitespace=True)
+    default_profile_id: str = Field(default='', pattern=PROFILE_ID_PATTERN)
+    mandatory_profile_id: str = Field(default='', pattern=PROFILE_ID_PATTERN)
     revision: int = Field(default=0, ge=0, strict=True)
-    default_profile_id: str = ''
-    floor_profile_id: str = ''
 
 
-def intersect(*policies):
-    result = ProfilePolicy().model_dump()
-    levels = {'none': 0, 'read': 1, 'write': 2}
-    for policy in policies:
-        policy = ProfilePolicy.model_validate(policy or {}).model_dump()
-        for key in ('network_domains', 'connected_apps', 'tools'):
-            value = policy[key]
-            if value is not None:
-                result[key] = value if result[key] is None else sorted(set(result[key]) & set(value))
-        if levels[policy['git_access']] < levels[result['git_access']]:
-            result['git_access'] = policy['git_access']
-    return result
+class SessionBinding(NamedTuple):
+    """What a new session pins: the selected profile ('' and 0 for none) and its policy."""
+    profile_id: str
+    revision: int
+    policy: ProfilePolicy
+
+
+class MandatoryProfile(NamedTuple):
+    profile_id: str
+    revision: int
+    policy: ProfilePolicy
+
+
+def validated[M: BaseModel](model: type[M], value) -> M:
+    """Validate a library input like a request body: errors become a safe 422."""
+    if isinstance(value, model):
+        return value
+    if isinstance(value, BaseModel):
+        value = value.model_dump()
+    try:
+        return model.model_validate(value)
+    except ValidationError as error:
+        raise RequestValidationError(error.errors(include_url=False, include_input=False,
+                                                  include_context=False)) from None
+
+
+def _tool_label(name):
+    return name.replace('_', ' ').capitalize()
+
+
+_TOOL_GROUPS = (
+    ('credentials_', 'Credentials'), ('automation_', 'Automations'), ('browser_', 'Browser'),
+    ('github_', 'GitHub'), ('linear_', 'Linear'), ('notion_', 'Notion'), ('slack_', 'Slack'),
+)
+_NAMED_GROUPS = {
+    **dict.fromkeys(('create_pull_request', 'update_pull_request', 'publication_status',
+                     'request_pull_request_write_access'), 'GitHub'),
+    'load_capability': 'Skills',
+}
+
+
+def _tool_group(name):
+    if name in _NAMED_GROUPS:
+        return _NAMED_GROUPS[name]
+    if 'memory' in name:
+        return 'Memory'
+    return next((group for prefix, group in _TOOL_GROUPS if name.startswith(prefix)), 'Workspace')
+
+
+def policy_catalog(tools: Iterable[str | Mapping] | None = None) -> dict:
+    """Choices for the policy editor: connected apps and the known tool names.
+
+    tools defaults to the app.permissions.TOOL_PERMISSIONS names when defined.
+    Entries may be names or {id, label?, group?}; names a policy cannot hold are
+    skipped. Tools are ordered by group, then id.
+    """
+    if tools is None:
+        from . import permissions
+        tools = sorted(getattr(permissions, 'TOOL_PERMISSIONS', None) or ())
+    entries = {}
+    for tool in tools:
+        extra = tool if isinstance(tool, Mapping) else {}
+        name = extra.get('id') if extra else tool
+        if not isinstance(name, str) or not TOOL_NAME.fullmatch(name) or name in entries:
+            continue
+        entries[name] = {'id': name, 'label': extra.get('label') or _tool_label(name),
+                         'group': extra.get('group') or _tool_group(name)}
+    return {'connected_apps': [{'id': key, 'label': label} for key, label in CONNECTED_APPS.items()],
+            'tools': sorted(entries.values(), key=lambda entry: (entry['group'], entry['id']))}
+
+
+_COLUMNS = 'id,name,enabled,revision,policy,updated_by,updated_at'
+
+
+def _view(row, policy=None):
+    policy = _stored(row['policy']) if policy is None else policy
+    return {'id': row['id'], 'name': row['name'], 'enabled': bool(row['enabled']), 'revision': row['revision'],
+            'policy': policy.model_dump(mode='json'), 'updated_at': row['updated_at'],
+            'updated_by': row['updated_by']}
+
+
+def _ordered(rows):
+    # Python ordering: PostgreSQL collations would otherwise differ from SQLite.
+    return sorted(rows, key=lambda row: (row['name'].casefold(), row['name'], row['id']))
 
 
 class SecurityProfiles:
-    def __init__(self, store, settings=None, security=None):
-        self.store, self.settings, self.security = store, settings, security
+    """Synchronous canonical service; async callers run it in a worker thread.
+
+    roles: an EnterpriseRoles over the same store. When given, every write
+    re-resolves the actor inside its writer transaction and requires
+    security.manage, as enterprise_roles does, so a demotion or SCIM
+    deactivation that commits after the route's check still refuses the write;
+    the label is then the resolved authority's (the same text actor_label gives).
+    """
+
+    def __init__(self, store, *, roles=None):
+        self.store, self.roles = store, roles
         if store.schema_updates:
             initialize_schema(store)
-            from .governance_audit import initialize_schema as initialize_audit
             initialize_audit(store)
-        store.security_profiles = self
 
-    def _rows(self, sql, values=(), conn=None):
-        return [dict(row) for row in conn.execute(sql, values)] if conn else self.store.rows(sql, values)
-
-    def defaults(self, conn=None):
-        rows = self._rows('SELECT revision,default_profile_id,floor_profile_id FROM security_profile_defaults WHERE id=1', conn=conn)
-        return rows[0] if rows else {'revision': 0, 'default_profile_id': '', 'floor_profile_id': ''}
-
-    def get(self, identity, conn=None, *, enabled=False):
-        rows = self._rows('SELECT * FROM security_profiles WHERE id=?', (identity,), conn)
-        if not rows:
-            raise HTTPException(404, 'Security profile not found.')
-        row = rows[0]
-        if enabled and not row['enabled']:
-            raise HTTPException(409, 'This security profile is disabled.')
-        return {**row, 'enabled': bool(row['enabled']), 'policy': json.loads(row['policy'])}
-
-    def catalog(self, admin=False):
-        return [{**row, 'enabled': bool(row['enabled']), 'policy': json.loads(row['policy'])}
-                for row in self.store.rows('SELECT * FROM security_profiles ORDER BY name,id') if admin or row['enabled']]
-
-    def _network_change(self, before, after, conn):
-        if before.get('network_domains') == after.get('network_domains'):
-            return
-        # Non-durable runs keep sandbox_id after their machine is terminated;
-        # only a non-terminal run can still hold one.
-        live = conn.execute("""SELECT 1 FROM runs WHERE deleted_at='' AND
-            ((sandbox_id<>'' AND status NOT IN ('completed','failed','cancelled','interrupted','idle'))
-             OR (mode='modal' AND status IN ('running','reconnecting','provisioning','awaiting_approval')))
-            LIMIT 1""").fetchone()
-        if not live and 'durable_sessions' in conn.table_names():
-            # Warm idle durable machines and independent control guests keep a
-            # durable machine identity whatever the run status or sandbox_id.
-            live = conn.execute("SELECT 1 FROM durable_sessions WHERE COALESCE(json_text(state,'sandbox_id'),'')<>'' LIMIT 1").fetchone()
-        if live:
-            raise HTTPException(409, 'Release session sandboxes before changing the mandatory network policy.')
-
-    def authorize_in(self, conn, actor):
-        # Browser callers retain their verified identity until the writer lock
-        # is held. Do not authorize a queued write from cached permissions or
-        # reduce its identity to an audit label before rechecking live access.
-        if isinstance(actor, dict):
-            return self.security.user_roles.enterprise.authorize_in(conn, actor, 'security.manage')
-        return actor  # Trusted in-process callers already supply an audit label.
-
-    def save(self, identity, body, actor):
-        body = SaveProfile.model_validate(body)
-        with self.store.connect() as conn:
-            conn.begin_write()
-            actor = self.authorize_in(conn, actor)
-            previous = conn.execute('SELECT * FROM security_profiles WHERE id=?', (identity,)).fetchone()
-            if (previous['revision'] if previous else 0) != body.revision:
-                raise HTTPException(409, 'This profile changed. Reload before saving.')
-            defaults = self.defaults(conn)
-            if identity in {defaults['default_profile_id'], defaults['floor_profile_id']} and not body.enabled:
-                raise HTTPException(409, 'Remove this profile from organization defaults before disabling it.')
-            if identity == defaults['floor_profile_id'] and previous:
-                self._network_change(json.loads(previous['policy']), body.policy.model_dump(), conn)
-            revision = body.revision + 1
-            policy = body.policy.model_dump_json()
-            stamp = now()
-            conn.execute('''INSERT INTO security_profiles(id,name,revision,enabled,policy,updated_by,updated_at)
-                VALUES(?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,revision=excluded.revision,
-                enabled=excluded.enabled,policy=excluded.policy,updated_by=excluded.updated_by,updated_at=excluded.updated_at''',
-                         (identity, body.name, revision, body.enabled, policy, actor, stamp))
-            conn.execute('INSERT INTO security_profile_revisions(profile_id,revision,policy,created_by,created_at) VALUES(?,?,?,?,?)',
-                         (identity, revision, policy, actor, stamp))
-        return self.get(identity)
-
-    def delete(self, identity, actor='Organization admin'):
-        # Retain revisions and references for sessions/checkpoints and auditing.
-        row = self.get(identity)
-        return self.save(identity, {**{key: row[key] for key in ('name', 'revision', 'policy')}, 'enabled': False}, actor)
-
-    def save_defaults(self, body, actor='Organization admin'):
-        body = ProfileDefaults.model_validate(body)
-        with self.store.connect() as conn:
-            conn.begin_write()
-            actor = self.authorize_in(conn, actor)
-            old = self.defaults(conn)
-            if old['revision'] != body.revision:
-                raise HTTPException(409, 'Organization security defaults changed. Reload before saving.')
-            for identity in (body.default_profile_id, body.floor_profile_id):
-                if identity:
-                    self.get(identity, conn, enabled=True)
-            previous = self.get(old['floor_profile_id'], conn)['policy'] if old['floor_profile_id'] else {}
-            selected = self.get(body.floor_profile_id, conn)['policy'] if body.floor_profile_id else {}
-            self._network_change(ProfilePolicy.model_validate(previous).model_dump(), ProfilePolicy.model_validate(selected).model_dump(), conn)
-            conn.execute('''INSERT INTO security_profile_defaults(id,revision,default_profile_id,floor_profile_id,updated_by,updated_at)
-                VALUES(1,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET revision=excluded.revision,
-                default_profile_id=excluded.default_profile_id,floor_profile_id=excluded.floor_profile_id,
-                updated_by=excluded.updated_by,updated_at=excluded.updated_at''',
-                         (body.revision + 1, body.default_profile_id, body.floor_profile_id, actor, now()))
-            from .governance_audit import record_event_in
-            record_event_in(conn, 'security.defaults.updated', actor, 'SecurityDefaults', 'workspace')
-        return self.defaults()
-
-    def floor(self, conn=None):
-        identity = self.defaults(conn)['floor_profile_id']
-        return self.get(identity, conn)['policy'] if identity else {}
-
-    def effective(self, run, conn=None):
-        """Use authoritative persisted snapshots, including all ancestors."""
-        if conn is None:
-            # One snapshot and one pooled connection for the floor and lineage.
-            with self.store.connect() as conn:
-                conn.begin_read()
-                return self.effective(run, conn)
-        if not run:
-            return intersect(self.floor(conn))
-        policies, seen, current, persisted = [self.floor(conn)], set(), run, False
-        while current:
-            identity = current.get('id')
-            if identity in seen:
-                raise HTTPException(409, 'Security profile lineage is cyclic.')
-            if identity:
-                seen.add(identity)
-                if not persisted:
-                    rows = self._rows('SELECT * FROM runs WHERE id=?', (identity,), conn)
-                    if not rows:
-                        raise HTTPException(409, 'Security profile session lineage is missing.')
-                    current = rows[0]
-            try:
-                policies.append(json.loads(current.get('security_policy') or '{}'))
-            except (TypeError, ValueError):
-                raise HTTPException(409, 'The saved session security policy is invalid.') from None
-            parent = current.get('parent_run_id') or current.get('side_chat_of')
-            if not parent:
-                break
-            rows = self._rows('SELECT * FROM runs WHERE id=?', (parent,), conn)
-            if not rows:
-                raise HTTPException(409, 'Security profile parent session is missing.')
-            current, persisted = rows[0], True
-        try:
-            return intersect(*policies)
-        except ValidationError:
-            raise HTTPException(409, 'The saved session security policy is invalid.') from None
-
-    def binding(self, profile_id='', *, provider='modal', parent_run_id='', automation_id='', conn=None):
-        defaults = self.defaults(conn)
-        if automation_id and not profile_id:
-            rows = self._rows('SELECT security_profile_id FROM automations WHERE id=?', (automation_id,), conn)
-            if not rows:
-                raise HTTPException(404, 'Automation not found.')
-            profile_id = rows[0]['security_profile_id']
-        identity = profile_id or defaults['default_profile_id']
-        selected = self.get(identity, conn, enabled=True) if identity else None
-        policies = [selected['policy'] if selected else {}, self.floor(conn)]
-        if parent_run_id:
-            rows = self._rows('SELECT * FROM runs WHERE id=?', (parent_run_id,), conn)
-            if not rows:
-                raise HTTPException(409, 'Security profile parent session is missing.')
-            policies.append(self.effective(rows[0], conn))
-        policy = intersect(*policies)
-        self.require_provider(policy, provider)
-        return {'security_profile_id': identity, 'security_profile_revision': selected['revision'] if selected else 0,
-                'security_policy': json.dumps(policy, sort_keys=True)}
-
-    def bind_session(self, run, profile_id='', automation_id='', conn=None):
-        run = self.store.run(run) if isinstance(run, str) else run
-        if not run:
-            raise HTTPException(404, 'Session not found.')
-        if run.get('security_policy') not in (None, '', '{}'):
-            self.require_provider(self.effective(run, conn), run.get('sandbox_provider', 'modal'))
-            return run
-        profile_id = profile_id or run.get('security_profile_id', '')
-        if run.get('parent_run_id') and not profile_id and not automation_id:
-            # Delegated agents and swarm workers keep their parent's selection.
-            # The organization default applies only to new user selections.
-            rows = self._rows('SELECT * FROM runs WHERE id=?', (run['parent_run_id'],), conn)
-            if not rows:
-                raise HTTPException(409, 'Security profile parent session is missing.')
-            policy = self.effective(rows[0], conn)  # Includes the current floor.
-            self.require_provider(policy, run.get('sandbox_provider', 'modal'))
-            fields = {'security_profile_id': rows[0]['security_profile_id'],
-                      'security_profile_revision': rows[0]['security_profile_revision'],
-                      'security_policy': json.dumps(policy, sort_keys=True)}
-        else:
-            fields = self.binding(profile_id, provider=run.get('sandbox_provider', 'modal'),
-                                  parent_run_id=run.get('parent_run_id', ''), automation_id=automation_id, conn=conn)
-        sql = 'UPDATE runs SET security_profile_id=?,security_profile_revision=?,security_policy=? WHERE id=?'
-        values = (fields['security_profile_id'], fields['security_profile_revision'], fields['security_policy'], run['id'])
-        if conn:
-            conn.execute(sql, values)
-        else:
-            self.store.execute(sql, values)
-        return {**run, **fields}
+    def _authorized_in(self, conn, actor, label: str) -> str:
+        return label if self.roles is None else self.roles.authorize_in(conn, actor, 'security.manage').label
 
     @staticmethod
-    def require_selection(policy, *, plugins=(), repository=False):
-        if policy['connected_apps'] is not None and not set(plugins) <= set(policy['connected_apps']):
-            raise HTTPException(422, 'The selected security policy does not allow all selected apps.')
-        if repository and (policy['git_access'] == 'none' or
-                           policy['connected_apps'] is not None and 'github' not in policy['connected_apps']):
-            raise HTTPException(422, 'The selected security policy does not allow managed repository access.')
-
-    @staticmethod
-    def require_provider(policy, provider):
-        if policy.get('network_domains') is not None and provider != 'substrate':
-            raise HTTPException(409, 'Domain network policies require Substrate. This provider cannot enforce the selected security profile.')
-
-    def network_hosts(self, run, *, conn=None):
-        policy = self.effective(run, conn)
-        self.require_provider(policy, run.get('sandbox_provider', 'modal'))
-        domains = policy['network_domains']
-        if domains is None:
+    def _row_in(conn, profile_id):
+        if not isinstance(profile_id, str) or not PROFILE_ID.fullmatch(profile_id):
             return None
-        # The authenticated broker is essential infrastructure, not an app
-        # destination. Keep model/service secrets exclusively on the broker.
-        broker = urlsplit(self.settings.public_url).hostname if self.settings else None
-        if not broker:
-            raise HTTPException(503, 'Configure the broker URL before running a network-restricted session.')
-        from .sandboxes.substrate import egress_host_allowed
-        ceiling = getattr(self.settings, 'substrate_egress_hosts', '*').split(',')
-        if not any(egress_host_allowed(broker.lower(), pattern.strip()) for pattern in ceiling):
-            raise HTTPException(409, 'Allow the broker hostname in Substrate egress settings before starting this network-restricted session.')
-        return sorted(set(domains) | {broker.lower()})
+        return conn.execute(f'SELECT {_COLUMNS} FROM security_profiles WHERE id=?', (profile_id,)).fetchone()
 
     @staticmethod
-    def permits(policy, name, provider=None, write=False):
-        """Evaluate one tool against an already resolved effective policy."""
-        # Personal Slack reads are credential tools rather than connector tools,
-        # so broker catalogs/dispatch do not supply their app from TOOLS.
-        if provider is None and name.startswith('slack_personal_'):
-            provider = 'slack'
-        if policy['tools'] is not None and name not in policy['tools']:
-            return False
-        if provider and policy['connected_apps'] is not None and provider not in policy['connected_apps']:
-            return False
-        if provider == 'github' or name.startswith('github_'):
-            if policy['git_access'] == 'none' or (write and policy['git_access'] != 'write'):
-                return False
-        return True
+    def defaults_in(conn) -> dict:
+        row = conn.execute('''SELECT revision,default_profile_id,mandatory_profile_id,updated_by,updated_at
+            FROM security_profile_defaults WHERE id=1''').fetchone()
+        if row is None:
+            return {'default_profile_id': '', 'mandatory_profile_id': '', 'revision': 0,
+                    'updated_at': None, 'updated_by': ''}
+        return {'default_profile_id': row['default_profile_id'], 'mandatory_profile_id': row['mandatory_profile_id'],
+                'revision': row['revision'], 'updated_at': row['updated_at'], 'updated_by': row['updated_by']}
 
-    def allowed_tool(self, run, name, provider=None, write=False, *, conn=None, policy=None):
-        return self.permits(self.effective(run, conn) if policy is None else policy, name, provider, write)
+    def _selected_in(self, conn):
+        defaults = self.defaults_in(conn)
+        return {defaults['default_profile_id'], defaults['mandatory_profile_id']} - {''}
 
-    def require_tool(self, run, name, provider=None, write=False, *, conn=None, policy=None):
-        if not self.allowed_tool(run, name, provider, write, conn=conn, policy=policy):
-            raise HTTPException(403, 'This operation is disabled by the session security profile.')
+    def defaults(self) -> dict:
+        with self.store.connect() as conn:
+            conn.begin_read()
+            return self.defaults_in(conn)
 
-    def require_url(self, run, url, *, conn=None, policy=None):
-        domains = (self.effective(run, conn) if policy is None else policy)['network_domains']
-        if domains is not None and urlsplit(url).hostname not in domains:
-            raise HTTPException(403, 'This destination is disabled by the session security profile.')
+    def get(self, profile_id: str) -> dict:
+        with self.store.connect() as conn:
+            conn.begin_read()
+            row = self._row_in(conn, profile_id)
+        if row is None:
+            raise ProfileNotFound()
+        return _view(row)
 
-    def routes(self, security=None):
-        self.security = security = security or self.security
-        router = APIRouter()
+    def catalog(self) -> dict:
+        """Enabled profiles a person may choose for a new session, plus the defaults."""
+        with self.store.connect() as conn:
+            conn.begin_read()
+            defaults = self.defaults_in(conn)
+            rows = [dict(row) for row in conn.execute(f'SELECT {_COLUMNS} FROM security_profiles WHERE enabled=1')]
+            mandatory = self._row_in(conn, defaults['mandatory_profile_id'])
+        return {'profiles': [{'id': row['id'], 'name': row['name'],
+                              'policy': _stored(row['policy']).model_dump(mode='json')} for row in _ordered(rows)],
+                'default_profile_id': defaults['default_profile_id'],
+                'mandatory': {'id': mandatory['id'], 'name': mandatory['name']} if mandatory else None}
 
-        def actor(request):
-            security.require(request, permission='security.manage', mutation=True)
-            info = security.session_info(request)
-            if not info:
-                raise HTTPException(401, 'Sign in to the workspace.')
-            return info
+    def admin_listing(self, tools: Iterable[str | Mapping] | None = None) -> dict:
+        """Every profile including disabled ones, the defaults and the editor catalog."""
+        with self.store.connect() as conn:
+            conn.begin_read()
+            defaults = self.defaults_in(conn)
+            rows = [dict(row) for row in conn.execute(f'SELECT {_COLUMNS} FROM security_profiles')]
+        return {'profiles': [_view(row) for row in _ordered(rows)], 'defaults': defaults,
+                'catalog': policy_catalog(tools)}
 
-        @router.get('/api/security-profiles')
-        def catalog(request: Request):
-            security.require(request)
-            return self.catalog()
+    @staticmethod
+    def _revise_in(conn, row, *, name, enabled, policy, label, action):
+        revision, stamp, text = row['revision'] + 1, timestamp(), dump_policy(policy)
+        if conn.execute('''UPDATE security_profiles SET name=?,enabled=?,revision=?,policy=?,updated_by=?,updated_at=?
+                WHERE id=? AND revision=?''', (name, enabled, revision, text, label, stamp, row['id'],
+                                               row['revision'])).rowcount != 1:
+            raise StaleRevision()
+        conn.execute('INSERT INTO security_profile_revisions(profile_id,revision,policy,created_by,created_at) '
+                     'VALUES(?,?,?,?,?)', (row['id'], revision, text, label, stamp))
+        record_event_in(conn, action, label, 'security_profile', row['id'],
+                        {'name': name, 'revision': revision, 'enabled': enabled})
+        return {'id': row['id'], 'name': name, 'enabled': enabled, 'revision': revision,
+                'policy': policy.model_dump(mode='json'), 'updated_at': stamp, 'updated_by': label}
 
-        @router.get('/api/admin/security-profiles')
-        def administration(request: Request):
-            security.require(request, permission='security.manage')
-            return {'profiles': self.catalog(admin=True), 'defaults': self.defaults(),
-                    'network_enforcement': {'supported_providers': ['substrate']}}
+    def save(self, body: SaveProfile | Mapping, actor, *, profile_id: str = '') -> dict:
+        """Create (no profile_id; revision 0) or update a profile at its current revision.
 
-        @router.put('/api/admin/security-profiles/defaults')
-        def defaults(body: ProfileDefaults, request: Request):
-            return self.save_defaults(body, actor(request))
+        An unchanged save returns the profile without a new revision or event.
+        A profile selected as the default or mandatory profile cannot be disabled.
+        """
+        body, label = validated(SaveProfile, body), actor_label(actor)
+        with self.store.connect() as conn:
+            conn.begin_write()
+            label = self._authorized_in(conn, actor, label)
+            if profile_id:
+                row = self._row_in(conn, profile_id)
+                if row is None:
+                    raise ProfileNotFound()
+                if row['revision'] != body.revision:
+                    raise StaleRevision()
+                if not body.enabled and profile_id in self._selected_in(conn):
+                    raise ProfileInUse()
+                current = _stored(row['policy'])
+                if (row['name'], bool(row['enabled']), current) == (body.name, body.enabled, body.policy):
+                    return _view(row, current)
+                return self._revise_in(conn, row, name=body.name, enabled=body.enabled, policy=body.policy,
+                                       label=label, action='security_profile.updated')
+            if body.revision != 0:
+                raise StaleRevision()
+            if conn.execute('SELECT COUNT(*) AS total FROM security_profiles').fetchone()['total'] >= MAX_PROFILES:
+                raise ProfileLimit()
+            identity, stamp, text = uuid4().hex, timestamp(), dump_policy(body.policy)
+            conn.execute(f'INSERT INTO security_profiles({_COLUMNS}) VALUES(?,?,?,?,?,?,?)',
+                         (identity, body.name, body.enabled, 1, text, label, stamp))
+            conn.execute('INSERT INTO security_profile_revisions(profile_id,revision,policy,created_by,created_at) '
+                         'VALUES(?,?,?,?,?)', (identity, 1, text, label, stamp))
+            record_event_in(conn, 'security_profile.created', label, 'security_profile', identity,
+                            {'name': body.name, 'revision': 1, 'enabled': body.enabled})
+            return {'id': identity, 'name': body.name, 'enabled': body.enabled, 'revision': 1,
+                    'policy': body.policy.model_dump(mode='json'), 'updated_at': stamp, 'updated_by': label}
 
-        @router.post('/api/admin/security-profiles', status_code=201)
-        def create(body: SaveProfile, request: Request):
-            return self.save(uuid4().hex, body, actor(request))
+    def disable(self, profile_id: str, revision: int, actor) -> dict:
+        """Disable a profile at its current revision; disabling a disabled one is a no-op."""
+        if type(revision) is not int:
+            raise TypeError('Profile revisions are integers.')
+        label = actor_label(actor)
+        with self.store.connect() as conn:
+            conn.begin_write()
+            label = self._authorized_in(conn, actor, label)
+            row = self._row_in(conn, profile_id)
+            if row is None:
+                raise ProfileNotFound()
+            if row['revision'] != revision:
+                raise StaleRevision()
+            if profile_id in self._selected_in(conn):
+                raise ProfileInUse()
+            policy = _stored(row['policy'])
+            if not row['enabled']:
+                return _view(row, policy)
+            return self._revise_in(conn, row, name=row['name'], enabled=False, policy=policy, label=label,
+                                   action='security_profile.disabled')
 
-        @router.put('/api/admin/security-profiles/{identity}')
-        def save(identity: str, body: SaveProfile, request: Request):
-            who = actor(request)
-            self.get(identity)
-            return self.save(identity, body, who)
+    def save_defaults(self, body: ProfileDefaults | Mapping, actor) -> dict:
+        """Select the organization default and mandatory profiles ('' clears either).
 
-        @router.delete('/api/admin/security-profiles/{identity}')
-        def delete(identity: str, request: Request):
-            who = actor(request)
-            return self.delete(identity, who)
+        Both must name enabled profiles. An unchanged selection returns the
+        current defaults without a new revision or event.
+        """
+        body, label = validated(ProfileDefaults, body), actor_label(actor)
+        with self.store.connect() as conn:
+            conn.begin_write()
+            label = self._authorized_in(conn, actor, label)
+            current = self.defaults_in(conn)
+            if current['revision'] != body.revision:
+                raise StaleRevision()
+            rows = {identity: self._row_in(conn, identity)
+                    for identity in (body.default_profile_id, body.mandatory_profile_id) if identity}
+            if any(row is None or not row['enabled'] for row in rows.values()):
+                raise DefaultsUnavailable()
+            selection = (body.default_profile_id, body.mandatory_profile_id)
+            if selection == (current['default_profile_id'], current['mandatory_profile_id']):
+                return current
+            revision, stamp = body.revision + 1, timestamp()
+            conn.execute('''INSERT INTO security_profile_defaults
+                (id,revision,default_profile_id,mandatory_profile_id,updated_by,updated_at) VALUES(1,?,?,?,?,?)
+                ON CONFLICT(id) DO UPDATE SET revision=excluded.revision,default_profile_id=excluded.default_profile_id,
+                mandatory_profile_id=excluded.mandatory_profile_id,updated_by=excluded.updated_by,
+                updated_at=excluded.updated_at''', (revision, *selection, label, stamp))
+            mandatory = rows.get(body.mandatory_profile_id)
+            record_event_in(conn, 'security_defaults.updated', label, 'security_defaults', 'organization', {
+                'default_profile_id': body.default_profile_id, 'mandatory_profile_id': body.mandatory_profile_id,
+                'mandatory_profile_revision': mandatory['revision'] if mandatory else 0, 'revision': revision,
+                'previous_default_profile_id': current['default_profile_id'],
+                'previous_mandatory_profile_id': current['mandatory_profile_id']})
+            return {'default_profile_id': body.default_profile_id, 'mandatory_profile_id': body.mandatory_profile_id,
+                    'revision': revision, 'updated_at': stamp, 'updated_by': label}
 
-        return router
+    def mandatory_in(self, conn, defaults: dict | None = None) -> MandatoryProfile | None:
+        """The current mandatory profile, or None. A dangling selection fails closed."""
+        identity = (self.defaults_in(conn) if defaults is None else defaults)['mandatory_profile_id']
+        if not identity:
+            return None
+        row = self._row_in(conn, identity)
+        if row is None:
+            raise OrganizationPolicyUnavailable()
+        # Applied even if disabled out of band: the selection still restricts.
+        return MandatoryProfile(identity, row['revision'], _stored(row['policy']))
 
+    def mandatory(self) -> MandatoryProfile | None:
+        with self.store.connect() as conn:
+            conn.begin_read()
+            return self.mandatory_in(conn)
 
-def initialize_schema(store):
-    store.execute('''CREATE TABLE IF NOT EXISTS security_profiles (
-        id TEXT PRIMARY KEY,name TEXT NOT NULL,revision INTEGER NOT NULL,enabled INTEGER NOT NULL DEFAULT 1,
-        policy TEXT NOT NULL,updated_by TEXT NOT NULL,updated_at TEXT NOT NULL)''')
-    store.execute('''CREATE TABLE IF NOT EXISTS security_profile_revisions (
-        profile_id TEXT NOT NULL REFERENCES security_profiles(id),revision INTEGER NOT NULL,
-        policy TEXT NOT NULL,created_by TEXT NOT NULL,created_at TEXT NOT NULL,PRIMARY KEY(profile_id,revision))''')
-    store.execute('''CREATE TABLE IF NOT EXISTS security_profile_defaults (
-        id INTEGER PRIMARY KEY,revision INTEGER NOT NULL,default_profile_id TEXT NOT NULL DEFAULT '',
-        floor_profile_id TEXT NOT NULL DEFAULT '',updated_by TEXT NOT NULL,updated_at TEXT NOT NULL)''')
-    with store.connect() as conn:
-        columns = conn.column_names('runs')
-        for name, definition in (('security_profile_id', "TEXT NOT NULL DEFAULT ''"),
-                                 ('security_profile_revision', 'INTEGER NOT NULL DEFAULT 0'),
-                                 ('security_policy', "TEXT NOT NULL DEFAULT '{}'")):
-            if name not in columns:
-                conn.execute(f'ALTER TABLE runs ADD COLUMN {name} {definition}')
-        if conn.column_names('automations') and 'security_profile_id' not in conn.column_names('automations'):
-            conn.execute("ALTER TABLE automations ADD COLUMN security_profile_id TEXT NOT NULL DEFAULT ''")
+    def resolve_for_new_session_in(self, conn, requested_id: str = '') -> SessionBinding:
+        """Resolve a new session's binding in the caller's canonical snapshot.
+
+        '' selects the organization default, and no default binds no profile
+        ('', 0). A requested profile that is missing, malformed or disabled
+        raises ProfileUnavailable; a dangling organization selection raises
+        OrganizationPolicyUnavailable. The bound policy already includes the
+        current mandatory profile, so loosening it later never widens a session.
+        """
+        if not isinstance(requested_id, str):
+            raise TypeError('Requested security profile ids are text.')
+        defaults = self.defaults_in(conn)
+        identity = requested_id or defaults['default_profile_id']
+        selected = None
+        if identity:
+            selected = self._row_in(conn, identity)
+            if selected is None or not selected['enabled']:
+                raise ProfileUnavailable() if requested_id else OrganizationPolicyUnavailable()
+        mandatory = self.mandatory_in(conn, defaults)
+        policy = intersect(_stored(selected['policy']) if selected else None, mandatory.policy if mandatory else None)
+        return SessionBinding(identity if selected else '', selected['revision'] if selected else 0, policy)
+
+    def resolve_for_new_session(self, requested_id: str = '') -> SessionBinding:
+        with self.store.connect() as conn:
+            conn.begin_read()
+            return self.resolve_for_new_session_in(conn, requested_id)

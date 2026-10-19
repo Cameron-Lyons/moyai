@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Literal
 from urllib.parse import urlsplit
 
-from pydantic import AliasChoices, Field, SecretStr
+from pydantic import AliasChoices, Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -23,6 +23,7 @@ class Settings(BaseSettings):
 
     data_dir: Path = Field(default=Path(".data"), validation_alias="DATA_DIR")
     database_url: str = Field(default="", validation_alias="MOYAI_DATABASE_URL")
+    database_pool_size: int = Field(default=8, ge=1, le=256, validation_alias="MOYAI_DATABASE_POOL_SIZE")
     product_mode: Literal["standalone", "existing"] = Field(
         default="standalone", validation_alias="MOYAI_PRODUCT_MODE",
     )
@@ -47,18 +48,65 @@ class Settings(BaseSettings):
     temporal_address: str = Field(default="127.0.0.1:7233", validation_alias="TEMPORAL_ADDRESS")
     temporal_namespace: str = Field(default="default", validation_alias="TEMPORAL_NAMESPACE")
     temporal_queue: str = Field(default="moyai-pydantic-v1", validation_alias="TEMPORAL_TASK_QUEUE")
+    worker_deployment: str = Field(
+        default="", pattern=r"^(?:[A-Za-z0-9][A-Za-z0-9_-]{0,127})?$",
+        validation_alias="MOYAI_WORKER_DEPLOYMENT",
+    )
+    worker_build_id: str = Field(
+        default="", pattern=r"^(?:[A-Za-z0-9][A-Za-z0-9_-]{0,127})?$",
+        validation_alias="MOYAI_WORKER_BUILD_ID",
+    )
     temporal_api_key: SecretStr = Field(default=SecretStr(""), validation_alias="TEMPORAL_API_KEY")
     temporal_tls: bool = Field(default=False, validation_alias="TEMPORAL_TLS")
+    compress_temporal_payloads: bool = Field(
+        default=False, validation_alias="MOYAI_COMPRESS_TEMPORAL_PAYLOADS",
+    )
+    history_continue_bytes: int = Field(
+        default=8 * 1024 * 1024, ge=16384, le=20 * 1024 * 1024,
+        validation_alias="MOYAI_HISTORY_CONTINUE_BYTES",
+    )
+    history_continue_events: int = Field(
+        default=8000, ge=100, le=10000, validation_alias="MOYAI_HISTORY_CONTINUE_EVENTS",
+    )
+    worker_shutdown_seconds: int = Field(
+        default=0, ge=0, le=240, validation_alias="MOYAI_WORKER_SHUTDOWN_SECONDS",
+    )
+    http_shutdown_seconds: int = Field(
+        default=20, ge=1, le=270, validation_alias="MOYAI_HTTP_SHUTDOWN_SECONDS",
+    )
+    temporal_worker_activities: int = Field(default=120, ge=1, le=10000, validation_alias="TEMPORAL_WORKER_ACTIVITIES")
+    temporal_workflow_cache_size: int = Field(default=200, ge=0, le=100000, validation_alias="TEMPORAL_WORKFLOW_CACHE_SIZE")
+    temporal_dispatch_concurrency: int = Field(default=10, ge=1, le=1000, validation_alias="TEMPORAL_DISPATCH_CONCURRENCY")
+    temporal_dispatch_batch_size: int = Field(default=200, ge=1, le=10000, validation_alias="TEMPORAL_DISPATCH_BATCH_SIZE")
     modal_app: str = Field(
         default="moyai-pydantic",
         validation_alias=AliasChoices("MOYAI_MODAL_APP", "MODAL_APP_NAME"),
+    )
+    sandbox_provider: Literal["modal", "lambda"] = Field(default="modal", validation_alias="SANDBOX_PROVIDER")
+    lambda_region: str = Field(default="us-east-1", validation_alias="LAMBDA_REGION")
+    lambda_profile: str = Field(default="", validation_alias="LAMBDA_PROFILE")
+    lambda_image: str = Field(default="", validation_alias="LAMBDA_IMAGE")
+    lambda_image_version: str = Field(default="", validation_alias="LAMBDA_IMAGE_VERSION")
+    lambda_checkpoint_bucket: str = Field(default="", validation_alias="LAMBDA_CHECKPOINT_BUCKET")
+    lambda_checkpoint_prefix: str = Field(
+        default="moyai-native-lambda", pattern=r"^[A-Za-z0-9_-][A-Za-z0-9_/-]*$",
+        validation_alias="LAMBDA_CHECKPOINT_PREFIX",
+    )
+    lambda_execution_role_arn: str = Field(default="", validation_alias="LAMBDA_EXECUTION_ROLE_ARN")
+    lambda_egress_connector: str = Field(default="", validation_alias="LAMBDA_EGRESS_CONNECTOR")
+    lambda_checkpoint_timeout: int = Field(
+        default=900, ge=30, le=900, validation_alias="SNAPSHOT_TIMEOUT_SECONDS",
     )
     computer_lifetime: int = Field(default=3600, ge=60, le=86400, validation_alias="MOYAI_COMPUTER_TIMEOUT")
     computer_idle_timeout: int = Field(
         default=600, ge=60, le=86400, validation_alias="MOYAI_COMPUTER_IDLE_TIMEOUT"
     )
+    # Replay-only: new turns and delegates have no model-request-count cap.
     model_request_limit: int = Field(default=100, ge=1, le=1000, validation_alias="MOYAI_MODEL_CALL_LIMIT")
     model_timeout_seconds: int = Field(default=300, ge=10, le=900, validation_alias="MOYAI_MODEL_TIMEOUT")
+    optional_question_timeout_seconds: int = Field(
+        default=90, ge=5, le=900, validation_alias="MOYAI_OPTIONAL_QUESTION_TIMEOUT",
+    )
     secure_cookies: bool = Field(default=False, validation_alias="MOYAI_SECURE_COOKIES")
     public_url: str = Field(default="", validation_alias=AliasChoices("MOYAI_PUBLIC_URL", "PUBLIC_URL"))
     slack_signing_secret: SecretStr = Field(default=SecretStr(""), validation_alias="SLACK_SIGNING_SECRET")
@@ -77,6 +125,12 @@ class Settings(BaseSettings):
     artifact_session_token: SecretStr = Field(
         default=SecretStr(""), validation_alias="OBJECT_STORAGE_SESSION_TOKEN",
     )
+
+    @model_validator(mode="after")
+    def worker_version_is_complete(self) -> Settings:
+        if bool(self.worker_deployment) != bool(self.worker_build_id):
+            raise ValueError("Worker deployment name and build ID must be configured together.")
+        return self
 
     @property
     def models(self) -> list[str]:
@@ -131,6 +185,10 @@ class Settings(BaseSettings):
         return value
 
     def validate_worker(self, *, brokered: bool = False) -> None:
+        if self.sandbox_provider == "lambda" and not all((
+            self.lambda_region, self.lambda_image, self.lambda_image_version, self.lambda_checkpoint_bucket,
+        )):
+            raise ValueError("Lambda requires LAMBDA_REGION, LAMBDA_IMAGE, LAMBDA_IMAGE_VERSION and LAMBDA_CHECKPOINT_BUCKET.")
         if not self.gateway_key.get_secret_value() and not (
             self.product_mode == "existing" and brokered
         ):

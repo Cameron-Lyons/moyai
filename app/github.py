@@ -19,7 +19,7 @@ import jwt
 from fastapi import HTTPException
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator, model_serializer
 
-from agent.github_paths import publishable_path
+from app.github_paths import publishable_path
 from .connector_errors import ConnectorError
 from .db import now
 from .github_repositories import GitHubRepositories
@@ -231,6 +231,7 @@ TOOLS = {
 class GitHub(GitHubCoding, GitHubCI, GitHubWriteAccess, GitHubRepositories):
     def __init__(self, store, security, settings, connectors):
         self.store, self.security, self.settings, self.connectors = store, security, settings, connectors
+        self.api_url = API
         self.write_lock = asyncio.Lock()
         self.token_lock = asyncio.Lock()
         self.setup_lock = asyncio.Lock()
@@ -260,24 +261,26 @@ class GitHub(GitHubCoding, GitHubCI, GitHubWriteAccess, GitHubRepositories):
         except Exception:
             raise ConnectorError('The GitHub App signing key is invalid. An administrator must reconnect it.') from None
 
-    async def request(self, method, path, *, token='', missing=False, repository_redirect=False, **kwargs):
+    async def request(self, method, path, *, token='', missing=False, repository_redirect=False,
+                      api_version='2022-11-28', include_status=False, **kwargs):
         # Every caller below constructs a fixed GitHub API path; no user URL.
-        headers = {'Accept': 'application/vnd.github+json', 'X-GitHub-Api-Version': '2022-11-28'}
+        headers = {'Accept': 'application/vnd.github+json', 'X-GitHub-Api-Version': api_version}
         if token:
             headers['Authorization'] = 'Bearer ' + token
         try:
             async with httpx.AsyncClient(timeout=45, follow_redirects=False) as client:
-                response = await client.request(method, API + path, headers=headers, **kwargs)
+                response = await client.request(method, self.api_url + path, headers=headers, **kwargs)
                 if repository_redirect and method == 'GET' and response.status_code in (301, 302, 307, 308):
                     location = response.headers.get('location', '')
-                    if not re.fullmatch(re.escape(API) + r'/repositories/[1-9][0-9]*', location):
+                    if not re.fullmatch(re.escape(self.api_url) + r'/repositories/[1-9][0-9]*', location):
                         raise ConnectorError('GitHub returned an unexpected repository redirect.')
                     response = await client.get(location, headers=headers)
                 if missing and response.status_code == 404:
                     return None
                 if not 200 <= response.status_code < 300:
                     raise GitHubError(f'GitHub did not confirm the operation ({response.status_code}). Check the installation, repository access and destination before retrying a write.', response.status_code)
-                return response.json() if response.content else {}
+                data = response.json() if response.content else {}
+                return {'status_code': response.status_code, 'data': data} if include_status else data
         except (httpx.HTTPError, ValueError):
             raise ConnectorError('The GitHub response was not received. Check the destination before retrying a write.') from None
 
@@ -871,18 +874,4 @@ class GitHub(GitHubCoding, GitHubCI, GitHubWriteAccess, GitHubRepositories):
         return result
 
 
-def initialize_schema(store):
-    store.execute('CREATE TABLE IF NOT EXISTS github_app (id INTEGER PRIMARY KEY CHECK(id=1), encrypted TEXT NOT NULL)')
-    store.execute('''CREATE TABLE IF NOT EXISTS github_publications (
-        id TEXT PRIMARY KEY, run_id TEXT NOT NULL, message_id INTEGER NOT NULL,
-        arguments_hash TEXT NOT NULL, branch TEXT NOT NULL, commit_sha TEXT NOT NULL DEFAULT '',
-        result TEXT NOT NULL DEFAULT '', connection_version TEXT NOT NULL, created_at TEXT NOT NULL)''')
-    with store.connect() as conn:
-        if 'attempted' not in conn.column_names('github_publications'):
-            conn.execute('ALTER TABLE github_publications ADD COLUMN attempted INTEGER NOT NULL DEFAULT 0')
-            conn.execute("UPDATE github_publications SET attempted=1 WHERE commit_sha!='' AND result=''")
-
-    store.execute("""CREATE TABLE IF NOT EXISTS github_followups (
-        id TEXT PRIMARY KEY, arguments_hash TEXT NOT NULL, connection_version TEXT NOT NULL,
-        commit_sha TEXT NOT NULL DEFAULT '', sent INTEGER NOT NULL DEFAULT 0,
-        result TEXT NOT NULL DEFAULT '')""")
+from .schema_initializers import initialize_github as initialize_schema

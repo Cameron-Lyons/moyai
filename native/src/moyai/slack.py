@@ -14,6 +14,7 @@ import logging
 import time
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
+from urllib.parse import parse_qs
 
 import httpx
 from fastapi import APIRouter, HTTPException, Request
@@ -21,12 +22,31 @@ from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
 
 from .contracts import NewMessage
+from .failure_report import FailureReport
 from .models import Delivery, Session, SlackInbox, SlackThread, Turn, User, new_id, now
+from .slack_file_delivery import SlackFileDelivery
+from .slack_messages import navigation_action, pr_cards, saved_message, session_url, thread_message
 
 if TYPE_CHECKING:
     from .runtime import Runtime
 
 logger = logging.getLogger(__name__)
+
+
+def verify_signature(runtime: Runtime, raw: bytes, headers) -> None:
+    secret = runtime.settings.slack_signing_secret.get_secret_value()
+    if not secret or not runtime.settings.slack_team_id:
+        raise HTTPException(503, "Slack bot ingress is not configured.")
+    stamp = headers.get("x-slack-request-timestamp", "")
+    try:
+        recent = abs(time.time() - int(stamp)) <= 300
+    except ValueError:
+        recent = False
+    expected = "v0=" + hmac.new(
+        secret.encode(), b"v0:" + stamp.encode() + b":" + raw, hashlib.sha256
+    ).hexdigest()
+    if not recent or not hmac.compare_digest(expected, headers.get("x-slack-signature", "")):
+        raise HTTPException(401, "Invalid Slack signature.")
 
 
 def routes(runtime: Runtime) -> APIRouter:
@@ -37,24 +57,10 @@ def routes(runtime: Runtime) -> APIRouter:
 
     @router.post("/hooks/slack")
     async def receive(request: Request):
-        secret = runtime.settings.slack_signing_secret.get_secret_value()
-        if not secret or not runtime.settings.slack_team_id:
-            raise HTTPException(503, "Slack bot ingress is not configured.")
         raw = await request.body()
         if len(raw) > 256 * 1024:
             raise HTTPException(413, "Event is too large.")
-        stamp = request.headers.get("x-slack-request-timestamp", "")
-        try:
-            recent = abs(time.time() - int(stamp)) <= 300
-        except ValueError:
-            recent = False
-        expected = "v0=" + hmac.new(
-            secret.encode(), b"v0:" + stamp.encode() + b":" + raw, hashlib.sha256
-        ).hexdigest()
-        if not recent or not hmac.compare_digest(
-            expected, request.headers.get("x-slack-signature", "")
-        ):
-            raise HTTPException(401, "Invalid Slack signature.")
+        verify_signature(runtime, raw, request.headers)
         body = json.loads(raw)
         if body.get("type") == "url_verification":
             return {"challenge": body.get("challenge", "")}
@@ -69,6 +75,27 @@ def routes(runtime: Runtime) -> APIRouter:
         except IntegrityError:
             pass  # Slack delivery retries acknowledge the same persisted event.
         return {"accepted": True}
+
+    @router.post("/hooks/slack/interactions")
+    async def interact(request: Request):
+        raw = await request.body()
+        if len(raw) > 65536:
+            raise HTTPException(413, "Interaction is too large.")
+        verify_signature(runtime, raw, request.headers)
+        try:
+            values = parse_qs(raw.decode(), strict_parsing=True)
+            if len(values["payload"]) != 1:
+                raise ValueError()
+            payload = json.loads(values["payload"][0])
+            if not isinstance(payload, dict) or not isinstance(payload.get("team"), dict):
+                raise TypeError()
+        except (ValueError, TypeError, KeyError, UnicodeDecodeError):
+            raise HTTPException(400, "Invalid Slack interaction.") from None
+        if payload["team"].get("id") != runtime.settings.slack_team_id:
+            raise HTTPException(403, "This Slack workspace is not connected.")
+        if not navigation_action(payload):
+            raise HTTPException(409, "This Slack action requires the Moyai session.")
+        return {"ok": True}
 
     return router
 
@@ -128,14 +155,34 @@ async def admit_one(runtime: Runtime, inbox: SlackInbox) -> None:
         # app_mention and message envelopes can describe the same Slack message.
         # Channel + message timestamp identifies that message independently of event_id.
         message_key = hashlib.sha256(json.dumps([team, channel, event["ts"]]).encode()).hexdigest()
-        await runtime.database.submit(actor, thread.session_id, NewMessage(
-            prompt=event["text"], request_key=f"slack-message:{message_key}", mode="asap",
+        from .inbound_events import InboundEvent
+        body = NewMessage.from_event(InboundEvent(
+            source="slack", sender_id=actor.id, deduplication_key=message_key, text=event["text"],
+            provenance={"team_id": team, "channel_id": channel, "thread_ts": thread_ts,
+                        "message_ts": event["ts"], "user_id": event["user"]},
         ))
+        turn = await runtime.database.submit(actor, thread.session_id, body)
     except HTTPException as error:
         if error.status_code not in (401, 403, 404):
             raise
         await mark_inbox(runtime, inbox.id, "access_denied")
         return
+    from .slack_progress import anchor_identity
+    try:
+        async with runtime.database.sessions.begin() as db:
+            db.add(Delivery(
+                id=new_id(), identity=anchor_identity(turn.id, False),
+                session_id=thread.session_id, turn_id=turn.id,
+                destination=json.dumps({
+                    "channel": thread.channel_id, "thread_ts": thread.thread_ts,
+                    "rich_reply": True, "segment_id": turn.id,
+                }),
+                content=runtime.security.seal(thread_message(
+                    "Moyai received your message.", session_url(runtime.settings.public_url, thread.session_id),
+                )),
+            ))
+    except IntegrityError:
+        pass
     await mark_inbox(runtime, inbox.id, "accepted")
 
 
@@ -147,6 +194,8 @@ async def mark_inbox(runtime: Runtime, identity: str, status: str) -> None:
 
 
 async def stage_deliveries(runtime: Runtime) -> None:
+    from app.slack_format import slack_text
+
     async with runtime.database.sessions() as db:
         pairs = (await db.execute(select(Turn, SlackThread).join(
             SlackThread, SlackThread.session_id == Turn.session_id
@@ -163,30 +212,68 @@ async def stage_deliveries(runtime: Runtime) -> None:
         async with runtime.database.sessions() as db:
             if await db.scalar(select(Delivery.id).where(Delivery.identity == identity)):
                 continue
+        failure_report = (
+            await FailureReport.for_turn(runtime, turn) if turn.status == "failed" else None
+        )
         text = runtime.security.unseal(turn.result).decode() if turn.result else ""
         if turn.status == "waiting":
             text = "Moyai needs your response before continuing."
         elif turn.status == "failed":
-            text = turn.error or "This task stopped before it completed."
+            text = failure_report.text if failure_report is not None else ""
         if not text:
             text = "This task completed without a text answer."
-        link = (
-            f"{runtime.settings.public_url.rstrip('/')}/#{turn.session_id}"
-            if runtime.settings.public_url else ""
-        )
-        text = text[:3500] + ("\n\nOpen conversation: " + link if link else "")
+        link = session_url(runtime.settings.public_url, turn.session_id)
+        # Standalone publishes the answer before its checkpoint finishes saving.
+        cards = pr_cards(text, link) if turn.status in {"saving", "completed"} else []
+        content = thread_message(slack_text(text), link, cards=cards)
         try:
             async with runtime.database.sessions.begin() as db:
+                from .slack_progress import latest_segment
+                segment = await latest_segment(db, turn)
+                destination = json.dumps({
+                    "channel": thread.channel_id, "thread_ts": thread.thread_ts, "rich_reply": True,
+                    "segment_id": segment.id,
+                })
                 db.add(Delivery(
                     id=new_id(), identity=identity, session_id=turn.session_id, turn_id=turn.id,
-                    destination=json.dumps({"channel": thread.channel_id, "thread_ts": thread.thread_ts}),
-                    content=runtime.security.seal(text),
+                    destination=destination,
+                    content=runtime.security.seal(content),
                 ))
+                if failure_report is not None:
+                    db.add(Delivery(
+                        id=new_id(), identity=f"slack-answer:{turn.id}:debug",
+                        session_id=turn.session_id, turn_id=turn.id,
+                        destination=destination,
+                        content=runtime.security.seal(SlackFileDelivery.content(
+                            failure_report.debug_log,
+                            after=identity,
+                        )),
+                    ))
         except IntegrityError:
             pass
 
 
+async def _settle_delivery(
+    runtime: Runtime, delivery: Delivery, status: str, receipt: dict[str, object],
+) -> None:
+    async with runtime.database.sessions.begin() as db:
+        await db.execute(update(Delivery).where(
+            Delivery.id == delivery.id, Delivery.status == "sending",
+        ).values(status=status, receipt=runtime.security.seal(receipt)))
+
+
 async def deliver_one(runtime: Runtime, client: httpx.AsyncClient, delivery: Delivery) -> None:
+    from .slack_progress import claim_delivery, reply_target, skip_obsolete
+    if await skip_obsolete(runtime, delivery, product=False):
+        return
+    destination = json.loads(delivery.destination)
+    content = saved_message(runtime.security.unseal(delivery.content), destination)
+    is_upload = SlackFileDelivery.is_content(content)
+    if is_upload and not await SlackFileDelivery.ready(runtime, content):
+        return
+    ready, reply_ts = await reply_target(runtime, delivery, product=False)
+    if not ready:
+        return
     async with runtime.database.sessions.begin() as db:
         turn = await db.get(Turn, delivery.turn_id)
         actor = await db.get(User, turn.actor_id) if turn else None
@@ -194,16 +281,37 @@ async def deliver_one(runtime: Runtime, client: httpx.AsyncClient, delivery: Del
         if actor is None or not actor.enabled or session is None or session.deleted:
             await db.execute(update(Delivery).where(Delivery.id == delivery.id).values(status="suppressed"))
             return
-        claimed = await db.scalar(update(Delivery).where(
-            Delivery.id == delivery.id, Delivery.status == "pending"
-        ).values(status="sending", claimed_at=now()).returning(Delivery.id))
-    if claimed is None:
+    if not await claim_delivery(runtime, delivery, product=False):
         return
-    destination = json.loads(delivery.destination)
+    if is_upload:
+        async def before_send():
+            async with runtime.database.sessions() as db:
+                turn = await db.get(Turn, delivery.turn_id)
+                actor = await db.get(User, turn.actor_id) if turn else None
+                session = await db.get(Session, delivery.session_id)
+            if actor is None or not actor.enabled or session is None or session.deleted:
+                raise PermissionError("Slack file delivery is no longer authorized.")
+
+        try:
+            receipt = await SlackFileDelivery.send(
+                client, content, destination, headers=None, before_send=before_send,
+            )
+        except asyncio.CancelledError as exc:
+            await _settle_delivery(runtime, delivery, "rejected", {"error": str(exc)})
+            raise
+        except Exception as exc:  # noqa: BLE001  # [BLE001] Failed uploads must settle rejected.
+            await _settle_delivery(runtime, delivery, "rejected", {"error": str(exc)})
+            return
+        await _settle_delivery(runtime, delivery, "sent", receipt)
+        return
+
     try:
-        response = await client.post("chat.postMessage", json={
-            **destination, "text": runtime.security.unseal(delivery.content).decode(),
-            "unfurl_links": False, "unfurl_media": False,
+        response = await client.post("chat.update" if reply_ts else "chat.postMessage", json={
+            "channel": destination["channel"],
+            **({"ts": reply_ts} if reply_ts else {
+                "thread_ts": destination["thread_ts"], "unfurl_links": False, "unfurl_media": False,
+            }),
+            **content,
             "metadata": {"event_type": "moyai_delivery", "event_payload": {"id": delivery.id}},
         })
         response.raise_for_status()
@@ -267,6 +375,8 @@ async def pump(runtime: Runtime) -> None:
         ).order_by(SlackInbox.created_at).limit(10))).all())
     for item in inbox:
         await admit_one(runtime, item)
+    from .slack_progress import stage_progress
+    await stage_progress(runtime)
     await stage_deliveries(runtime)
     async with runtime.database.sessions() as db:
         deliveries = list((await db.scalars(select(Delivery).where(

@@ -184,13 +184,25 @@ class FilePreviewService:
         if current.auth_version != user.auth_version:
             raise HTTPException(401, "Your session expired.")
         async with self.runtime.database.sessions() as db:
-            await self.runtime.database.allowed_session(db, session_id, current)
+            await self.runtime.database.allowed_session(db, session_id, user)
             row = await db.get(Artifact if kind == "artifact" else Upload, resource_id)
-            # An unattached upload or a file from another allowed session is
-            # still not a member of the requested session.
-            if row is None or row.session_id != session_id:
+            if row is None:
+                raise HTTPException(404, "File not found in this session.")
+            if row.session_id != session_id and (
+                kind != "artifact"
+                or not (
+                    await self.runtime.database.swarms.shared_artifact(db, user, session_id, row.session_id)
+                    or await self.delegated_artifact(db, user, session_id, row.session_id)
+                )
+            ):
+                # Ordinary allowed sessions and input uploads do not imply
+                # cross-session access. Swarms explicitly share saved outputs.
                 raise HTTPException(404, "File not found in this session.")
             return FileRecord(row.id, kind, session_id, row.name, row.media_type, row.size, row.digest)
+
+    async def delegated_artifact(self, db, user: User, session_id: str, source_id: str | None) -> bool:
+        from .delegation import DelegationService
+        return await DelegationService(self.runtime.database).shared_artifact(db, user, session_id, source_id)
 
     async def load(
         self, user: User, session_id: str, kind: ResourceKind, resource_id: str,

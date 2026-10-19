@@ -12,13 +12,15 @@ from pydantic_ai.messages import (
     ModelRequest,
     ModelResponse,
     PartDeltaEvent,
+    PartEndEvent,
     PartStartEvent,
     ToolCallPart,
     ToolReturnPart,
 )
 from pydantic_ai.run import AgentRunResultEvent
 
-from .live_events import ResponseStart
+from .commentary import text_phase
+from .live_events import PUBLIC_UPDATE_PREFIXES, ResponseStart
 
 PRIVATE_TOOLS = {"read_memory", "search_memory", "write_memory", "delete_memory", "load_capability"}
 
@@ -32,11 +34,24 @@ def public_event(event: Any) -> dict[str, Any] | None:
         return {"type": "response_start", "run_id": event.run_id, "step": event.step}
     if isinstance(event, PartStartEvent):
         if event.part.part_kind == "text":
-            return {"type": "text_start", "index": event.index, "text": event.part.content}
+            return {
+                "type": "text_start", "index": event.index, "text": event.part.content,
+                "phase": text_phase(event.part.provider_details),
+            }
         return None
     if isinstance(event, PartDeltaEvent):
         if event.delta.part_delta_kind == "text":
-            return {"type": "text_delta", "index": event.index, "text": event.delta.content_delta}
+            return {
+                "type": "text_delta", "index": event.index, "text": event.delta.content_delta,
+                "phase": text_phase(event.delta.provider_details),
+            }
+        return None
+    if isinstance(event, PartEndEvent):
+        if event.part.part_kind == "text":
+            return {
+                "type": "text_end", "index": event.index, "text": event.part.content,
+                "phase": text_phase(event.part.provider_details),
+            }
         return None
     if isinstance(event, FunctionToolCallEvent):
         part = event.part
@@ -57,7 +72,7 @@ def public_event(event: Any) -> dict[str, Any] | None:
         return {"type": "agent_finished", "run_id": event.result.run_id}
     name = type(event).__name__
     if (
-        name.startswith(("Plan", "Delegation", "AskUser", "EnqueuedMessages"))
+        name.startswith(PUBLIC_UPDATE_PREFIXES)
         and is_dataclass(event) and not isinstance(event, type)
     ):
         value = asdict(event)
@@ -82,9 +97,11 @@ def redact(value: Any, secrets: list[str]) -> Any:
 
 
 def saved_activity(messages: list[ModelMessage], run_id: str) -> list[dict[str, Any]]:
+    from .history_handoff import is_turn_run
+
     result = []
     for message in messages:
-        if message.run_id != run_id:
+        if not is_turn_run(message.run_id, run_id):
             continue
         for part in message.parts:
             if isinstance(message, ModelResponse) and isinstance(part, ToolCallPart):

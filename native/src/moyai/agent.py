@@ -3,24 +3,23 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from contextvars import ContextVar
 from dataclasses import replace
 from datetime import timedelta
 from functools import cached_property
 from pathlib import Path
-from typing import Any
+from typing import Annotated, Any
 
 import anyio
 import modal
 from openai import AsyncOpenAI, DefaultAsyncHttpxClient
 from opentelemetry.trace import get_tracer
-from pydantic import TypeAdapter
+from pydantic import Field, TypeAdapter
 from pydantic_ai import Agent, DeferredToolRequests, RunContext
 from pydantic_ai.capabilities import AbstractCapability, SetToolMetadata, durable_operation
 from pydantic_ai.capabilities.abstract import WrapToolExecuteHandler
 from pydantic_ai.durable_exec.temporal import TemporalDurability, TemporalRunContext
-from pydantic_ai.exceptions import ToolFailed
-from pydantic_ai.messages import ModelRequest, ToolCallPart
+from pydantic_ai.exceptions import CallDeferred, ModelRetry, ToolFailed
+from pydantic_ai.messages import ToolCallPart
 from pydantic_ai.models import Model, ModelRequestContext
 from pydantic_ai.models.openai import OpenAIResponsesModel, OpenAIResponsesModelSettings
 from pydantic_ai.providers.litellm import LiteLLMProvider
@@ -29,7 +28,6 @@ from pydantic_ai.toolsets import AbstractToolset, FunctionToolset
 from pydantic_ai.workspaces import WorkspaceRef
 from pydantic_ai_harness import (
     AskUser,
-    Coder,
     ConversationSearch,
     Memory,
     ModalSandbox,
@@ -38,6 +36,7 @@ from pydantic_ai_harness import (
     StepPersistence,
     SummarizingCompaction,
 )
+from pydantic_ai_harness.ask_user import AskUserRequest, Question
 from pydantic_ai_harness.conversation_search import SnapshotHistorySource
 from temporalio import workflow
 from temporalio.common import RetryPolicy
@@ -45,17 +44,29 @@ from temporalio.exceptions import ActivityError, ApplicationError
 
 from .artifacts import artifact_capability
 from .browser import browser_capability
+from .browser_login import BrowserLogin
+from .bundled_skills import bundled_skill_catalog
+from .commentary import Commentary
+from .computer_startup import OnDemandDurability, on_demand_coder
+from .connection_catalog import ConnectionToolSearch
 from .connections import connection_tools
 from .contracts import GuidanceChanged, RunScope
 from .database import Database
+from .delegation import InteractiveDelegation
 from .effects import EffectReceipts
+from .goal_tools import GoalCapability
 from .inference_usage import InferenceUsageTransport
 from .input_attachments import attachment_capability
+from .input_identity import DELEGATED_INPUT, input_identity
 from .live_events import root_event_stream
+from .request_limits import UnlimitedModelRequests
 from .settings import Settings
 from .settings_runtime import settings_capability
 from .storage import ObjectStore
 from .stores import NativeStores
+from .swarm_tools import SwarmCapability
+from .tools import WORKSPACE_TOOLS
+from .tools.desktop import desktop_capability
 
 PACKAGE_ROOT = Path(__file__).resolve().parent / "resources"
 if not PACKAGE_ROOT.is_dir():
@@ -66,18 +77,6 @@ PLAN_TOOLS = {
     "write_plan", "read_plan", "add_task", "update_task_status", "update_task_statuses",
     "remove_task", "add_subtask", "set_dependency", "get_available_tasks",
 }
-DELEGATED_INPUT: ContextVar[str | None] = ContextVar("moyai_delegated_input", default=None)
-
-
-def input_identity(ctx: RunContext[RunScope]) -> str:
-    identity = DELEGATED_INPUT.get() or ctx.deps.turn_id
-    for message in ctx.messages:
-        if (
-            isinstance(message, ModelRequest) and message.metadata
-            and message.metadata.get("moyai_parent_turn_id") == ctx.deps.turn_id
-        ):
-            identity = message.metadata.get("moyai_input_id", identity)
-    return identity
 
 
 class HarnessActivityContext(TemporalRunContext[RunScope]):
@@ -110,9 +109,45 @@ class DurableQuestions(AskUser[RunScope]):
         native = super().get_toolset()
         if not isinstance(native, FunctionToolset):
             raise TypeError("The native question capability changed its toolset contract.")
-        # Keep the SDK's tool, validator, events and deferral implementation unchanged.
+        original = native.tools["ask_user_question"].function
+
+        async def ask_user_question(
+            ctx: RunContext[RunScope],
+            questions: Annotated[list[Question], Field(min_length=1, max_length=10)],
+            required: bool = True,
+        ) -> dict[str, list[str]] | str:
+            """Ask a clarification with options; the user can also type their answer.
+
+            Ask only when the answer cannot be found in the conversation, the connected repositories, or the workspace. If the request has several readings that are each cheap to check, check them instead of asking.
+            Use required=False for optional preferences with a reasonable fallback.
+            Optional questions may time out with no answer; state your assumption then.
+            Use required=True when missing information prevents correct work.
+            Never use this tool for permission, credentials, or approval of an action.
+
+            Args:
+                questions: One to ten questions with unique headers and concrete options.
+                required: Whether an explicit answer is necessary to continue.
+            """
+            try:
+                request = AskUserRequest.from_tool_call(ToolCallPart(
+                    "ask_user_question", {"questions": [question.model_dump() for question in questions]},
+                    tool_call_id=ctx.tool_call_id or "",
+                ))
+            except ValueError as error:
+                raise ModelRetry("Use valid questions with unique headers and distinct option labels.") from error
+            try:
+                return await original(ctx, list(request.questions))
+            except CallDeferred as error:
+                if required:
+                    raise
+                raise CallDeferred(metadata={
+                    **(error.metadata or {}), "moyai_question_required": False,
+                }) from None
+
+        # Retain the SDK's validation, events and result shape. Optional intent
+        # belongs to the persisted deferred call, never a browser-only timer.
         return FunctionToolset(
-            tools=list(native.tools.values()), id="moyai_questions"
+            tools=[ask_user_question], id="moyai_questions"
         ).with_metadata(temporal=False)
 
     def get_toolset(self) -> AbstractToolset[RunScope]:
@@ -134,9 +169,17 @@ class DurableConversationSearch(ConversationSearch[RunScope]):
 
 
 class StartupSkills(Skills[RunScope]):
-    """Let bounded native workspace reads settle after a sibling startup fails."""
+    """Load packaged skills without a computer, retaining old workflow reads."""
+
+    def __init__(self, directory: str, *, catalog: Skills[RunScope] | None = None) -> None:
+        super().__init__(directory)
+        self.catalog = catalog
 
     async def for_run(self, ctx: RunContext[RunScope]) -> AbstractCapability[RunScope]:
+        if self.catalog is not None and (
+            not workflow.in_workflow() or workflow.patched("moyai-bundled-skill-catalog-v1")
+        ):
+            return await self.catalog.for_run(ctx)
         if not workflow.in_workflow():
             return await super().for_run(ctx)
         # AnyIO level cancellation can repeatedly cancel Temporal's activity
@@ -203,6 +246,36 @@ class Authority(AbstractCapability[RunScope]):
             return False
         return True
 
+    @durable_operation('governance_tool')
+    async def governance_tool(self, scope: RunScope, name: str, read_only: bool | None) -> None:
+        governance = getattr(self.database, 'governance', None)
+        if governance is not None:
+            await governance.check_tool(scope, name, read_only=read_only)
+
+    @durable_operation('governance_model')
+    async def governance_model(self, scope: RunScope) -> None:
+        governance = getattr(self.database, 'governance', None)
+        if governance is not None:
+            await governance.check_model(scope)
+
+    @durable_operation('governance_catalog')
+    async def governance_catalog(self, scope: RunScope, definitions: list[tuple[str, bool | None]]) -> list[str]:
+        governance = getattr(self.database, 'governance', None)
+        return await governance.tools(scope, definitions) if governance is not None else [name for name, _ in definitions]
+
+    async def prepare_tools(self, ctx: RunContext[RunScope], tool_defs: list[ToolDefinition]) -> list[ToolDefinition]:
+        if not self.governed():
+            return tool_defs
+        allowed = set(await self.governance_catalog(ctx.deps, [
+            (tool.name, (tool.metadata or {}).get('annotations', {}).get('readOnlyHint')) for tool in tool_defs]))
+        return [tool for tool in tool_defs if tool.name in allowed]
+
+    def governed(self) -> bool:
+        # Old histories must not acquire new durable commands during replay.
+        # Actual activity attempts still enforce live policy independently.
+        return getattr(self.database, 'governance', None) is not None and (
+            not workflow.in_workflow() or workflow.patched('moyai-governance-v23'))
+
     @durable_operation("save_workspace")
     async def save_workspace(self, scope: RunScope, reference: dict[str, Any]) -> None:
         await self.database.save_workspace_reference(scope, reference)
@@ -211,6 +284,8 @@ class Authority(AbstractCapability[RunScope]):
         self, ctx: RunContext[RunScope], request_context: ModelRequestContext
     ) -> ModelRequestContext:
         await self.check(ctx.deps)
+        if self.governed():
+            await self.governance_model(ctx.deps)
         if ctx.workspace.ref:
             await self.save_workspace(
                 ctx.deps, TypeAdapter(WorkspaceRef).dump_python(ctx.workspace.ref, mode="json")
@@ -224,6 +299,9 @@ class Authority(AbstractCapability[RunScope]):
         if not await self.check(ctx.deps, input_identity(ctx)):
             # Pair the skipped call with a result so native pending guidance can be consumed.
             raise ToolFailed("New guidance arrived before dispatch; this action did not execute.")
+        metadata = tool_def.metadata or {}
+        if self.governed():
+            await self.governance_tool(ctx.deps, call.tool_name, metadata.get('annotations', {}).get('readOnlyHint'))
         return args
 
     async def wrap_tool_execute(
@@ -259,6 +337,28 @@ def inference_models(settings: Settings) -> dict[str, Model]:
     return {name: OpenAIResponsesModel(name, provider=provider) for name in settings.models}
 
 
+
+def workspace_image() -> modal.Image:
+    """The same image definition for lazy startup and deployment prewarming."""
+    image = (
+        modal.Image.debian_slim(python_version="3.13")
+        .apt_install("git", "ripgrep", "curl", "jq", "util-linux", "nodejs", "npm",
+                     "xvfb", "openbox", "xterm", "xdotool", "chromium", "tint2", "x11vnc",
+                     "x11-xserver-utils", "fonts-dejavu-core")
+        .pip_install("uv", "pytest", "pillow==12.3.0", "websockify==0.13.0", "playwright==1.63.0")
+    )
+    for tool in WORKSPACE_TOOLS:
+        image = tool.install(image)
+    return (
+        image
+        .add_local_dir(PACKAGE_ROOT / "skills", "/opt/moyai/skills", copy=True)
+        .add_local_file(PACKAGE_ROOT / "desktop.py", "/opt/moyai/desktop.py", copy=True)
+        .add_local_file(PACKAGE_ROOT / "browser_guest.py", "/opt/moyai/browser_guest.py", copy=True)
+        .add_local_file(PACKAGE_ROOT / "browser_driver.py", "/opt/moyai/browser_driver.py", copy=True)
+        .add_local_file(PACKAGE_ROOT / "ocu_guest.py", "/opt/moyai/ocu_guest.py", copy=True)
+    )
+
+
 def make_agent(
     settings: Settings, database: Database, stores: NativeStores, objects: ObjectStore,
     *, models: dict[str, Model] | None = None,
@@ -269,21 +369,14 @@ def make_agent(
 ) -> tuple[Agent[RunScope, str | DeferredToolRequests], TemporalDurability[RunScope]]:
     models = models or inference_models(settings)
     if workspace is None:
-        image = (
-            modal.Image.debian_slim(python_version="3.13")
-            .apt_install("git", "ripgrep", "curl", "jq", "util-linux", "nodejs", "npm",
-                         "xvfb", "openbox", "xterm", "xdotool", "chromium", "tint2", "x11vnc",
-                         "x11-xserver-utils", "fonts-dejavu-core")
-            .pip_install("uv", "pytest", "pillow==12.3.0", "websockify==0.13.0", "playwright==1.63.0")
-            .add_local_dir(PACKAGE_ROOT / "skills", "/opt/moyai/skills", copy=True)
-            .add_local_file(PACKAGE_ROOT / "desktop.py", "/opt/moyai/desktop.py", copy=True)
-            .add_local_file(PACKAGE_ROOT / "browser_guest.py", "/opt/moyai/browser_guest.py", copy=True)
+        from .lambda_workspace import WorkspaceProviders
+        workspace = WorkspaceProviders(
+            settings, ModalSandbox(
+                image=workspace_image(), app_name=settings.modal_app, working_dir="/workspace",
+                sandbox_timeout=settings.computer_lifetime, idle_timeout=settings.computer_idle_timeout,
+            ),
         )
-        workspace = ModalSandbox(
-            image=image, app_name=settings.modal_app, working_dir="/workspace",
-            sandbox_timeout=settings.computer_lifetime, idle_timeout=settings.computer_idle_timeout,
-        )
-    durability: TemporalDurability[RunScope] = TemporalDurability(
+    durability: TemporalDurability[RunScope] = OnDemandDurability(
         models=models,
         run_context_type=HarnessActivityContext,
         activity_config={
@@ -300,6 +393,7 @@ def make_agent(
         },
         event_stream_handler=root_event_stream,
     )
+    authority = Authority(database)
     agent = Agent(
         models[settings.default_model],
         name="moyai",
@@ -308,23 +402,41 @@ def make_agent(
         retries=2,
         instructions=(PACKAGE_ROOT / "instructions.md").read_text(),
         capabilities=[
+            UnlimitedModelRequests(),
             workspace,
-            Authority(database),
+            authority,
+            InteractiveDelegation(database),
+            SwarmCapability(database.swarms),
+            GoalCapability(database.goals),
+            Commentary(database),
             EffectReceipts(database),
             *product_capabilities,
             connection_tools(database.security),
+            ConnectionToolSearch(
+                strategy="keywords", max_results=6,
+                tool_description=(
+                    "Find tools for the selected connected accounts. Search by service, repository, "
+                    "and action before calling a connected tool. Only matching definitions are loaded."
+                ),
+            ),
             artifact_capability(database, objects),
             attachment_capability(database, objects),
             browser_capability(database),
-            Coder(),
+            desktop_capability(database),
+            BrowserLogin(database),
+            on_demand_coder(authority.save_workspace, database),
             WorkflowPlanning(
                 store_resolver=lambda ctx: stores.plan(
-                    ctx.deps.session_id if ctx.run_id == ctx.deps.turn_id
+                    ctx.deps.session_id if ctx.run_id == ctx.deps.root_run_id
                     else f"{ctx.deps.session_id}/delegate/{ctx.run_id}"
                 ),
                 enable_subtasks=True,
             ),
-            StartupSkills(skills_directory),
+            StartupSkills(
+                skills_directory,
+                catalog=bundled_skill_catalog(PACKAGE_ROOT / "skills", skills_directory)
+                if skills_directory == "/opt/moyai/skills" else None,
+            ),
             settings_capability(database),
             memory or Memory(
                 store=stores.memory, namespace=lambda ctx: ctx.deps.memory_namespace, injection_errors="raise",
@@ -342,4 +454,3 @@ def make_agent(
         ],
     )
     return agent, durability
-

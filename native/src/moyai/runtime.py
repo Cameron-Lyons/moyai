@@ -79,6 +79,8 @@ class Runtime:
         self.product_continuations: ProductContinuationService | None = None
         self.product_drain: ProductDrainService | None = None
         if self.product is not None:
+            from .product_governance import ProductGovernance
+            self.database.governance = ProductGovernance(self.product, self.database)
             from .product_automations import ProductAutomationService
             from .product_billing_routes import ProductBillingService
             from .product_connections import ProductConnections
@@ -108,6 +110,12 @@ class Runtime:
                 self.product_drain = ProductDrainService.from_runtime(self)
                 self.database.product_drain = self.product_drain
         self.client: Client | None = None
+        from .skill_invocations import SkillInvocations
+        from .slack_activity import SlackActivityService
+        from .work_progress import WorkProgress
+        self.skill_invocations = SkillInvocations(self)
+        self.work_progress = WorkProgress(self)
+        self.slack_activity = SlackActivityService(self)
         self.agent: Agent[RunScope, str | DeferredToolRequests]
         self.durability: TemporalDurability[RunScope]
         self.models: dict[str, Model] = {}
@@ -170,9 +178,23 @@ class Runtime:
             if self.product_automations is not None:
                 from .product_automation_tools import capability
                 product_capabilities.append(capability(self.product_automations))
+                if self.product_skill_catalog is not None:
+                    from .product_skill_tools import capability as skill_capability
+                    product_capabilities.append(skill_capability(self.product_skill_catalog, self.product_automations))
             if self.product_secrets is not None:
                 from .product_credential_tools import capability as credential_capability
                 product_capabilities.append(credential_capability(self.product_secrets.execution))
+            if self.product is not None and self.product_connections is not None:
+                from .context import ContextSource, SessionContext
+                from .context.github import GitHubRepositories, make_repository_names
+                from .context.slack import SlackThread, make_slack_thread_reader
+
+                sources: list[ContextSource] = [
+                    GitHubRepositories(make_repository_names(self.product_connections), self.database.governance),
+                ]
+                if self.product_slack is not None:
+                    sources.append(SlackThread(make_slack_thread_reader(self.product_slack)))
+                product_capabilities.append(SessionContext(sources=sources))
             self.agent, self.durability = make_agent(
                 self.settings, self.database, self.stores, self.objects, models=self.models, workspace=workspace,
                 skills_directory=skills_directory, product_capabilities=product_capabilities, memory=memory,
@@ -198,6 +220,7 @@ class Runtime:
         return self.client
 
     async def close(self) -> None:
+        self.work_progress.clear()
         try:
             if self.product_inference is not None:
                 await self.product_inference.close()
@@ -237,4 +260,3 @@ def current() -> Runtime:
     if _runtime is None:
         raise RuntimeError("Moyai runtime is not initialized.")
     return _runtime
-

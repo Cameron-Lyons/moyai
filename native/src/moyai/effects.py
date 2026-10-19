@@ -30,6 +30,7 @@ from .pr_publications import CreationReceipt, creation_receipt, persist_publicat
 logger = logging.getLogger(__name__)
 
 COMPUTER_EFFECTS = {"shell", "run_command", "start_command", "credentials_run"}
+SKILL_EFFECTS = {"skill_create", "skill_update", "skill_delete"}
 AUTOMATION_EFFECTS = {
     "automation_create", "automation_update", "automation_migrate",
     "automation_enable", "automation_pause", "automation_retire",
@@ -40,9 +41,17 @@ SCOPED_AUTOMATION_EFFECTS = {
     "automation_grant", "automation_self_update", "automation_claim_item", "automation_webhook_setup",
 }
 SERVICE_PREFIXES = ("github_", "linear_", "notion_", "slack_")
+SHELL_RECOVERY_VERSION = "moyai-shell-readiness-v1"
+SHELL_READINESS_SUPPORTED = "moyai_shell_readiness_supported"
+
+
+class PendingEffectError(PermissionError):
+    """A new call was refused before dispatch; the earlier receipt stays pending."""
 
 
 def requires_receipt(tool: ToolDefinition) -> bool:
+    if tool.name in SKILL_EFFECTS:
+        return not workflow.in_workflow() or workflow.patched("moyai-skill-receipts-v1")
     if tool.name == "credentials_run":
         return not workflow.in_workflow() or workflow.patched("moyai-credential-command-receipts-v1")
     if tool.name in SCOPED_AUTOMATION_EFFECTS:
@@ -108,7 +117,10 @@ class EffectReceipts(AbstractCapability[RunScope]):
         self.database = database
 
     @durable_operation("reserve")
-    async def reserve(self, scope: RunScope, identity: str, name: str, args: dict[str, Any]) -> None:
+    async def reserve(
+        self, scope: RunScope, identity: str, name: str, args: dict[str, Any],
+        shell_readiness: bool = False,
+    ) -> None:
         await self.database.authorize_scope(scope)
         serialized = json.dumps(args, sort_keys=True, default=str)
         fingerprint = hashlib.sha256(f"{name}:{serialized}".encode()).hexdigest()
@@ -122,18 +134,20 @@ class EffectReceipts(AbstractCapability[RunScope]):
                 if await db.scalar(select(Effect.id).where(
                     Effect.session_id == scope.session_id, Effect.state == "pending"
                 )):
-                    raise PermissionError("An earlier action needs reconciliation before another write.")
+                    raise PendingEffectError("An earlier action needs reconciliation before another write.")
                 db.add(Effect(
                     id=identity, session_id=scope.session_id, turn_id=scope.turn_id,
                     actor_id=scope.actor_id, tool_name=name,
                     arguments=self.database.security.seal(serialized), fingerprint=fingerprint,
                     resolution=(
                         self.database.security.seal({"browser_phase": "reserved"})
-                        if name in BROWSER_WRITES else None
+                        if name in BROWSER_WRITES else
+                        self.database.security.seal({"shell_phase": "reserved"})
+                        if name == "shell" and shell_readiness else None
                     ),
                 ))
         except IntegrityError as error:
-            raise PermissionError("Another action is awaiting a confirmed outcome.") from error
+            raise PendingEffectError("Another action is awaiting a confirmed outcome.") from error
 
     @durable_operation("confirm")
     async def confirm(self, identity: str) -> None:
@@ -171,7 +185,12 @@ class EffectReceipts(AbstractCapability[RunScope]):
         self, ctx: RunContext[RunScope], tool_defs: list[ToolDefinition]
     ) -> list[ToolDefinition]:
         return [
-            replace(tool, sequential=True) if requires_receipt(tool) else tool
+            replace(
+                tool, sequential=True,
+                metadata={**(tool.metadata or {}), SHELL_RECOVERY_VERSION: True},
+            ) if tool.name == "shell" and (tool.metadata or {}).get(SHELL_READINESS_SUPPORTED) and (
+                not workflow.in_workflow() or workflow.patched(SHELL_RECOVERY_VERSION)
+            ) else replace(tool, sequential=True) if requires_receipt(tool) else tool
             for tool in tool_defs
         ]
 
@@ -201,8 +220,20 @@ class EffectReceipts(AbstractCapability[RunScope]):
             # enforced by the SDK before this hook once the tool is marked below.
             identity = effect_id(ctx, call)
             try:
-                await self.reserve(ctx.deps, identity, call.tool_name, args)
+                if tool_def.name == "shell" and (tool_def.metadata or {}).get(SHELL_RECOVERY_VERSION):
+                    await self.reserve(ctx.deps, identity, call.tool_name, args, shell_readiness=True)
+                else:
+                    await self.reserve(ctx.deps, identity, call.tool_name, args)
             except Exception as error:
+                cause = error.cause if isinstance(error, ActivityError) else error
+                if isinstance(cause, PendingEffectError) or (
+                    isinstance(cause, ApplicationError) and cause.type == "PendingEffectError"
+                ):
+                    raise ToolFailed(
+                        "This action did not run. An earlier action has an unconfirmed outcome. "
+                        "Use available read tools to inspect it and explain what still needs review. "
+                        "Do not repeat the earlier action or attempt other writes until it is reconciled."
+                    ) from error
                 if tool_def.name in BROWSER_WRITES and await self.not_dispatched(identity):
                     raise ToolFailed("Browser reservation failed before dispatch. The action did not execute.") from error
                 raise
@@ -213,6 +244,7 @@ class EffectReceipts(AbstractCapability[RunScope]):
         tool_def: ToolDefinition, args: dict[str, Any], result: Any,
     ) -> Any:
         if tool_def.name in BROWSER_WRITES:
+            surface = "desktop" if tool_def.name == "desktop_action" else "browser"
             outcome = (result.metadata or {}).get(BROWSER_OUTCOME) if isinstance(result, ToolReturn) else None
             if outcome in {"not_dispatched", "unknown"}:
                 guarded = requires_receipt(tool_def)
@@ -223,19 +255,21 @@ class EffectReceipts(AbstractCapability[RunScope]):
                     raise ToolFailed(str(result.return_value))
                 state = await self.browser_state(identity) if guarded else None
                 if state == "confirmed":
-                    raise ToolFailed("The browser action completed, but its result could not be delivered. Do not repeat it.")
+                    raise ToolFailed(f"The {surface} action completed, but its result could not be delivered. Do not repeat it.")
                 if state == "not_dispatched":
-                    raise ToolFailed("This browser call was already refused before dispatch. It was not repeated.")
+                    raise ToolFailed(f"This {surface} call was already refused before dispatch. It was not repeated.")
                 raise ToolFailed(
-                    "The browser outcome is uncertain. Use browser_read to inspect it, then reconcile "
+                    f"The {surface} outcome is uncertain. Use {surface}_read to inspect it, then reconcile "
                     "the pending action before another write. Do not repeat the action."
                 )
             if requires_receipt(tool_def) and outcome != "completed":
                 # A missing/malformed result marker cannot attest success.
-                raise ToolFailed("The browser result has no confirmed outcome. Inspect and reconcile the pending action.")
+                raise ToolFailed(f"The {surface} result has no confirmed outcome. Inspect and reconcile the pending action.")
         if requires_receipt(tool_def):
             await self.confirm(effect_id(ctx, call))
-            is_creation = call.tool_name.startswith("github_") and call.tool_name.endswith("_create_pull_request")
+            is_creation = call.tool_name.startswith("github_") and call.tool_name.endswith(
+                ("_create_pull_request", "_open_pull_request")
+            )
             if is_creation and (not workflow.in_workflow() or workflow.patched("moyai-pr-publications-v1")):
                 try:
                     receipt = creation_receipt(
@@ -256,6 +290,7 @@ class EffectReceipts(AbstractCapability[RunScope]):
     ) -> Any:
         cause = error.cause if isinstance(error, ActivityError) else None
         if tool_def.name in BROWSER_WRITES and requires_receipt(tool_def):
+            surface = "desktop" if tool_def.name == "desktop_action" else "browser"
             identity = effect_id(ctx, call)
             if isinstance(cause, ApplicationError) and cause.type in {
                 "MoyaiGuidanceChanged", "MoyaiPermissionDenied", "MoyaiMissingExecutionScope",
@@ -263,11 +298,11 @@ class EffectReceipts(AbstractCapability[RunScope]):
                 raise ToolFailed("Execution authority changed before browser dispatch. The action did not execute.") from error
             state = await self.browser_state(identity)
             if state == "confirmed":
-                raise ToolFailed("The browser action completed, but its result could not be delivered. Do not repeat it.") from error
+                raise ToolFailed(f"The {surface} action completed, but its result could not be delivered. Do not repeat it.") from error
             if state == "not_dispatched":
-                raise ToolFailed("This browser call was already refused before dispatch. It was not repeated.") from error
+                raise ToolFailed(f"This {surface} call was already refused before dispatch. It was not repeated.") from error
             raise ToolFailed(
-                "The browser outcome is uncertain. Inspect with browser_read and reconcile "
+                f"The {surface} outcome is uncertain. Inspect with {surface}_read and reconcile "
                 "the pending action before another write."
             ) from error
         if (

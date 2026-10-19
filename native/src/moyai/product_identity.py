@@ -8,8 +8,8 @@ Integration contract (the caller owns activation and reviewed schema migrations)
   No Store, login enrollment, schema initialization or agent runtime is imported.
 * API actor dependency:
     principal = await identity.authenticate(request, mutation=is_mutation)
-    async with database.sessions.begin() as db:
-        user = await identity.project_native_user(db, principal)
+    Read requests first use read_native_user in a read session. Missing native
+    users and mutations use project_native_user in a write transaction.
     return user
   Return principal.csrf_token from /me. The browser can send the same verified
   token as both x-csrf-token and X-Moyai-CSRF. Exact legacy Origin remains required.
@@ -80,6 +80,10 @@ class ProductGrant:
     authority_version: str
 
 
+class _GrantedUser(Protocol):
+    product_grant: ProductGrant
+
+
 @dataclass(frozen=True)
 class ProductPrincipal:
     id: str
@@ -95,6 +99,18 @@ class ProductPrincipal:
     account_created_at: str = field(default="", repr=False)
     native_auth_version: int = field(default=1, repr=False)
     role_revision: int = field(default=0, repr=False)
+    permissions: frozenset[str] | None = None
+    direct_permissions: frozenset[str] | None = None
+    access_role: dict[str, str] | None = None
+
+    @property
+    def effective_permissions(self) -> frozenset[str]:
+        from app.permissions import BUILTIN_PERMISSIONS
+        return self.permissions if self.permissions is not None else BUILTIN_PERMISSIONS[self.role]
+
+    def require(self, permission: str) -> None:
+        if permission not in self.effective_permissions:
+            raise HTTPException(403, 'Your workspace role does not allow this action.')
 
     @property
     def individual(self) -> bool:
@@ -112,16 +128,16 @@ class SlackAuthority(Protocol):
 
 
 class _RoleConnection:
-    """Adapt the existing pure UserRoles.role_in query to this async SQL session."""
+    """Adapt the shared role/revision query to this async SQL session."""
 
     def __init__(self, session: Any, table: str):
         self.session, self.table = session, table
 
     def execute(self, statement: str, parameters: tuple[str, ...]):
-        if statement != "SELECT role FROM user_roles WHERE email=?" or len(parameters) != 1:
+        if statement != "SELECT role,revision FROM user_roles WHERE email=?" or len(parameters) != 1:
             raise RuntimeError("The product role query changed; review its identity adapter.")
         return self.session.execute(
-            text(f"SELECT role FROM {self.table} WHERE email=:email"), {"email": parameters[0]},
+            text(f"SELECT role,revision FROM {self.table} WHERE email=:email"), {"email": parameters[0]},
         ).mappings()
 
 
@@ -160,6 +176,7 @@ class ProductIdentityAdapter:
         self.settings = legacy_settings
         self.source_engine = source_engine
         self.native_engine = native_engine or source_engine
+        self._controls_engine: AsyncEngine | None = None
         self.allow_shared_identities = allow_shared_identities
         self.slack_authority: SlackAuthority | None = None
         # No role service is attached here: Security handles signed-session and
@@ -184,14 +201,18 @@ class ProductIdentityAdapter:
     async def _native_controls(self, user_id: str, db: AsyncSession | None = None) -> tuple[bool, int]:
         async def read(session: AsyncSession) -> tuple[bool, int]:
             connection = await session.connection()
-            schema = User.__table__.schema
-            if connection.dialect.name == "postgresql" and schema is None:
-                schema = await connection.scalar(text("SELECT current_schema()"))
-            exists = await connection.run_sync(
-                lambda conn: inspect(conn).has_table(User.__tablename__, schema=schema)
-            )
-            if not exists:
-                return True, 1
+            if self._controls_engine is not connection.engine:
+                schema = User.__table__.schema
+                if connection.dialect.name == "postgresql" and schema is None:
+                    schema = await connection.scalar(text("SELECT current_schema()"))
+                exists = await connection.run_sync(
+                    lambda conn: inspect(conn).has_table(User.__tablename__, schema=schema)
+                )
+                if not exists:
+                    return True, 1
+                # Cache only positive schema discovery, never account authority.
+                # A later missing table fails the SELECT below closed.
+                self._controls_engine = connection.engine
             row = (await session.execute(select(User.enabled, User.auth_version).where(User.id == user_id))).first()
             return (bool(row.enabled), row.auth_version) if row else (True, 1)
 
@@ -217,7 +238,8 @@ class ProductIdentityAdapter:
         if kind == "slack":
             if self.slack_authority is None:
                 raise HTTPException(401, "Signed Slack authority is not configured.")
-            return await self.slack_authority.current(db, dict(row), (enabled, controls[1]))
+            principal = await self.slack_authority.current(db, dict(row), (enabled, controls[1]))
+            return await self.govern_principal(db, principal)
         revision = 0
         binding = None
         if kind in {"google", "cloudflare"}:
@@ -235,12 +257,11 @@ class ProductIdentityAdapter:
                 method = "google"
             else:
                 raise HTTPException(401, "This product sign-in method is no longer enabled.")
-            role = await db.run_sync(
-                lambda session: self.roles.role_in(_RoleConnection(session, self._table("user_roles")), email)
+            role, revision = await db.run_sync(
+                lambda session: self.roles.role_and_revision_in(
+                    _RoleConnection(session, self._table("user_roles")), email,
+                )
             )
-            revision = (await db.execute(
-                text(f"SELECT revision FROM {self._table('user_roles')} WHERE email=:email"), {"email": email},
-            )).scalar_one_or_none() or 0
         elif kind == "shared" and self.allow_shared_identities:
             parts = user_id.split(":")
             if len(parts) != 3 or parts[0] != "shared":
@@ -279,12 +300,38 @@ class ProductIdentityAdapter:
             json.dumps(authority, sort_keys=True, separators=(",", ":")).encode(),
             hashlib.sha256,
         ).hexdigest()
-        return ProductPrincipal(
+        principal = ProductPrincipal(
             id=user_id, kind=kind, method=method, email=email, name=row["name"] or email or user_id,
             role=role, enabled=True, authority_version=version, linked_user_id=row.get("linked_user_id"),
             account_created_at=row["created_at"], native_auth_version=controls[1],
             role_revision=revision,
         )
+        return await self.govern_principal(db, principal)
+
+    async def govern_principal(self, db: AsyncSession, principal: ProductPrincipal) -> ProductPrincipal:
+        from dataclasses import replace
+
+        from app.enterprise_roles import qualified_fetch, resolve_access
+        from app.permissions import BUILTIN_PERMISSIONS
+        if principal.kind == 'shared':
+            return replace(principal, permissions=BUILTIN_PERMISSIONS[principal.role],
+                           direct_permissions=BUILTIN_PERMISSIONS[principal.role])
+        if not principal.email or not self.roles.eligible(principal.email):
+            return replace(principal, permissions=BUILTIN_PERMISSIONS['member'],
+                           direct_permissions=BUILTIN_PERMISSIONS['member'])
+        state = await db.run_sync(lambda session: resolve_access(
+            qualified_fetch(lambda sql, values: [dict(row) for row in session.execute(text(sql), values).mappings()], self._table),
+            principal.email, principal.role if principal.individual else 'member'))
+        if state.scim_active is False:
+            raise HTTPException(401, 'This workspace account has been deactivated.')
+        entry = state.authority_entry()
+        version = principal.authority_version
+        if entry is not None:
+            version = hmac.new(self.legacy_security.secret.encode(), json.dumps(
+                [version, entry], sort_keys=True, separators=(',', ':')).encode(), hashlib.sha256).hexdigest()
+        return replace(principal, permissions=state.permissions, direct_permissions=state.direct_permissions,
+                       authority_version=version, access_role=(
+                           {'id': state.role_id, 'name': state.role_name or state.role_id} if state.role_id else None))
 
     async def current(self, user_id: str) -> ProductPrincipal:
         try:
@@ -426,7 +473,11 @@ class ProductIdentityAdapter:
             raise HTTPException(401, "The product identity mapping changed.")
         if principal.method != method:
             raise HTTPException(401, "The product sign-in method changed.")
-        if admin and principal.role != "admin":
+        from app.permissions import MEMBER_PERMISSIONS, route_permission
+        permission = route_permission(request)
+        if permission:
+            principal.require(permission)
+        if admin and (permission is None or permission in MEMBER_PERMISSIONS) and principal.role != 'admin':
             raise HTTPException(403, "An organization administrator must perform this action.")
         request.state.product_identity_grant = principal.grant
         return replace(principal, csrf_token=self.legacy_security.csrf(sid))
@@ -461,6 +512,23 @@ class ProductIdentityAdapter:
         if not hmac.compare_digest(principal.authority_version, grant.authority_version):
             raise HTTPException(401, "Product authority changed before admission.")
         return principal
+
+    async def read_native_user(self, db: AsyncSession, principal: ProductPrincipal) -> User | None:
+        """Use authenticated authority without updating the native profile cache."""
+        user = await db.get(User, principal.id)
+        if user is None:
+            return None
+        username = "product:" + hashlib.sha256(principal.id.encode()).hexdigest()
+        if user.username != username:
+            raise HTTPException(409, "Product identity conflicts with an existing native account.")
+        if not user.enabled or user.auth_version != principal.native_auth_version:
+            raise HTTPException(401, "Your access changed. Sign in again.")
+        # Request-only values must never flush over a concurrent profile/revocation
+        # write. The response middleware rechecks this original grant after awaits.
+        db.expunge(user)
+        user.display_name, user.role = principal.name[:200], principal.role
+        cast(_GrantedUser, user).product_grant = principal.grant
+        return user
 
     async def project_native_user(self, db: AsyncSession, principal: ProductPrincipal) -> User:
         """A native FK/profile cache, never the source of product authority."""
@@ -497,5 +565,5 @@ class ProductIdentityAdapter:
             user.display_name, user.role = fresh.name[:200], fresh.role
         # No preference, Slack identity, local disable or local epoch is reset.
         # This server-authored request context is intentionally not an ORM field.
-        cast(Any, user).product_grant = fresh.grant
+        cast(_GrantedUser, user).product_grant = fresh.grant
         return user

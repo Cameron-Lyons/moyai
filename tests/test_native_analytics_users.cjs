@@ -27,7 +27,7 @@ function load(relative) {
     if (request.endsWith('.css')) return {};
     // UsersReport does not render charts/date controls. Their Vite-only legacy
     // adapter is outside this test; table/Input/Button are the real shared components.
-    if (request === './analytics-shared' || request.endsWith('?native-analytics')) return {};
+    if (request === './analytics-shared' || request === './analytics-render.js') return {};
     if (request.startsWith('@/')) return load(path.join(root, 'frontend', request.slice(2)));
     if (request.startsWith('.')) return load(path.resolve(path.dirname(filename), request));
     return requireFromFile(request);
@@ -165,8 +165,8 @@ test('methodology remains available but collapsed once, outside the compact row'
   assert.equal((html.match(/<details\b/g) || []).length, 1);
   assert.doesNotMatch(html, /<details\b[^>]*\bopen(?:=|>|\s)/);
   assert.match(html, /Coverage and calculations/);
-  assert.match(html, /Only authoritative response amounts are included/);
-  assert.match(html, /Authoritative linked-session cost per verified merge/);
+  assert.doesNotMatch(html, /Only authoritative response amounts are included/);
+  assert.match(html, /Cost per merged PR uses spend from sessions linked to merged PRs/);
 });
 
 test('one search filters usage and PR columns together by genuine identity fields', () => {

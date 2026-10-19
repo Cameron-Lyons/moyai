@@ -4,6 +4,7 @@ import sys
 import time
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -18,15 +19,15 @@ class Page:
         self.url = f"https://example.com/{identity}"
         self.calls = []
         self.closed = False
-        self.mouse = SimpleNamespace(click=lambda x, y: self.calls.append(("click", x, y)),
-                                     wheel=lambda x, y: self.calls.append(("scroll", x, y)))
-        self.keyboard = SimpleNamespace(insert_text=lambda text: self.calls.append(("text", text)),
-                                        press=lambda key: self.calls.append(("key", key)))
+        self.mouse = SimpleNamespace(click=AsyncMock(side_effect=lambda x, y: self.calls.append(("click", x, y))),
+                                     wheel=AsyncMock(side_effect=lambda x, y: self.calls.append(("scroll", x, y))))
+        self.keyboard = SimpleNamespace(insert_text=AsyncMock(side_effect=lambda text: self.calls.append(("text", text))),
+                                        press=AsyncMock(side_effect=lambda key: self.calls.append(("key", key))))
     def is_closed(self):
         return self.closed
-    def title(self):
+    async def title(self):
         return self.identity
-    def evaluate(self, expression):
+    async def evaluate(self, expression):
         if expression == "document.title":
             return self.identity
         if "visibilityState" in expression:
@@ -34,21 +35,21 @@ class Page:
         if "innerWidth" in expression and "screenX" not in expression:
             return {"width": 1200, "height": 700}
         return {"x": 10, "y": 90}
-    def bring_to_front(self):
+    async def bring_to_front(self):
         self.calls.append(("focus",))
-    def close(self):
+    async def close(self):
         self.closed = True
-    def goto(self, url, **kwargs):
+    async def goto(self, url, **kwargs):
         self.url = url
         self.calls.append(("navigate", url))
     def locator(self, selector):
         self.calls.append(("locator", selector))
         return SimpleNamespace(
-            aria_snapshot=lambda **_: "- heading Example\n" * 2000,
-            scroll_into_view_if_needed=lambda: self.calls.append(("scroll-target",)),
-            bounding_box=lambda: {"x": 20, "y": 30, "width": 100, "height": 40},
-            click=lambda: self.calls.append(("target-click",)),
-            fill=lambda text: self.calls.append(("fill", text)),
+            aria_snapshot=AsyncMock(side_effect=lambda **_: "- heading Example\n" * 2000),
+            scroll_into_view_if_needed=AsyncMock(side_effect=lambda: self.calls.append(("scroll-target",))),
+            bounding_box=AsyncMock(return_value={"x": 20, "y": 30, "width": 100, "height": 40}),
+            click=AsyncMock(side_effect=lambda: self.calls.append(("target-click",))),
+            fill=AsyncMock(side_effect=lambda text: self.calls.append(("fill", text))),
         )
 
 
@@ -60,30 +61,67 @@ def browser(monkeypatch):
     class Context:
         def __init__(self):
             self.pages = pages
-        def new_cdp_session(self, page):
+        async def new_cdp_session(self, page):
             return SimpleNamespace(
-                send=lambda method: {"targetInfo": {"targetId": page.identity}},
-                detach=lambda: None,
+                send=AsyncMock(side_effect=lambda method: {"targetInfo": {"targetId": page.identity}}),
+                detach=AsyncMock(),
             )
         def set_default_timeout(self, *_):
             pass
         def set_default_navigation_timeout(self, *_):
             pass
-        def new_page(self):
+        async def new_page(self):
             page = Page("target-new", active=True)
             pages.append(page)
             return page
-    connection = SimpleNamespace(contexts=[Context()], close=lambda: calls.append(("disconnect",)))
+    connection = SimpleNamespace(contexts=[Context()], close=AsyncMock(side_effect=lambda: calls.append(("disconnect",))))
     class Playwright:
-        def __enter__(self):
+        async def __aenter__(self):
             return SimpleNamespace(chromium=SimpleNamespace(
-                connect_over_cdp=lambda endpoint, **kwargs: (calls.append((endpoint, kwargs)), connection)[1],
+                connect_over_cdp=AsyncMock(side_effect=lambda endpoint, **kwargs: (calls.append((endpoint, kwargs)), connection)[1]),
             ))
-        def __exit__(self, *_):
+        async def __aexit__(self, *_):
             pass
-    monkeypatch.setitem(sys.modules, "playwright.sync_api", SimpleNamespace(sync_playwright=Playwright))
+    monkeypatch.setitem(sys.modules, "playwright.async_api", SimpleNamespace(
+        async_playwright=Playwright, Error=BrowserError,
+    ))
     monkeypatch.setattr(guest.subprocess, "run", lambda argv, **kwargs: calls.append(tuple(argv)))
     return first, second, pages, calls
+
+
+class BrowserError(Exception):
+    pass
+
+
+@pytest.mark.parametrize("code", [
+    "ERR_CONNECTION_REFUSED", "ERR_NAME_NOT_RESOLVED", "ERR_ADDRESS_UNREACHABLE", "ERR_INTERNET_DISCONNECTED",
+])
+def test_failed_navigation_returns_its_known_error_without_repeating_it(browser, code):
+    _, page, _, _ = browser
+    navigations = []
+    async def refused(url, **kwargs):
+        navigations.append(url)
+        page.url = "chrome-error://chromewebdata/"
+        raise BrowserError(f"Page.goto: net::{code} at {url}")
+    page.goto = refused
+    result = guest.operate(
+        {"action": "open", "url": "http://127.0.0.1:4173", "new_tab": False}, time.time() + 25, {},
+    )
+    assert result["navigation_error"]["code"] == code
+    assert result["tab_id"] == page.identity
+    assert navigations == ["http://127.0.0.1:4173"]
+
+
+@pytest.mark.parametrize("message", [
+    "Page.goto: Timeout 15000ms exceeded at https://example.test/net::ERR_CONNECTION_REFUSED",
+    "Page.goto: net::ERR_CONNECTION_RESET at https://example.test/submit",
+])
+def test_ambiguous_navigation_still_fails_without_a_confirmed_outcome(browser, message):
+    _, page, _, _ = browser
+    page.goto = AsyncMock(side_effect=BrowserError(message))
+    with pytest.raises(BrowserError):
+        guest.operate({"action": "open", "url": "https://example.test", "new_tab": False}, time.time() + 25, {})
+    assert page.goto.await_count == 1
 
 
 def test_inspection_tracks_actual_visible_tab_without_focus_or_input(browser):
@@ -112,7 +150,7 @@ def test_stable_tab_selection_and_navigation_share_one_context(browser):
 def test_history_returns_after_document_commit_without_waiting_for_new_dom_event(browser, action, method):
     _, page, _, _ = browser
     traversals = []
-    def traverse(*, wait_until):
+    async def traverse(*, wait_until):
         traversals.append(wait_until)
         if wait_until != "commit":
             raise TimeoutError("A restored document did not emit another DOMContentLoaded event.")
@@ -129,7 +167,7 @@ def test_history_returns_after_document_commit_without_waiting_for_new_dom_event
 def test_unknown_history_traversal_is_not_repeated(browser):
     _, page, _, _ = browser
     traversals = []
-    def uncertain(*, wait_until):
+    async def uncertain(*, wait_until):
         traversals.append(wait_until)
         raise TimeoutError("Traversal may have occurred.")
     page.go_back = uncertain

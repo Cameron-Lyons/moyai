@@ -1,59 +1,80 @@
-import React, { useCallback, useEffect, useId, useReducer, useRef, useState } from "react"
+import React, { useCallback, useEffect, useId, useLayoutEffect, useReducer, useRef, useState } from "react"
 import { createRoot } from "react-dom/client"
-import Markdown from "react-markdown"
-import remarkGfm from "remark-gfm"
-import { ArrowUp, BookOpen, Check, Clock, ExternalLink, Link2, ListTree, LockKeyhole, LogOut, Menu, MessageSquare, PanelLeft, PanelRight, Plus, Search, Settings, Square, SquarePen, Users, X } from "lucide-react"
+import { Send, Bug, Download, FileText, Check, Clock, ExternalLink, Link2, LockKeyhole, LogOut, Menu, MessageCircleQuestion, MessageSquare, PanelRight, Plus, Search, Settings, Square, SquarePen, Users, X } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Textarea } from "@/components/ui/textarea"
-import { Checkbox } from "@/components/ui/checkbox"
+import { SkillComposer } from "./skill-composer"
+import { GoalDialog, GoalPanel, goalCommandAction, type Goal } from "./goal"
+import { SkillMessage } from "./skill-content"
+import { SkillMarkdown, SkillMarkdownProvider } from "./skill-markdown"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import "@/theme.css"
 import "./style.css"
 import "./product-shell.css"
-import logo from "../../app/static/moyai-logo.png"
 import { api, ApiError, csrfToken, setCsrf } from "./api"
+import { downloadDebugTrace } from "./debug-trace"
 import { AttachButton, AttachmentPreviews, useAttachments, useFileDrop, FileDropOverlay } from "./attachments"
-import { ComputerPanel } from "./computer"
+import slackLogo from "./assets/slack-logo.svg"
+import { Home } from "./home"
+import type { GeneralPreferences } from "./general-preferences"
+import { MoyaiBrand, SidebarToggle } from "./brand"
+import { initializeAppearance } from "./appearance"
+import { AppearanceToggle } from "./appearance-toggle"
+import { SpaceBackdrop } from "./space-backdrop"
+import { activeSession, pollVisible } from "./polling"
 import { SessionSidebar, SessionFolder, SidebarSession, SessionListView } from "./sidebar"
 import { SessionActionsProvider, SessionMenu, sessionIsReadOnly, sessionKey, useSessionActions } from "./session-actions"
-import { WorkspaceOverview, SubagentPanel } from "./workspace"
+import { SessionTitle } from "./session-title"
+import { useSessionPreferences } from "./use-session-preferences"
+import { WorkspaceOverview, SubagentPanel, WorkspaceResourceProvider, WorkspaceMenuKey } from "./workspace"
+import { SwarmPanel } from "./swarm"
 import { PullRequestPanel } from "./pull-request"
 import { FilesPanel, OutputPanel } from "./output"
 import { PanelTabs, emptyPanelState, panelReducer, type AddTabKind, type PanelAction } from "./panel-tabs"
-import type { OutputResource, WorkspaceTab } from "./workspace-types"
+import type { ActionSelection, OutputResource, WorkspaceTab } from "./workspace-types"
 import { CommandPalette, COMMAND_PALETTE_ID, type PaletteCurrentSession, type PaletteSearchAdapter, type PaletteSession } from "./command-palette"
-import { applyLiveEvent, emptyLiveTranscript, liveCommentary, mergeActivity, type LiveEvent } from "./live-transcript"
+import { applyLiveEvent, emptyLiveTranscript, liveFinalAnswer, mergeActivity, type LiveEvent } from "./live-transcript"
+import { TurnProgress, toolLabel } from "./turn-progress"
+import { ActionPanel } from "./action-panel"
+import { useWorkProgress } from "./use-work-progress"
+import { orderedWorkMessages, workSegments } from "./work-timeline"
 import { PanelRatioProvider, PanelResizeHandle } from "./panel-resize"
 import { WorkspaceOverlay, WorkspaceOverlayContent, WorkspaceOverlayTrigger } from "./workspace-overlay"
 import { previewFileLink, type OpenFile } from "./file-links"
 import { firstMessage, waitsBehindActive, type Session, type Turn, type Message, type NewConversation } from "./conversation-state"
 import { ProductCredentialRequest } from "./product-credentials"
+import { QuestionChoices, type Question } from "./question-choices"
+import { BrowserLoginCard, type BrowserLoginMetadata, type LoginOutcome } from "./browser-login"
+import { can, canOpenPage, permissionKey } from "./permissions"
 
-const Home = React.lazy(() => import("./home").then(module => ({ default: module.Home })))
+const ComputerPanel = React.lazy(() => import("./computer").then(module => ({ default: module.ComputerPanel })))
 const SettingsPage = React.lazy(() => import("./settings").then(module => ({ default: module.SettingsPage })))
 const ProductHistory = React.lazy(() => import("./product-history").then(module => ({ default: module.ProductHistory })))
 const ProductHistoryPrefix = React.lazy(() => import("./product-history").then(module => ({ default: module.ProductHistoryPrefix })))
 
 type PRSummary = NonNullable<SidebarSession["pull_requests"]>[number]
-type WorkspaceRequest = { sessionId: string; sequence: number; tab: "computer" | "pull-request"; url?: string }
+type WorkspaceRequest = { sessionId: string; sequence: number; tab: "computer" | "pull-request" | "side-chat"; url?: string; child?: { id: string; title: string } }
 
-type Me = { user: { id: string; name: string; role: string; individual?: boolean }; csrf: string; models: string[]; default_model: string; product_mode?: "standalone" | "existing" }
-type SessionInventory = { sessions: Session[]; has_more: boolean; next_cursor?: string | null; notice?: string | null }
+type Me = { user: { id: string; name: string; role: string; individual?: boolean ; permissions?: string[]; access_role?: { id: string; name: string } | null }; csrf: string; models: string[]; default_model: string; product_mode?: "standalone" | "existing"; preferences?: GeneralPreferences; permissions?: string[]; access_role?: { id: string; name: string } | null }
+type SessionInventory = { sessions: Session[]; ancestors?: Session[]; has_more: boolean; next_cursor?: string | null; notice?: string | null }
 type Connection = { id: string; name: string; kind: string; owner_id: string; read_only: boolean; enabled: boolean; shared: boolean; revision?: number }
 type Plan = { id: string; content: string; status: string }
 type Call = { tool_call_id: string; tool_name: string; args: Record<string, unknown> | string }
-type Pending = { calls: Call[]; approvals: Call[]; metadata?: Record<string, { request_id?: string }> }
+type Pending = { calls: Call[]; approvals: Call[]; metadata?: Record<string, BrowserLoginMetadata & { request_id?: string }> }
 type Effect = { id: string; turn_id: string; tool_name: string; arguments: unknown }
-type View = { session: Session; turns: Turn[]; pending?: Pending; can_answer?: boolean; credential_requests?: { request_id: string }[]; activity?: Activity[]; effects?: Effect[]; has_unsettled_effects?: boolean }
+type View = { transcript_version?: string; slack_delivery?: { pending: number; sending: number; rejected: number }; session: Session; turns: Turn[]; goal?: Goal | null; messages?: Message[]; pending?: Pending; can_answer?: boolean; can_reply_with_text?: boolean; question_deadline?: string; credential_requests?: { request_id: string }[]; activity?: Activity[]; effects?: Effect[]; has_unsettled_effects?: boolean }
 type Activity = LiveEvent
-type Question = { header: string; question: string; multi_select?: boolean; options: { label: string; description?: string }[] }
 const settingsDestinations = [
+  { page: "general", label: "General" },
   { page: "skills", label: "Skills" }, { page: "automations", label: "Automations" }, { page: "memory", label: "Memory" },
   { page: "connections", label: "Connections" }, { page: "secrets", label: "Secrets" },
   { page: "personal-slack", label: "Personal Slack", productOnly: true },
-  { page: "users", label: "Users", adminOnly: true }, { page: "performance", label: "Performance", adminOnly: true },
-  { page: "usage", label: "Spend & usage", adminOnly: true },
+  { page: "users", label: "Users" }, { page: "performance", label: "Performance" },
+  { page: "usage", label: "Spend & usage" },
+  { page: "roles", label: "Roles & access", productOnly: true }, { page: "provisioning", label: "Provisioning", productOnly: true },
+  { page: "security-policies", label: "Security policies", productOnly: true }, { page: "spend-limits", label: "Spend limits", productOnly: true },
+  { page: "audit-log", label: "Audit log", productOnly: true },
 ]
 function currentRoute() {
   const hash = location.hash.slice(1)
@@ -92,11 +113,14 @@ function App() {
   const [me, setMe] = useState<Me | null>(null)
   const [ready, setReady] = useState(false)
   const [error, setError] = useState("")
+  const [refreshError, setRefreshError] = useState("")
   const [folders, setFolders] = useState<SessionFolder[]>([])
   const refreshVersion = useRef(0)
   const [sessions, setSessions] = useState<Session[]>([])
+  const sessionsNow = useRef(sessions)
+  sessionsNow.current = sessions
   const [sessionPageCount, setSessionPageCount] = useState(1)
-  const [inventoryState, setInventoryState] = useState({ hasMore: false, loading: false, notice: "" })
+  const [inventoryState, setInventoryState] = useState({ hasMore: false, loading: false, loaded: false, notice: "" })
   const [selected, setSelected] = useState(currentRoute)
   const [workspaceRequest, setWorkspaceRequest] = useState<WorkspaceRequest | null>(null)
   const [prStates, setPrStates] = useState<Record<string, PRSummary[]>>({})
@@ -114,11 +138,18 @@ function App() {
   const [continued, setContinued] = useState<{ scope: string; original: string; id: string } | null>(null)
   const continuedNow = useRef(continued)
   continuedNow.current = continued
-  const [nativeRoute, setNativeRoute] = useState<{ key: string; ready?: boolean; error?: string } | null>(null)
+  const [nativeRoute, setNativeRoute] = useState<{ key: string; ready?: boolean; error?: string; view?: View } | null>(null)
   const lastConversation = useRef("")
   const settingsOpen = selected === "settings" || selected.startsWith("settings/")
   const historical = selected.startsWith("run=")
-  const scopeKey = `${me?.user.id}:${me?.user.role}:${me?.user.individual}:${me?.csrf}`
+  const access = me ? { role: me.user.role, permissions: me.permissions ?? me.user.permissions } : null
+  const scopeKey = `${me?.user.id}:${me?.user.role}:${me?.user.individual}:${me?.csrf}:${access ? permissionKey(access) : ""}`
+  const preferences = useSessionPreferences(scopeKey)
+  const preferenceRows = new Map(sessions.filter(row => !sessionIsReadOnly(row)).map(row => [row.id, row]))
+  const preferenceSession = (row: SidebarSession) => {
+    const latest = preferenceRows.get(row.id)
+    return preferences.apply(sessionIsReadOnly(row) || !latest ? row : { ...row, pinned: latest.pinned, folder: latest.folder })
+  }
   const routeScope = `${scopeKey}:${routeRevision}`, routeKey = `${routeScope}:${selected}`
   const originalId = historical ? decodeRoute(selected.slice(4)) : ""
   const acceptedStart = (initialConversation?.scope === scopeKey && initialConversation.value.session.id === selected)
@@ -132,7 +163,8 @@ function App() {
     const controller = new AbortController(), key = routeKey
     // A native UUID can itself be an alias. Only the authenticated read adapter
     // may supply that mapping; ordinary session reads still enforce native ACLs.
-    void api<{ session: SessionReference }>(`/history/sessions/${encodeURIComponent(selected)}?source=native`, "GET", undefined, controller.signal).then(({ session }) => {
+    void api<View & { reference: SessionReference }>(`/sessions/${encodeURIComponent(selected)}?resolve=true&include_activity=false&include_messages=true`, "GET", undefined, controller.signal).then(value => {
+      const session = value.reference
       if (controller.signal.aborted || currentRoute() !== selected) return
       if (session.id !== selected || session.source !== "native") throw new Error("The session reference changed. Reopen the conversation.")
       if (session.source_session_id) {
@@ -142,7 +174,7 @@ function App() {
         setContinued({ scope: routeScope, original, id: reference.id })
         history.replaceState(null, "", `#run=${original}`)
         setSelected(`run=${original}`)
-      } else setNativeRoute({ key, ready: true })
+      } else setNativeRoute({ key, ready: true, view: value })
     }).catch(reason => {
       if (!controller.signal.aborted && currentRoute() === selected) {
         setCurrentSession(null); setInitialConversation(null); setContinued(null)
@@ -157,24 +189,30 @@ function App() {
     const authorized = continuationReference(reference, originalId)
     if (!authorized) { setError("The saved continuation reference is invalid. Refresh this history."); return }
     setContinued({ scope: routeScope, original: originalId, id: authorized.id })
-    void refresh().catch(reason => setError(String(reason)))
+    void refresh()
   }
   useEffect(() => { if (selected && !settingsOpen) lastConversation.current = selected }, [selected, settingsOpen])
-  const refresh = useCallback(async () => {
+  const refresh = useCallback(async (signal?: AbortSignal) => {
     const version = ++refreshVersion.current
-    setInventoryState(previous => ({ ...previous, loading: true }))
+    const preferenceCheckpoint = preferences.checkpoint()
+    // Background polling keeps the existing list and pagination control quiet.
+    // Explicit pagination sets loading before starting its new refresh.
+    setInventoryState(previous => previous.loaded ? previous : { ...previous, loading: true })
     const inventory = async () => {
       const rows = new Map<string, Session>(), notices = new Set<string>()
       let cursor: string | null = null, hasMore = false
       for (let page = 0; page < sessionPageCount; page++) {
-        const next: SessionInventory = await api(`/history/sessions?source=all&scope=mine&limit=100&archived=${listView === "archived"}&deleted=${listView === "deleted"}${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}`)
-        if (version !== refreshVersion.current || listViewRef.current !== listView) return null
+        const next: SessionInventory = await api(`/history/sessions?source=all&scope=mine&limit=100&archived=${listView === "archived"}&deleted=${listView === "deleted"}${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}`, "GET", undefined, signal)
+        if (signal?.aborted || version !== refreshVersion.current || listViewRef.current !== listView) return null
         for (const row of next.sessions) {
           let unread = row.unread
           if (row.source === "legacy" && row.read_marker_key && row.completion_marker) {
             try { unread = localStorage.getItem(row.read_marker_key) !== row.completion_marker } catch { unread = false }
           }
           rows.set(sessionKey(row), { ...row, unread })
+        }
+        for (const row of next.ancestors ?? []) {
+          if (!rows.has(sessionKey(row))) rows.set(sessionKey(row), row)
         }
         if (next.notice) notices.add(next.notice)
         hasMore = Boolean(next.has_more && next.next_cursor)
@@ -184,28 +222,46 @@ function App() {
       return { rows: [...rows.values()], hasMore, notice: [...notices].join(" ") }
     }
     try {
-      const [result, accounts, groups] = await Promise.all([
-        inventory(), api<Connection[]>("/connections"), api<SessionFolder[]>("/session-folders"),
+      const current = () => !signal?.aborted && version === refreshVersion.current && listViewRef.current === listView
+      // Publish the list independently; a slow account catalog must not leave
+      // the rail empty after its authenticated inventory has arrived.
+      const results = await Promise.allSettled([
+        inventory().then(result => {
+          if (result && current()) {
+            preferences.acceptRead(preferenceCheckpoint, result.rows)
+            setSessions(result.rows)
+            setInventoryState({ loading: false, loaded: true, hasMore: result.hasMore, notice: result.notice })
+          }
+        }).catch(reason => {
+          if (current() && reason instanceof ApiError && [401, 403, 404].includes(reason.status)) setSessions([])
+          throw reason
+        }),
+        api<Connection[]>("/connections", "GET", undefined, signal).then(accounts => { if (current()) setConnections(accounts) }),
+        api<SessionFolder[]>("/session-folders", "GET", undefined, signal).then(groups => { if (current()) setFolders(groups) }),
       ])
-      if (!result || version !== refreshVersion.current || listViewRef.current !== listView) return
-      setSessions(result.rows); setConnections(accounts); setFolders(groups)
-      setInventoryState({ loading: false, hasMore: result.hasMore, notice: result.notice })
+      if (!current()) return
+      const failure = results.find(result => result.status === "rejected")
+      if (failure?.status === "rejected") throw failure.reason
+      setRefreshError("")
     } catch (reason) {
-      if (version !== refreshVersion.current) return
+      if (signal?.aborted || version !== refreshVersion.current) return
       if (reason instanceof ApiError && [401, 403, 404].includes(reason.status)) setSessions([])
-      throw reason
+      // Every caller shares this catalog. A successful send, rename or new
+      // conversation must not inherit its refresh failure as an action error.
+      setRefreshError(String(reason))
     } finally {
       if (version === refreshVersion.current) setInventoryState(previous => ({ ...previous, loading: false }))
     }
-  }, [listView, sessionPageCount])
+  }, [listView, sessionPageCount, preferences])
 
   useEffect(() => {
     api<Me>("/me").then(value => { setCsrf(value.csrf); setMe(value) }).catch(() => {}).finally(() => setReady(true))
-    const signedOut = () => { ++refreshVersion.current; lastConversation.current = ""; setCsrf(""); setMe(null); setSessions([]); setSessionPageCount(1); setInventoryState({ hasMore: false, loading: false, notice: "" }); setFolders([]); setConnections([]); setWorkspaceRequest(null); setPrStates({}); setCurrentSession(null); setInitialConversation(null); setPaletteOpen(false); setContinued(null); setNativeRoute(null); setRouteRevision(value => value + 1) }
+    const signedOut = () => { ++refreshVersion.current; lastConversation.current = ""; setCsrf(""); setMe(null); setSessions([]); setSessionPageCount(1); setInventoryState({ hasMore: false, loading: false, loaded: false, notice: "" }); setFolders([]); setConnections([]); setWorkspaceRequest(null); setPrStates({}); setCurrentSession(null); setInitialConversation(null); setPaletteOpen(false); setContinued(null); setNativeRoute(null); setRouteRevision(value => value + 1) }
     const accessChanged = () => {
       const requestCsrf = csrfToken()
       ++refreshVersion.current
       setSessions([]); setConnections([]); setFolders([]); setPrStates({}); setPrRefresh(value => value + 1); setCurrentSession(null); setInitialConversation(null); setPaletteOpen(false)
+      setSessionPageCount(1); setInventoryState({ hasMore: false, loading: false, loaded: false, notice: "" })
       setContinued(null); setNativeRoute(null); setRouteRevision(value => value + 1)
       void api<Me>("/me").then(value => { if (csrfToken() === requestCsrf) { setCsrf(value.csrf); setMe(value) } }, () => {})
     }
@@ -237,14 +293,8 @@ function App() {
   }, [])
   useEffect(() => {
     if (!me) return
-    let live = true
-    let timer: ReturnType<typeof setTimeout>
-    const poll = async () => {
-      try { await refresh() } catch (e) { if (live) setError(String(e)) }
-      if (live) timer = setTimeout(poll, 4000)
-    }
-    void poll()
-    return () => { live = false; ++refreshVersion.current; clearTimeout(timer) }
+    const stop = pollVisible(refresh, () => sessionsNow.current.some(row => activeSession(row.status)) ? 4000 : 15000, reason => setRefreshError(String(reason)))
+    return () => { stop(); ++refreshVersion.current }
   }, [me, refresh])
 
   const prSessionIds = [...new Set([...sessions.filter(row => !row.deleted && !sessionIsReadOnly(row)).map(row => row.id), ...(nativeSelected ? [nativeSelected] : [])])].sort().join(",")
@@ -252,86 +302,87 @@ function App() {
   useEffect(() => {
     setPrStates({})
     if (!me || !prSessionIds) return
-    const controller = new AbortController()
-    let timer: ReturnType<typeof setTimeout>
-    const poll = async () => {
-      try {
+    return pollVisible(async signal => {
         const ids = prSessionIds.split(",")
         const batches = await Promise.all(Array.from({ length: Math.ceil(ids.length / 100) }, (_, index) =>
-          api<Record<string, PRSummary[]>>("/pull-requests/statuses", "POST", { session_ids: ids.slice(index * 100, (index + 1) * 100) }, controller.signal),
+          api<Record<string, PRSummary[]>>("/pull-requests/statuses", "POST", { session_ids: ids.slice(index * 100, (index + 1) * 100) }, signal),
         ))
         const states = Object.assign({}, ...batches) as Record<string, PRSummary[]>
-        if (!controller.signal.aborted) setPrStates(states)
-      } catch {
-        if (!controller.signal.aborted) setPrStates({})
-      }
-      if (!controller.signal.aborted) timer = setTimeout(poll, 20000)
-    }
-    void poll()
-    return () => { controller.abort(); clearTimeout(timer) }
+        if (!signal.aborted) setPrStates(states)
+    }, () => 20000, () => setPrStates({}))
   }, [me?.user.id, prSessionIds, connectionVersion, prRefresh])
 
   if (!ready) return <div className="center muted" role="status">Opening Moyai…</div>
-  if (!me) return <Login onLogin={value => { setCsrf(value.csrf); setMe(value); setError("") }} />
+  if (!me) return <Login onLogin={value => { setCsrf(value.csrf); setMe(value); setError(""); setRefreshError("") }} />
   const newSession = () => { location.hash = ""; setMobileNav(false); setWorkspaceRequest(null) }
   const navigateSettings = (page: string) => { if (selected && !settingsOpen) lastConversation.current = selected; location.hash = `settings/${page}` }
   const toggleSidebar = () => { if (matchMedia("(max-width: 600px)").matches) setMobileNav(value => !value); else setSidebarHidden(value => !value) }
-  return <PanelRatioProvider key={JSON.stringify([me.product_mode || "standalone", me.user.id])} scope={me.product_mode || "standalone"} userId={me.user.id}><SessionActionsProvider key={scopeKey} userId={me.user.id} folders={folders} refresh={refresh} onNewSession={newSession} onDeleted={id => { if (nativeSelected === id) newSession() }} onOpenComputer={sessionId => {
+  return <PanelRatioProvider key={JSON.stringify([me.product_mode || "standalone", me.user.id])} scope={me.product_mode || "standalone"} userId={me.user.id}><SessionActionsProvider key={scopeKey} userId={me.user.id} folders={folders} refresh={refresh} preferences={preferences} preferenceSession={preferenceSession} onNewSession={newSession} onDeleted={id => { if (nativeSelected === id) newSession() }} onOpenComputer={sessionId => {
     setWorkspaceRequest(previous => ({ sessionId, sequence: (previous?.sequence ?? 0) + 1, tab: "computer" }))
     location.hash = sessionId; setMobileNav(false)
   }}><div className={`app ${settingsOpen ? "settings-open" : ""} ${sidebarHidden ? "sidebar-collapsed" : ""}`}>
     {!settingsOpen && <aside className={`sidebar ${mobileNav ? "open" : ""}`}>
-      <a href="#" className="brand"><img src={logo} alt="" /><span>Moyai<small>LiteLLM</small></span></a>
+      <div className="sidebar-brand-row"><MoyaiBrand /><Button variant="ghost" size="icon-sm" className="rail-palette-trigger" aria-label="Search sessions & commands" title="Search sessions & commands (⌘K)" aria-haspopup="dialog" aria-controls={COMMAND_PALETTE_ID} onClick={() => setPaletteOpen(true)}><Search size={15} /></Button><SidebarToggle collapsed={sidebarHidden} onToggle={toggleSidebar} /></div>
       <Button variant="secondary" className="new-chat" onClick={newSession}><Plus />New session<span className="key-hint">⌘⇧O</span></Button>
-      <Button variant="ghost" className="rail-palette-trigger" aria-haspopup="dialog" aria-controls={COMMAND_PALETTE_ID} onClick={() => setPaletteOpen(true)}><Search size={16} /><span>Search sessions & commands</span><span className="key-hint">⌘K</span></Button>
       <nav className="rail-destinations" aria-label="Workspace tools">
-        <Button variant="ghost" className="rail-button" onClick={() => navigateSettings("skills")}><BookOpen />Skills</Button>
+        <Button variant="ghost" className="rail-button" onClick={() => navigateSettings("skills")}><FileText />Skills</Button>
         <Button variant="ghost" className="rail-button" onClick={() => navigateSettings("automations")}><Clock />Automations</Button>
         <Button variant="ghost" className="rail-button" onClick={() => navigateSettings("connections")}><Link2 />Connections</Button>
       </nav>
-      <SessionSidebar key={me.user.id} sessions={sessions.map(row => ({ ...row, pull_requests: sessionIsReadOnly(row) ? [] : prStates[row.id] ?? [] }))} folders={folders} selected={nativeSelected || selected} userId={me.user.id} view={listView}
-        hasMore={inventoryState.hasMore} loading={inventoryState.loading} notice={inventoryState.notice} onLoadMore={() => setSessionPageCount(value => value + 1)}
-        onViewChange={value => { ++refreshVersion.current; setSessions([]); setSessionPageCount(1); setInventoryState({ hasMore: false, loading: false, notice: "" }); setListView(value) }}
+      <SessionSidebar key={me.user.id} sessions={sessions.map(row => ({ ...preferences.apply(row), pull_requests: sessionIsReadOnly(row) ? [] : prStates[row.id] ?? [] }))} folders={folders} selected={nativeSelected || selected} userId={me.user.id} view={listView}
+        hasMore={inventoryState.hasMore} loading={inventoryState.loading} notice={inventoryState.notice} onLoadMore={() => {
+          ++refreshVersion.current
+          setInventoryState(previous => ({ ...previous, loading: true }))
+          setSessionPageCount(value => value + 1)
+        }}
+        onViewChange={value => { ++refreshVersion.current; setSessions([]); setSessionPageCount(1); setInventoryState({ hasMore: false, loading: false, loaded: false, notice: "" }); setListView(value) }}
+        onOpenSideChat={row => {
+          const host = nativeSelected && nativeSelected !== row.id ? nativeSelected : row.parent_session_id
+          if (!host) return
+          setWorkspaceRequest(previous => ({ sessionId: host, tab: "side-chat", child: { id: row.id, title: row.title }, sequence: (previous?.sequence ?? 0) + 1 }))
+          if (nativeSelected !== host) location.hash = host
+          setMobileNav(false)
+        }}
         onOpenPullRequest={(sessionId, url) => { setWorkspaceRequest(previous => ({ sessionId, url, tab: "pull-request", sequence: (previous?.sequence ?? 0) + 1 })); location.hash = sessionId; setMobileNav(false) }} />
-      <div className="account"><span>{me.user.name}</span><Button variant="ghost" size="icon" aria-label="Settings" onClick={() => navigateSettings("overview")}><Settings /></Button><Button variant="ghost" size="icon" aria-label="Sign out" onClick={async () => {
+      <div className="account"><span>{me.user.name}</span><AppearanceToggle /><Button variant="ghost" size="icon" aria-label="Settings" onClick={() => navigateSettings("overview")}><Settings /></Button><Button variant="ghost" size="icon" aria-label="Sign out" onClick={async () => {
         try { const result = await api<{ logout_url?: string }>("/logout", "POST"); window.dispatchEvent(new Event("moyai:signed-out")); if (result.logout_url) navigateAuth(result.logout_url, true) }
         catch (reason) { setError(String(reason)) }
       }}><LogOut /></Button></div>
     </aside>}
     <main className="main">
       {!settingsOpen && <Button className="mobile-menu" variant="outline" size="icon" aria-label="Toggle conversations" onClick={() => setMobileNav(!mobileNav)}>{mobileNav ? <X /> : <Menu />}</Button>}
-      {!settingsOpen && sidebarHidden && <Button className="restore-sidebar" variant="outline" size="icon-sm" aria-label="Show sidebar" onClick={() => setSidebarHidden(false)}><PanelLeft size={16} /></Button>}
-      {error && <div className="error global-error" role="alert">{error}<Button variant="ghost" onClick={() => setError("")}>Dismiss</Button></div>}
+      {(error || refreshError) && <div className="error global-error" role="alert">{error || refreshError}<Button variant="ghost" onClick={() => error ? setError("") : setRefreshError("")}>Dismiss</Button></div>}
       {settingsOpen
-        ? <React.Suspense fallback={<div className="center muted">Opening settings…</div>}><SettingsPage user={me.user} productMode={me.product_mode} page={selected.split("/")[1] || "overview"} onNavigate={page => { location.hash = `settings/${page}` }} onBack={() => { location.hash = lastConversation.current }} /></React.Suspense>
+        ? <React.Suspense fallback={<div className="center muted">Opening settings…</div>}><SettingsPage user={{...me.user, permissions: me.permissions ?? me.user.permissions, access_role: me.access_role ?? me.user.access_role}} productMode={me.product_mode} page={selected.split("/")[1] || "overview"} onNavigate={page => { location.hash = `settings/${page}` }} onBack={() => { location.hash = lastConversation.current }} sidebarCollapsed={sidebarHidden} onToggleSidebar={toggleSidebar} onPreferences={preferences => setMe(current => current?.user.id === me.user.id && current.csrf === me.csrf ? { ...current, preferences } : current)} /></React.Suspense>
         : historical && !nativeSelected
         ? <React.Suspense fallback={<div className="center muted">Opening saved history…</div>}><ProductHistory key={`${routeScope}:${selected}`} sessionId={originalId} scopeKey={routeScope} onOpenSession={openHistorySession} onStartNewNative={newSession} /></React.Suspense>
         : nativeSelected
         ? <Conversation key={`${scopeKey}:${nativeSelected}`} id={nativeSelected} me={me} connections={connections} connectionVersion={connectionVersion} refreshList={refresh} workspaceRequest={workspaceRequest?.sessionId === nativeSelected ? workspaceRequest : null} pullRequests={prStates[nativeSelected] ?? []} onPRUpdated={() => setPrRefresh(value => value + 1)}
           originalSessionId={originalId || undefined} authorityKey={routeScope}
+          resolved={nativeRoute?.key === routeKey ? nativeRoute.view : undefined}
           initial={initialConversation?.scope === scopeKey && initialConversation.value.session.id === nativeSelected ? initialConversation.value : undefined}
           onSession={session => { setCurrentSession(session); setInitialConversation(previous => previous?.value.session.id === (session?.id ?? nativeSelected) ? null : previous) }} />
         : selected
         ? <div className="center" role={routeError ? "alert" : "status"}>{routeError || "Opening conversation…"}{routeError && <Button variant="outline" onClick={() => setRouteRevision(value => value + 1)}>Retry</Button>}</div>
-        : <React.Suspense fallback={<div className="center muted">Opening workspace…</div>}><Home models={me.models} defaultModel={me.default_model} individual={me.user.individual !== false} productMode={me.product_mode} connectionVersion={connectionVersion} onCreated={refresh}
-          onStarted={value => { setInitialConversation({ scope: scopeKey, value }); setSelected(value.session.id); location.hash = value.session.id }} /></React.Suspense>}
+        : <Home preferences={me.preferences} models={me.models} defaultModel={me.default_model} individual={me.user.individual !== false} productMode={me.product_mode} connectionVersion={connectionVersion} securityPolicies={me.product_mode === "existing" && can({role: me.user.role, permissions: me.permissions ?? me.user.permissions}, "security.manage")} onCreated={refresh}
+          onStarted={value => { setInitialConversation({ scope: scopeKey, value }); setSelected(value.session.id); location.hash = value.session.id }} />}
     </main>
-    <AppCommandPalette open={paletteOpen} onOpenChange={setPaletteOpen} scopeKey={`${scopeKey}:${selected}`} role={me.user.role} productMode={me.product_mode}
+    <AppCommandPalette open={paletteOpen} onOpenChange={setPaletteOpen} scopeKey={`${scopeKey}:${selected}`} role={me.user.role} productMode={me.product_mode} permissions={me.permissions ?? me.user.permissions}
       current={currentSession?.id === nativeSelected ? { ...currentSession, url: originalId ? `/#run=${originalId}` : currentSession.url } : sessions.find(row => !sessionIsReadOnly(row) && row.id === nativeSelected)}
       historicalId={historical && !nativeSelected ? originalId : undefined} onNewSession={newSession} onToggleSidebar={toggleSidebar} onOpenSettings={navigateSettings} onError={setError} />
   </div></SessionActionsProvider></PanelRatioProvider>
 }
 
-function AppCommandPalette({ current, historicalId, productMode, ...props }: {
-  current?: Session; historicalId?: string; productMode?: Me["product_mode"]; open: boolean; onOpenChange: (open: boolean) => void; scopeKey: string; role: string
+function AppCommandPalette({ current, historicalId, productMode, permissions, ...props }: {
+  current?: Session; historicalId?: string; productMode?: Me["product_mode"]; permissions?: string[]; open: boolean; onOpenChange: (open: boolean) => void; scopeKey: string; role: string
   onNewSession: () => void; onToggleSidebar: () => void; onOpenSettings: (page: string) => void; onError: (error: string) => void
 }) {
   const actions = useSessionActions()
   const session: PaletteCurrentSession | undefined = current ? {
-    ...current, source: "native", capabilities: { read: true, rename: current.owner_id === actions.userId, pin: true, move: true },
+    ...actions.preferenceSession(current), source: "native", capabilities: { read: true, rename: current.can_manage ?? current.owner_id === actions.userId, pin: true, move: true },
   } : historicalId ? { id: historicalId, title: "Saved session", source: "legacy", read_only: true } : undefined
   return <CommandPalette {...props} scopeLabel="Your accessible sessions" currentSession={session} busy={actions.busy} search={searchSessions}
-    destinations={settingsDestinations.filter(item => !item.productOnly || productMode === "existing")} onOpenSession={openSessionReference}
+    destinations={settingsDestinations.filter(item => !item.productOnly || productMode === "existing").map(item => ({ ...item, available: canOpenPage({ role: props.role, permissions }, item.page) }))} onOpenSession={openSessionReference}
     onNewFolder={() => actions.openEditor({ action: "folder-create" })}
     onCopySessionLink={async row => { await navigator.clipboard.writeText(`${location.origin}/#${sessionReferenceHash(row)}`) }}
     onRenameSession={() => { if (current) actions.openEditor({ action: "rename", session: current }) }}
@@ -357,7 +408,7 @@ function Login({ onLogin }: { onLogin: (me: Me) => void }) {
     return () => controller.abort()
   }, [retry])
   return <main className="center"><section className="login" aria-labelledby="login-title">
-    <img src={logo} alt="" /><h1 id="login-title">Welcome to Moyai</h1><p className="muted">Sign in to your workspace.</p>
+    <h1 id="login-title">Welcome to Moyai</h1><p className="muted">Sign in to your workspace.</p>
     {!config && !error && <p role="status">Loading sign-in options…</p>}
     {config?.google_enabled && <Button variant="outline" disabled={busy} onClick={async () => {
       setBusy(true); setError("")
@@ -384,18 +435,34 @@ function Login({ onLogin }: { onLogin: (me: Me) => void }) {
   </section></main>
 }
 
-function Conversation({ id, me, connections, connectionVersion, refreshList, workspaceRequest, pullRequests, onPRUpdated, sideMode = false, visible = true, onTitle, onSession, onOpenFile, initial, originalSessionId, authorityKey }: { id: string; me: Me; connections: Connection[]; connectionVersion: string; refreshList: () => Promise<void>; workspaceRequest: WorkspaceRequest | null; pullRequests: PRSummary[]; onPRUpdated: () => void; sideMode?: boolean; visible?: boolean; onTitle?: (title: string) => void; onSession?: (session: Session | null) => void; onOpenFile?: OpenFile; initial?: NewConversation; originalSessionId?: string; authorityKey?: string }) {
-  const [view, setView] = useState<View | null>(() => initial ? { session: initial.session, turns: [initial.turn] } : null)
-  const [messages, setMessages] = useState<Message[]>(() => initial ? [firstMessage(initial)] : [])
+function Conversation({ id, me, connections, connectionVersion, refreshList, workspaceRequest, pullRequests, onPRUpdated, sideMode = false, visible = true, onTitle, onSession, onOpenFile, onOpenAction, initial, resolved, originalSessionId, authorityKey }: { id: string; me: Me; connections: Connection[]; connectionVersion: string; refreshList: () => Promise<void>; workspaceRequest: WorkspaceRequest | null; pullRequests: PRSummary[]; onPRUpdated: () => void; sideMode?: boolean; visible?: boolean; onTitle?: (title: string) => void; onSession?: (session: Session | null) => void; onOpenFile?: OpenFile; onOpenAction?: (action: ActionSelection) => void; initial?: NewConversation; resolved?: View; originalSessionId?: string; authorityKey?: string }) {
+  const [view, setView] = useState<View | null>(() => initial ? { session: initial.session, turns: [initial.turn] } : resolved?.messages !== undefined ? resolved : null)
+  const [messages, setMessages] = useState<Message[]>(() => initial ? [firstMessage(initial)] : resolved?.messages ?? [])
   const [plan, setPlan] = useState<Plan[]>([])
+  const [panelLoading, setPanelLoading] = useState(false)
+  const [panelError, setPanelError] = useState("")
+  const [traceBusy, setTraceBusy] = useState(false)
+  const [traceError, setTraceError] = useState("")
+  const resolvedOnce = useRef(resolved)
+  const viewNow = useRef(view)
+  viewNow.current = view
+  const sensitiveVersion = useRef(0)
   const [draft, setDraft] = useState("")
-  const [model, setModel] = useState(initial?.session.model ?? me.default_model)
-  const [selectedAccounts, setSelectedAccounts] = useState<string[]>(initial?.turn.connections ?? [])
+  const [answeredRequest, setAnsweredRequest] = useState<string | null>(null)
+  const [swarmSpace, setSwarmSpace] = useState<boolean | null>(null)
+  const [goalDialog, setGoalDialog] = useState(false)
+  const [model, setModel] = useState(view?.session.model ?? me.default_model)
+  const [selectedAccounts, setSelectedAccounts] = useState<string[]>(() => {
+    const latest = view?.turns[0]
+    return (latest?.is_self ?? latest?.actor_id === me.user.id) ? latest.connections ?? [] : []
+  })
   const [accountRevision, setAccountRevision] = useState(0)
   const [accountNotice, setAccountNotice] = useState("")
   const [accountCatalog, setAccountCatalog] = useState<{ scope: string; rows: Connection[]; loading: boolean; error: string }>({ scope: "", rows: [], loading: false, error: "" })
-  const [mode, setMode] = useState("when_idle")
+  const mode = me.preferences?.delivery_mode ?? "when_idle"
+  const [skippedAccountScope, setSkippedAccountScope] = useState("")
   const [error, setError] = useState("")
+  const [loadError, setLoadError] = useState("")
   const pictures = useAttachments(setError)
   const [busy, setBusy] = useState(false)
   const [activity, setActivity] = useState<Activity[]>([])
@@ -405,7 +472,14 @@ function Conversation({ id, me, connections, connectionVersion, refreshList, wor
   const endedStreams = useRef(new Set<string>())
   const [panelState, dispatchPanel] = useReducer((state: typeof emptyPanelState, action: PanelAction | { type: "reset" }) => action.type === "reset" ? emptyPanelState : panelReducer(state, action), emptyPanelState)
   const [workspaceOpen, setWorkspaceOpen] = useState(false)
+  const openedBrowserLogin = useRef("")
+  const panelReturnFocus = useRef<HTMLElement | null>(null)
   const sessionActions = useSessionActions()
+  const exportTrace = useCallback(() => {
+    setTraceBusy(true)
+    setTraceError("")
+    void downloadDebugTrace(id).catch(error => setTraceError(String(error))).finally(() => setTraceBusy(false))
+  }, [id])
   const titleCallback = useRef(onTitle)
   titleCallback.current = onTitle
   const sessionCallback = useRef(onSession)
@@ -414,38 +488,75 @@ function Conversation({ id, me, connections, connectionVersion, refreshList, wor
   const [sendingNow, setSendingNow] = useState<Set<string>>(() => new Set())
   const fileDrop = useFileDrop(pictures.add, setError, busy || Boolean(editing) || !visible)
   const [editText, setEditText] = useState("")
-  const composerInput = useRef<HTMLTextAreaElement>(null)
+  const composerInput = useRef<HTMLDivElement>(null)
   const heading = useRef<HTMLHeadingElement>(null)
   const transcript = useRef<HTMLDivElement>(null)
+  const followingWork = useRef(true)
+  const followWork = useCallback(() => {
+    if (followingWork.current && transcript.current) transcript.current.scrollTop = transcript.current.scrollHeight
+  }, [])
   const workspaceElement = useRef<HTMLDivElement>(null), chatId = useId()
   const lastRequest = useRef<{ payload: string; key: string } | null>(null)
-  const loaded = useRef(false)
+  const lastGoalRequest = useRef<{ payload: string; key: string } | null>(null)
+  const goalSending = useRef(false)
+  const composerInitialized = useRef(Boolean(view))
   const readThrough = useRef<number | null>(null)
   const loadVersion = useRef(0)
+  const completeHistory = useRef<{ version: string; messages: Message[] } | null>(null)
   const visibleNow = useRef(visible)
   visibleNow.current = visible
-  function clearSensitive() {
+  function clearSensitive(message = "Access to this conversation changed. Please reopen it.") {
     ++loadVersion.current
+    ++sensitiveVersion.current
+    setGoalDialog(false); lastGoalRequest.current = null; setBusy(false)
+    resolvedOnce.current = undefined
+    composerInitialized.current = false
+    readThrough.current = null
+    lastRequest.current = null
+    viewNow.current = null
+    completeHistory.current = null
     liveNow.current = emptyLiveTranscript()
-    setLiveText(liveNow.current); setView(null); setMessages([]); setPlan([]); setActivity([])
-    setDraft(""); setEditing(null); setEditText(""); pictures.clear(); setSendingNow(new Set()); setSelectedAccounts([]); setWorkspaceOpen(false)
-    setAccountCatalog({ scope: "", rows: [], loading: false, error: "" }); setAccountNotice("")
+    setLiveText(liveNow.current); setView(null); setMessages([]); setPlan([]); setActivity([]); setPanelError("")
+    setDraft(""); setAnsweredRequest(null); setEditing(null); setEditText(""); pictures.clear(); setSendingNow(new Set()); setModel(me.default_model); setSelectedAccounts([]); setWorkspaceOpen(false)
+    setError(""); setLoadError(message); setBusy(false)
+    setAccountCatalog({ scope: "", rows: [], loading: false, error: "" }); setAccountNotice(""); setSkippedAccountScope("")
     dispatchPanel({ type: "reset" })
+    openedBrowserLogin.current = ""
+    panelReturnFocus.current = null
     sessionCallback.current?.(null)
   }
   const clearSensitiveNow = useRef(clearSensitive)
   clearSensitiveNow.current = clearSensitive
-  useEffect(() => () => { ++loadVersion.current }, [])
+  useEffect(() => () => { ++loadVersion.current; ++sensitiveVersion.current }, [])
   const load = useCallback(async (signal?: AbortSignal) => {
     const version = ++loadVersion.current
     try {
-      const [next, history, tasks] = await Promise.all([
-        api<View>(`/sessions/${id}`, "GET", undefined, signal),
-        api<Message[]>(`/sessions/${id}/messages`, "GET", undefined, signal),
-        sideMode ? Promise.resolve([] as Plan[]) : api<Plan[]>(`/sessions/${id}/plan`, "GET", undefined, signal),
-      ])
+      const cached = resolvedOnce.current
+      resolvedOnce.current = undefined
+      const next = cached ?? await api<View>(`/sessions/${id}?include_activity=false&include_messages=true`, "GET", undefined, signal)
+      // Older servers can omit the transcript during a rolling deployment.
+      const unchanged = next.transcript_version && completeHistory.current?.version === next.transcript_version
+      const history = unchanged ? completeHistory.current!.messages : [...(next.messages ?? await api<Message[]>(`/sessions/${id}/messages`, "GET", undefined, signal))]
+      let pageSize = unchanged ? 0 : history.length
+      while (pageSize === 200 && !signal?.aborted && version === loadVersion.current) {
+        const after = history.at(-1)!.id
+        const page = await api<Message[]>(`/sessions/${id}/messages?after=${after}`, "GET", undefined, signal)
+        if (page.some(message => message.id <= after)) throw new Error("Conversation history changed while loading. Refresh to retry.")
+        history.push(...page); pageSize = page.length
+      }
       if (signal?.aborted || version !== loadVersion.current) return
-      setView(next); setMessages(history); setPlan(tasks)
+      // Publish a complete composer with the transcript, before read bookkeeping.
+      // Seed only once so polling and late receipts cannot overwrite user edits.
+      if (!composerInitialized.current) {
+        setModel(next.session.model)
+        const latest = next.turns[0]
+        setSelectedAccounts((latest?.is_self ?? latest?.actor_id === me.user.id) ? latest.connections ?? [] : [])
+        composerInitialized.current = true
+      }
+      if (next.transcript_version) completeHistory.current = { version: next.transcript_version, messages: history }
+      viewNow.current = next
+      setView(next); setMessages(history)
+      if (next.activity) setActivity(next.activity)
       setSendingNow(previous => {
         const pending = [...previous].filter(id => next.turns.some(turn => turn.id === id && turn.status === "queued" && turn.mode !== "asap"))
         return pending.length === previous.size ? previous : new Set(pending)
@@ -457,42 +568,66 @@ function Conversation({ id, me, connections, connectionVersion, refreshList, wor
         if (signal?.aborted || version !== loadVersion.current) return
         readThrough.current = latestMessage
       }
-      if (next.activity) setActivity(next.activity)
-      if (!loaded.current) {
-        setModel(next.session.model)
-        const latest = next.turns[0]
-        if (latest?.actor_id === me.user.id) setSelectedAccounts(latest.connections ?? [])
-        loaded.current = true
-      }
+      setLoadError("")
     } catch (reason) {
       if (signal?.aborted || version !== loadVersion.current) return
       if (reason instanceof ApiError && [401, 403, 404].includes(reason.status)) {
-        clearSensitiveNow.current()
+        clearSensitiveNow.current(String(reason))
       }
       throw reason
     }
   }, [id, me.user.id, sideMode])
+  async function reloadAfterAction(message?: string) {
+    try { await load() }
+    catch (reason) {
+      const denied = reason instanceof ApiError && [401, 403, 404].includes(reason.status)
+      setLoadError(denied ? String(reason) : message ?? String(reason))
+    }
+  }
+  async function runConversationAction(action: () => Promise<unknown>, onAccepted?: () => void) {
+    const version = sensitiveVersion.current
+    try {
+      await action()
+      if (version !== sensitiveVersion.current) return
+      onAccepted?.()
+      await reloadAfterAction()
+    } catch (reason) {
+      if (version === sensitiveVersion.current) setError(String(reason))
+    }
+  }
   useEffect(() => {
     if (sideMode && !visible) return
-    const controller = new AbortController()
-    let timer: ReturnType<typeof setTimeout>
-    const poll = async () => {
-      try { await load(controller.signal) } catch (e) {
-        if (!controller.signal.aborted) {
-          setError(String(e))
-        }
-      }
-      if (!controller.signal.aborted) timer = setTimeout(poll, 1500)
-    }
-    void poll()
-    return () => { controller.abort(); clearTimeout(timer) }
+    return pollVisible(load, () => {
+      const current = viewNow.current
+      return !current || activeSession(current.session.status) || current.turns.some(turn => activeSession(turn.status)) ? 1500 : 10000
+    }, reason => setLoadError(String(reason)))
   }, [load, sideMode, visible])
-  const productAccounts = me.product_mode === "existing"
-  const accountScope = view ? `${id}:${view.session.visibility}:${view.session.surface}:${connectionVersion}:${accountRevision}` : ""
-  const effectiveConnections = productAccounts ? accountCatalog.scope === accountScope ? accountCatalog.rows : [] : connections
-  const accountBlocked = productAccounts && (Boolean(accountNotice) || selectedAccounts.length > 0 && (accountCatalog.scope !== accountScope || accountCatalog.loading || Boolean(accountCatalog.error)))
+  const auxiliaryPanel = panelState.visible && visible
+    ? panelState.tabs.find(tab => tab.id === panelState.activeId)?.kind : undefined
   useEffect(() => {
-    if (!productAccounts || !view || !visible) return
+    if (!view || (auxiliaryPanel !== "plan" && auxiliaryPanel !== "activity")) return
+    const version = sensitiveVersion.current
+    setPanelLoading(true); setPanelError("")
+    return pollVisible(async signal => {
+      const rows = await api<Plan[] | Activity[]>(`/sessions/${id}/${auxiliaryPanel}`, "GET", undefined, signal)
+      if (signal.aborted || version !== sensitiveVersion.current) return
+      if (auxiliaryPanel === "plan") setPlan(rows as Plan[])
+      else setActivity(rows as Activity[])
+      setPanelLoading(false); setPanelError("")
+    }, () => activeSession(viewNow.current?.session.status) ? 1500 : 10000, reason => {
+      if (version !== sensitiveVersion.current) return
+      if (reason instanceof ApiError && [401, 403, 404].includes(reason.status)) clearSensitiveNow.current(String(reason))
+      else { setPanelLoading(false); setPanelError(String(reason)) }
+    })
+  }, [id, auxiliaryPanel, Boolean(view)])
+  const accountScope = view ? `${id}:${view.session.visibility}:${view.session.surface}:${connectionVersion}:${accountRevision}` : ""
+  const effectiveConnections = accountCatalog.scope === accountScope ? accountCatalog.rows.filter(row => row.enabled && (view?.session.visibility === "private" || row.shared)) : []
+  const preferredAccounts = me.preferences?.connection_ids ?? selectedAccounts
+  const skipAccounts = skippedAccountScope === accountScope
+  const sendAccounts = skipAccounts ? [] : preferredAccounts.filter(id => effectiveConnections.some(row => row.id === id))
+  const accountBlocked = !skipAccounts && (Boolean(accountNotice) || preferredAccounts.length > 0 && (accountCatalog.scope !== accountScope || accountCatalog.loading || Boolean(accountCatalog.error)))
+  useEffect(() => {
+    if (!view || !visible) return
     const controller = new AbortController(), scope = accountScope
     setAccountCatalog({ scope, rows: [], loading: true, error: "" })
     const query = new URLSearchParams({ session_id: id })
@@ -500,20 +635,24 @@ function Conversation({ id, me, connections, connectionVersion, refreshList, wor
       if (!controller.signal.aborted) setAccountCatalog({ scope, rows, loading: false, error: "" })
     }, reason => { if (!controller.signal.aborted) setAccountCatalog({ scope, rows: [], loading: false, error: String(reason) }) })
     return () => controller.abort()
-  }, [productAccounts, accountScope, visible])
+  }, [accountScope, visible])
   useEffect(() => {
-    if (!productAccounts || accountCatalog.scope !== accountScope || accountCatalog.loading || accountCatalog.error) return
+    if (me.preferences?.connection_ids != null || accountCatalog.scope !== accountScope || accountCatalog.loading || accountCatalog.error) return
     const available = new Set(accountCatalog.rows.filter(row => row.enabled).map(row => row.id))
     const retained = selectedAccounts.filter(account => available.has(account))
     if (retained.length !== selectedAccounts.length) {
       setSelectedAccounts(retained)
-      setAccountNotice("Account access changed. Review Context & connections before sending your next message.")
+      setAccountNotice("Some connections are no longer available for this chat.")
     }
-  }, [productAccounts, accountScope, accountCatalog, selectedAccounts])
+  }, [accountScope, accountCatalog, selectedAccounts, me.preferences?.connection_ids])
   useEffect(() => {
     if (!workspaceRequest || sideMode) return
     setWorkspaceOpen(false)
     if (workspaceRequest.tab === "computer") dispatchPanel({ type: "open", tab: { id: "computer", kind: "computer", title: "Computer" } })
+    else if (workspaceRequest.tab === "side-chat" && workspaceRequest.child) dispatchPanel({ type: "open", tab: {
+      id: `side-chat:${workspaceRequest.child.id}`, kind: "side-chat",
+      sessionId: workspaceRequest.child.id, title: workspaceRequest.child.title,
+    } })
     else if (workspaceRequest.url) dispatchPanel({ type: "open", tab: { id: `pr:${workspaceRequest.url.toLowerCase()}`, kind: "pull-request", title: "Pull request", url: workspaceRequest.url } })
   }, [workspaceRequest, sideMode])
   useEffect(() => { if (visible) heading.current?.focus() }, [Boolean(view), visible])
@@ -523,10 +662,33 @@ function Conversation({ id, me, connections, connectionVersion, refreshList, wor
   }, [view?.session.title, sideMode])
   useEffect(() => {
     const element = transcript.current
-    if (element) element.scrollTop = element.scrollHeight
+    if (element) { followingWork.current = true; element.scrollTop = element.scrollHeight }
   }, [messages.length, sendingNow])
   const active = view?.turns.find(turn => turn.id === view.session.active_turn)
-  const activeId = visible && active && ["running", "saving"].includes(active.status) && active.actor_id === me.user.id ? active.id : null
+  const work = useWorkProgress(
+    id, `${authorityKey}:${connectionVersion}:${id}:${me.user.id}`,
+    (active?.is_self ?? active?.actor_id === me.user.id) ? active : undefined, visible && !swarmSpace,
+    () => clearSensitiveNow.current(),
+  )
+  const requestAnswered = Boolean(active && answeredRequest === active.id)
+  const browserLoginIds = view?.pending?.calls.filter(call => call.tool_name === "request_browser_login")
+    .map(call => call.tool_call_id).join(",") ?? ""
+  const browserLogin = view?.pending?.calls.find(call => call.tool_name === "request_browser_login")
+  const loginMetadata = browserLogin ? view?.pending?.metadata?.[browserLogin.tool_call_id] : undefined
+  const canResolveInput = Boolean(active && (view?.can_answer ?? active.actor_id === me.user.id))
+  useEffect(() => {
+    if (sideMode || !visible || !browserLoginIds || !canResolveInput || requestAnswered) return
+    const identity = `${id}:${active?.id}:${browserLoginIds}`
+    if (openedBrowserLogin.current === identity) return
+    openedBrowserLogin.current = identity
+    setWorkspaceOpen(false)
+    dispatchPanel({ type: "open", tab: { id: "computer", kind: "computer", title: "Computer" } })
+    const frame = requestAnimationFrame(() =>
+      transcript.current?.querySelector(".browser-login-request")?.scrollIntoView({ block: "end" }))
+    return () => cancelAnimationFrame(frame)
+  }, [id, active?.id, browserLoginIds, canResolveInput, visible, requestAnswered, sideMode])
+  const answeringQuestion = Boolean(view?.session.status === "waiting" && view.can_reply_with_text && active && !requestAnswered && pictures.files.length === 0)
+  const activeId = visible && active && ["running", "saving"].includes(active.status) && (active.is_self ?? active.actor_id === me.user.id) ? active.id : null
   useEffect(() => {
     if (!activeId || endedStreams.current.has(activeId)) return
     if (liveNow.current.turnId !== activeId) {
@@ -537,7 +699,7 @@ function Conversation({ id, me, connections, connectionVersion, refreshList, wor
     let closed = false
     const stream = new EventSource(`/api/sessions/${encodeURIComponent(id)}/events?turn_id=${encodeURIComponent(activeId)}&offset=${liveNow.current.offset + 1}`)
     const current = () => !closed && auth === csrfToken() && visibleNow.current
-    const refreshSaved = () => { if (current()) void load().catch(reason => { if (current()) setError(String(reason)) }) }
+    const refreshSaved = () => { if (current()) void load().catch(reason => { if (current()) setLoadError(String(reason)) }) }
     stream.onmessage = event => {
       if (!current() || !/^\d+$/.test(event.lastEventId)) return
       try {
@@ -561,60 +723,135 @@ function Conversation({ id, me, connections, connectionVersion, refreshList, wor
       closed = true; stream.close(); setReconnecting(false); endedStreams.current.add(activeId)
       clearSensitiveNow.current()
       window.dispatchEvent(new Event("moyai:access-changed"))
-      void load().catch(reason => { if (auth === csrfToken()) setError(String(reason)) })
+      void load().catch(reason => { if (auth === csrfToken()) setLoadError(String(reason)) })
     })
     stream.onerror = () => { if (current()) { setReconnecting(true); refreshSaved() } }
     return () => { closed = true; stream.close() }
   }, [activeId, id, load])
   useEffect(() => {
-    const element = transcript.current
-    if (element && element.scrollHeight - element.scrollTop - element.clientHeight < 180) element.scrollTop = element.scrollHeight
-  }, [liveText])
+    followWork()
+  }, [liveText, followWork])
 
-  async function send() {
-    if (editing) {
-      if (busy || !editText.trim()) return
-      setBusy(true); setError("")
-      try { await api(`/turns/${editing.turn_id}`, "PATCH", { prompt: editText }); setEditing(null); await load() }
-      catch (error) { setError(String(error)) } finally { setBusy(false) }
+  async function applyGoal(command: string): Promise<void> {
+    if (goalSending.current || busy) throw new Error("Wait for the current submission to finish, then retry.")
+    const startingGoal = goalCommandAction(command) === "set"
+    if (startingGoal && (pictures.uploading || pictures.hasErrors)) {
+      throw new Error("Finish uploading or retry the attached files before starting a goal.")
+    }
+    if (startingGoal && accountBlocked) throw new Error("Resolve the connection error before starting a goal.")
+    const auth = csrfToken(), version = sensitiveVersion.current
+    const current = () => auth === csrfToken() && version === sensitiveVersion.current
+    const body = { prompt: command, ...(startingGoal ? {
+      model, connections: [...sendAccounts].sort(), attachments: pictures.readyFiles.map(file => file.id),
+    } : {}) }
+    const payload = JSON.stringify([id, auth, body])
+    if (lastGoalRequest.current?.payload !== payload) lastGoalRequest.current = { payload, key: crypto.randomUUID() }
+    const attempt = lastGoalRequest.current
+    goalSending.current = true; setBusy(true); setError("")
+    try {
+      await api(`/sessions/${id}/messages`, "POST", { ...body, request_key: attempt.key })
+      if (lastGoalRequest.current === attempt) lastGoalRequest.current = null
+      if (!current()) return
+      if (startingGoal) pictures.clear()
+      // The mutation is acknowledged. Refresh errors must not retry that mutation.
+      await reloadAfterAction("Your goal was updated, but the conversation could not be refreshed.")
+      if (current()) await refreshList()
+    } finally {
+      goalSending.current = false
+      if (current()) setBusy(false)
+    }
+  }
+
+  async function send(promptOverride?: string) {
+    const prompt = promptOverride ?? (editing ? editText : draft)
+    const version = sensitiveVersion.current
+    if (!editing && ["/goal", "/goal edit"].includes(prompt.trim())) {
+      if (prompt.trim() === "/goal" && view?.goal) { setDraft(""); return }
+      setGoalDialog(true); setDraft(""); return
+    }
+    if (!editing && goalCommandAction(prompt)) {
+      try { await applyGoal(prompt); if (version === sensitiveVersion.current) setDraft("") }
+      catch (reason) { if (version === sensitiveVersion.current) setError(String(reason)) }
       return
     }
-    if ((!draft.trim() && !pictures.files.length) || busy || pictures.uploading || pictures.hasErrors || accountBlocked) return
+    if (editing) {
+      if (busy || !prompt.trim()) return
+      setBusy(true); setError("")
+      try {
+        await api(`/turns/${editing.turn_id}`, "PATCH", { prompt })
+        if (version !== sensitiveVersion.current) return
+        setEditing(null); await reloadAfterAction()
+      } catch (error) {
+        if (version === sensitiveVersion.current) setError(String(error))
+      } finally {
+        if (version === sensitiveVersion.current) setBusy(false)
+      }
+      return
+    }
+    if ((!prompt.trim() && !pictures.files.length) || busy || pictures.uploading || pictures.hasErrors || accountBlocked) return
     setBusy(true); setError("")
-    const body = { prompt: draft, model, mode, connections: selectedAccounts, attachments: pictures.readyFiles.map(file => file.id) }
+    const body = {
+      prompt, model: answeringQuestion ? active?.model ?? model : model, mode,
+      connections: answeringQuestion ? active?.connections ?? sendAccounts : sendAccounts,
+      attachments: pictures.readyFiles.map(file => file.id),
+      ...(answeringQuestion ? { reply_to: active?.id } : {}),
+    }
     const serialized = JSON.stringify(body)
     if (lastRequest.current?.payload !== serialized) lastRequest.current = { payload: serialized, key: crypto.randomUUID() }
     try {
       await api(`/sessions/${id}/messages`, "POST", { ...body, request_key: lastRequest.current.key })
-      setDraft(""); pictures.clear(); lastRequest.current = null; await load(); await refreshList()
-    } catch (e) { setError(String(e)) } finally { setBusy(false) }
+      if (version !== sensitiveVersion.current) return
+      if (body.reply_to) setAnsweredRequest(body.reply_to)
+      setDraft(""); pictures.clear(); lastRequest.current = null
+      await reloadAfterAction(body.reply_to
+        ? "Your response was sent, but the conversation could not be refreshed."
+        : "Your message was sent, but the conversation could not be refreshed.")
+      if (version === sensitiveVersion.current) await refreshList()
+    } catch (e) {
+      if (version === sensitiveVersion.current) setError(String(e))
+    } finally {
+      if (version === sensitiveVersion.current) setBusy(false)
+    }
   }
   async function sendNow(turnId: string) {
     if (busy) return
+    const version = sensitiveVersion.current
     setBusy(true); setError("")
     setSendingNow(previous => new Set(previous).add(turnId))
     try {
       const turn = await api<Turn>(`/turns/${turnId}/steer`, "POST")
+      if (version !== sensitiveVersion.current) return
       setView(previous => previous ? { ...previous, turns: previous.turns.map(item => item.id === turn.id ? turn : item) } : previous)
-      await load()
+      await reloadAfterAction()
     } catch (reason) {
+      if (version !== sensitiveVersion.current) return
       setSendingNow(previous => { const next = new Set(previous); next.delete(turnId); return next })
       setError(String(reason))
-    } finally { setBusy(false) }
+    } finally {
+      if (version === sensitiveVersion.current) setBusy(false)
+    }
   }
-  if (!view) return <div className="center" role="status">{error || "Opening conversation…"}</div>
+  if (!view) return <div className="center" role={loadError || error ? "alert" : "status"}>{loadError || error || "Opening conversation…"}</div>
   const session = originalSessionId ? { ...view.session, url: `/#run=${originalSessionId}` } : view.session
   const savedAssistant = messages.some(message => message.role === "assistant" && message.turn_id === liveText.turnId)
-  const commentary = liveCommentary(liveText, savedAssistant)
-  const liveMessage = commentary ? <article className="message assistant live-message" data-turn-id={liveText.turnId}>
-    <div className="message-author">Moyai</div><div className="message-content"><Markdown remarkPlugins={[remarkGfm]}>{commentary}</Markdown></div>
-  </article> : null
+  const finalText = liveFinalAnswer(liveText)
+  const liveMessage: Message | null = !savedAssistant && finalText ? {
+    id: -2, turn_id: liveText.turnId, role: "assistant", author_id: null, content: finalText,
+  } : null
   const displayedActivity = mergeActivity(activity, liveText.activity)
-  const queued = messages.filter(message => message.author_id === me.user.id && view.turns.some(turn =>
+  const queued = messages.filter(message => (message.is_self ?? message.author_id === me.user.id) && view.turns.some(turn =>
     turn.id === message.turn_id && waitsBehindActive(turn, active, sendingNow.has(turn.id))))
+  const visibleMessages = orderedWorkMessages((liveMessage ? [...messages, liveMessage] : messages).filter(message =>
+    (message.role !== "system" || message.source === "delegation") && !queued.some(item => item.id === message.id)), view.turns)
+  const segments = workSegments(visibleMessages.filter(message => message !== liveMessage), view.turns)
   const starting = !active && !view.has_unsettled_effects && view.turns.some(turn => turn.status === "queued")
   const displayStatus = starting || active?.status === "starting" ? "starting" : session.status
   function openTab(tab: WorkspaceTab) { setWorkspaceOpen(false); dispatchPanel({ type: "open", tab }) }
+  function openAction(action: ActionSelection) {
+    if (sideMode && onOpenAction) { onOpenAction(action); return }
+    openTab({ id: "action", kind: "action", title: "Action", action })
+  }
+  const selectedTab = panelState.visible ? panelState.tabs.find(tab => tab.id === panelState.activeId) : undefined
   function openOutput(resource: OutputResource, sourceSessionId = id) {
     openTab({
       id: `output:${sourceSessionId}:${resource.kind}:${resource.id ?? resource.url}`,
@@ -625,32 +862,75 @@ function Conversation({ id, me, connections, connectionVersion, refreshList, wor
     const titles = { "side-chat": "Side chat", computer: "Computer", files: "Files", activity: "Activity", plan: "Plan" }
     openTab({ id: kind === "side-chat" ? `side-chat:new:${crypto.randomUUID()}` : kind, kind, title: titles[kind] })
   }
-  const chat = <section className="chat file-drop-zone" id={chatId} {...fileDrop.handlers}>
+  // Questions and effect reviews remain in the conversation where they can be answered.
+  const space = Boolean(session.swarm_id && !sideMode && (swarmSpace ?? session.swarm_id === id)
+    && !view.pending && !view.credential_requests?.length && !view.has_unsettled_effects)
+  const chat = <SkillMarkdownProvider messages={visibleMessages}><section className={`chat file-drop-zone${space ? " swarm-space-mode" : ""}`} id={chatId} {...fileDrop.handlers}>
+      <div className="chat-layout"><div className="chat-content">
+        {!space && <SpaceBackdrop variant="chat" />}
         {fileDrop.dragging && <FileDropOverlay />}
-        {originalSessionId && <React.Suspense fallback={<div className="muted" role="status">Opening earlier history…</div>}>
+        {view.goal && <GoalPanel goal={view.goal} canControl={view.goal.owner_id === me.user.id} busy={busy}
+          onCommand={command => {
+            const version = sensitiveVersion.current
+            void applyGoal(command).catch(reason => { if (version === sensitiveVersion.current) setError(String(reason)) })
+          }} onEdit={() => setGoalDialog(true)} />}
+        <GoalDialog open={goalDialog} onOpenChange={setGoalDialog} goal={view.goal} onSubmit={applyGoal} />
+        {session.swarm_id && <SwarmPanel key={id} sessionId={id} visible={visible} onChanged={load}
+          space={space} onSpaceChange={sideMode ? undefined : setSwarmSpace} />}
+        {originalSessionId && !space && <React.Suspense fallback={<div className="muted" role="status">Opening earlier history…</div>}>
           <ProductHistoryPrefix sessionId={originalSessionId} scopeKey={`${authorityKey}:${connectionVersion}`} active={visible} onOpenSession={openSessionReference} />
         </React.Suspense>}
-        <div className="transcript" ref={transcript}
+        <div className="transcript" ref={transcript} hidden={space}
+          onScroll={event => {
+            const element = event.currentTarget
+            followingWork.current = element.scrollHeight - element.scrollTop - element.clientHeight < 180
+          }}
           onClickCapture={event => previewFileLink(event, id, sideMode ? onOpenFile : openOutput)}>
-          {!messages.length && <div className="empty-chat"><img src={logo} alt="" /><h2>Start with a task or a question.</h2><p className="muted">Your work and saved outputs stay with this conversation.</p></div>}
-          {messages.filter(message => !queued.some(item => item.id === message.id)).map(message => {
+          {!messages.length && <div className="empty-chat"><h2>Start with a task or a question.</h2><p className="muted">Your work and saved outputs stay with this conversation.</p></div>}
+          {visibleMessages.map(message => {
             const turn = view.turns.find(item => item.id === message.turn_id)
-            return <React.Fragment key={message.id}>{message.role === "assistant" && message.turn_id === liveText.turnId && liveMessage}<article className={`message ${message.role}`}>
-              <div className="message-author">{message.role === "assistant" ? "Moyai" : message.author_id === me.user.id ? "You" : "Teammate"}
+            const segment = segments.get(message.id)
+            return <React.Fragment key={message.id}><article className={`message ${message.role}${message === liveMessage ? " live-message" : ""}`}
+              data-turn-id={message.turn_id}>
+              <div className="message-author">{message.source === "slack" && <img src={slackLogo} width={14} height={14} alt="Slack" />}
+                {message.source === "delegation" ? "Parent agent" : message.role === "assistant" ? "Moyai" : (message.is_self ?? message.author_id === me.user.id) ? (message.author_name ? `${message.author_name} · You` : "You") : message.author_name || "Unknown sender"}
+                {message.source_timestamp && <time className="message-source-time" dateTime={new Date(Number(message.source_timestamp) * 1000).toISOString()} title={new Date(Number(message.source_timestamp) * 1000).toLocaleString()}>{new Date(Number(message.source_timestamp) * 1000).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}</time>}
+                {message.source_url && <a className="message-source-link" href={message.source_url} target="_blank" rel="noreferrer" aria-label="Open message in Slack" title="Open message in Slack"><ExternalLink size={12} /></a>}
                 {message.role === "user" && turn && waitsBehindActive(turn, active, sendingNow.has(turn.id)) && <span className="status">Queued</span>}
                 {message.role === "user" && turn?.status === "stopped" && <span className="muted">Stopped</span>}
               </div>
               <div className={message.role === "user" ? "user-bubble" : undefined}>
-                {message.content && <div className="message-content">{message.role === "assistant" ? <Markdown remarkPlugins={[remarkGfm]}>{message.content}</Markdown> : message.content}</div>}
+                {message.content && <div className="message-content">{message.role === "assistant" ? <SkillMarkdown>{message.content}</SkillMarkdown> : <SkillMessage content={message.content} />}</div>}
                 <AttachmentPreviews files={message.attachments ?? []} />
+                {message.deleted && <p className="muted">Deleted in Slack.{message.edited_after_start ? " Work that already started may continue." : ""}</p>}
+                {message.edited && <p className="muted">Edited in {message.edited_in === "web" ? "Moyai" : "Slack"}.{message.edited_after_start ? " This task received the original text. Send a follow-up to change the work." : ""}</p>}
+                {message.attachments_changed && <p className="muted">Attachments changed in Slack. This task keeps the original files; send a follow-up to use the updated files.</p>}
+                {message.legacy_review_required && <p className="muted">Open this older message in Slack to review its files and text.</p>}
+                {message.attachment_status?.filter(file => file.error || file.preview_error).map((file, index) => <p className="muted" role="status" key={file.file_id ?? index}>{file.name || "Slack attachment"}: {file.error ? "File unavailable. Open the message in Slack to retry or share it again." : "Preview unavailable. The original file is attached."}</p>)}
               </div>
 
-            </article></React.Fragment>
+            </article>{(segment?.turn.is_self ?? segment?.turn.actor_id === me.user.id) && <TurnProgress
+              key={`${authorityKey}:${connectionVersion}:${segment.id}`} segment={segment} visible={visible && !space}
+              entry={work.entries[segment.turn.id]} request={work.load}
+              live={liveText.turnId === segment.turn.id ? liveText : undefined}
+              onContentChange={followWork}
+              selectedAction={selectedTab?.kind === "action" ? selectedTab.action : undefined}
+              onAction={(tool, agent) => openAction({ sessionId: id, turnId: segment.turn.id, toolId: tool.id, agentId: agent?.id, name: toolLabel(tool.name) })}
+              onSubagent={agent => openTab(agent.session_id ? {
+                id: `side-chat:${agent.session_id}`, kind: "side-chat", title: agent.name, sessionId: agent.session_id,
+              } : {
+                id: `subagent:${agent.id}`, kind: "subagent", title: agent.name, runId: agent.id,
+                name: agent.name, status: agent.status, avatar: agent.avatar,
+              })}
+            />}</React.Fragment>
           })}
-          {!savedAssistant && liveMessage}
           {starting && <div className="working live-action" role="status"><span className="running-dot" /><span>Starting…</span></div>}
           {active && ["starting", "running", "saving"].includes(active.status) && <div className="working live-action" role="status"><span className="running-dot" /><span>{active.status === "saving" ? "Saving the response…" : active.status === "starting" ? "Starting…" : reconnecting ? "Reconnecting to live progress…" : active.id === liveText.turnId ? liveText.action || "Working…" : "Working…"}</span>{!sideMode && <Button type="button" variant="ghost" size="sm" onClick={() => addTab("activity")}>Activity</Button>}</div>}
-          {view.pending && active && (view.can_answer ?? active.actor_id === me.user.id) && <PendingRequests key={active.id} pending={view.pending} turnId={active.id} sessionId={id} onDone={load} />}
+          {view.pending && active && (view.can_answer ?? (active.is_self ?? active.actor_id === me.user.id)) && <>
+            {view.question_deadline && <p className="notice">Optional question. If unanswered, Moyai will continue using its judgment after {new Date(view.question_deadline).toLocaleTimeString([], { hour: "numeric", minute: "2-digit", second: "2-digit" })}.</p>}
+            <PendingRequests key={active.id} pending={view.pending} turnId={active.id} sessionId={id} submitted={requestAnswered} onAccepted={() => setAnsweredRequest(active.id)} onDone={load} onOpenComputer={() => sideMode ? sessionActions.openComputer(id) : addTab("computer")} />
+          </>}
+          {session.status === "waiting" && !view.can_answer && !view.pending && <p className="notice">Waiting for the original requester’s response. New messages will be queued.</p>}
           {view.credential_requests?.map(request => <div className="pending" key={request.request_id}><p>This task needs organization access.</p><ProductCredentialRequest requestId={request.request_id} onResolved={load} /></div>)}
           {view.turns[0]?.error && <p className="error" role="alert">{view.turns[0].error}</p>}
           {!session.active_turn && view.effects?.map(effect => <EffectReview key={effect.id} effect={effect} onDone={load} />)}
@@ -658,79 +938,135 @@ function Conversation({ id, me, connections, connectionVersion, refreshList, wor
           {session.save_warning && <p className="notice" role="status">{session.save_warning}</p>}
         </div>
         <form className="composer-wrap" onSubmit={e => { e.preventDefault(); void send() }}>
-          {error && <div className="error" role="alert">{error}<Button size="sm" variant="ghost" onClick={() => setError("")}>Dismiss</Button></div>}
+          {session.surface === "slack" && <p className="composer-hint"><img src={slackLogo} width={14} height={14} alt="Slack" /> Messages and replies appear in the linked Slack conversation.</p>}
+          {(error || loadError) && <div className="error" role="alert">{error || loadError}<Button size="sm" variant="ghost" onClick={() => error ? setError("") : setLoadError("")}>Dismiss</Button></div>}
+          {answeringQuestion && <p className="question-reply-hint">Your reply will answer the pending question.</p>}
+          {requestAnswered && <p className="question-reply-hint">Your answer was sent. You can send a follow-up.</p>}
+          {session.status === "waiting" && view.can_answer && !answeringQuestion && !requestAnswered && <p className="notice">Resolve the requests above to continue. New messages will be queued.</p>}
           {queued.length > 0 && <div className="queued-messages" aria-label="Queued messages">{queued.map(message => <div className="queued-message" key={message.id}>
-            <span><small>Queued after the current task</small><span>{message.content || "File message"}</span></span>
+            <span><small>Queued after the current task</small><span>{message.content ? <SkillMessage content={message.content} /> : "File message"}</span></span>
             <Button type="button" size="sm" variant="ghost" disabled={busy || Boolean(editing)} onClick={() => void sendNow(message.turn_id)}>Send now</Button>
             <Button type="button" size="sm" variant="ghost" disabled={busy} onClick={() => { setEditing(message); setEditText(message.content); requestAnimationFrame(() => composerInput.current?.focus()) }}>Edit</Button>
-            <Button type="button" size="icon-sm" variant="ghost" aria-label="Cancel queued message" disabled={busy} onClick={async () => { try { await api(`/turns/${message.turn_id}`, "DELETE"); if (editing?.id === message.id) setEditing(null); await load() } catch (error) { setError(String(error)) } }}><X size={14} /></Button>
+            <Button type="button" size="icon-sm" variant="ghost" aria-label="Cancel queued message" disabled={busy} onClick={() => void runConversationAction(
+              () => api(`/turns/${message.turn_id}`, "DELETE"),
+              () => { if (editing?.id === message.id) setEditing(null) },
+            )}><X size={14} /></Button>
           </div>)}</div>}
           {editing && <div className="editing-message" role="status"><span>Editing queued message · attachments are kept</span><Button type="button" size="sm" variant="ghost" disabled={busy} onClick={() => setEditing(null)}>Cancel edit</Button></div>}
           <div className="composer">
-            <AttachmentPreviews files={editing ? editing.attachments ?? [] : pictures.files} remove={editing || busy ? undefined : pictures.remove} retry={editing || busy ? undefined : pictures.retry} draft />
-            <Textarea ref={composerInput} aria-label="Message Moyai" placeholder="Describe the work…" value={editing ? editText : draft} onChange={e => editing ? setEditText(e.target.value) : setDraft(e.target.value)} onPaste={editing || busy ? undefined : pictures.paste} onKeyDown={e => { if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) { e.preventDefault(); void send() } }} />
-            <div className="composer-actions">
-              <AttachButton add={pictures.add} disabled={Boolean(editing) || busy} />
-              <Choice value={model} onChange={setModel} label="Model" options={me.models.map(item => ({ value: item, label: item }))} />
+            <div className="composer-entry">
+              <AttachmentPreviews files={editing ? editing.attachments ?? [] : pictures.files} remove={editing || busy ? undefined : pictures.remove} retry={editing || busy ? undefined : pictures.retry} draft />
+              <SkillComposer ref={composerInput} value={editing ? editText : draft} onChange={editing ? setEditText : setDraft} onSend={prompt => void send(prompt)} shared={session.visibility !== "private"} sessionId={id} disabled={busy} placeholder={answeringQuestion ? "Type your answer to the pending question…" : "Ask Moyai to help with your work…"} onPaste={editing ? undefined : pictures.paste} />
               <div className="send-actions">
-                {session.active_turn && <><Choice value={mode} onChange={setMode} label="Delivery timing" options={[{ value: "when_idle", label: "Queue next" }, { value: "asap", label: "Send now" }]} /><Button type="button" variant="outline" aria-label="Stop task" onClick={async () => { try { await api(`/sessions/${id}/stop`, "POST"); await load() } catch (e) { setError(String(e)) } }}><Square size={13} />Stop</Button></>}
-                <Button type="submit" size={editing ? "sm" : "icon"} aria-label={editing ? "Save queued message" : "Send message"} disabled={(editing ? !editText.trim() : !draft.trim() && !pictures.files.length) || busy || (!editing && (pictures.uploading || pictures.hasErrors || session.status === "waiting" || accountBlocked))}>{editing ? "Save message" : <ArrowUp />}</Button>
+                <Button type="submit" size={editing ? "sm" : "icon"} aria-label={editing ? "Save queued message" : answeringQuestion ? "Answer question" : "Send message"} disabled={(editing ? !editText.trim() : !draft.trim() && !pictures.files.length) || busy || (!editing && (pictures.uploading || pictures.hasErrors || accountBlocked))}>{editing ? <><Check className="composer-save-icon" /><span className="composer-optional-label">Save message</span></> : <Send size={16} />}</Button>
               </div>
             </div>
+            <div className="composer-actions">
+              <AttachButton add={pictures.add} disabled={Boolean(editing) || busy} compact />
+              {session.active_turn && <Button type="button" variant="outline" aria-label="Stop task" onClick={() => void runConversationAction(() => api(`/sessions/${id}/stop`, "POST"))}><Square size={13} /><span className="composer-optional-label">Stop</span></Button>}
+              <Choice value={model} onChange={setModel} label="Model" options={me.models.map(item => ({ value: item, label: item }))} />
+            </div>
           </div>
-          {accountNotice && <p className="notice" role="status">{accountNotice}<Button type="button" variant="ghost" size="sm" onClick={() => setAccountNotice("")}>Dismiss</Button></p>}
-          {session.surface !== "slack" && (productAccounts || effectiveConnections.some(item => item.enabled)) && <details className="account-selection"><summary>Context & connections{selectedAccounts.length ? ` · ${selectedAccounts.length} selected` : ""}</summary>
-            {productAccounts && (accountCatalog.scope !== accountScope || accountCatalog.loading) && <p className="muted" role="status">Loading accounts for this session…</p>}
-            {productAccounts && accountCatalog.error && <p className="error" role="alert">{accountCatalog.error}<Button type="button" variant="outline" size="sm" onClick={() => setAccountRevision(value => value + 1)}>Retry accounts</Button>{selectedAccounts.length > 0 && <Button type="button" variant="ghost" size="sm" onClick={() => { setSelectedAccounts([]); setAccountNotice("") }}>Clear selected accounts</Button>}</p>}
-            <div className="connection-options">{effectiveConnections.filter(item => item.enabled && (session.visibility === "private" || item.shared)).map(item => <label key={item.id}><Checkbox checked={selectedAccounts.includes(item.id)} onCheckedChange={checked => { setAccountNotice(""); setSelectedAccounts(values => checked ? [...values, item.id] : values.filter(value => value !== item.id)) }} />{item.name}<span className="muted">{item.read_only ? "Read only" : "Can make changes"}</span></label>)}</div>
-            {productAccounts && !accountCatalog.loading && !accountCatalog.error && !effectiveConnections.length && <p className="muted">No accounts are available for this session’s visibility and surface. <a href="#settings/connections">Manage Connections</a></p>}
-          </details>}
-          <p className="composer-hint">{pictures.uploading ? "Uploading files…" : "Drop files or paste images · Enter to send · Shift+Enter for a new line"}</p>
+          {accountNotice && !skipAccounts && <p className="notice" role="status">{accountNotice}<Button type="button" variant="ghost" size="sm" onClick={() => setAccountNotice("")}>Continue</Button><a href="#settings/general">Preferences</a></p>}
+          {session.surface === "slack" && view.slack_delivery && <div className="composer-hint" role="status">
+            {view.slack_delivery.rejected > 0 ? <><span>Slack could not deliver {view.slack_delivery.rejected} message(s). Check the Slack connection in Settings.</span>{session.can_manage && <Button variant="ghost" size="sm" onClick={async () => { try { await api(`/sessions/${id}/slack-delivery/retry`, "POST"); await load() } catch (reason) { setError(String(reason)) } }}>Retry delivery</Button>}</>
+              : view.slack_delivery.sending > 0 ? "Confirming Slack delivery. Your message will not be sent twice."
+              : view.slack_delivery.pending > 0 ? "Waiting to deliver to Slack…" : null}
+          </div>}
+          {accountBlocked && !accountNotice && !accountCatalog.error && <p className="composer-hint" role="status">Loading connections…</p>}
+          {accountBlocked && accountCatalog.error && <p className="error" role="alert">{accountCatalog.error}<Button type="button" variant="outline" size="sm" onClick={() => setAccountRevision(value => value + 1)}>Retry connections</Button><Button type="button" variant="ghost" size="sm" onClick={() => { setSkippedAccountScope(accountScope); setAccountNotice("") }}>Continue without connections</Button></p>}
+          {pictures.uploading && <p className="composer-hint" role="status">Uploading files…</p>}
         </form>
-      </section>
+      </div>
+      {!sideMode && <WorkspaceOverlayContent>
+        <WorkspaceOverview id={id} pullRequests={pullRequests} onUpdated={onPRUpdated}
+          onPullRequest={(url, title) => openTab({ id: `pr:${url.toLowerCase()}`, kind: "pull-request", url, title })}
+          onSubagent={agent => {
+            if (agent.session_id) { window.location.hash = agent.session_id; return }
+            openTab({ id: `subagent:${agent.id}`, kind: "subagent", title: agent.name, runId: agent.id, name: agent.name, status: agent.status, avatar: agent.avatar })
+          }}
+          onSubagentSideChat={agent => {
+            if (agent.session_id) openTab({ id: `side-chat:${agent.session_id}`, kind: "side-chat", sessionId: agent.session_id, title: agent.name })
+          }}
+          onOutput={openOutput} />
+      </WorkspaceOverlayContent>}
+      </div>
+      </section></SkillMarkdownProvider>
   if (sideMode) return <div className="conversation side-conversation">
     <header className="side-chat-heading"><h2 ref={heading} tabIndex={-1} title={session.title}>{session.title}</h2><a href={`#${id}`} title="Open as main conversation" aria-label="Open side chat as main conversation"><ExternalLink size={15} /></a></header>
     {chat}
   </div>
   return <div className="conversation">
+    <WorkspaceResourceProvider id={id} visible={visible} expanded={workspaceOpen}>
     <WorkspaceOverlay open={workspaceOpen} onOpenChange={setWorkspaceOpen} panelVisible={panelState.visible} panelExpanded={panelState.visible && panelState.expanded}>
     <div ref={workspaceElement} className={`workspace ${panelState.visible ? "with-panel" : "panel-closed"} ${panelState.visible && panelState.expanded ? "panel-expanded" : ""}`}>
-      <header className="topbar">
-        <div className="session-heading"><h1 ref={heading} tabIndex={-1} title={session.title}>{session.title}</h1>
+      <header className={`topbar${traceError ? " has-trace-error" : ""}`}>
+        <div className="session-heading"><h1 ref={heading} tabIndex={-1} title={session.title} aria-label={session.title}>
+          <SessionTitle session={session} onRenamed={title => {
+            // Discard reads started before the rename so they cannot restore the old title.
+            ++loadVersion.current
+            const current = viewNow.current
+            if (!current) return
+            const next = { ...current, session: { ...current.session, title } }
+            viewNow.current = next; setView(next); sessionCallback.current?.(next.session)
+          }} />
+        </h1>
           <span className={`status ${displayStatus}`}>{displayStatus === "waiting" ? "Needs input" : displayStatus}</span>
           <span className="privacy-icon" title={session.surface === "slack" ? "Replies are delivered to Slack" : session.visibility === "private" ? "Private conversation" : "Shared conversation"} aria-label={session.surface === "slack" ? "Slack conversation" : `${session.visibility} conversation`}>{session.visibility === "private" ? <LockKeyhole size={13} /> : <Users size={13} />}</span>
         </div>
         <div className="header-controls">
+          <Button type="button" variant="ghost" size="icon-sm" className="header-debug-trace" disabled={traceBusy} aria-busy={traceBusy} title={traceBusy ? "Preparing debug trace…" : "Download this session's debug trace (ATIF JSON)"} aria-label="Debug trace" onClick={exportTrace}><Bug size={14} /></Button>
+          {session.parent_session_id && <Button asChild variant="ghost" size="sm"><a href={`#${session.parent_session_id}`}>Parent chat</a></Button>}
+          <Button variant={panelState.visible ? "secondary" : "ghost"} size="icon-sm" aria-label={panelState.visible ? "Hide side panel" : "Open side panel"} title={panelState.visible ? "Hide panel" : "Open panel"} onClick={() => dispatchPanel({ type: panelState.visible ? "hide" : "show" })}><PanelRight size={16} /></Button>
+          <WorkspaceOverlayTrigger asChild><WorkspaceMenuKey open={workspaceOpen} sessionFailed={session.status === "failed"}
+            aria-label={workspaceOpen ? "Close workspace" : "Open workspace"} /></WorkspaceOverlayTrigger>
           <Button className="header-new-session" type="button" variant="ghost" size="icon-sm" aria-label="New session" title="New session" onClick={sessionActions.newSession}><SquarePen size={16} /></Button>
           <SessionMenu session={session} header />
-          <WorkspaceOverlayTrigger asChild><Button className="workspace-toggle" type="button" variant={workspaceOpen ? "secondary" : "ghost"} size="icon-sm" aria-label={workspaceOpen ? "Close workspace" : "Open workspace"} title="Workspace"><ListTree size={17} /></Button></WorkspaceOverlayTrigger>
-          <Button variant={panelState.visible ? "secondary" : "ghost"} size="icon-sm" aria-label={panelState.visible ? "Hide side panel" : "Open side panel"} title={panelState.visible ? "Hide panel" : "Open panel"} onClick={() => dispatchPanel({ type: panelState.visible ? "hide" : "show" })}><PanelRight size={16} /></Button>
         </div>
+        {traceError && <p className="error header-debug-trace-error" role="alert">{traceError}</p>}
       </header>
       {chat}
-      <WorkspaceOverlayContent>
-        <WorkspaceOverview id={id} pullRequests={pullRequests} onUpdated={onPRUpdated}
-          onPullRequest={(url, title) => openTab({ id: `pr:${url.toLowerCase()}`, kind: "pull-request", url, title })}
-          onSubagent={agent => openTab({ id: `subagent:${agent.id}`, kind: "subagent", title: agent.name, runId: agent.id, name: agent.name, status: agent.status, avatar: agent.avatar })}
-          onOutput={openOutput} />
-      </WorkspaceOverlayContent>
+
       <PanelResizeHandle workspace={workspaceElement} enabled={panelState.visible && !panelState.expanded} chatId={chatId} />
-      <PanelTabs state={panelState} dispatch={dispatchPanel} onAdd={addTab}>{(tab, activeTab) => {
+      <PanelTabs state={panelState} dispatch={dispatchPanel} onAdd={addTab} returnFocus={panelReturnFocus}>{(tab, activeTab) => {
+        if (tab.kind === "action") return <ActionPanel
+          key={JSON.stringify([authorityKey, connectionVersion, me.user.id, me.csrf, tab.action])}
+          action={tab.action} active={activeTab} onDenied={() => clearSensitiveNow.current()} />
         if (tab.kind === "pull-request") return <PullRequestPanel key={`${connectionVersion}:${session.visibility}:${session.surface}`} sessionId={id} url={tab.url} onBack={() => { dispatchPanel({ type: "hide" }); setWorkspaceOpen(true) }} onUpdated={summary => { dispatchPanel({ type: "rename", id: tab.id, title: summary.title }); onPRUpdated() }} />
         if (tab.kind === "subagent") return <SubagentPanel sessionId={id} agent={{ id: tab.runId, name: tab.name, status: tab.status, avatar: tab.avatar }} active={activeTab} onOpenFile={openOutput} />
         if (tab.kind === "output") return <OutputPanel sessionId={tab.sessionId ?? id} resource={tab.resource} active={activeTab}
           onOpenFile={openOutput} onName={title => dispatchPanel({ type: "rename", id: tab.id, title })} />
         if (tab.kind === "files") return <FilesPanel sessionId={id} onOpen={openOutput} active={activeTab} />
-        if (tab.kind === "computer") return <ComputerPanel id={id} hasWorkspace={Boolean(session.workspace)} active={activeTab} />
-        if (tab.kind === "activity") return <>{!displayedActivity.length && <div className="panel-empty"><MessageSquare /><p>{session.status === "running" ? "Connecting to live activity…" : "Live steps appear here while Moyai works."}</p></div>}{displayedActivity.map((item, index) => <ActivityRow key={index} item={item} />)}</>
-        if (tab.kind === "plan") return <>{!plan.length && <div className="panel-empty"><Check /><p>Moyai’s task plan will appear here.</p></div>}{plan.map(task => <div className="plan-row" key={task.id}><span className={`plan-mark ${task.status}`}>{task.status === "completed" ? "✓" : "○"}</span><div>{task.content}<small>{task.status.replaceAll("_", " ")}</small></div></div>)}</>
+        if (tab.kind === "computer") return <div className="browser-login-computer">
+          {browserLoginIds && canResolveInput && !requestAnswered && <div className="browser-login-panel-hint" role="region" aria-label="Browser sign-in instructions">
+            <strong>Sign in using Computer</strong>
+            {loginMetadata?.site && <p>{loginMetadata.site}</p>}
+            {loginMetadata?.reason && <p>{loginMetadata.reason}</p>}
+            <p>Take control, complete sign-in, then release control. Return to the request to confirm or cancel.</p>
+            <Button type="button" variant="outline" size="sm" onClick={() => {
+              panelReturnFocus.current = transcript.current?.querySelector<HTMLButtonElement>(".browser-login-request button[aria-pressed]") ?? null
+              dispatchPanel({ type: "hide" })
+            }}>Back to sign-in request</Button>
+          </div>}
+          <React.Suspense fallback={<div className="panel-empty" role="status">Opening computer…</div>}><ComputerPanel id={id} hasWorkspace={Boolean(session.workspace)} active={activeTab} /></React.Suspense>
+        </div>
+        if (tab.kind === "activity") return <>
+          <div className="activity-toolbar">
+            <Button variant="outline" size="sm" disabled={traceBusy} onClick={exportTrace}><Download size={15} />{traceBusy ? "Preparing trace…" : "Get debug trace"}</Button>
+          </div>
+          {panelError && <p className="error" role="alert">{panelError}</p>}
+          {!displayedActivity.length && <div className="panel-empty"><MessageSquare /><p>{panelLoading ? "Loading activity…" : session.status === "running" ? "Connecting to live activity…" : "Live steps appear here while Moyai works."}</p></div>}
+          {displayedActivity.map((item, index) => <ActivityRow key={index} item={item} />)}
+        </>
+        if (tab.kind === "plan") return <>{panelError && <p className="error" role="alert">{panelError}</p>}{!plan.length && <div className="panel-empty"><Check /><p>{panelLoading ? "Loading plan…" : "Moyai’s task plan will appear here."}</p></div>}{plan.map(task => <div className="plan-row" key={task.id}><span className={`plan-mark ${task.status}`}>{task.status === "completed" ? "✓" : "○"}</span><div>{task.content}<small>{task.status.replaceAll("_", " ")}</small></div></div>)}</>
         if (tab.kind === "side-chat") return tab.sessionId
-          ? <Conversation key={`${me.user.id}:${tab.sessionId}`} id={tab.sessionId} me={me} connections={connections} connectionVersion={connectionVersion} refreshList={refreshList} workspaceRequest={null} pullRequests={[]} onPRUpdated={onPRUpdated} sideMode visible={activeTab} onOpenFile={openOutput} onTitle={title => dispatchPanel({ type: "rename", id: tab.id, title })} />
+          ? <Conversation key={`${me.user.id}:${tab.sessionId}`} id={tab.sessionId} me={me} connections={connections} connectionVersion={connectionVersion} refreshList={refreshList} workspaceRequest={null} pullRequests={[]} onPRUpdated={onPRUpdated} sideMode visible={activeTab} onOpenFile={openOutput} onOpenAction={openAction} onTitle={title => dispatchPanel({ type: "rename", id: tab.id, title })} />
           : <SideChatPicker parentId={id} defaultModel={me.default_model} individual={me.user.individual !== false} onCreated={refreshList} onSelect={selected => dispatchPanel({ type: "replace", id: tab.id, tab: { id: `side-chat:${selected.id}`, kind: "side-chat", sessionId: selected.id, title: selected.title } })} />
         return null
       }}</PanelTabs>
     </div>
     </WorkspaceOverlay>
+    </WorkspaceResourceProvider>
   </div>
 }
 
@@ -756,7 +1092,7 @@ function SideChatPicker({ parentId, defaultModel, individual, onCreated, onSelec
     <Button className="side-chat-new" disabled={busy} onClick={async () => {
       setBusy(true); setError("")
       try {
-        const next = await api<Session>("/sessions", "POST", { visibility: individual ? "private" : "shared", model: defaultModel })
+        const next = await api<Session>("/sessions", "POST", { visibility: "shared", model: defaultModel })
         if (alive.current) onSelect(next)
         // The session already exists; a sidebar refresh failure must not turn
         // a confirmed creation into an invitation to create it again.
@@ -796,41 +1132,106 @@ function EffectReview({ effect, onDone }: { effect: Effect; onDone: () => Promis
   </form>
 }
 
-function PendingRequests({ pending, turnId, sessionId, onDone }: { pending: Pending; turnId: string; sessionId: string; onDone: () => Promise<void> }) {
+function PendingRequests({ pending, turnId, sessionId, submitted, onAccepted, onDone, onOpenComputer }: { pending: Pending; turnId: string; sessionId: string; submitted: boolean; onAccepted: () => void; onDone: () => Promise<void>; onOpenComputer: () => void }) {
   const [values, setValues] = useState<Record<string, string[]>>({})
   const [custom, setCustom] = useState<Record<string, string>>({})
   const [approvals, setApprovals] = useState<Record<string, boolean>>({})
+  const [browserLogins, setBrowserLogins] = useState<Record<string, LoginOutcome>>({})
   const [error, setError] = useState("")
   const [busy, setBusy] = useState(false)
+  const form = useRef<HTMLFormElement>(null)
+  const restoreFocus = useRef<HTMLElement | null>(null)
   const requestKey = useRef(crypto.randomUUID())
+  const submitting = useRef(false)
+  const disabled = busy || submitted
+  useLayoutEffect(() => {
+    if (busy || submitted || !restoreFocus.current) return
+    const target = restoreFocus.current
+    restoreFocus.current = null
+    if (target.isConnected && document.activeElement === document.body) target.focus()
+  }, [busy, submitted])
   const questions = pending.calls.filter(call => call.tool_name === "ask_user_question").map(call => ({ call, questions: (typeof call.args === "string" ? JSON.parse(call.args) : call.args).questions as Question[] }))
   const credentials = pending.calls.filter(call => call.tool_name === "credentials_request")
-  const unknown = pending.calls.some(call => !["ask_user_question", "credentials_request"].includes(call.tool_name))
+  const logins = pending.calls.filter(call => call.tool_name === "request_browser_login")
+  const unknown = pending.calls.some(call => !["ask_user_question", "credentials_request", "request_browser_login"].includes(call.tool_name))
+  const isComplete = (nextValues: typeof values, nextCustom: typeof custom, nextLogins = browserLogins) => questions.every(({ call, questions }) => questions.every(question => {
+    const key = `${call.tool_call_id}:${question.header}`
+    return Boolean(nextCustom[key]?.trim() || nextValues[key]?.length)
+  })) && pending.approvals.every(call => typeof approvals[call.tool_call_id] === "boolean")
+    && logins.every(call => Boolean(nextLogins[call.tool_call_id]))
+  const requiresContinue = pending.approvals.length > 0 || credentials.length > 0 || logins.length > 1 || (logins.length > 0 && questions.length > 0)
+  async function refreshSubmitted() {
+    setBusy(true); setError("")
+    try { await onDone() }
+    catch { setError("Your response was sent, but the conversation could not be refreshed.") }
+    finally { setBusy(false) }
+  }
+  async function submit(nextValues = values, nextCustom = custom, nextLogins = browserLogins) {
+    if (submitting.current || submitted || unknown) return
+    if (!isComplete(nextValues, nextCustom, nextLogins)) {
+      setError(requiresContinue ? "Complete the remaining questions and approval requests before continuing." : "Answer the remaining questions before continuing.")
+      return
+    }
+    submitting.current = true
+    restoreFocus.current = document.activeElement instanceof HTMLElement && form.current?.contains(document.activeElement)
+      ? document.activeElement : null
+    setBusy(true); setError("")
+    const answers = Object.fromEntries(questions.map(({ call, questions }) => [call.tool_call_id, { answers: questions.map(question => {
+      const key = `${call.tool_call_id}:${question.header}`
+      return { header: question.header, selected: nextCustom[key]?.trim() ? [] : nextValues[key] ?? [], custom_answer: nextCustom[key]?.trim() || null }
+    }) }]))
+    try { await api(`/sessions/${sessionId}/answers`, "POST", { turn_id: turnId, request_key: requestKey.current, approvals, answers, ...(logins.length ? { browser_logins: nextLogins } : {}) }) }
+    catch (e) {
+      submitting.current = false
+      setError(String(e)); setBusy(false)
+      return
+    }
+    // Once accepted, only refresh the conversation; never reopen this answer.
+    restoreFocus.current = null
+    onAccepted()
+    await refreshSubmitted()
+  }
   return <>
     {credentials.map(call => {
       const requestId = pending.metadata?.[call.tool_call_id]?.request_id
       return <div className="pending" key={call.tool_call_id}><h3>Secure access requested</h3><p>Provide access through the secure form to continue this task.</p>{requestId ? <ProductCredentialRequest requestId={requestId} onResolved={onDone} /> : <p role="alert">This request has no secure form reference. Refresh the session to check its current state.</p>}</div>
     })}
     {unknown && <p className="notice" role="status">This task is waiting for an input that this client cannot resolve.</p>}
-    {(questions.length > 0 || pending.approvals.length > 0) && <form className="pending" onSubmit={async e => {
-    e.preventDefault(); setBusy(true); setError("")
-    const answers = Object.fromEntries(questions.map(({ call, questions }) => [call.tool_call_id, { answers: questions.map(question => {
-      const key = `${call.tool_call_id}:${question.header}`
-      return { header: question.header, selected: custom[key]?.trim() ? [] : values[key] ?? [], custom_answer: custom[key]?.trim() || null }
-    }) }]))
-    try { await api(`/sessions/${sessionId}/answers`, "POST", { turn_id: turnId, request_key: requestKey.current, approvals, answers }); await onDone() }
-    catch (e) { setError(String(e)) } finally { setBusy(false) }
-  }}>
-    <h3>Your input is needed</h3>
+    {(questions.length > 0 || pending.approvals.length > 0 || logins.length > 0) && <form ref={form} aria-busy={busy} className={questions.length ? "question-form" : "pending"} onSubmit={e => { e.preventDefault(); void submit() }}>
+    {questions.length
+      ? <div className="question-form-header"><MessageCircleQuestion size={14} aria-hidden="true" /><h3>{questions.reduce((count, item) => count + item.questions.length, 0) > 1 ? "Questions" : "Question"}</h3>{disabled && <span className="question-send-status" role="status">{submitted ? "Answer sent" : "Sending…"}</span>}</div>
+      : logins.length === 0 && <h3>Your input is needed</h3>}
+    {logins.map(call => <BrowserLoginCard key={call.tool_call_id} metadata={pending.metadata?.[call.tool_call_id]}
+      outcome={browserLogins[call.tool_call_id]} disabled={disabled} onOpen={onOpenComputer}
+      onAnswer={outcome => {
+        if (submitting.current) return
+        const next = { ...browserLogins, [call.tool_call_id]: outcome }
+        setBrowserLogins(next)
+        if (!requiresContinue && isComplete(values, custom, next)) void submit(values, custom, next)
+      }} />)}
     {questions.map(({ call, questions }) => questions.map(question => {
       const key = `${call.tool_call_id}:${question.header}`
-      return <fieldset key={key}><legend>{question.question}</legend><div className="question-options">{question.options.map(option => <Button type="button" key={option.label} variant={(values[key] ?? []).includes(option.label) && !custom[key] ? "secondary" : "outline"} aria-pressed={(values[key] ?? []).includes(option.label) && !custom[key]} onClick={() => { setCustom(previous => ({ ...previous, [key]: "" })); setValues(previous => ({ ...previous, [key]: question.multi_select ? (previous[key] ?? []).includes(option.label) ? previous[key].filter(item => item !== option.label) : [...previous[key] ?? [], option.label] : [option.label] })) }} title={option.description}>{option.label}</Button>)}</div><Input aria-label={`Custom answer for ${question.header}`} placeholder="Or write your own answer…" value={custom[key] ?? ""} onChange={e => setCustom(previous => ({ ...previous, [key]: e.target.value }))} /></fieldset>
+      return <QuestionChoices key={key} question={question} selected={values[key] ?? []} customAnswer={custom[key] ?? ""} disabled={disabled}
+        onSelect={selected => {
+          if (submitting.current) return
+          const nextValues = { ...values, [key]: selected }, nextCustom = { ...custom, [key]: "" }
+          setValues(nextValues); setCustom(nextCustom)
+          if (!question.multi_select && !requiresContinue && isComplete(nextValues, nextCustom)) void submit(nextValues, nextCustom)
+        }}
+        onCustomAnswer={value => {
+          if (submitting.current) return
+          setCustom(previous => ({ ...previous, [key]: value }))
+          if (value.trim()) setValues(previous => ({ ...previous, [key]: [] }))
+        }} />
     }))}
-    {pending.approvals.map(call => <fieldset key={call.tool_call_id}><legend>Allow {call.tool_name.replaceAll("_", " ")}?</legend><pre>{JSON.stringify(typeof call.args === "string" ? JSON.parse(call.args) : call.args, null, 2)}</pre><div className="question-options">{[true, false].map(value => <Button key={String(value)} type="button" variant={approvals[call.tool_call_id] === value ? "secondary" : "outline"} onClick={() => setApprovals(previous => ({ ...previous, [call.tool_call_id]: value }))}>{value ? "Allow this action" : "Decline"}</Button>)}</div></fieldset>)}
+    {pending.approvals.map(call => <fieldset key={call.tool_call_id} className={questions.length ? "question-approval" : undefined}><legend>Allow {call.tool_name.replaceAll("_", " ")}?</legend><pre>{JSON.stringify(typeof call.args === "string" ? JSON.parse(call.args) : call.args, null, 2)}</pre><div className="question-options">{[true, false].map(value => <Button key={String(value)} type="button" disabled={disabled} variant={approvals[call.tool_call_id] === value ? "secondary" : "outline"} onClick={() => setApprovals(previous => ({ ...previous, [call.tool_call_id]: value }))}>{value ? "Allow this action" : "Decline"}</Button>)}</div></fieldset>)}
     {credentials.length > 0 && <p className="muted">Resolve secure access above before continuing with these answers.</p>}
-    {error && <p className="error" role="alert">{error}</p>}<Button type="submit" disabled={busy || unknown}>{busy ? "Submitting…" : "Continue"}</Button>
+    {error && <p className="error" role="alert">{error}</p>}
+    {submitted && <div className={questions.length ? "question-form-actions" : undefined}><Button type="button" variant="outline" size="sm" disabled={busy} onClick={() => void refreshSubmitted()}>Refresh conversation</Button></div>}
+    {requiresContinue && <div className={questions.length ? "question-form-actions" : undefined}><Button type="submit" disabled={disabled || unknown || !isComplete(values, custom)}>{submitted ? "Submitted" : busy ? "Submitting…" : "Continue"}</Button></div>}
   </form>}
   </>
 }
 
+initializeAppearance()
 createRoot(document.getElementById("root")!).render(<App />)

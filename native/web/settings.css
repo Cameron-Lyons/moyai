@@ -1,42 +1,41 @@
 .native-settings {
   display: grid;
-  grid-template-columns: 280px minmax(0, 1fr);
+  grid-template-columns: 240px minmax(0, 1fr);
   height: 100%;
   min-height: 0;
   width: 100%;
   color: var(--ui-foreground);
-  background: var(--ui-canvas);
+  background: transparent;
   font-size: 14px;
   line-height: 1.55;
 }
 .native-settings .ns-rail {
   display: flex;
   flex-direction: column;
-  gap: 16px;
+  gap: 8px;
   min-height: 0;
   min-width: 0;
-  padding: 24px 16px 12px;
-  background: var(--ui-subtle);
-  border-inline-end: 1px solid var(--ui-border);
+  padding: 8px 10px 8px;
+  background: var(--ui-glass-surface);
+  background-image: var(--ui-glass-sheen); -webkit-backdrop-filter: var(--ui-glass-blur); backdrop-filter: var(--ui-glass-blur);
+  border-inline-end: 1px solid var(--ui-glass-line);
 }
-.native-settings .ns-brand-row { display: flex; align-items: center; justify-content: space-between; }
-.native-settings .ns-brand { display: flex; align-items: center; gap: 12px; padding-inline: 8px; font-size: 22px; font-weight: 500; }
-.native-settings .ns-brand img { flex: none; object-fit: contain; }
-.native-settings .ns-brand small { margin-top: -3px; font-size: 11px; }
+.native-settings .ns-brand-row { display: flex; align-items: center; justify-content: space-between; gap: 4px; min-height: 28px; }
+.native-settings .ns-brand-row > .moyai-brand { flex: 1; }
 .native-settings .ns-back { justify-content: flex-start; padding-inline: 8px; color: var(--ui-muted); }
 .native-settings .ns-navigation { flex: 1; min-height: 0; overflow-y: auto; scrollbar-width: thin; padding-bottom: 12px; }
-.native-settings .ns-nav-title { padding: 0 8px 12px; font-size: 16px; font-weight: 450; }
+.native-settings .ns-nav-title { padding: 0 8px 12px; font-size: 11px; font-weight: 400; letter-spacing: .18em; text-transform: uppercase; }
 .native-settings .ns-navigation a { display: flex; align-items: center; gap: 10px; min-height: 36px; padding: 7px 8px; border-radius: 7px; color: var(--ui-muted); }
 .native-settings .ns-navigation a svg { flex: none; }
 .native-settings .ns-navigation a:hover { background: var(--ui-secondary); color: var(--ui-foreground); }
 .native-settings .ns-navigation a[aria-current="page"] { background: var(--ui-secondary); color: var(--ui-foreground); font-weight: 500; box-shadow: inset 2px 0 var(--ui-primary); }
 .native-settings .ns-nav-group { margin-top: 20px; }
-.native-settings .ns-nav-group h2 { margin: 0 8px 6px; color: var(--ui-muted); font-size: 11px; font-weight: 500; letter-spacing: .04em; }
+.native-settings .ns-nav-group h2 { margin: 0 8px 6px; color: var(--ui-muted); font-size: 11px; font-weight: 400; letter-spacing: .14em; text-transform: uppercase; }
 .native-settings .ns-account { margin-top: auto; padding: 12px 8px 0; border-top: 1px solid var(--ui-border); overflow-wrap: anywhere; }
 .native-settings .ns-account small { font-size: 11px; }
 .native-settings .ns-nav-toggle { display: none; }
-.native-settings .ns-main { min-width: 0; min-height: 0; display: flex; flex-direction: column; }
-.native-settings .ns-breadcrumb { display: flex; align-items: center; gap: 10px; min-height: 64px; flex: none; padding: 16px 32px; border-bottom: 1px solid var(--ui-border); color: var(--ui-muted); font-size: 13px; }
+.native-settings .ns-main { background: var(--ui-reading-surface); min-width: 0; min-height: 0; display: flex; flex-direction: column; }
+.native-settings .ns-breadcrumb { display: flex; align-items: center; gap: 10px; min-height: 64px; flex: none; padding: 16px 32px; border-bottom: 1px solid var(--ui-border); color: var(--ui-muted); font-size: 13px; background: var(--ui-glass-chrome); background-image: var(--ui-glass-sheen); -webkit-backdrop-filter: var(--ui-glass-blur); backdrop-filter: var(--ui-glass-blur); box-shadow: var(--ui-glass-inset); }
 .native-settings .ns-content { flex: 1; min-height: 0; overflow-y: auto; overflow-x: hidden; scroll-padding-block: 24px; padding: 40px max(32px, calc((100% - 1056px) / 2)) 64px; }
 .native-settings .ns-page-heading { margin-bottom: 32px; }
 .native-settings .ns-page-heading h1 { margin: 0 0 8px; font-size: 28px; font-weight: 450; line-height: 1.25; letter-spacing: -.035em; overflow-wrap: anywhere; }
@@ -126,26 +125,130 @@
 .native-settings-dialog .ns-check .ns-field-hint { grid-column: 2; }
 .native-settings .ns-field-hint, .native-settings-dialog .ns-field-hint { color: var(--ui-muted); font-size: 12px; line-height: 1.6; }
 .native-settings-dialog .ns-dialog-actions { display: flex; justify-content: flex-end; flex-wrap: wrap; gap: 12px; margin-top: 24px; }
+.native-settings .ns-badge.ns-warning { background: var(--ui-warning-bg); color: var(--ui-warning); }
+.native-settings .ns-badge.ns-danger { background: var(--ui-danger-bg); color: var(--ui-danger); }
+.native-settings .ns-table code, .native-settings-dialog code, .native-settings .ns-record code, .native-settings .ns-empty code { font-size: 12px; overflow-wrap: anywhere; }
+/* Governance */
+.native-settings .ns-gov-intro { display: flex; align-items: flex-start; flex-wrap: wrap; gap: 12px 16px; margin-bottom: 8px; }
+.native-settings .ns-gov-intro > .ns-notice { flex: 1 1 420px; margin-bottom: 0; }
+.native-settings .ns-gov-page-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; flex: none; }
+.native-settings .ns-gov-section { margin-top: 40px; }
+.native-settings .ns-gov-section-heading { display: flex; align-items: flex-start; justify-content: space-between; flex-wrap: wrap; gap: 12px 16px; margin-bottom: 16px; }
+.native-settings .ns-gov-section-heading > div:first-child { min-width: 0; flex: 1 1 320px; }
+.native-settings .ns-gov-section-heading h2 { margin: 0 0 4px; font-size: 18px; font-weight: 500; }
+.native-settings .ns-gov-section-heading p { max-width: 75ch; }
+.native-settings .ns-gov-section .ns-toolbar { margin-block: 0 16px; }
+.native-settings .ns-gov-section .ns-empty h3 { margin: 0; }
+:is(.native-settings, .native-settings-dialog) .ns-gov-error { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px 12px; }
+.native-settings .ns-gov-permission-list { display: grid; gap: 6px; margin: 4px 0 8px; padding: 0; list-style: none; }
+.native-settings .ns-gov-permission-list li { display: flex; flex-wrap: wrap; gap: 4px 12px; color: var(--ui-foreground); }
+.native-settings .ns-gov-permission-list code { color: var(--ui-muted); }
+.native-settings .ns-gov-builtins { margin-top: 16px; }
+.native-settings .ns-gov-builtins dl { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 8px 16px; margin: 8px 0 0; padding: 16px; border: 1px solid var(--ui-border); border-radius: 8px; background: var(--ui-subtle); font-size: 13px; }
+.native-settings .ns-gov-builtins dt { font-weight: 500; }
+.native-settings .ns-gov-builtins dd { margin: 0; color: var(--ui-muted); overflow-wrap: anywhere; }
+.native-settings .ns-gov-summary { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px 24px; margin: 10px 0 4px; font-size: 13px; }
+.native-settings .ns-gov-summary dt { color: var(--ui-muted); font-size: 12px; }
+.native-settings .ns-gov-summary dd { margin: 0; overflow-wrap: anywhere; }
+.native-settings .ns-gov-defaults { display: grid; gap: 16px; }
+.native-settings :is(.ns-gov-defaults, .ns-gov-limit-fields, .ns-gov-filters) .ns-field { display: grid; gap: 8px; min-width: 0; }
+.native-settings :is(.ns-gov-defaults, .ns-gov-limit-fields, .ns-gov-filters) .ns-field > label { font-size: 13px; font-weight: 500; }
+.native-settings :is(.ns-gov-defaults, .ns-gov-filters) [data-slot="select-trigger"] { width: 100%; }
+:is(.native-settings, .native-settings-dialog) .ns-gov-field-pair { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px 20px; }
+.native-settings-dialog[data-slot="dialog-content"].ns-gov-wide { width: min(800px, calc(100vw - 32px)); max-width: min(800px, calc(100vw - 32px)); }
+.native-settings-dialog .ns-field textarea.ns-gov-short { min-height: 72px; }
+.native-settings-dialog .ns-gov-permissions, .native-settings-dialog .ns-gov-policy-block { min-width: 0; margin: 0; padding: 0; border: 0; }
+.native-settings-dialog :is(.ns-gov-permissions, .ns-gov-policy-block) > legend { margin-bottom: 8px; padding: 0; font-size: 14px; font-weight: 500; }
+.native-settings-dialog .ns-gov-policy-block { display: grid; gap: 12px; padding-top: 16px; border-top: 1px solid var(--ui-border); }
+.native-settings-dialog .ns-gov-policy-block > legend { float: left; width: 100%; margin-bottom: 0; }
+.native-settings-dialog .ns-gov-policy-block > legend + * { clear: both; }
+.native-settings-dialog .ns-gov-permission-groups { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; margin-top: 12px; }
+.native-settings-dialog .ns-gov-permission-groups > fieldset, .native-settings-dialog .ns-gov-tool-list > fieldset { display: grid; align-content: start; gap: 10px; min-width: 0; margin: 0; padding: 12px 14px; border: 1px solid var(--ui-border); border-radius: 8px; background: var(--ui-subtle); }
+.native-settings-dialog .ns-gov-permission-groups legend, .native-settings-dialog .ns-gov-tool-list legend { padding: 0 6px; color: var(--ui-muted); font-size: 12px; font-weight: 500; }
+:is(.native-settings, .native-settings-dialog) .ns-gov-check { display: grid; grid-template-columns: auto minmax(0, 1fr); align-items: start; column-gap: 10px; }
+:is(.native-settings, .native-settings-dialog) .ns-gov-check > button[role="checkbox"] { margin-top: 3px; }
+:is(.native-settings, .native-settings-dialog) .ns-gov-check > div { display: grid; gap: 2px; min-width: 0; }
+:is(.native-settings, .native-settings-dialog) .ns-gov-check label { font-size: 13px; font-weight: 500; cursor: pointer; overflow-wrap: anywhere; }
+:is(.native-settings, .native-settings-dialog) .ns-gov-check small { color: var(--ui-muted); font-size: 12px; line-height: 1.5; overflow-wrap: anywhere; }
+.native-settings-dialog .ns-gov-check:has(button:disabled) > div { cursor: not-allowed; opacity: .7; }
+.native-settings-dialog .ns-gov-options { display: flex; flex-wrap: wrap; gap: 12px 24px; }
+.native-settings-dialog .ns-gov-tool-list { display: grid; gap: 12px; max-height: 300px; overflow-y: auto; padding: 4px; border-radius: 8px; overscroll-behavior: contain; }
+.native-settings-dialog .ns-gov-tool-list:focus-visible { outline: 2px solid var(--ui-primary); outline-offset: 2px; }
+.native-settings-dialog .ns-notice { display: flex; align-items: flex-start; gap: 8px; padding: 12px 16px; border: 1px solid var(--ui-border); border-radius: 8px; background: var(--ui-subtle); color: var(--ui-muted); font-size: 13px; overflow-wrap: anywhere; }
+.native-settings-dialog .ns-notice > svg { flex: none; margin-top: 2px; }
+.native-settings-dialog .ns-gov-warning { display: flex; align-items: flex-start; gap: 10px; margin: 0; padding: 12px 16px; border: 1px solid var(--ui-warning-border); border-radius: 8px; background: var(--ui-warning-bg); color: var(--ui-warning); font-size: 13px; }
+.native-settings-dialog .ns-gov-warning > svg { flex: none; margin-top: 2px; }
+.native-settings-dialog .ns-gov-warning strong { font-weight: 600; }
+:is(.native-settings, .native-settings-dialog) .ns-gov-copy { display: grid; gap: 8px; max-width: 720px; }
+:is(.native-settings, .native-settings-dialog) .ns-gov-copy > label { font-size: 13px; font-weight: 500; }
+:is(.native-settings, .native-settings-dialog) .ns-gov-copy-row { display: flex; gap: 8px; }
+:is(.native-settings, .native-settings-dialog) .ns-gov-copy-row input { flex: 1; min-width: 0; }
+:is(.native-settings, .native-settings-dialog) .ns-gov-copy .ns-field-hint:empty { display: none; }
+.native-settings-dialog .ns-gov-secret { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px; }
+.native-settings .ns-gov-activity { margin: 0; padding: 0; list-style: none; border-top: 1px solid var(--ui-border); }
+.native-settings .ns-gov-activity li { display: flex; align-items: baseline; justify-content: space-between; flex-wrap: wrap; gap: 4px 16px; padding: 12px 0; border-bottom: 1px solid var(--ui-border); font-size: 13px; }
+.native-settings .ns-gov-activity li > div { display: flex; flex-wrap: wrap; gap: 4px 12px; min-width: 0; }
+.native-settings .ns-gov-activity li span, .native-settings .ns-gov-activity small { color: var(--ui-muted); overflow-wrap: anywhere; }
+.native-settings .ns-gov-activity strong { font-weight: 500; }
+.native-settings .ns-gov-details { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 4px 12px; margin: 4px 0 0; text-align: start; }
+.native-settings .ns-gov-details dt { color: var(--ui-muted); text-transform: capitalize; }
+.native-settings .ns-gov-details dd { margin: 0; overflow-wrap: anywhere; }
+.native-settings .ns-table td:last-child .ns-gov-details, .native-settings .ns-table td:last-child details { text-align: start; }
+.native-settings .ns-gov-stats { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 0; margin: 24px 0 0; border: 1px solid var(--ui-border); border-radius: 12px; background: var(--ui-subtle); }
+.native-settings .ns-gov-stats > div { min-width: 0; padding: 16px 20px; border-inline-start: 1px solid var(--ui-border); }
+.native-settings .ns-gov-stats > div:first-child { border-inline-start: 0; }
+.native-settings .ns-gov-stats dt { color: var(--ui-muted); font-size: 12px; }
+.native-settings .ns-gov-stats dd { margin: 4px 0 0; font-size: 22px; font-weight: 450; font-variant-numeric: tabular-nums; letter-spacing: -.02em; overflow-wrap: anywhere; }
+.native-settings .ns-gov-stats dd small { display: block; margin-top: 4px; color: var(--ui-warning); font-size: 12px; letter-spacing: 0; }
+.native-settings .ns-gov-limits { display: grid; gap: 12px; margin: 0; }
+.native-settings .ns-gov-limits > div { display: grid; grid-template-columns: minmax(0, 260px) minmax(0, 1fr); gap: 4px 16px; padding-bottom: 12px; border-bottom: 1px solid var(--ui-border); }
+.native-settings .ns-gov-limits dd { margin: 0; font-variant-numeric: tabular-nums; }
+.native-settings .ns-gov-limits dd small { display: block; color: var(--ui-muted); font-size: 12px; }
+.native-settings .ns-gov-limit-fields { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 20px; margin-bottom: 16px; }
+:is(.native-settings, .native-settings-dialog) .ns-gov-money { position: relative; display: flex; align-items: center; }
+:is(.native-settings, .native-settings-dialog) .ns-gov-money > span { position: absolute; inset-inline-start: 12px; color: var(--ui-muted); pointer-events: none; }
+:is(.native-settings, .native-settings-dialog) .ns-gov-money > input { padding-inline-start: 26px; font-variant-numeric: tabular-nums; }
+.native-settings .ns-gov-filters { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); align-items: end; gap: 16px; padding: 16px; border: 1px solid var(--ui-border); border-radius: 12px; background: var(--ui-subtle); }
+.native-settings .ns-gov-filters > .ns-error { grid-column: 1 / -1; margin: 0; }
+.native-settings .ns-gov-filter-actions { grid-column: 1 / -1; display: flex; flex-wrap: wrap; gap: 8px; }
+.native-settings .ns-gov-export { display: flex; align-items: center; flex-wrap: wrap; gap: 8px 12px; margin-block: 16px; }
+.native-settings .ns-gov-export > .ns-gov-page-actions { margin-inline-start: auto; }
+.native-settings .ns-gov .ns-table :is(th, td) { overflow-wrap: break-word; }
+.native-settings .ns-gov .ns-table th { white-space: nowrap; }
+.native-settings .ns-gov .ns-table td :is(small, code) { overflow-wrap: anywhere; }
+.native-settings .ns-gov .ns-table td:last-child { text-align: start; }
+.native-settings .ns-gov .ns-table table:has(td:last-child > .ns-row-actions) th:last-child { text-align: end; }
+.native-settings .ns-gov-more { margin-top: 12px; }
+.native-settings .ns-gov-count { margin-bottom: 8px; }
 @media (max-width: 1250px) {
   .native-settings { grid-template-columns: 230px minmax(0, 1fr); }
+  .native-settings .ns-gov-filters { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .native-settings .ns-gov-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
 @media (max-width: 850px) {
   .native-settings { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto minmax(0, 1fr); }
-  .native-settings .ns-rail { padding: 12px 20px; border-inline-end: 0; border-bottom: 1px solid var(--ui-border); gap: 8px; }
-  .native-settings .ns-brand { font-size: 18px; padding: 0; }
-  .native-settings .ns-brand img { width: 28px; height: 28px; }
+  .native-settings .ns-rail { padding: 8px 10px 8px; border-inline-end: 0; border-bottom: 1px solid var(--ui-border); gap: 8px; }
   .native-settings .ns-nav-toggle { display: inline-flex; }
+  .native-settings .ns-brand-row > .sidebar-toggle { display: none; }
   .native-settings .ns-back { align-self: flex-start; }
   .native-settings .ns-navigation { display: none; flex: none; max-height: 50dvh; padding-top: 12px; }
   .native-settings .ns-navigation.open { display: block; }
   .native-settings .ns-account { display: none; }
   .native-settings .ns-breadcrumb { min-height: 48px; padding: 12px 24px; }
   .native-settings .ns-content { padding: 28px 24px 48px; }
+  .native-settings .ns-gov-limit-fields { grid-template-columns: minmax(0, 1fr); }
+  .native-settings-dialog .ns-gov-permission-groups { grid-template-columns: minmax(0, 1fr); }
+}
+@media (min-width: 851px) {
+  .native-settings.ns-sidebar-collapsed { grid-template-columns: 52px minmax(0, 1fr); }
+  .native-settings.ns-sidebar-collapsed .ns-rail { padding: 12px 8px 8px; }
+  .native-settings.ns-sidebar-collapsed .ns-rail > :not(.ns-brand-row),
+  .native-settings.ns-sidebar-collapsed .moyai-brand { display: none; }
+  .native-settings.ns-sidebar-collapsed .ns-brand-row { justify-content: center; }
 }
 @media (max-width: 600px) {
   .native-settings-dialog .ns-credential-variable { grid-template-columns: minmax(0, 1fr); gap: 8px; }
   .native-settings-dialog .ns-credential-variable > button { justify-self: end; }
-  .native-settings .ns-rail { padding-inline: 16px; }
   .native-settings .ns-content { padding: 24px 16px 40px; }
   .native-settings .ns-breadcrumb { padding-inline: 16px; }
   .native-settings .ns-page-heading { margin-bottom: 24px; }
@@ -164,6 +267,17 @@
   .native-settings .ns-navigation a { min-height: 44px; }
   .native-settings :is(input, textarea), .native-settings-dialog :is(input, textarea) { font-size: 16px; }
   .native-settings-dialog[data-slot="dialog-content"] { padding: 20px; }
+  :is(.native-settings, .native-settings-dialog) .ns-gov-field-pair { grid-template-columns: minmax(0, 1fr); }
+  .native-settings .ns-gov-filters { grid-template-columns: minmax(0, 1fr); padding: 12px; }
+  .native-settings .ns-gov-stats { grid-template-columns: minmax(0, 1fr); }
+  .native-settings .ns-gov-stats > div { border-inline-start: 0; border-top: 1px solid var(--ui-border); }
+  .native-settings .ns-gov-stats > div:first-child { border-top: 0; }
+  .native-settings .ns-gov-limits > div { grid-template-columns: minmax(0, 1fr); }
+  .native-settings .ns-gov-section { margin-top: 32px; }
+  .native-settings .ns-gov-export > .ns-gov-page-actions { margin-inline-start: 0; }
+  :is(.native-settings, .native-settings-dialog) .ns-gov-copy-row { flex-wrap: wrap; }
+  :is(.native-settings, .native-settings-dialog) .ns-gov-copy-row input { flex-basis: 100%; }
+  .native-settings .ns-gov-builtins dl { grid-template-columns: minmax(0, 1fr); }
 }
 @media (prefers-reduced-motion: reduce) {
   .native-settings *, .native-settings-dialog * { animation: none; transition: none; scroll-behavior: auto; }

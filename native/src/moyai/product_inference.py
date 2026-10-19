@@ -34,6 +34,7 @@ if TYPE_CHECKING:
     from .product_memory_review import ProductMemoryReviewService
 
 log = logging.getLogger(__name__)
+UNSENT_CLEANUP_TIMEOUT_SECONDS = 10.0
 
 
 class InferenceAdmissionError(RuntimeError):
@@ -251,10 +252,7 @@ class ProductInferenceService:
                     or (session.visibility == "private" and session.owner_id != actor.id)
                 ):
                     raise InferenceAdmissionError("Inference authority changed before dispatch.")
-                grants = await self.database.resolve_grants(
-                    db, actor.id, [grant.id for grant in scope.grants],
-                    shared_session=session.visibility == "shared", surface=session.surface,
-                )
+                grants = await self.database.scope_grants(db, scope, session)
                 if [(g.id, g.revision) for g in grants] != [(g.id, g.revision) for g in scope.grants]:
                     raise InferenceAdmissionError("Connection access changed before inference dispatch.")
                 prior = await db.scalar(select(ProductInferenceRequest.id).where(
@@ -273,6 +271,9 @@ class ProductInferenceService:
                 # A runtime settings/key change while waiting cannot bind another scope.
                 if self.validate_request(request, capture) != (gateway, key_hash):
                     raise InferenceAdmissionError("The inference policy changed during admission.")
+                governance = getattr(self.database, 'governance', None)
+                if governance is not None:
+                    await governance.check_model(scope, db=db)
                 capture.values["provider_scope"] = gateway
                 db.add(ProductInferenceRequest(
                     id=request_id, request_key=capture.values["request_key"], logical_key=logical_key,
@@ -309,7 +310,9 @@ class ProductInferenceService:
 
     async def not_dispatched(self, request_id: str) -> None:
         try:
-            async with asyncio.timeout(1):
+            # This clears a known-unsent replay barrier, not optional analytics.
+            # Allow transient pool/row contention while keeping shutdown bounded.
+            async with asyncio.timeout(UNSENT_CLEANUP_TIMEOUT_SECONDS):
                 async with self.database.sessions.begin() as db:
                     row = await db.get(ProductInferenceRequest, request_id, with_for_update=True)
                     if row is None or row.status != "dispatching" or row.cost_usd is not None:

@@ -1,11 +1,16 @@
 # Explicit PostgreSQL schema migrations
 
-Explicit schema verification is the database prerequisite for
-[compatible rolling releases](rolling-deploy.md). This release requires
-revision **22**. Verified roles can overlap under their reviewed protocols and
-shared settings. After every role runs the bridge, future explicitly reviewed
-additive revisions can use the rolling action; initial activation and breaking
-changes still require maintenance. Production is not opted in by merging code.
+This branch's canonical schema requires revision **23**, with compatibility floor
+**23**. It retains the governance tables and organization pin alongside upstream
+revision 22. Upstream and the earlier governance branch used revision 22 for
+different changes; neither layout is admitted as the combined schema. Use the
+offline migration for either source. Native application migrations have their
+own version receipts. Pair canonical revision 23 with native governance v23; both must verify before native execution starts.
+The Pydantic application and Harness have separate receipts; see the
+[deployment contract](pydantic-deployment.md). Coordinate a maintenance window
+for current native upgrades. The retained online migration engine and its ledger
+support historical schema compatibility. Managed deployment procedures live in
+a private repository.
 
 `MOYAI_SCHEMA_MODE=auto` remains the default for existing installations and SQLite.
 For an explicitly migrated PostgreSQL schema, use `MOYAI_SCHEMA_MODE=verify` on
@@ -36,68 +41,53 @@ is insufficient.
    python -m app.schema_migrations --apply
    ```
 
-   It prints `{"schema_revision": 22, "status": "ready"}` on success. An empty
+   It prints `{"schema_revision": 23, "status": "ready"}` on success. An empty
    schema must already exist, and requires `MOYAI_DATABASE_INITIALIZE=true`.
    Existing schemas do not need that flag. No credentials are printed.
 4. Set `MOYAI_SCHEMA_MODE=verify` on every role, including the dedicated API.
    Use the same reviewed release and shared settings for this first activation.
    Start the coordinator to publish the contracts, then broker, workers and API.
-   Activate role routing and coordinator handoff following the rolling runbook;
-   verify health and an ordinary saved session before reopening ingress.
+   Enable the configured role routing and coordinator handoff; verify health and
+   an ordinary saved session before reopening ingress.
 
-The API-only and rolling release modes do **not** perform this first migration
-or topology activation. Complete the separately coordinated maintenance
-transition before enabling them. A normal pre-deploy hook that runs while the old
+Complete this coordinated maintenance transition before enabling concurrent
+replacements of compatible runtime versions. A normal pre-deploy hook that runs while the old
 app is live will be rejected. Once this activation is complete, deploy the bridge
 at the same schema revision to all four roles before using online expansions.
 An installation still on an earlier revision, such as revision 14, first needs
-the one-time maintenance adoption of the current revision (22); the empty online
-registry does not provide a migration path for it.
-
-## Enterprise governance upgrade
-
-Revision 22 combines the fork's workspace roles, SCIM provisioning, session security
-profiles, governance audit feed and organization pin with upstream revisions 20
-and 21. It advances the compatibility baseline to 22. The earlier governance
-branch also used revision 20 for a different schema; neither that version nor
-upstream's 20-to-21 online expansion is an online path to this combined schema.
-Use the coordinated maintenance steps above; the
-rolling and API release actions reject it. See
-[Enterprise governance](enterprise-governance.md#operator-rollout-and-verification)
-for the verification checklist.
+the one-time maintenance adoption of revision 21; the online registry only
+declares the additive step from revision 20 to 21.
 
 ## Private-session upgrade
 
-Revision 19 adds immutable private ownership and personal Slack grants. It also
-advances the compatibility baseline to 19: older application code treats all
+Revision 19 introduced immutable private ownership and personal Slack grants. It
+advanced the compatibility baseline to 19: older application code treats all
 sessions as shared and cannot safely overlap once private sessions exist.
 
-Use the coordinated maintenance steps above for an existing revision-18 deployment
-(this release migrates it directly to revision 22):
+Use the coordinated maintenance steps above for an existing revision-18 deployment:
 back up the database, drain work, stop **all four roles** (including the dedicated
 API), run `python -m app.schema_migrations --apply` from the target release, and
 start every role at that release with `MOYAI_SCHEMA_MODE=verify`. Confirm the
-migration prints this release's revision (22), health checks pass, and an ordinary saved session
+migration prints the current revision 21, health checks pass, and an ordinary saved session
 opens before reopening ingress. Verify that a private test session returns 404
 for a second individual account.
 
-The rolling and API release actions reject this compatibility change. The original
-coordinated action covers the older two/three-service topology and does not perform
-this four-role migration. Do not use it to bypass the compatibility check.
+This compatibility change requires a coordinated maintenance window; older
+application versions must not overlap the upgraded runtime.
 
 ## Reviewed online expansions
 
-Keep `MOYAI_SCHEMA_MODE=verify`. Use the usual **Deploy production** action with
-**rolling** selected. The controller computes the plan from the immutable
-candidate checkout, verifies every live role's installed protocol support, and
-applies the plan before replacing any service. `preflight_only` validates the
-entire plan and records it while making no database or service writes.
+The following describes the retained canonical online engine. Current native
+upgrades still require maintenance. Keep `MOYAI_SCHEMA_MODE=verify`. Compute the
+plan from the target release and verify every live role's installed protocol
+support before applying it.
 
 `app/online_schema_migrations.json` is the explicit reviewed registry. Each step
 names its source and target revision, their digests from `schema_versions.json`,
 the unchanged compatibility revision, and a list of declarative operations.
-Steps must be contiguous. The registry is empty and the compatibility revision
-is 20; online steps keep that revision and the existing role fingerprints.
+Steps must be contiguous. The current registry declares revision 20 to 21 at
+compatibility revision 20. It adds nullable timing fields to `performance_samples`;
+it does not authorize a rolling transition to the native runtime.
 
 Protocol 1 accepts only:
 
@@ -125,12 +115,10 @@ failures inside the transaction roll the whole plan back. A lost commit
 acknowledgement remains uncertain and does not imply rollback. No background
 jobs, provider clients or schema initializers are started by this path.
 
-After commit, all four existing service identities must still be healthy with
-the same policy/contracts and the target schema before replacement begins. An
-uncertain response stops the release without retry or rollback. Inspect the
-receipt and database state; a fresh action can observe a complete compatible
-target and resume replacements without executing the plan again. A partial
-receipt chain, dirty state or unknown schema drift is rejected.
+After commit, every existing service must still be healthy with the same
+policy/contracts and the target schema. Inspect the receipt and database state
+after an uncertain response before continuing. A partial receipt chain, dirty
+state or unknown schema drift is rejected.
 
 ## Maintenance migration failure and rollback
 
@@ -155,9 +143,9 @@ force admission by an older binary.
 
 ## Changing the schema
 
-Keep schema setup and legacy backfills in each component's `initialize_schema`
-function (core Store/database methods use `_initialize_schema`). Add new
-components to the dependency-ordered registry in `app/schema_migrations.py`.
+Keep canonical feature schema setup and historical backfills in
+`app/schema_initializers.py`; Store, Security and Spend retain their core methods.
+Register components in dependency order in `app/schema_migrations.py`.
 Do not place DDL, migration backfills or seed writes in ordinary constructors.
 
 Increment `SCHEMA_REVISION` when any initializer changes and **append**, never
@@ -193,20 +181,19 @@ Point `MOYAI_TEST_POSTGRES_URL` at a disposable PostgreSQL database, then run:
 
 ```sh
 python -m pytest -q tests/test_schema_migrations.py
-python -m scripts.schema_migration_probe --output /tmp/moyai-schema-proof
-python -m pytest -q tests/test_online_migrations.py tests/release
+python -m pytest -q native/tests/test_canonical_schema_migrations.py
+python -m pytest -q tests/test_online_migrations.py
 python -m scripts.online_migration_probe --output /tmp/moyai-online-migration
 ```
 
-The probe creates/drops only its own randomly named test schema. It records real
-migration and constructor results in JSON and a terminal cast. It does not run
+The canonical regression creates/drops only its own randomly named test schema.
+It verifies migration, historical session preservation and no retired-engine imports. It does not run
 Temporal, inference, or external provider requests; it proves schema admission
 and restart behavior, not production traffic handoff.
 
 The online probe keeps a separate worker process writing and renewing its lease
 through a synthetic future expansion. It reconnects an old-source reader, kills
 a migration process after real uncommitted DDL, and verifies rollback and an
-explicit inspected retry. The required production release rehearsal runs these
-checks and saves their receipts. This remains a local PostgreSQL proof; a real
-Render deployment with an active session is still required for production
-continuity qualification.
+explicit inspected retry. The public runtime rehearsal runs these checks and
+saves their receipts. This remains a local PostgreSQL proof; continuity must also
+be qualified against the actual deployment with an active session.

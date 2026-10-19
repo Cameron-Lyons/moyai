@@ -1,144 +1,193 @@
 import React, { useEffect, useRef, useState } from "react"
-import { ArrowUp, ArrowUpRight, Code2, Search, Sparkles } from "lucide-react"
+import { ArrowUpRight, Bug, Code2, FileCode2, Globe, ListChecks, LockKeyhole, Send } from "lucide-react"
 import { Button } from "@/components/ui/button"
-import { Textarea } from "@/components/ui/textarea"
-import { Checkbox } from "@/components/ui/checkbox"
+import { SkillComposer } from "./skill-composer"
+import { GoalDialog, goalCommandAction } from "./goal"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
-import { mountSculpture } from "@/moyai-sculpture"
-import "../../app/static/space-field.js"
-import logo from "../../app/static/moyai-logo.png"
+import { SpaceBackdrop } from "./space-backdrop"
+import "./home.css"
 import { api, csrfToken } from "./api"
 import { AttachButton, AttachmentPreviews, useAttachments, useFileDrop, FileDropOverlay } from "./attachments"
+import type { GeneralPreferences } from "./general-preferences"
 import type { NewConversation, Session, Turn } from "./conversation-state"
-
-declare global {
-  interface Window { MoyaiSpace?: { mount(canvas: HTMLCanvasElement, options?: { anchor?: HTMLElement }): () => void } }
-}
+import type { SessionProfileCatalog } from "./governance-types"
 
 type HomeConnection = { id: string; name: string; enabled: boolean; shared: boolean; read_only: boolean }
-export function homeSubmission(prompt: string, model: string, privateSession: boolean, attachments: string[], selected: string[], available: HomeConnection[]) {
+const starters = [
+  { label: "Review code", detail: "Find the edge cases", prompt: "Review my changes for bugs and improvements.", Icon: Code2 },
+  { label: "Fix a bug", detail: "Trace it to the source", prompt: "Help me investigate and fix this bug: ", Icon: Bug },
+  { label: "Plan a feature", detail: "Make the next change clear", prompt: "Help me plan and implement this feature: ", Icon: ListChecks },
+]
+export function homeSubmission(prompt: string, model: string, privateSession: boolean, attachments: string[], selected: string[], available: HomeConnection[], securityProfileId = "", profiles: readonly string[] = []) {
   const connections = [...new Set(selected)].sort()
   const allowed = new Set(available.filter(row => row.enabled && (privateSession || row.shared)).map(row => row.id))
   if (connections.some(id => !allowed.has(id))) throw new Error("Account access changed. Review the selected accounts before sending.")
+  if (securityProfileId && (!/^[0-9a-f]{32}$/.test(securityProfileId) || !profiles.includes(securityProfileId))) throw new Error("This security policy is no longer available. Choose another policy.")
   const body = { prompt, model, attachments, connections }, visibility = privateSession ? "private" : "shared"
-  return { body, visibility, signature: JSON.stringify([visibility, body]) }
+  // An empty selection leaves the organization default to the server.
+  const session = { model, visibility, ...(securityProfileId ? { security_profile_id: securityProfileId } : {}) }
+  return { body, visibility, session, signature: JSON.stringify([visibility, body, securityProfileId]) }
 }
 
-export function Home({ models, defaultModel, individual = true, productMode = "standalone", connectionVersion = "", onCreated, onStarted }: {
-  models: string[]; defaultModel: string; individual?: boolean; productMode?: "standalone" | "existing"; connectionVersion?: string
+export function Home({ models, defaultModel, individual = true, productMode = "standalone", connectionVersion = "", preferences, securityPolicies = false, onCreated, onStarted }: {
+  models: string[]; defaultModel: string; individual?: boolean; productMode?: "standalone" | "existing"; connectionVersion?: string; preferences?: GeneralPreferences; securityPolicies?: boolean
   onCreated: () => Promise<void>; onStarted: (conversation: NewConversation) => void
 }) {
   const [draft, setDraft] = useState("")
   const [model, setModel] = useState(defaultModel)
-  const [privateSession, setPrivateSession] = useState(individual)
+  const [privateSession, setPrivateSession] = useState(false)
   const isPrivate = individual && privateSession
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState("")
+  const [goalDialog, setGoalDialog] = useState(false)
   const pictures = useAttachments(setError)
   const fileDrop = useFileDrop(pictures.add, setError, busy)
-  const [selectedAccounts, setSelectedAccounts] = useState<string[]>([])
-  const selectedNow = useRef(selectedAccounts)
-  selectedNow.current = selectedAccounts
-  const accountsInitialized = useRef(false)
-  const [accountsVersion, setAccountsVersion] = useState(0), [accountNotice, setAccountNotice] = useState("")
-  const [skipAccounts, setSkipAccounts] = useState(false)
+  const [accountsVersion, setAccountsVersion] = useState(0)
+  const [skippedScope, setSkippedScope] = useState("")
   const [catalog, setCatalog] = useState<{ scope: string; rows: HomeConnection[]; loading: boolean; error: string }>({ scope: "", rows: [], loading: false, error: "" })
+  const [policies, setPolicies] = useState<SessionProfileCatalog | null>(null), [policyId, setPolicyId] = useState("")
+  const policyNow = useRef(policyId)
+  policyNow.current = policyId
   const accountScope = `${isPrivate ? "private" : "shared"}:${connectionVersion}:${accountsVersion}`
   const accounts = catalog.scope === accountScope ? catalog.rows : []
-  const accountsReady = productMode !== "existing" || skipAccounts || (catalog.scope === accountScope && !catalog.loading && !catalog.error
-    && !accountNotice && selectedAccounts.every(id => accounts.some(row => row.id === id && row.enabled && (isPrivate || row.shared))))
-  const sculpture = useRef<HTMLDivElement>(null)
-  const stars = useRef<HTMLCanvasElement>(null)
-  const input = useRef<HTMLTextAreaElement>(null)
+  const skipAccounts = skippedScope === accountScope
+  const needsAccounts = preferences?.connection_ids != null ? preferences.connection_ids.length > 0 : productMode === "existing"
+  const selectedAccounts = skipAccounts || !needsAccounts ? [] : accounts.filter(row => preferences?.connection_ids == null || preferences.connection_ids.includes(row.id)).map(row => row.id)
+  const accountsReady = !needsAccounts || skipAccounts || (catalog.scope === accountScope && !catalog.loading && !catalog.error)
+  const [composerFocus, setComposerFocus] = useState(0)
   const admission = useRef<{ signature: string; session?: Session; request: string } | null>(null)
   const submitting = useRef(false)
   const mounted = useRef(true)
   useEffect(() => {
     mounted.current = true
     document.title = "New session · Moyai"
-    const cleanupSculpture = mountSculpture(sculpture.current)
-    const cleanupStars = stars.current ? window.MoyaiSpace?.mount(stars.current, { anchor: sculpture.current ?? undefined }) : undefined
-    return () => { mounted.current = false; cleanupSculpture(); cleanupStars?.() }
+    return () => { mounted.current = false }
   }, [])
   useEffect(() => {
-    if (productMode !== "existing") return
+    if (!needsAccounts) return
     const controller = new AbortController(), scope = accountScope
     setCatalog({ scope, rows: [], loading: true, error: "" })
     void api<HomeConnection[]>(`/connections?shared=${!isPrivate}`, "GET", undefined, controller.signal).then(rows => {
       if (controller.signal.aborted) return
       const eligible = rows.filter(row => row.enabled && (isPrivate || row.shared))
-      const next = accountsInitialized.current ? selectedNow.current.filter(id => eligible.some(row => row.id === id)) : eligible.map(row => row.id)
-      if (accountsInitialized.current && next.length !== selectedNow.current.length) setAccountNotice("Account access changed. Review your selections before starting this session.")
-      accountsInitialized.current = true; selectedNow.current = next; setSelectedAccounts(next)
       setCatalog({ scope, rows: eligible, loading: false, error: "" })
     }, reason => { if (!controller.signal.aborted) setCatalog({ scope, rows: [], loading: false, error: String(reason) }) })
     return () => controller.abort()
-  }, [productMode, accountScope, isPrivate])
+  }, [needsAccounts, accountScope, isPrivate])
 
-  async function send() {
-    if (submitting.current || pictures.uploading || pictures.hasErrors || !accountsReady || (!draft.trim() && !pictures.files.length)) return
+  async function send(prompt = draft) {
+    if (prompt.trim() === "/goal") { setGoalDialog(true); return }
+    const auth = csrfToken()
+    try { await submit(prompt) }
+    catch (reason) { if (mounted.current && csrfToken() === auth) setError(String(reason)) }
+  }
+
+  useEffect(() => {
+    setPolicies(null)
+    if (!securityPolicies) { setPolicyId(""); return }
+    const controller = new AbortController()
+    // Without a catalog the server applies the organization default, so a failed
+    // read hides the selector instead of blocking the session.
+    void api<SessionProfileCatalog>("/security-profiles", "GET", undefined, controller.signal).then(value => {
+      if (controller.signal.aborted || !Array.isArray(value?.profiles)) return
+      setPolicies(value)
+      if (policyNow.current && !value.profiles.some(profile => profile.id === policyNow.current)) {
+        setPolicyId("")
+      }
+    }, () => { if (!controller.signal.aborted) setPolicies(null) })
+    return () => controller.abort()
+  }, [securityPolicies, accountsVersion])
+
+  async function submit(prompt: string): Promise<void> {
+    const action = goalCommandAction(prompt)
+    if (action && action !== "set") throw new Error("Open an existing conversation to change its goal.")
+    if (submitting.current) throw new Error("A message is already being sent.")
+    if (pictures.uploading) throw new Error("Wait for the attached files to finish uploading, then retry.")
+    if (pictures.hasErrors) throw new Error("Retry or remove the failed attachments before sending.")
+    if (!accountsReady) throw new Error(catalog.error
+      ? "Connections could not be loaded. Cancel to retry connections or continue without them."
+      : "Connections are still loading. Retry when they are ready.")
+    if (!prompt.trim() && !pictures.files.length) throw new Error("Enter a message or attach a file.")
     submitting.current = true
     setBusy(true); setError("")
-    const auth = csrfToken(), prompt = draft, attachments = pictures.readyFiles
+    const auth = csrfToken(), attachments = pictures.readyFiles
+    const requireCurrent = () => {
+      if (!mounted.current || csrfToken() !== auth) throw new Error("Your sign-in changed. Retry from the current workspace.")
+    }
     try {
-      const submission = homeSubmission(prompt, model, isPrivate, attachments.map(file => file.id), selectedAccounts, accounts)
-      if (admission.current?.signature !== submission.signature) admission.current = { signature: submission.signature, request: crypto.randomUUID() }
-      if (!admission.current.session) {
-        admission.current.session = await api<Session>("/sessions", "POST", { model, visibility: submission.visibility })
+      const submission = homeSubmission(prompt, model, isPrivate, attachments.map(file => file.id), selectedAccounts, accounts, policyId, policies?.profiles.map(profile => profile.id))
+      const signature = JSON.stringify([auth, submission.signature])
+      if (admission.current?.signature !== signature) admission.current = { signature, request: crypto.randomUUID() }
+      const attempt = admission.current
+      if (!attempt.session) {
+        attempt.session = await api<Session>("/sessions", "POST", submission.session)
       }
-      const turn = await api<Turn>(`/sessions/${admission.current.session.id}/messages`, "POST", {
-        ...submission.body, request_key: admission.current.request,
+      requireCurrent()
+      const turn = await api<Turn>(`/sessions/${attempt.session.id}/messages`, "POST", {
+        ...submission.body, request_key: attempt.request,
       })
-      if (!mounted.current || csrfToken() !== auth) return
-      onStarted({ session: admission.current.session, turn, prompt, attachments })
-      await onCreated()
-    } catch (error) { if (mounted.current && csrfToken() === auth) setError(String(error)) }
+      requireCurrent()
+      onStarted({ session: attempt.session, turn, prompt, attachments })
+      // Admission succeeded. A list refresh failure must not invite a second start.
+      try { await onCreated() }
+      catch { if (mounted.current && csrfToken() === auth) setError("Your message was sent, but the session list could not be refreshed.") }
+    }
     finally { submitting.current = false; if (mounted.current) setBusy(false) }
   }
 
+  const defaultPolicy = policies?.profiles.find(profile => profile.id === policies.default_profile_id)
   return <section className="home file-drop-zone" {...fileDrop.handlers}>
+    <GoalDialog open={goalDialog} onOpenChange={setGoalDialog} onSubmit={async command => { setDraft(command); await submit(command) }} />
     {fileDrop.dragging && <FileDropOverlay />}
-    <div className="home-crumb">✧ &nbsp; NEW SESSION</div>
-    <canvas className="space-backdrop" ref={stars} />
+    <SpaceBackdrop />
+    <div className="home-workbench-bar"><span><FileCode2 size={14} />Workspace<span className="home-path-separator">/</span><strong>New session</strong></span><span className="home-workbench-context"><Code2 size={13} />Moyai</span></div>
     <div className="home-content">
-      <p className="home-eyebrow">A space for your next big idea</p>
-      <h1>What are we working on?</h1>
-      <p className="home-description">From the first spark to the final commit. Make it happen with Moyai.</p>
-      <div className="home-sculpture" ref={sculpture}><img src={logo} alt="Moyai" /></div>
-      <div className="home-mode">Chat</div>
+      <header className="home-header">
+        <p className="home-eyebrow">Workspace</p>
+        <h1>What are we <span>building?</span></h1>
+        <p className="home-subtitle">A feature. A stubborn bug. A better way to do it.</p>
+      </header>
       <form className="home-form" onSubmit={event => { event.preventDefault(); void send() }}>
-        <label className="check-label home-privacy"><Checkbox checked={isPrivate} disabled={!individual || busy} onCheckedChange={value => { setSkipAccounts(false); setPrivateSession(Boolean(value)) }} />Private session · Only you</label>
-        {!individual && <p className="home-privacy-hint">This shared sign-in creates shared sessions. Use an individual sign-in for private work.</p>}
-        <p className="home-privacy-hint">{isPrivate ? "Your conversation, files and computer stay private." : "Workspace members can see messages, images, files and the computer, including browser sign-ins, and take turns controlling it."}</p>
         {error && <p className="error" role="alert">{error}</p>}
+        {needsAccounts && catalog.scope === accountScope && catalog.error && !skipAccounts && <div className="home-connection-error" role="alert">
+          <span className="error">{catalog.error}</span>
+          <Button type="button" variant="outline" size="sm" disabled={busy} onClick={() => setAccountsVersion(value => value + 1)}>Retry connections</Button>
+          <Button type="button" variant="ghost" size="sm" disabled={busy} onClick={() => setSkippedScope(accountScope)}>Continue without connections</Button>
+        </div>}
         <div className="composer home-composer">
+          <div className="home-editor-heading"><span><FileCode2 size={14} />New session</span><span className="home-editor-mode">Draft</span></div>
           <AttachmentPreviews files={pictures.files} remove={busy ? undefined : pictures.remove} retry={busy ? undefined : pictures.retry} draft />
-          <Textarea ref={input} value={draft} aria-label="Message Moyai" placeholder="Ask Moyai to build, investigate, or pick up a thread…" onChange={event => setDraft(event.target.value)} onPaste={busy ? undefined : pictures.paste} onKeyDown={event => { if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); void send() } }} />
+          <div className="home-editor-input"><SkillComposer focusRequest={composerFocus} value={draft} onChange={setDraft} onSend={prompt => void send(prompt)} shared={!isPrivate} disabled={busy} placeholder="Describe a change, paste an error, or ask a question…" onPaste={pictures.paste} /></div>
           <div className="composer-actions">
-            <AttachButton add={pictures.add} disabled={busy} />
+            <div className="home-composer-tools">
+              <AttachButton add={pictures.add} disabled={busy} compact />
+              <Button type="button" variant="ghost" size="sm" className="home-privacy-toggle" aria-label="Private session" aria-pressed={isPrivate} disabled={!individual || busy}
+                title={!individual ? "Private sessions require an individual sign-in." : isPrivate ? "Private · Only you. Click to share with your workspace." : "Public · Shared with your workspace. Click to make private."}
+                onClick={() => { setSkippedScope(""); setPrivateSession(value => !value) }}>
+                {isPrivate ? <LockKeyhole /> : <Globe />}{isPrivate ? "Private" : "Public"}
+              </Button>
+            </div>
             <div className="send-actions"><Select value={model} onValueChange={setModel}><SelectTrigger aria-label="Model"><SelectValue /></SelectTrigger><SelectContent>{models.map(value => <SelectItem value={value} key={value}>{value.replace(/^openai\//, "")}</SelectItem>)}</SelectContent></Select>
-              <Button type="submit" size="icon" aria-label="Send message" disabled={busy || pictures.uploading || pictures.hasErrors || !accountsReady || (!draft.trim() && !pictures.files.length)}><ArrowUp /></Button>
+              <Button type="submit" size="icon" aria-label="Send message" disabled={busy || pictures.uploading || pictures.hasErrors || !accountsReady || (!draft.trim() && !pictures.files.length)}><Send /></Button>
             </div>
           </div>
         </div>
-        {productMode === "existing" && <details className="account-selection"><summary>Context & connections · {selectedAccounts.length} selected</summary>
-          {(catalog.scope !== accountScope || catalog.loading) && <p className="muted" role="status">Loading accounts for this session…</p>}
-          {catalog.error && <p className="error" role="alert">{catalog.error}<Button type="button" variant="outline" size="sm" disabled={busy} onClick={() => { setSkipAccounts(false); setAccountsVersion(value => value + 1) }}>Retry accounts</Button><Button type="button" variant="ghost" size="sm" disabled={busy} onClick={() => { accountsInitialized.current = true; selectedNow.current = []; setSelectedAccounts([]); setAccountNotice(""); setSkipAccounts(true) }}>Use no accounts for this session</Button></p>}
-          {accountNotice && <p className="notice" role="status">{accountNotice}<Button type="button" variant="ghost" size="sm" onClick={() => setAccountNotice("")}>Selections reviewed</Button></p>}
-          <div className="connection-options">{accounts.map(account => <label key={account.id}><Checkbox disabled={busy} checked={selectedAccounts.includes(account.id)} onCheckedChange={checked => {
-            const next = checked ? [...new Set([...selectedNow.current, account.id])] : selectedNow.current.filter(id => id !== account.id)
-            accountsInitialized.current = true; selectedNow.current = next; setSelectedAccounts(next); setAccountNotice(""); setSkipAccounts(false)
-          }} />{account.name}<span className="muted">{account.read_only ? "Read only" : "Can make changes"}</span></label>)}</div>
-          {!catalog.loading && !catalog.error && !accounts.length && <p className="muted">No accounts are available for this session. <a href="#settings/connections">Manage Connections</a>.</p>}
-          {skipAccounts && <p className="muted" role="status">This session will start without connected accounts.</p>}
-        </details>}
-        <div className="home-composer-hint"><span>{pictures.uploading ? "Uploading files…" : "Your own cloud workspace"}</span><span>Drop files or paste images · Enter to send</span></div>
+        <div className="home-composer-hint">
+          {pictures.uploading && <span role="status">Uploading files…</span>}
+          {needsAccounts && !accountsReady && !catalog.error && <span role="status">Loading connections…</span>}
+          <span>Drop files or paste images · Enter to send</span>
+        </div>
+
+        {policies && <div className="home-policy"><label htmlFor="home-security-policy">Security policy</label><Select value={policyId || "__default__"} disabled={busy} onValueChange={value => setPolicyId(value === "__default__" ? "" : value)}><SelectTrigger id="home-security-policy" aria-label="Security policy"><SelectValue /></SelectTrigger><SelectContent><SelectItem value="__default__">Organization default{defaultPolicy ? ` · ${defaultPolicy.name}` : ""}</SelectItem>{policies.profiles.map(profile => <SelectItem value={profile.id} key={profile.id}>{profile.name}</SelectItem>)}</SelectContent></Select></div>}
       </form>
-      <div className="suggestions">{[
-        { icon: Search, title: "Investigate a bug", detail: "Find the signal in the noise.", prompt: "Help me investigate a bug. " },
-        { icon: Code2, title: "Explore a codebase", detail: "Get the lay of the land.", prompt: "Help me explore a codebase. " },
-        { icon: Sparkles, title: "Build something", detail: "Turn an idea into working software.", prompt: "Help me build " },
-      ].map(item => <button key={item.title} type="button" onClick={() => { setDraft(item.prompt); input.current?.focus() }}><item.icon size={19} /><span>{item.title}<small>{item.detail}</small></span><ArrowUpRight size={15} /></button>)}</div>
+      <div className="home-starters" role="group" aria-label="Start with a prompt" aria-hidden={Boolean(draft.trim())}>
+        <p className="home-starters-heading">Start with a prompt</p>
+        {starters.map(({ label, detail, prompt, Icon }) => <Button key={label} type="button" variant="ghost" aria-label={label} disabled={busy || Boolean(draft.trim())}
+          onClick={() => {
+            setDraft(prompt)
+            setComposerFocus(value => value + 1)
+          }}><Icon aria-hidden="true" /><span className="home-starter-label">{label}</span><span className="home-starter-detail" aria-hidden="true">{detail}</span><ArrowUpRight className="home-starter-arrow" aria-hidden="true" /></Button>)}
+      </div>
     </div>
   </section>
 }

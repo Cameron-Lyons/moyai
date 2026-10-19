@@ -20,11 +20,21 @@ from cryptography.fernet import InvalidToken
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from sqlalchemy import and_, case, column, false, func, or_, select, table
 from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.orm import aliased
 
+from .delegation_models import DelegatedSession
 from .models import Message, Session, SessionPreference, SessionRead, Turn, User
 from .product_files import routes as file_routes
-from .product_history import MAX_MESSAGE_CHARS, MAX_OFFSET, MAX_PAGE, Principal, bounded
+from .product_history import (
+    MAX_MESSAGE_CHARS,
+    MAX_OFFSET,
+    MAX_PAGE,
+    Principal,
+    bounded,
+    prepare_history_query,
+)
 from .product_history import routes as legacy_routes
+from .swarm_models import SwarmMember
 
 if TYPE_CHECKING:
     from .runtime import Runtime
@@ -100,8 +110,16 @@ class ProductReadService:
         ownership = Session.owner_id == reader.user.id
         access = or_(ownership if private else false(), Session.visibility == "shared")
         clauses = [Session.deleted.is_(deleted), access]
-        if deleted:
-            clauses.append(ownership)
+        if not deleted:
+            root = aliased(Session)
+            membership = select(SwarmMember.session_id).where(SwarmMember.session_id == Session.id)
+            parent_access = or_(
+                root.owner_id == reader.user.id if private else false(), root.visibility == "shared",
+            )
+            visible_parent = select(SwarmMember.session_id).join(
+                root, root.id == SwarmMember.mission_id,
+            ).where(SwarmMember.session_id == Session.id, root.deleted.is_(False), parent_access)
+            clauses.append(~membership.exists() | visible_parent.exists())
         return and_(*clauses)
 
     def native_query(self, reader: Reader):
@@ -113,6 +131,11 @@ class ProductReadService:
         unread = select(Message.id).where(
             Message.session_id == Session.id, Message.id > SessionRead.message_id,
         ).exists()
+        parent = aliased(Session)
+        parent_access = or_(
+            parent.visibility == "shared",
+            parent.owner_id == reader.user.id if reader.principal is None or reader.principal.individual else false(),
+        )
         query = select(
             Session.id, Session.title, Session.owner_id, Session.visibility, Session.surface, Session.model,
             Session.status, Session.active_turn, Session.archived, Session.deleted, Session.created_at,
@@ -120,7 +143,12 @@ class ProductReadService:
             SessionRead.unread.label("marked_unread"), unread.label("new_messages"),
             (Session.owner_id == reader.user.id).label("created_by_me"),
             (and_(Session.owner_id != reader.user.id, participated)).label("participated"),
-        ).outerjoin(SessionPreference, preference).outerjoin(SessionRead, read)
+            parent.id.label("parent_session_id"),
+        ).outerjoin(SessionPreference, preference).outerjoin(SessionRead, read).outerjoin(
+            DelegatedSession, DelegatedSession.session_id == Session.id,
+        ).outerjoin(parent, and_(
+            parent.id == DelegatedSession.parent_session_id, parent.deleted.is_(False), parent_access,
+        ))
         if self.continuations is not None:
             from .product_continuation_models import ProductContinuation
             query = query.add_columns(ProductContinuation.source_session_id).outerjoin(
@@ -136,7 +164,9 @@ class ProductReadService:
             )
             folders = table("session_folders", column("id"), column("owner_id"), column("name"), schema=schema)
             old_messages = table("messages", column("run_id"), column("role"), column("user_id"), schema=schema)
-            roots = table("run_roots", column("run_id"), column("root_id"), schema=schema)
+            roots = select(table(
+                "run_roots", column("run_id"), column("root_id"), schema=schema,
+            )).cte("history_roots").prefix_with("MATERIALIZED", dialect="postgresql")
             users = table("users", column("id"), column("kind"), column("linked_user_id"), schema=schema)
             original = ProductContinuation.source_session_id
             old_pin = select(pins.c.run_id).where(
@@ -173,11 +203,12 @@ class ProductReadService:
         view = dict(row)
         marked = view.pop("marked_unread")
         new_messages = view.pop("new_messages")
+        view.setdefault("parent_session_id", None)
         view.update({
             "source_format": "moyai-native-v1", "execution_engine": "pydantic-v1",
             "read_only": False, "pinned": bool(view["pinned"]), "folder": view["folder"] or "",
             "unread": bool(marked or new_messages), "workspace": None, "save_warning": None,
-            "parent_session_id": None, "capabilities": {
+            "capabilities": {
                 "read": not view["deleted"], "continue": not view["deleted"],
                 "rename": not view["deleted"], "move": not view["deleted"], "pin": not view["deleted"],
             },
@@ -186,9 +217,24 @@ class ProductReadService:
 
     async def native_recheck(self, reader: Reader, ids: list[str], *, deleted: bool = False) -> set[str]:
         await self.current(reader)
+        mapped: dict[str, str] = {}
         async with self.runtime.database.sessions() as db:
+            await prepare_history_query(db)
             valid = set(await db.scalars(select(Session.id).where(self.visible(reader, deleted=deleted),
                                                                 Session.id.in_(ids))))
+            for session_id in list(valid):
+                try:
+                    if deleted:
+                        session = await db.get(Session, session_id)
+                        if session is None or not await self.runtime.database.same_person(db, reader.user, session.owner_id):
+                            raise HTTPException(404, "Conversation not found.")
+                        await self.runtime.database.check_source_audience(db, session, reader.user)
+                    else:
+                        await self.runtime.database.allowed_session(db, session_id, reader.user)
+                except HTTPException as error:
+                    if error.status_code != 404:
+                        raise
+                    valid.discard(session_id)
             if self.continuations and self.history and reader.principal and not deleted:
                 from .product_continuation_models import ProductContinuation
                 mapped = dict((await db.execute(select(
@@ -197,18 +243,27 @@ class ProductReadService:
                     ProductContinuation.source_schema == self.continuations.source_schema,
                     ProductContinuation.native_session_id.in_(valid),
                 ))).all())
-                source_allowed = await self.history.recheck(reader.principal, list(mapped.values()))
-                valid -= {native for native, source in mapped.items() if source not in source_allowed}
-            return valid
+        # Canonical revalidation reads native controls through its own connection.
+        # Release this snapshot before it can borrow from the same bounded pool.
+        if self.continuations and self.history and reader.principal and not deleted:
+            source_allowed = await self.history.recheck(reader.principal, list(mapped.values()))
+            valid -= {native for native, source in mapped.items() if source not in source_allowed}
+        return valid
 
     async def native_list(
         self, reader: Reader, *, limit: int, offset: int, archived: bool = False, deleted: bool = False,
         scope: NavigationScope = "all",
     ) -> dict[str, Any]:
         async with self.runtime.database.sessions() as db:
+            await prepare_history_query(db)
             query = self.native_query(reader).where(self.visible(reader, deleted=deleted))
             if not deleted:
-                query = query.where(Session.archived.is_(archived))
+                query = query.where(
+                    Session.archived.is_(archived),
+                    ~select(SwarmMember.session_id).where(
+                        SwarmMember.session_id == Session.id, SwarmMember.position > 0,
+                    ).exists(),
+                )
                 if scope == "mine":
                     columns = query.selected_columns
                     query = query.where(or_(
@@ -227,13 +282,15 @@ class ProductReadService:
         matches: dict[str, dict[str, Any]] = {}
         scanned, consumed, limited = 0, 0, False
         async with self.runtime.database.sessions() as db:
+            await prepare_history_query(db)
             title_rows = (await db.execute(self.native_query(reader).where(
                 self.visible(reader), func.lower(Session.title).contains(query.lower(), autoescape=True),
             ).order_by(Session.updated_at.desc(), Session.id.desc()).limit(offset + limit + 1))).mappings()
             candidates.update({r["id"]: self.native_view(r) for r in title_rows})
             # Never select encrypted native working snapshots or another user's private messages.
             stream = await db.stream(select(
-                Message.id, Message.session_id, func.substr(Message.content, 1, CIPHER_CHARS + 1).label("content"),
+                Message.id, Message.session_id, Message.turn_id, Message.role, Message.author_id, Message.identity,
+                func.substr(Message.content, 1, CIPHER_CHARS + 1).label("content"),
             ).join(Session, Session.id == Message.session_id).where(
                 self.visible(reader), Message.role.in_(("user", "assistant")),
             ).order_by(Message.id.desc()).limit(SEARCH_ROWS + 1).execution_options(yield_per=16))
@@ -248,7 +305,14 @@ class ProductReadService:
                         limited = True
                         continue
                     try:
-                        content = self.runtime.security.unseal(row["content"]).decode("utf-8")
+                        try:
+                            await self.runtime.database.allowed_session(db, row["session_id"], reader.user)
+                        except HTTPException as error:
+                            if error.status_code != 404:
+                                raise
+                            continue
+                        from .message_sources import public_message
+                        content, _ = await public_message(self.runtime.database, db, Message(**dict(row)))
                     except (InvalidToken, UnicodeError, ValueError):
                         limited = True
                         continue
@@ -269,6 +333,7 @@ class ProductReadService:
             earlier = await self.history.search(reader.principal, query, limit=MAX_PAGE, continued_only=True)
             historical_limited = earlier["has_more"]
             async with self.runtime.database.sessions() as db:
+                await prepare_history_query(db)
                 mapping = dict((await db.execute(select(
                     ProductContinuation.native_session_id, ProductContinuation.source_session_id,
                 ).where(
@@ -294,6 +359,41 @@ class ProductReadService:
                       "histories per query. Narrow the search for older matches."
             if limited or historical_limited else None,
         }
+
+    async def native_ancestors(
+        self, reader: Reader, rows: list[dict[str, Any]], *, archived: bool, scope: NavigationScope,
+    ) -> list[dict[str, Any]]:
+        """Sidebar context is separate from paginated hits and reuses their ACLs."""
+        seen = {row["id"] for row in rows if row["source"] == "native"}
+        pending = {
+            row["parent_session_id"] for row in rows
+            if row["source"] == "native" and row.get("parent_session_id") and not row["pinned"] and not row["folder"]
+        } - seen
+        ancestors: list[dict[str, Any]] = []
+        # Native delegation admits children and grandchildren, never an unbounded tree.
+        for _ in range(2):
+            if not pending:
+                break
+            async with self.runtime.database.sessions() as db:
+                await prepare_history_query(db)
+                query = self.native_query(reader).where(
+                    self.visible(reader), Session.id.in_(pending), Session.archived.is_(archived),
+                )
+                if scope == "mine":
+                    columns = query.selected_columns
+                    query = query.where(or_(
+                        columns.created_by_me, columns.participated, columns.pinned.is_(True),
+                        func.coalesce(columns.folder, "") != "",
+                    ))
+                found = [self.native_view(row) for row in (await db.execute(query)).mappings()]
+            seen.update(pending)
+            ancestors.extend(found)
+            pending = {
+                row["parent_session_id"] for row in found
+                if row.get("parent_session_id") and not row["pinned"] and not row["folder"]
+            } - seen
+        valid = await self.native_recheck(reader, [row["id"] for row in ancestors]) if ancestors else set()
+        return [row for row in ancestors if row["id"] in valid]
 
     @staticmethod
     def cursor_scope(
@@ -333,12 +433,12 @@ class ProductReadService:
         offsets = self.offsets(cursor, cursor_scope)
         pages: dict[str, dict[str, Any]] = {}
         notices, states = [], {}
-        for selected in (("native", "legacy") if source == "all" else (source,)):
+        async def read_source(selected: Source) -> None:
             if selected == "legacy" and self.history is None:
                 states[selected] = "disabled"
                 if source == "legacy":
                     raise HTTPException(503, "Existing product history is not configured.")
-                continue
+                return
             try:
                 async with asyncio.timeout(10):
                     if selected == "native":
@@ -369,6 +469,17 @@ class ProductReadService:
                     raise HTTPException(503, "Session history is temporarily unavailable.") from None
                 states[selected] = "unavailable"
                 notices.append(f"{selected.capitalize()} history is temporarily unavailable. Refresh to retry.")
+        # Each source owns/releases its connections before revalidation. Keep
+        # at most two reads in flight, including with one-slot database pools.
+        tasks = [asyncio.create_task(read_source(selected))
+                 for selected in (("native", "legacy") if source == "all" else (source,))]
+        try:
+            await asyncio.gather(*tasks)
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
         # Current authority fences partial results too. A source failure never downgrades ACL.
         await self.current(reader)
         if "native" in pages:
@@ -385,6 +496,11 @@ class ProductReadService:
         merged = merge_session_lists(pages.get("native", {}).get("sessions", []),
                                      pages.get("legacy", {}).get("sessions", []))
         chosen = merged[:limit]
+        async with self.runtime.database.sessions() as db:
+            for item in chosen:
+                if item["source"] == "native":
+                    item["can_manage"] = await self.runtime.database.same_person(db, reader.user, item["owner_id"])
+                    item["capabilities"]["rename"] = item["can_manage"] and not item["deleted"]
         has_more = len(merged) > limit or any(page["has_more"] for page in pages.values())
         for selected, page in pages.items():
             consumed = sum(row["source"] == selected for row in chosen)
@@ -397,7 +513,25 @@ class ProductReadService:
         next_cursor = base64.urlsafe_b64encode(json.dumps(
             {"v": 1, "scope": cursor_scope, **offsets}, separators=(",", ":"),
         ).encode()).decode().rstrip("=") if has_more else None
-        return {"sessions": chosen, "has_more": has_more, "next_cursor": next_cursor, "sources": states,
+        ancestors: list[dict[str, Any]] = []
+        if not query and not deleted and any(
+            row["source"] == "native" and row.get("parent_session_id") for row in chosen
+        ):
+            try:
+                async with asyncio.timeout(3):
+                    ancestors = await self.native_ancestors(reader, chosen, archived=archived, scope=scope)
+            except (SQLAlchemyError, TimeoutError):
+                notices.append("Some parent conversations are temporarily unavailable. Refresh to retry.")
+            valid = await self.native_recheck(reader, [row["id"] for row in chosen if row["source"] == "native"])
+            chosen = [row for row in chosen if row["source"] != "native" or row["id"] in valid]
+        native_rows = [row for row in [*chosen, *ancestors] if row["source"] == "native"]
+        if native_rows:
+            async with self.runtime.database.sessions() as db:
+                owners = {owner: await self.runtime.database.same_person(db, reader.user, owner)
+                          for owner in {row["owner_id"] for row in native_rows}}
+                for row in native_rows:
+                    row["can_manage"] = owners[row["owner_id"]]
+        return {"sessions": chosen, "ancestors": ancestors, "has_more": has_more, "next_cursor": next_cursor, "sources": states,
                 "partial": "unavailable" in states.values(), "notice": " ".join(notices) or None,
                 "search_limits": {
                     "native_messages": SEARCH_ROWS, "native_ciphertext_bytes": SEARCH_BYTES,
@@ -418,12 +552,16 @@ class ProductReadService:
                 result["continuation_supported"] = True
         else:
             async with self.runtime.database.sessions() as db:
+                await prepare_history_query(db)
                 row = (await db.execute(self.native_query(reader).where(
                     self.visible(reader), Session.id == run_id,
                 ))).mappings().first()
             if row is None or run_id not in await self.native_recheck(reader, [run_id]):
                 raise HTTPException(404, "Conversation not found.")
             result = {"session": self.native_view(row)}
+            async with self.runtime.database.sessions() as db:
+                result["session"]["can_manage"] = await self.runtime.database.same_person(db, reader.user, row["owner_id"])
+                result["session"]["capabilities"]["rename"] = result["session"]["can_manage"]
         await self.current(reader)
         return result
 
@@ -438,27 +576,27 @@ class ProductReadService:
             result = await self.history.messages(reader.principal, run_id, limit=limit, offset=offset)
         else:
             async with self.runtime.database.sessions() as db:
-                rows = list((await db.execute(select(
-                    Message.id, Message.turn_id, Message.role, Message.author_id, Message.created_at,
-                    func.substr(Message.content, 1, CIPHER_CHARS + 1).label("content"),
-                ).where(Message.session_id == run_id, Message.role.in_(("user", "assistant")))
-                             .order_by(Message.id).offset(offset).limit(limit + 1))).mappings())
-            messages = []
-            for row in rows[:limit]:
-                item = dict(row)
-                if len(item["content"]) > CIPHER_CHARS:
-                    item.update(content="", content_unavailable=True)
-                else:
+                rows = list(await db.scalars(select(Message).where(
+                    Message.session_id == run_id, Message.role.in_(("user", "assistant")),
+                ).order_by(Message.id).offset(offset).limit(limit + 1)))
+                from .message_sources import public_message, source_view
+                messages = []
+                for row in rows[:limit]:
+                    item = {key: getattr(row, key) for key in ("id", "turn_id", "role", "author_id", "created_at")}
                     try:
-                        decoded = self.runtime.security.unseal(item["content"]).decode("utf-8")
+                        if len(row.content) > CIPHER_CHARS:
+                            raise ValueError("Message exceeds display budget")
+                        decoded, origin = await public_message(self.runtime.database, db, row)
+                        author = await db.get(User, row.author_id) if row.author_id else None
+                        item.update(content=decoded[:MAX_MESSAGE_CHARS], content_truncated=len(decoded) > MAX_MESSAGE_CHARS,
+                                    author_name=author.display_name if author else None,
+                                    is_self=await self.runtime.database.same_person(db, reader.user, row.author_id),
+                                    **source_view(origin, session_id=run_id, message_id=row.id))
                     except (InvalidToken, ValueError, UnicodeError):
                         item.update(content="", content_unavailable=True)
-                    else:
-                        item.update(content=decoded[:MAX_MESSAGE_CHARS],
-                                    content_truncated=len(decoded) > MAX_MESSAGE_CHARS)
-                messages.append(item)
-            result = {"messages": messages, "has_more": len(rows) > limit,
-                      "next_offset": offset + limit if len(rows) > limit else None}
+                    messages.append(item)
+                result = {"messages": messages, "has_more": len(rows) > limit,
+                          "next_offset": offset + limit if len(rows) > limit else None}
         await self.detail(reader, run_id, source)
         return result
 

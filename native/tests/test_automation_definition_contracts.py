@@ -46,6 +46,12 @@ def test_json_schema_matches_original_public_contract(name):
     if event is not None:
         assert event["properties"]["session_id"]["maxLength"] == 36
         event["properties"]["session_id"]["maxLength"] = 32
+    # Governance adds an optional, separately authorized selection. Preserve
+    # the original schema receipt for every other field.
+    definition = schema if name == "Definition" else schema.get("$defs", {}).get("Definition")
+    if definition is not None:
+        selection = definition["properties"].pop("security_profile_id")
+        assert selection == {"default": "", "pattern": "^([0-9a-f]{32})?$", "title": "Security Profile Id", "type": "string"}
     assert hashlib.sha256(json.dumps(schema, sort_keys=True).encode()).hexdigest() == SCHEMAS[name]
 
 
@@ -111,22 +117,18 @@ def test_original_validation_still_rejects_invalid_inputs(name, value):
         getattr(definitions, name).model_validate(value)
 
 
-def test_pure_import_avoids_database_and_executors_and_legacy_exports_are_identical():
+def test_pure_import_avoids_database_and_retired_executors():
     result = subprocess.run(
         [sys.executable, "-c", (
             "import sys; from app import automation_definitions as d; "
             "assert not any(n in sys.modules for n in "
             "('app.main','app.runner','app.db','app.automations','app.automation_events',"
             "'app.agent_runtime','app.durable_runner','agents','deepagents','langgraph')); "
-            "from app import automations as a, automation_permissions as p; "
-            "assert all(getattr(a,n) is getattr(d,n) for n in "
-            "('Timing','Trigger','Definition','Save','Toggle','Launch','Claim')); "
-            "assert a.SelfManagement is p.SelfManagement is d.SelfManagement; "
             "assert d.SelfManagement(instructions=True).allowed()==['instructions']; "
-            "print('pure imports and legacy aliases preserved')"
+            "print('pure imports preserved')"
         )],
         cwd=ROOT, env={"PATH": os.environ.get("PATH", ""), "PYTHONPATH": str(ROOT)},
         capture_output=True, text=True, timeout=15, check=False,
     )
     assert result.returncode == 0, result.stderr
-    assert result.stdout.strip() == "pure imports and legacy aliases preserved"
+    assert result.stdout.strip() == "pure imports preserved"

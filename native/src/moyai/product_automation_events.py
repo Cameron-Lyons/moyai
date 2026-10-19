@@ -704,6 +704,7 @@ class ProductAutomationEvents:
                 model=service.settings.resolve_model(definition.model or None),
                 request_key="automation-" + hashlib.sha256(occurrence.encode()).hexdigest(),
                 connections=connections,
+                security_profile_id=definition.security_profile_id,
             )
             if service.workspace is not None:
                 await service.workspace.bind_automation_turn(db, session, turn, workspace)

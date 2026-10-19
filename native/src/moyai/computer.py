@@ -29,9 +29,13 @@ if not GUEST.is_file():
 GUEST_CONTENT = GUEST.read_bytes()
 BROWSER_GUEST = GUEST.with_name("browser_guest.py")
 BROWSER_CONTENT = BROWSER_GUEST.read_bytes()
-DESKTOP_VERSION = hashlib.sha256(GUEST_CONTENT + BROWSER_CONTENT).hexdigest()
+DRIVER_CONTENT = GUEST.with_name("browser_driver.py").read_bytes()
+OCU_CONTENT = GUEST.with_name("ocu_guest.py").read_bytes()
+DESKTOP_VERSION = hashlib.sha256(GUEST_CONTENT + BROWSER_CONTENT + DRIVER_CONTENT + OCU_CONTENT).hexdigest()
 REMOTE_GUEST = f"/opt/moyai/desktop-{DESKTOP_VERSION}.py"
 REMOTE_BROWSER = f"/opt/moyai/browser-{DESKTOP_VERSION}.py"
+REMOTE_DRIVER = f"/opt/moyai/browser-driver-{DESKTOP_VERSION}.py"
+REMOTE_OCU = f"/opt/moyai/ocu-{DESKTOP_VERSION}.py"
 LEASE_SECONDS = 180
 logger = logging.getLogger(__name__)
 
@@ -93,8 +97,10 @@ async def authorize(runtime: Runtime, session_id: str, user: User) -> Session:
             Turn.session_id == session_id
         ).order_by(Turn.created_at.desc()).limit(1))
         if session.workspace and context:
+            policy = await runtime.database.execution_context(db, session)
             grants = await runtime.database.resolve_grants(
-                db, user.id, json.loads(context.connections), shared_session=session.visibility == "shared",
+                db, user.id, json.loads(context.connections), shared_session=policy.visibility == "shared",
+                surface=policy.surface,
             )
             scope = RunScope(session.id, context.id, user.id, context.model, grants, session.visibility, session.surface)
             if session.workspace_scope != scope.workspace_key:
@@ -107,7 +113,7 @@ async def lease(runtime: Runtime, session_id: str, user: User, action: str, clie
     if not session.workspace:
         raise HTTPException(409, "Send Moyai a task to start this conversation's computer.")
     async with runtime.database.sessions.begin() as db:
-        # Serialize human control and agent browser writes only. Chat and
+        # Serialize human control and agent desktop/browser input. Chat and
         # native coding continue independently.
         locked = await db.scalar(update(Session).where(
             Session.id == session_id, Session.deleted.is_(False),
@@ -128,7 +134,7 @@ async def lease(runtime: Runtime, session_id: str, user: User, action: str, clie
         if pending and pending.expires_at > stamp and action in {"claim", "heartbeat"} and (
             current is None or current.expires_at <= stamp or current.actor_id != user.id
         ):
-            raise HTTPException(409, "A browser action is still settling. Inspect the screen before taking control.")
+            raise HTTPException(409, "A computer action is still settling. Inspect the screen before taking control.")
         if pending and pending.expires_at > stamp and action not in {"claim", "heartbeat"}:
             raise HTTPException(409, "Wait for the current desktop action to settle before continuing or releasing control.")
         if action == "release":
@@ -178,15 +184,19 @@ async def lease(runtime: Runtime, session_id: str, user: User, action: str, clie
 
 async def guest_request(workspace: Workspace, body: dict) -> dict:
     """One bounded guest dispatch, used by HTTP and native Temporal tools."""
-    if body["action"] == "start":
+    if body["action"] == "start" or (
+        body["action"] in {"browser", "desktop"} and not await workspace.exists(REMOTE_GUEST)
+    ):
         await workspace.write_bytes(REMOTE_GUEST, GUEST_CONTENT)
         await workspace.write_bytes(REMOTE_BROWSER, BROWSER_CONTENT)
+        await workspace.write_bytes(REMOTE_DRIVER, DRIVER_CONTENT)
+        await workspace.write_bytes(REMOTE_OCU, OCU_CONTENT)
     elif not await workspace.exists(REMOTE_GUEST):
         if body["action"] == "frame":
             return {"available": False, "width": 1280, "height": 800}
         raise HTTPException(409, "Open the computer before sending desktop input.")
     body = {
-        **body, "browser_helper": REMOTE_BROWSER,
+        **body, "browser_helper": REMOTE_BROWSER, "browser_driver": REMOTE_DRIVER, "ocu_helper": REMOTE_OCU,
         "browser_diagnostics": logger.isEnabledFor(logging.DEBUG),
     }
     result = await workspace.run(
@@ -208,9 +218,13 @@ async def request(runtime: Runtime, session: Session, body: dict) -> dict:
     if not session.workspace:
         raise HTTPException(409, "Send Moyai a task to start this conversation's computer.")
     reference = TypeAdapter(WorkspaceRef).validate_json(session.workspace)
-    if reference.provider != "modal":
-        raise HTTPException(409, "Desktop access requires a Modal computer.")
-    workspace = Workspace(ModalSandbox(working_dir="/workspace").backend(reference))
+    if reference.provider == "lambda":
+        from .lambda_workspace import LambdaBackend
+        workspace = Workspace(LambdaBackend(runtime.settings, ref=reference))
+    elif reference.provider == "modal":
+        workspace = Workspace(ModalSandbox(working_dir="/workspace").backend(reference))
+    else:
+        raise HTTPException(409, "Desktop access requires a supported cloud computer.")
     try:
         return await guest_request(workspace, body)
     except WorkspaceUnavailableError as error:

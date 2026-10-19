@@ -1,6 +1,6 @@
-import { useEffect, useRef, useState, type ReactNode } from "react"
+import { useEffect, useRef, useState, type ReactNode, type RefObject } from "react"
 import { Tabs as TabsPrimitive } from "radix-ui"
-import { Activity, CheckSquare, File, Files, GitPullRequest, Maximize2, MessageSquare, Minimize2, Monitor, PanelRightClose, Plus, Search, Sparkles, X } from "lucide-react"
+import { Activity, CheckSquare, File, Files, GitPullRequest, Maximize2, MessageSquare, Minimize2, Monitor, PanelRightClose, Plus, Search, Sparkles, Terminal, X } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover"
@@ -55,7 +55,7 @@ export function panelReducer(state: PanelState, action: PanelAction): PanelState
 
 const icons = {
   "pull-request": GitPullRequest, subagent: Sparkles, output: File, computer: Monitor,
-  activity: Activity, plan: CheckSquare, files: Files, "side-chat": MessageSquare,
+  action: Terminal, activity: Activity, plan: CheckSquare, files: Files, "side-chat": MessageSquare,
 }
 export type AddTabKind = "side-chat" | "files" | "computer" | "activity" | "plan"
 const choices: { kind: AddTabKind; label: string; description: string }[] = [
@@ -87,22 +87,24 @@ export function AddTabMenu({ onAdd }: { onAdd: (kind: AddTabKind) => void }) {
   </Popover>
 }
 
-export function PanelTabs({ state, dispatch, onAdd, children }: {
+export function PanelTabs({ state, dispatch, onAdd, children, returnFocus }: {
   state: PanelState; dispatch: (action: PanelAction) => void; onAdd: (kind: AddTabKind) => void
   children: (tab: WorkspaceTab, active: boolean) => ReactNode
+  returnFocus?: RefObject<HTMLElement | null>
 }) {
   const tablist = useRef<HTMLDivElement>(null)
   const wasVisible = useRef(false)
   useEffect(() => {
     const target = state.visible
       ? tablist.current?.querySelector<HTMLElement>('[aria-selected="true"]')
-      : wasVisible.current ? document.querySelector<HTMLElement>('.workspace-toggle') : null
+      : wasVisible.current ? returnFocus?.current ?? document.querySelector<HTMLElement>('.workspace-toggle') : null
+    if (!state.visible && returnFocus) returnFocus.current = null
     wasVisible.current = state.visible
     if (!target) return
     target.scrollIntoView({ block: "nearest", inline: "nearest" })
     const frame = requestAnimationFrame(() => target.focus({ preventScroll: true }))
     return () => cancelAnimationFrame(frame)
-  }, [state.activeId, state.visible])
+  }, [state.activeId, state.visible, returnFocus])
   const selected = Math.max(0, state.tabs.findIndex(tab => tab.id === state.activeId))
   return <TabsPrimitive.Root asChild value={state.activeId ?? ""} onValueChange={id => dispatch({ type: "select", id })}><aside className="details-panel tabbed-panel" aria-label="Session panel" hidden={!state.visible}>
     <div className="panel-tabbar">

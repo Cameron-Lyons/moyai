@@ -151,6 +151,7 @@ class ProductMemoryService:
         self, grant: ProductGrant, *, include_deleted: bool = False,
     ) -> tuple[str, dict[str, Any], list[dict[str, Any]]]:
         principal = await self.identity.require_current(grant)
+        principal.require('memory.read')
         owner = self._owner(principal)
         clause = "" if include_deleted else " AND deleted=0"
         async with self.identity._reader(self.identity.source_engine) as db:
@@ -196,6 +197,11 @@ class ProductMemoryService:
         native_review = await self.native_review.status(owner) if self.native_review is not None else None
         _, prefs, rows = await self.snapshot(grant)
         memories = [self._unpack(row) for row in rows]
+        from .message_sources import valid_memory_source
+        async with self.database.sessions() as db:
+            for note in memories:
+                if not await valid_memory_source(self.database, db, note):
+                    note["review_required"] = True
         return {
             "source": "canonical", "scope": {"kind": "personal", "owner_id": owner},
             "supported_scopes": ["personal"], "preferences": prefs, "memories": memories,
@@ -233,6 +239,7 @@ class ProductMemoryService:
             if cached is None:
                 raise HTTPException(401, "Current product authorization is required.")
             principal = await self.identity.authorize_admission(db, grant)
+            principal.require('memory.manage')
             yield db, await self.owner_in(db, principal)
 
     async def save_in(

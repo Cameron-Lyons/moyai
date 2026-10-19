@@ -1,0 +1,88 @@
+import { useEffect, useId, useRef, useState } from "react"
+import { Download } from "lucide-react"
+import { Button } from "@/components/ui/button"
+import { Input } from "@/components/ui/input"
+import { TableCell, TableRow } from "@/components/ui/table"
+import { api, csrfToken } from "./api"
+import { Choice, RecordTable, dateTime, errorText } from "./settings"
+import { actionLabel, auditExportUrl, auditParams, auditPath, emptyAuditFilters } from "./governance-data"
+import { AuditDetails, LoadGate, PageActions, useGovResource } from "./governance-shared"
+import type { AuditEntry, AuditFilters, AuditPage as AuditResponse } from "./governance-types"
+
+const ALL = "__all__"
+const sourceLabels: Record<string, string> = { governance: "Governance", user_roles: "Built-in roles", connections: "Connections", credentials: "Credentials" }
+
+export function AuditRows({ entries }: { entries: AuditEntry[] }) {
+  return <RecordTable label="Audit log entries" headings={["When", "Action", "Actor", "Resource", "Details"]}>{entries.map(entry => <TableRow key={`${entry.source}:${entry.id}`}>
+    <TableCell><time dateTime={entry.created_at}>{dateTime(entry.created_at)}</time></TableCell>
+    <TableCell><strong>{actionLabel(entry.action)}</strong><small><code>{entry.action}</code> · {sourceLabels[entry.source] ?? entry.source}</small></TableCell>
+    <TableCell>{entry.actor || "System"}</TableCell>
+    <TableCell>{entry.resource_type}<small>{entry.resource_id}</small></TableCell>
+    <TableCell><AuditDetails entry={entry} /></TableCell>
+  </TableRow>)}</RecordTable>
+}
+
+const filtered = (filters: AuditFilters) => Object.values(filters).some(Boolean)
+
+export function AuditLogPage() {
+  const id = useId()
+  const [draft, setDraft] = useState<AuditFilters>(emptyAuditFilters)
+  const [applied, setApplied] = useState<AuditFilters>(emptyAuditFilters)
+  const [formError, setFormError] = useState("")
+  const resource = useGovResource<AuditResponse>(auditPath(applied))
+  const [facets, setFacets] = useState<AuditResponse["facets"]>({ actions: [], resource_types: [] })
+  const [pages, setPages] = useState<{ base?: AuditResponse; entries: AuditEntry[]; next: string | null; loading: boolean; error: string }>({ entries: [], next: null, loading: false, error: "" })
+  const loadMore = useRef<AbortController | null>(null)
+  useEffect(() => { if (resource.data?.facets) setFacets(resource.data.facets) }, [resource.data])
+  // New filters or a refresh discard pages loaded for the previous result.
+  useEffect(() => { loadMore.current?.abort(); setPages({ base: resource.data, entries: [], next: null, loading: false, error: "" }) }, [resource.data])
+  useEffect(() => () => loadMore.current?.abort(), [])
+  const change = (patch: Partial<AuditFilters>) => { setFormError(""); setDraft(previous => ({ ...previous, ...patch })) }
+  const apply = (next: AuditFilters) => {
+    try { auditParams(next) } catch (reason) { setFormError(reason instanceof Error ? reason.message : "Check the filters."); return }
+    setFormError(""); setApplied(next)
+  }
+  const clear = () => { setDraft(emptyAuditFilters); apply(emptyAuditFilters) }
+  const options = (values: string[], current: string, all: string, label: (value: string) => string) =>
+    [{ value: ALL, label: all }, ...[...new Set([...values, ...(current ? [current] : [])])].map(value => ({ value, label: label(value) }))]
+  return <>
+    <form className="ns-gov-filters" aria-label="Audit log filters" noValidate onSubmit={event => { event.preventDefault(); apply(draft) }}>
+      <div className="ns-field"><label htmlFor={`${id}-action`}>Action</label><Choice id={`${id}-action`} label="Action" value={draft.action || ALL} onChange={value => change({ action: value === ALL ? "" : value })} options={options(facets.actions, draft.action, "All actions", actionLabel)} /></div>
+      <div className="ns-field"><label htmlFor={`${id}-resource`}>Resource type</label><Choice id={`${id}-resource`} label="Resource type" value={draft.resource_type || ALL} onChange={value => change({ resource_type: value === ALL ? "" : value })} options={options(facets.resource_types, draft.resource_type, "All resource types", value => value.replace(/_/g, " "))} /></div>
+      <div className="ns-field"><label htmlFor={`${id}-actor`}>Actor email</label><Input id={`${id}-actor`} type="email" autoComplete="off" maxLength={254} placeholder="name@example.com" value={draft.actor} onChange={event => change({ actor: event.target.value })} /></div>
+      <div className="ns-field"><label htmlFor={`${id}-from`}>From (UTC)</label><Input id={`${id}-from`} type="date" value={draft.from} max={draft.to || undefined} onChange={event => change({ from: event.target.value })} /></div>
+      <div className="ns-field"><label htmlFor={`${id}-to`}>To (UTC)</label><Input id={`${id}-to`} type="date" value={draft.to} min={draft.from || undefined} onChange={event => change({ to: event.target.value })} /></div>
+      <div className="ns-gov-filter-actions"><Button type="submit">Apply filters</Button>{(filtered(draft) || filtered(applied)) && <Button type="button" variant="outline" onClick={clear}>Clear filters</Button>}</div>
+      {formError && <p className="ns-error" role="alert">{formError}</p>}
+    </form>
+    <div className="ns-gov-export" role="group" aria-label="Export the filtered audit log">
+      <span className="ns-muted">Export {filtered(applied) ? "the filtered" : "the full"} history, up to 50,000 entries:</span>
+      <Button asChild variant="outline" size="sm"><a href={auditExportUrl(applied, "csv")} download><Download />Export CSV</a></Button>
+      <Button asChild variant="outline" size="sm"><a href={auditExportUrl(applied, "ndjson")} download><Download />Export NDJSON</a></Button>
+      <PageActions resource={resource} />
+    </div>
+    <LoadGate resource={resource} label="the audit log">{data => {
+      const current = pages.base === data
+      const entries = [...data.entries, ...(current ? pages.entries : [])]
+      const next = current && pages.entries.length ? pages.next : data.next_cursor
+      const more = () => {
+        if (!next || pages.loading) return
+        const controller = new AbortController(), auth = csrfToken()
+        loadMore.current?.abort(); loadMore.current = controller
+        setPages(previous => ({ ...previous, loading: true, error: "" }))
+        void api<AuditResponse>(auditPath(applied, next), "GET", undefined, controller.signal).then(page => {
+          if (controller.signal.aborted || auth !== csrfToken()) return
+          setPages(previous => previous.base === data ? { base: data, entries: [...previous.entries, ...page.entries], next: page.next_cursor, loading: false, error: "" } : previous)
+        }, reason => { if (!controller.signal.aborted) setPages(previous => ({ ...previous, loading: false, error: errorText(reason) })) })
+      }
+      return <>
+        <p className="ns-muted ns-gov-count" role="status">{entries.length.toLocaleString()} {entries.length === 1 ? "entry" : "entries"} shown{next ? "; more are available" : ""}.</p>
+        {entries.length ? <AuditRows entries={entries} /> : <div className="ns-empty"><h2>{filtered(applied) ? "No matching audit entries" : "No audit entries yet"}</h2>
+          <p>{filtered(applied) ? "Try a wider date range or clear the filters." : "Role, provisioning, policy, spend, connection and credential changes appear here once they are saved."}</p>
+          {filtered(applied) && <Button variant="outline" onClick={clear}>Clear filters</Button>}</div>}
+        {pages.error && <p className="ns-error" role="alert">{pages.error}</p>}
+        {next && <Button className="ns-gov-more" variant="outline" disabled={pages.loading} onClick={more}>{pages.loading ? "Loading entries…" : "Load more"}</Button>}
+      </>
+    }}</LoadGate>
+  </>
+}

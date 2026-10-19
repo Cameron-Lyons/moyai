@@ -1,15 +1,16 @@
-import type { ChartRow, ChartSeries } from "../../app/static/analytics.js?native-analytics"
+import type { ChartRow, ChartSeries } from "./analytics-render.js"
 import { finiteValue } from "./analytics-format"
 
 export type PricingStatus = "priced" | "partial" | "unpriced" | "empty"
 export type PRState = "open" | "draft" | "closed" | "merged" | "unknown"
-export type ReportUser = { id: string; username: string; display_name: string; email?: string | null }
+export type ReportUser = { id: string; username: string; display_name: string; email?: string | null; filterable?: boolean }
 export type ReportSummary = {
   turns: number; sessions: number; completed: number; failed: number
   sessions_created?: number; sessions_active?: number
   requests: number; input_tokens: number | null; output_tokens: number | null; total_tokens: number | null
   cost_usd: number | null; cost_usd_exact?: string | null; priced_turns?: number; unpriced_turns?: number
   unknown_request_turns?: number; capture_gap_turns?: number; token_samples?: number; usage_samples?: number; token_coverage?: number | null
+  unknown_requests?: number
   priced_requests?: number; unpriced_requests?: number; cost_coverage?: number | null; pricing_status?: PricingStatus
   latency_samples: number; mean_latency_ms: number | null; p50_latency_ms: number | null; p95_latency_ms: number | null
   prs_created?: number; prs_merged?: number; prs_merged_current?: number
@@ -32,6 +33,31 @@ export type TurnUsage = {
   usage_role?: "steering_input" | "inference_turn"; cost_models?: string[]
   queue_ms: number | null; latency_ms: number | null; total_ms: number | null
   cost_usd: number | null; pricing_status: string
+  api_to_dispatch_ms?: number | null; api_to_worker_ms?: number | null
+  queue_pickup_ms?: number | null; broker_preparation_ms?: number | null
+  worker_to_broker_ms?: number | null; broker_to_dispatch_ms?: number | null
+  computer_ready_ms?: number | null; computer_mode?: string | null; computer_status?: string | null
+  api_received_at?: string | null; worker_picked_up_at?: string | null
+  broker_received_at?: string | null; first_dispatch_at?: string | null
+  dispatch_attempt_id?: string | null; dispatch_route?: string | null
+  timing_start_source?: string | null; timing_surface?: string | null
+  startup_timing_status?: string; queue_timing_status?: string; broker_timing_status?: string; computer_timing_status?: string
+}
+export type TimingDistribution = { samples: number; mean_ms: number | null; p50_ms: number | null; p95_ms: number | null; max_ms?: number | null }
+export type TimingCard = TimingDistribution & { pending: number; missing: number; total?: number; excluded?: number; reasons?: Record<string, number> }
+export type TimingCardKey = "startup" | "queue" | "broker" | "computer"
+export type TimingCards = Record<TimingCardKey, TimingCard>
+export type TimingInterval = TimingCards & { start: string; end: string }
+export type NativePerformance = {
+  accounted_turns?: number
+  eligible_turns: number; api_received_samples: number; missing_dispatch_samples: number
+  dispatch: TimingDistribution
+  breakdown: {
+    samples: number; api_to_dispatch_ms: TimingDistribution; api_to_worker_ms: TimingDistribution
+    worker_to_broker_ms: TimingDistribution; broker_to_dispatch_ms: TimingDistribution
+  }
+  computer: { cold: TimingDistribution; restore: TimingDistribution; reuse: TimingDistribution; requested: number; failed: number; pending: number }
+  cards?: TimingCards; trend?: TimingInterval[]
 }
 export type UserAggregate = Partial<ReportSummary> & { user_id: string }
 export type UserReportRow = { user_id: string; label: string; secondary?: string; search: string; metrics: UserAggregate }
@@ -43,12 +69,16 @@ export type AnalyticsReport = {
   models: string[]; users: ReportUser[]; total: number; limit: number; offset: number
   start: string; end: string; preset?: string; timezone?: string; currency?: string
   cost_note?: string; latency_note?: string
+  performance?: NativePerformance
   coverage?: {
     legacy_turns: number; ledger_requests: number; priced_requests: number; unpriced_requests: number; unknown_request_turns?: number; capture_gap_turns?: number; linked_cost_limited?: boolean
     pr_receipts: number; pr_status_checked: number; pr_status_unknown: number; pr_tracking: string; pr_merge_date_unknown?: number; unclassified_confirmed_create_calls?: number
+    legacy_observations?: number; native_observations?: number; unknown_requests?: number
+    activity_unknown_request_turns?: number; activity_capture_gap_turns?: number
+    private_activity_details_omitted?: number
   }
-  methodology?: { sessions?: string; prs_created?: string; prs_merged?: string; cost?: string; requests?: string; model?: string; cost_per_merged_pr?: string }
-  capabilities?: { pr_analytics?: boolean; reported_costs?: boolean }
+  methodology?: { sessions?: string; prs_created?: string; prs_merged?: string; cost?: string; requests?: string; model?: string; cost_per_merged_pr?: string; startup?: string; startup_breakdown?: string; computer_readiness?: string; timing_coverage?: string; timing_cards?: string }
+  capabilities?: { pr_analytics?: boolean; reported_costs?: boolean; unified_billing?: boolean }
 }
 
 function displayIdentity(value: string | null | undefined): string {

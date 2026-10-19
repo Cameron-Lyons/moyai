@@ -3,15 +3,17 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import hmac
 import json
 import logging
+import re
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, cast
 from urllib.parse import quote, urlsplit
 
-from fastapi import Depends, FastAPI, HTTPException, Request, Response
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -20,12 +22,16 @@ from pydantic_ai import ConversationTypeAdapter, DeferredToolResults
 from pydantic_ai.run import AgentRunResultEvent
 from pydantic_ai_harness.ask_user import AskUserRequest, AskUserResponse, ask_user_result
 from sqlalchemy import func, select, update
+from sqlalchemy.orm import load_only
 from temporalio.service import RPCError
 
 from .computer import routes as computer_routes
 from .connections import ConnectionPolicy
 from .contracts import ApprovalReply, EffectResolution, NewMessage, NewSession, QueuedEdit, SessionEdit
+from .debug_trace import debug_trace
 from .file_preview import routes as file_preview_routes
+from .general_preferences import general_preferences
+from .history_handoff import is_turn_run, latest_turn_snapshot
 from .images import routes as image_routes
 from .live_events import PUBLIC_TOPIC
 from .live_stream import authorized_events
@@ -33,6 +39,7 @@ from .models import (
     Artifact,
     Connection,
     Effect,
+    Event,
     Message,
     Session,
     SessionPreference,
@@ -117,6 +124,7 @@ def connection_view(connection: Connection) -> dict[str, Any]:
 def create_app(runtime: Runtime | None = None, *, run_dispatcher: bool = True) -> FastAPI:
     owned = runtime is None
     runtime = runtime or Runtime(Settings())
+    work_progress = runtime.work_progress
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -128,6 +136,7 @@ def create_app(runtime: Runtime | None = None, *, run_dispatcher: bool = True) -
         ] if run_dispatcher else []
         if run_dispatcher and runtime.product is None and runtime.settings.slack_bot_token.get_secret_value():
             tasks.append(asyncio.create_task(slack_dispatcher(runtime)))
+            tasks.append(asyncio.create_task(runtime.slack_activity.watch()))
         try:
             yield
         finally:
@@ -135,6 +144,7 @@ def create_app(runtime: Runtime | None = None, *, run_dispatcher: bool = True) -
                 task.cancel()
             if tasks:
                 await asyncio.gather(*tasks, return_exceptions=True)
+            work_progress.clear()
             if owned:
                 await runtime.close()
 
@@ -158,9 +168,18 @@ def create_app(runtime: Runtime | None = None, *, run_dispatcher: bool = True) -
             principal = await runtime.product_identity.authenticate(
                 request, mutation=request.method not in {"GET", "HEAD", "OPTIONS"},
             )
-            async with runtime.database.sessions.begin() as db:
-                user = await runtime.product_identity.project_native_user(db, principal)
+            user: User | None = None
+            if request.method in {"GET", "HEAD", "OPTIONS"}:
+                async with runtime.database.sessions() as db:
+                    user = await runtime.product_identity.read_native_user(db, principal)
+            if user is None:
+                async with runtime.database.sessions.begin() as db:
+                    user = await runtime.product_identity.project_native_user(db, principal)
             request.state.product_principal = principal
+            cast(Any, user).governance_permissions = principal.effective_permissions
+            # Share membership reads only within this authenticated HTTP request.
+            # Live streams explicitly discard this snapshot before each recheck.
+            cast(Any, user).slack_read_cache = {}
             return user
         token = request.cookies.get(COOKIE, "")
         identity = runtime.security.read_session(token)
@@ -184,6 +203,8 @@ def create_app(runtime: Runtime | None = None, *, run_dispatcher: bool = True) -
     if runtime.product is not None:
         from .product_auth import routes as product_auth_routes
         app.include_router(product_auth_routes(runtime, actor))
+        from .product_governance_routes import routes as governance_routes
+        app.include_router(governance_routes(runtime))
     if runtime.product_connections is not None:
         from .product_connections import routes as product_connection_routes
         app.include_router(product_connection_routes(runtime.product_connections))
@@ -200,7 +221,7 @@ def create_app(runtime: Runtime | None = None, *, run_dispatcher: bool = True) -
         app.include_router(product_skill_routes(runtime.product_skill_catalog))
     if runtime.product_billing is not None:
         from .product_billing_routes import routes as product_billing_routes
-        app.include_router(product_billing_routes(runtime.product_billing))
+        app.include_router(product_billing_routes(runtime.product_billing, runtime=runtime))
     if runtime.product_automations is not None:
         from .product_automations import routes as product_automation_routes
         app.include_router(product_automation_routes(runtime.product_automations))
@@ -210,9 +231,27 @@ def create_app(runtime: Runtime | None = None, *, run_dispatcher: bool = True) -
     from .product_routes import routes as product_routes
     app.include_router(product_routes(runtime, actor))
     app.include_router(settings_routes(runtime, actor))
+    from .swarm_routes import routes as swarm_routes
+    app.include_router(swarm_routes(runtime, actor))
+
+    @app.get("/api/skills")
+    async def invocable_skills(
+        shared: bool = False, offset: int = Query(0, ge=0, le=10000),
+        limit: int = Query(100, ge=1, le=100), user: User = Depends(actor), session_id: str | None = None,
+    ):
+        if session_id is not None:
+            async with runtime.database.sessions() as db:
+                session = await runtime.database.allowed_session(db, session_id, user)
+                context = await runtime.database.execution_context(db, session)
+                if context.surface != "web":
+                    return {"skills": [], "has_more": False, "next_offset": None}
+                shared = context.visibility != "private"
+        return await runtime.skill_invocations.listing(user, shared=shared, offset=offset, limit=limit)
 
     @app.middleware("http")
     async def security_headers(request: Request, call_next):
+        if not hasattr(request.state, "moyai_received_at"):
+            request.state.moyai_received_at = now()
         if request.method not in {"GET", "HEAD", "OPTIONS"} and not request.url.path.startswith("/hooks/"):
             origin = request.headers.get("origin")
             expected = runtime.settings.public_url.rstrip("/") or str(request.base_url).rstrip("/")
@@ -259,11 +298,18 @@ def create_app(runtime: Runtime | None = None, *, run_dispatcher: bool = True) -
         origin_url = urlsplit(runtime.settings.public_url or str(request.base_url))
         stream_origin = f"{'wss' if origin_url.scheme == 'https' else 'ws'}://{origin_url.netloc}"
         response.headers["Content-Security-Policy"] = (
-            "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
-            f"img-src 'self' data: blob:; media-src 'self' blob:; connect-src 'self' {stream_origin}; font-src 'self'; "
+            "default-src 'self'; script-src 'self'; "
+            "style-src 'self' 'unsafe-inline' https://api.fontshare.com; "
+            f"img-src 'self' data: blob:; media-src 'self' blob:; connect-src 'self' {stream_origin}; "
+            "font-src 'self' https://cdn.fontshare.com; "
             "frame-ancestors 'none'; base-uri 'self'; object-src 'none'"
         )
-        response.headers["Cache-Control"] = "no-store"
+        # Only content-addressed build assets are public/cacheable. HTML,
+        # authenticated API data, unversioned files and errors remain no-store.
+        immutable = response.status_code in {200, 304} and re.fullmatch(
+            r"/assets/[^/]+-[A-Za-z0-9_-]{8,}\.(?:js|css|woff2?|png|svg|jpe?g|webp|ico)", request.url.path,
+        )
+        response.headers["Cache-Control"] = "public, max-age=31536000, immutable" if immutable else "no-store"
         return response
 
     @app.get("/health")
@@ -332,9 +378,14 @@ def create_app(runtime: Runtime | None = None, *, run_dispatcher: bool = True) -
             "user": {
                 "id": user.id, "name": user.display_name, "role": user.role,
                 "individual": principal.individual if principal is not None else True,
+                "permissions": sorted(principal.effective_permissions) if principal else None,
+                "access_role": principal.access_role if principal else None,
             },
             "csrf": csrf, "models": runtime.settings.models,
+            "permissions": sorted(principal.effective_permissions) if principal else None,
+            "access_role": principal.access_role if principal else None,
             "default_model": runtime.settings.default_model,
+            "preferences": general_preferences(user.preferences),
             "product_mode": "existing" if runtime.product_identity is not None else "standalone",
         }
 
@@ -357,8 +408,9 @@ def create_app(runtime: Runtime | None = None, *, run_dispatcher: bool = True) -
             reads = {item.session_id: item for item in await db.scalars(select(SessionRead).where(
                 SessionRead.user_id == user.id, SessionRead.session_id.in_(ids),
             ))}
+            owners = {row.id: await runtime.database.same_person(db, user, row.owner_id) for row in rows}
         return [{
-            **session_view(row),
+            **session_view(row), "can_manage": owners[row.id],
             "pinned": preferences[row.id].pinned if row.id in preferences else False,
             "folder": preferences[row.id].folder if row.id in preferences else "",
             "participated": row.owner_id != user.id and row.id in participated,
@@ -371,19 +423,77 @@ def create_app(runtime: Runtime | None = None, *, run_dispatcher: bool = True) -
         return session_view(await runtime.database.create_session(user, body))
 
     @app.get("/api/sessions/{session_id}")
-    async def session(session_id: str, request: Request, user: User = Depends(actor)):
+    async def session(
+        session_id: str, request: Request, resolve: bool = False, include_activity: bool = True,
+        include_messages: bool = False,
+        user: User = Depends(actor),
+    ):
+        reference = None
+        if resolve and runtime.product_identity is not None:
+            from .product_routes import ProductReadService, Reader
+            # actor has just verified the product principal. The read adapter
+            # still fences source/native ACLs and canonical continuation aliases.
+            reference = (await ProductReadService(runtime).detail(
+                Reader(user, request.state.product_principal), session_id, "native",
+            ))["session"]
         row = await runtime.database.session(user, session_id)
+        turn_columns = load_only(
+            Turn.id, Turn.session_id, Turn.actor_id, Turn.model, Turn.status, Turn.mode,
+            Turn.parent_turn, Turn.enqueue_id, Turn.connections, Turn.accepted_at, Turn.usage,
+            Turn.error, Turn.created_at, Turn.finished_at,
+        )
         async with runtime.database.sessions() as db:
             turns = list((await db.scalars(select(Turn).where(
                 Turn.session_id == session_id
-            ).order_by(Turn.created_at.desc()).limit(100))).all())
+            ).options(turn_columns).order_by(Turn.created_at.desc()).limit(100))).all())
             if row.active_turn and not any(turn.id == row.active_turn for turn in turns):
-                active_turn = await db.get(Turn, row.active_turn)
+                active_turn = await db.get(Turn, row.active_turn, options=[turn_columns])
                 if active_turn is not None:
                     turns.append(active_turn)
+            guidance = dict((await db.execute(select(Event.turn_id, Event.created_at).where(
+                Event.turn_id.in_([turn.id for turn in turns]), Event.kind == "steering_admitted",
+            ).order_by(Event.id))).all())
             result: dict[str, Any] = {
-                "session": session_view(row), "turns": [turn_view(turn) for turn in turns],
+                "session": {**session_view(row), "can_manage": await runtime.database.same_person(db, user, row.owner_id)}, "turns": [
+                    {**turn_view(turn), "guidance_at": guidance.get(turn.id),
+                     "is_self": await runtime.database.same_person(db, user, turn.actor_id)} for turn in turns
+                ],
             }
+            if include_messages:
+                from .models import MessageSource
+                version = (await db.execute(select(
+                    func.coalesce(func.max(Message.id), 0), func.count(MessageSource.message_identity),
+                    func.coalesce(func.sum(MessageSource.revision), 0),
+                ).outerjoin(MessageSource, MessageSource.message_identity == Message.identity).where(
+                    Message.session_id == session_id,
+                ))).one()
+                authors = (await db.execute(select(User.id, User.display_name, User.auth_version).join(
+                    Message, Message.author_id == User.id,
+                ).where(Message.session_id == session_id).distinct().order_by(User.id))).all()
+                identities = [(author.id, author.display_name, author.auth_version,
+                               await runtime.database.same_person(db, user, author.id)) for author in authors]
+                identity_version = hashlib.sha256(json.dumps(identities).encode()).hexdigest()
+                result["transcript_version"] = ":".join(str(part) for part in (*version, identity_version))
+            if row.surface == "slack":
+                from .slack_delivery_status import status as delivery_status
+                result["slack_delivery"] = await delivery_status(runtime.database, db, session_id)
+            swarm_member = await runtime.database.swarms.member(db, session_id)
+            from .goal_models import Goal
+            result["goal"] = runtime.database.goals.view(await db.get(Goal, session_id))
+            if swarm_member is not None:
+                result["session"]["swarm_id"] = swarm_member.mission_id
+            from .delegation_models import DelegatedSession
+            delegation = await db.get(DelegatedSession, session_id)
+            if delegation is not None:
+                try:
+                    await runtime.database.allowed_session(db, delegation.parent_session_id, user)
+                except HTTPException as error:
+                    if error.status_code != 404:
+                        raise
+                else:
+                    result["session"]["parent_session_id"] = delegation.parent_session_id
+            if reference is not None:
+                result["reference"] = reference
             preference = await db.get(SessionPreference, (user.id, session_id))
             result["session"]["pinned"] = bool(preference and preference.pinned)
             result["session"]["folder"] = preference.folder if preference else ""
@@ -394,12 +504,13 @@ def create_app(runtime: Runtime | None = None, *, run_dispatcher: bool = True) -
                 Effect.session_id == session_id, Effect.state == "pending"
             ))).all())
             result["has_unsettled_effects"] = bool(unsettled)
+            own_turns = {turn.id for turn, view in zip(turns, result["turns"]) if view["is_self"]}
             result["effects"] = [{
                 "id": effect.id, "turn_id": effect.turn_id, "tool_name": effect.tool_name,
                 "arguments": json.loads(runtime.security.unseal(effect.arguments)),
-            } for effect in unsettled if effect.actor_id == user.id]
-        if turns and turns[0].actor_id == user.id and turns[0].status != "running":
-            snapshot = await runtime.stores.steps.latest_snapshot(run_id=turns[0].id)
+            } for effect in unsettled if await runtime.database.same_person(db, user, effect.actor_id)]
+        if include_activity and turns and turns[0].id in own_turns and turns[0].status != "running":
+            snapshot = await latest_turn_snapshot(runtime, turns[0].id)
             if snapshot is not None:
                 result["activity"] = saved_activity(snapshot.messages, turns[0].id)
         if row.status == "waiting" and row.conversation and active_turn is not None:
@@ -409,6 +520,14 @@ def create_app(runtime: Runtime | None = None, *, run_dispatcher: bool = True) -
             if result["can_answer"]:
                 conversation = ConversationTypeAdapter.validate_json(runtime.security.unseal(row.conversation))
                 result["pending"] = TypeAdapter(Any).dump_python(conversation.deferred_tool_requests, mode="json")
+                from .questions import can_reply_with_text
+                result["can_reply_with_text"] = can_reply_with_text(conversation.deferred_tool_requests)
+                async with runtime.database.sessions() as db:
+                    deadline = await db.scalar(select(Event).where(
+                        Event.identity == f"optional-question:{active_turn.id}",
+                    ))
+                if deadline is not None:
+                    result["question_deadline"] = json.loads(runtime.security.unseal(deadline.content))["deadline"]
             elif runtime.product_secrets is not None and user.role == "admin":
                 # Organization access assistance does not confer permission to
                 # answer another requester's questions or approve their tools.
@@ -416,20 +535,117 @@ def create_app(runtime: Runtime | None = None, *, run_dispatcher: bool = True) -
                 result["credential_requests"] = [
                     {"request_id": item["request_id"]} for item in requests["requests"]
                 ]
+        if include_messages:
+            result["messages"] = await runtime.database.messages(user, session_id)
         return result
+
+    @app.get("/api/sessions/{session_id}/progress/{turn_id}")
+    async def progress(
+        session_id: str, turn_id: str, request: Request,
+        include_activity: bool = False, user: User = Depends(actor),
+    ):
+        from .progress import turn_progress
+
+        await runtime.database.session(user, session_id)
+        async with runtime.database.sessions() as db:
+            turn = await db.get(Turn, turn_id)
+            if turn is None or turn.session_id != session_id:
+                raise HTTPException(404, "Turn not found.")
+            if not await runtime.database.same_person(db, user, turn.actor_id):
+                raise HTTPException(403, "Working activity is visible only to its requester.")
+        result = (
+            await work_progress.read(turn) if include_activity
+            else {"messages": await turn_progress(runtime, turn)}
+        )
+        fresh = await runtime.database.user(user.id)
+        if fresh.auth_version != user.auth_version:
+            raise HTTPException(401, "Your session expired.")
+        if runtime.product_identity is not None:
+            await runtime.product_identity.require_request_current(request)
+        await runtime.database.session(user, session_id)
+        return result
+
+    @app.get("/api/sessions/{session_id}/progress/{turn_id}/actions/{action_id}")
+    async def action_detail(
+        session_id: str, turn_id: str, action_id: str, request: Request,
+        agent_id: str | None = None, user: User = Depends(actor),
+    ):
+        await runtime.database.session(user, session_id)
+        async with runtime.database.sessions() as db:
+            turn = await db.get(Turn, turn_id)
+            if turn is None or turn.session_id != session_id:
+                raise HTTPException(404, "Turn not found.")
+            if not await runtime.database.same_person(db, user, turn.actor_id):
+                raise HTTPException(403, "Working activity is visible only to its requester.")
+        result, source_session = await work_progress.action(turn, action_id, agent_id)
+        fresh = await runtime.database.user(user.id)
+        if fresh.auth_version != user.auth_version:
+            raise HTTPException(401, "Your session expired.")
+        if runtime.product_identity is not None:
+            await runtime.product_identity.require_request_current(request)
+        await runtime.database.session(user, session_id)
+        if source_session != session_id:
+            await runtime.database.session(user, source_session)
+        return result
+
+    @app.get("/api/sessions/{session_id}/activity")
+    async def session_activity(session_id: str, user: User = Depends(actor)):
+        await runtime.database.session(user, session_id)
+        async with runtime.database.sessions() as db:
+            turn = (await db.execute(select(Turn.id, Turn.actor_id, Turn.status).where(
+                Turn.session_id == session_id,
+            ).order_by(Turn.created_at.desc()).limit(1))).first()
+            own = turn is not None and await runtime.database.same_person(db, user, turn.actor_id)
+        if turn is not None and own and turn.status != "running":
+            snapshot = await latest_turn_snapshot(runtime, turn.id)
+            if snapshot is not None:
+                return saved_activity(snapshot.messages, turn.id)
+        return []
+
+    @app.get("/api/sessions/{session_id}/debug-trace")
+    async def session_debug_trace(session_id: str, user: User = Depends(actor)):
+        return JSONResponse(
+            content=await debug_trace(runtime, user, session_id),
+            headers={
+                "Content-Disposition": f'attachment; filename="moyai-trace-{session_id}.json"',
+                "Cache-Control": "no-store",
+            },
+        )
+
+    @app.get("/api/sessions/{session_id}/messages/{message_id}/source")
+    async def message_source(session_id: str, message_id: int, user: User = Depends(actor)):
+        from .slack_permalink import permalink
+        return RedirectResponse(await permalink(runtime, user, session_id, message_id),
+                                status_code=302, headers={"Cache-Control": "no-store"})
+
+    @app.post("/api/sessions/{session_id}/slack-delivery/retry")
+    async def retry_slack_delivery(session_id: str, user: User = Depends(actor)):
+        from .slack_delivery_status import retry
+        return await retry(runtime, user, session_id)
 
     @app.patch("/api/sessions/{session_id}")
     async def edit_session(session_id: str, body: SessionEdit, user: User = Depends(actor)):
         async with runtime.database.sessions.begin() as db:
+            if body.archived is True:
+                # Keep the same source/user/session lock order as goal admission.
+                # Archive and goal suspension commit together before dispatch can claim work.
+                await runtime.database.goals.lock(db, user, session_id)
             await lock_sidebar(db, user.id)
             row = await runtime.database.allowed_session(db, session_id, user)
             if body.title is not None or body.archived is not None:
-                if row.owner_id != user.id:
+                if not await runtime.database.same_person(db, user, row.owner_id):
                     raise HTTPException(403, "Only the owner can change this conversation.")
                 if body.title is not None:
                     row.title = body.title
                 if body.archived is not None:
                     row.archived = body.archived
+                    if body.archived:
+                        from .goal_models import Goal
+                        goal = await db.get(Goal, session_id)
+                        if goal is not None and goal.status == "active":
+                            await runtime.database.goals.pause_continuation(
+                                db, goal, "The conversation was archived. Unarchive it before resuming the goal.",
+                            )
                 row.updated_at = now()
             if body.pinned is not None or body.folder is not None:
                 pref = await db.get(SessionPreference, (user.id, session_id))
@@ -466,38 +682,102 @@ def create_app(runtime: Runtime | None = None, *, run_dispatcher: bool = True) -
     async def messages(session_id: str, after: int = 0, user: User = Depends(actor)):
         return await runtime.database.messages(user, session_id, after=after)
 
+    async def cancel_stopped_workflow(workflow_id: str) -> None:
+        # Stop intent has committed. The dispatcher keeps ownership until
+        # cancellation/terminal state is acknowledged, including lost RPCs.
+        try:
+            async with asyncio.timeout(2):
+                client = await runtime.connect()
+                await client.get_workflow_handle(workflow_id).cancel()
+        except (RPCError, TimeoutError, RuntimeError, OSError):
+            logging.getLogger(__name__).warning("Stop cancellation remains pending for dispatcher reconciliation.")
+
     @app.post("/api/sessions/{session_id}/messages", status_code=202)
-    async def send(session_id: str, body: NewMessage, user: User = Depends(actor)):
-        return turn_view(await runtime.database.submit(user, session_id, body))
+    async def send(session_id: str, body: NewMessage, request: Request, user: User = Depends(actor)):
+        from .goals import is_goal_command
+        from .skill_invocations import has_invocations
+        if is_goal_command(body.prompt):
+            result = await runtime.database.goals.command(user, session_id, body)
+            async with runtime.database.sessions() as db:
+                stopped_workflow = await db.scalar(select(Turn.workflow_id).join(
+                    Session, Session.active_turn == Turn.id,
+                ).where(Session.id == session_id, Turn.status == "stopped"))
+            if stopped_workflow:
+                await cancel_stopped_workflow(stopped_workflow)
+            return result
+        if body.reply_to is not None:
+            async with runtime.database.sessions() as db:
+                await runtime.database.allowed_session(db, session_id, user)
+                pending = await db.get(Turn, body.reply_to)
+                if pending is None or pending.session_id != session_id:
+                    raise HTTPException(409, "That question is no longer available.")
+            user = await answer_actor(runtime, user, pending)
+        elif has_invocations(body.prompt):
+            async with runtime.database.sessions() as db:
+                session = await runtime.database.allowed_session(db, session_id, user)
+            body = body.model_copy(update={"prompt": await runtime.skill_invocations.normalize(body.prompt, user, session)})
+        return turn_view(await runtime.database.submit(
+            user, session_id, body, received_at=request.state.moyai_received_at,
+        ))
 
     @app.patch("/api/turns/{turn_id}")
     async def edit_queued(turn_id: str, body: QueuedEdit, user: User = Depends(actor)):
         async with runtime.database.sessions.begin() as db:
             turn = await db.get(Turn, turn_id)
-            if turn is None or turn.actor_id != user.id:
+            if turn is None or not await runtime.database.same_person(db, user, turn.actor_id):
                 raise HTTPException(404, "Message not found.")
-            await runtime.database.allowed_session(db, turn.session_id, user)
+            session = await runtime.database.allowed_session(db, turn.session_id, user)
+            await runtime.database.swarms.editable_input(db, turn)
+            prompt = await runtime.skill_invocations.normalize(body.prompt, user, session)
+            from .models import MessageSource
+            message = await db.scalar(select(Message).where(Message.identity == f"user:{turn.id}"))
+            source = await db.get(MessageSource, message.identity) if message else None
+            execution_prompt = prompt
+            if message is not None:
+                from .message_sources import public_message
+                original, provenance = await public_message(runtime.database, db, message)
+                if provenance and provenance.get("legacy_review_required"):
+                    raise HTTPException(409, "Review this older message in Slack and send a correction instead.")
+                if source is None:
+                    source = MessageSource(message_identity=message.identity, kind=(provenance or {}).get("kind", "web"),
+                                           revision=0, data=runtime.security.seal(provenance or {"kind": "web"}))
+                    db.add(source)
+                frozen = runtime.security.unseal(turn.prompt).decode()
+                if not frozen.startswith(original):
+                    raise HTTPException(409, "The original input is unavailable. Send a correction instead.")
+                execution_prompt += frozen[len(original):]
+                provenance = json.loads(runtime.security.unseal(source.data))
+                provenance["edited_in"] = "web"
+                source.data = runtime.security.seal(provenance)
+                source.revision += 1
+                source.mirror = True
             changed = await db.scalar(update(Turn).where(
                 Turn.id == turn.id, Turn.status == "queued"
-            ).values(prompt=runtime.security.seal(body.prompt)).returning(Turn.id))
+            ).values(prompt=runtime.security.seal(execution_prompt)).returning(Turn.id))
             if changed is None:
                 raise HTTPException(409, "The message was already admitted. Send a correction instead.")
             await db.execute(update(Message).where(
                 Message.turn_id == turn.id, Message.role == "user"
-            ).values(content=runtime.security.seal(body.prompt)))
+            ).values(content=runtime.security.seal(prompt)))
         return {"updated": True}
 
     @app.post("/api/turns/{turn_id}/steer", status_code=202)
     async def steer_queued(turn_id: str, user: User = Depends(actor)):
-        return turn_view(await runtime.database.steer_queued(user, turn_id))
+        async with runtime.database.sessions() as db:
+            turn = await db.get(Turn, turn_id)
+            if turn is None or not await runtime.database.same_person(db, user, turn.actor_id):
+                raise HTTPException(404, "Message not found.")
+        original = await answer_actor(runtime, user, turn)
+        return turn_view(await runtime.database.steer_queued(original, turn_id))
 
     @app.delete("/api/turns/{turn_id}")
     async def cancel_queued(turn_id: str, user: User = Depends(actor)):
         async with runtime.database.sessions.begin() as db:
             turn = await db.get(Turn, turn_id)
-            if turn is None or turn.actor_id != user.id:
+            if turn is None or not await runtime.database.same_person(db, user, turn.actor_id):
                 raise HTTPException(404, "Message not found.")
             await runtime.database.allowed_session(db, turn.session_id, user)
+            await runtime.database.swarms.editable_input(db, turn)
             changed = await db.scalar(update(Turn).where(
                 Turn.id == turn.id, Turn.status == "queued"
             ).values(status="stopped", finished_at=now()).returning(Turn.id))
@@ -509,16 +789,11 @@ def create_app(runtime: Runtime | None = None, *, run_dispatcher: bool = True) -
     async def stop(session_id: str, user: User = Depends(actor)):
         workflow_id = await runtime.database.stop(user, session_id)
         if workflow_id:
-            try:
-                client = await runtime.connect()
-                await client.get_workflow_handle(workflow_id).cancel()
-            except RPCError:
-                # The persisted Stop already revoked authority. Dispatcher reconciliation follows.
-                pass
+            await cancel_stopped_workflow(workflow_id)
         return {"status": "stopping"}
 
     @app.post("/api/sessions/{session_id}/answers", status_code=202)
-    async def answer(session_id: str, body: ApprovalReply, user: User = Depends(actor)):
+    async def answer(session_id: str, body: ApprovalReply, request: Request, user: User = Depends(actor)):
         async with runtime.database.sessions() as db:
             await runtime.database.allowed_session(db, session_id, user)
             turn = await db.get(Turn, body.turn_id)
@@ -536,6 +811,15 @@ def create_app(runtime: Runtime | None = None, *, run_dispatcher: bool = True) -
                 calls, approvals = await stored_replies(runtime, db, turn)
                 calls.update(await runtime.product_secrets.execution.resolved_calls(db, turn, resumed_actor))
             questions = {call.tool_call_id: call for call in pending.calls}
+            if body.browser_logins:
+                from .browser_login import TOOL_NAME, login_result
+                for identity, outcome in body.browser_logins.items():
+                    call = questions.get(identity)
+                    if call is None or call.tool_name != TOOL_NAME:
+                        raise HTTPException(422, "Unknown browser sign-in request.")
+                    calls[identity] = await login_result(
+                        db, session_id, (pending.metadata or {}).get(identity) or {}, outcome,
+                    )
             for identity, value in body.answers.items():
                 call = questions.get(identity)
                 if call is None or call.tool_name != "ask_user_question":
@@ -555,6 +839,7 @@ def create_app(runtime: Runtime | None = None, *, run_dispatcher: bool = True) -
         resumed = await runtime.database.resume(
             resumed_actor, session_id, turn.id, body.request_key,
             TypeAdapter(DeferredToolResults).dump_python(results, mode="json"),
+            received_at=request.state.moyai_received_at,
         )
         return turn_view(resumed)
 
@@ -568,7 +853,7 @@ def create_app(runtime: Runtime | None = None, *, run_dispatcher: bool = True) -
             turn = await db.get(Turn, turn_id)
             if turn is None or turn.session_id != session_id:
                 raise HTTPException(404, "Turn not found.")
-            if turn.actor_id != user.id:
+            if not await runtime.database.same_person(db, user, turn.actor_id):
                 raise HTTPException(403, "Working activity is visible only to its requester.")
         client = await runtime.connect()
         try:
@@ -596,7 +881,7 @@ def create_app(runtime: Runtime | None = None, *, run_dispatcher: bool = True) -
                         async for event in native:
                             next_offset = native.offset + 1
                             if isinstance(event, AgentRunResultEvent):
-                                finished = event.result.run_id == turn.id
+                                finished = is_turn_run(event.result.run_id, turn.id)
                             item = public_event(event)
                             if item is not None:
                                 yield f"id: {native.offset}\ndata: " + json.dumps(
@@ -613,15 +898,22 @@ def create_app(runtime: Runtime | None = None, *, run_dispatcher: bool = True) -
             yield 'event: finished\ndata: {}\n\n'
 
         async def authorize_viewer():
+            cast(Any, user).slack_read_cache = {}
             fresh = await runtime.database.user(user.id)
             if fresh.auth_version != user.auth_version:
                 raise HTTPException(401, "Your access changed.")
             if runtime.product_identity is not None:
                 await runtime.product_identity.require_request_current(request)
-            await runtime.database.session(fresh, session_id)
+            await runtime.database.session(user, session_id)
+            async with runtime.database.sessions() as db:
+                if not await runtime.database.same_person(db, user, turn.actor_id):
+                    raise HTTPException(403, "Requester access changed.")
 
         return StreamingResponse(
-            authorized_events(stream(), authorize_viewer, request.is_disconnected),
+            authorized_events(
+                stream(), authorize_viewer, request.is_disconnected,
+                reconnect=getattr(request.state, "moyai_reconnect", None),
+            ),
             media_type="text/event-stream",
         )
 
@@ -629,11 +921,13 @@ def create_app(runtime: Runtime | None = None, *, run_dispatcher: bool = True) -
     async def connections(
         user: User = Depends(actor), session_id: str | None = None, shared: bool = False,
     ):
+        surface = "web"
+        if session_id is not None:
+            async with runtime.database.sessions() as db:
+                session = await runtime.database.allowed_session(db, session_id, user)
+                context = await runtime.database.execution_context(db, session)
+                shared, surface = context.visibility == "shared", context.surface
         if runtime.product_connections is not None:
-            surface = "web"
-            if session_id is not None:
-                session = await runtime.database.session(user, session_id)
-                shared, surface = session.visibility == "shared", session.surface
             return await runtime.product_connections.catalog(
                 user.id, shared_session=shared, surface=surface,
             )
@@ -641,7 +935,7 @@ def create_app(runtime: Runtime | None = None, *, run_dispatcher: bool = True) -
             rows = await db.scalars(select(Connection).where(
                 (Connection.owner_id == user.id) | Connection.shared.is_(True)
             ))
-            return [connection_view(row) for row in rows]
+            return [connection_view(row) for row in rows if not shared or row.shared]
 
     @app.post("/api/connections")
     async def create_connection(body: ConnectionInput, user: User = Depends(actor)):
@@ -703,20 +997,20 @@ def create_app(runtime: Runtime | None = None, *, run_dispatcher: bool = True) -
         async with runtime.database.sessions() as db:
             await runtime.database.allowed_session(db, session_id, user)
             rows = await db.scalars(select(Effect).where(
-                Effect.session_id == session_id, Effect.actor_id == user.id,
+                Effect.session_id == session_id,
                 Effect.state == "pending",
             ).order_by(Effect.created_at))
             return [{
                 "id": row.id, "turn_id": row.turn_id, "tool_name": row.tool_name,
                 "arguments": json.loads(runtime.security.unseal(row.arguments)),
                 "created_at": row.created_at,
-            } for row in rows]
+            } for row in rows if await runtime.database.same_person(db, user, row.actor_id)]
 
     @app.post("/api/effects/{effect_id}/resolve")
     async def resolve_effect(effect_id: str, body: EffectResolution, user: User = Depends(actor)):
         async with runtime.database.sessions.begin() as db:
             row = await db.get(Effect, effect_id)
-            if row is None or row.actor_id != user.id:
+            if row is None or not await runtime.database.same_person(db, user, row.actor_id):
                 raise HTTPException(404, "Action not found.")
             session = await runtime.database.allowed_session(db, row.session_id, user)
             if session.active_turn:

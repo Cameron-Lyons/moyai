@@ -14,7 +14,7 @@ from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from functools import partial
-from typing import Any, Literal
+from typing import Any, Literal, cast
 from uuid import uuid4
 
 from temporalio import activity, workflow
@@ -107,7 +107,12 @@ def _digest(value: Any) -> str:
 
 
 def definition_digest(definition: Definition) -> str:
-    return _digest(definition.model_dump(mode="json"))
+    value = definition.model_dump(mode="json")
+    # Preserve already-authorized native workflow receipts when no profile was
+    # selected before governance existed. Explicit selections remain bound.
+    if not value['security_profile_id']:
+        value.pop('security_profile_id')
+    return _digest(value)
 
 
 def _definition(row: dict[str, Any]) -> Definition:
@@ -546,7 +551,7 @@ class ProductAutomationService:
         self, scope: RunScope, run_id: str | None, *, db: AsyncSession | None = None,
     ) -> Any:
         """Preserve the original direct-chat and persisted private-sink rules."""
-        if run_id != scope.turn_id or scope.product_grant is None:
+        if run_id != scope.root_run_id or scope.delegation_generated or scope.product_grant is None:
             raise HTTPException(403, "Manage automations from an authenticated direct user chat.")
         if db is None:
             async with self.database.sessions.begin() as transaction:
@@ -585,13 +590,11 @@ class ProductAutomationService:
         if actor is None or not actor.enabled or turn is None:
             raise PermissionError("The execution requester is no longer authorized.")
         await self.database._check_product_turn(db, turn, scope.product_grant)
-        session = await self.database.allowed_session(db, scope.session_id, actor)
+        cast(Any, actor).product_grant = scope.product_grant
+        session = await self.database.execution_session(db, scope.session_id, actor)
         if session.active_turn != turn.id or turn.status != "running" or turn.actor_id != actor.id:
             raise PermissionError("The execution was stopped or superseded.")
-        current = await self.database.resolve_grants(
-            db, actor.id, [grant.id for grant in scope.grants],
-            shared_session=session.visibility == "shared", surface=session.surface,
-        )
+        current = await self.database.scope_grants(db, scope, session)
         if [(grant.id, grant.revision) for grant in current] != [(grant.id, grant.revision) for grant in scope.grants]:
             raise PermissionError("Selected connection authority changed.")
 
@@ -747,6 +750,7 @@ class ProductAutomationService:
         async with self.database.sessions.begin() as db:
             await self._writer(db)
             principal = await self.identity.authorize_admission(db, grant)
+            principal.require('automations.manage')
             if scope is not None:
                 caller = await self.authorize_tool(scope, scope.turn_id, db=db)
                 if caller.grant != grant:
@@ -801,6 +805,11 @@ class ProductAutomationService:
                     definition.harness = CORE_IDENTITY if binding else previous_harness
                     if self.events is not None:
                         await self.events.remove_receivers(db, identity, definition)
+                governance = getattr(self.database, 'governance', None)
+                if governance is not None and action in {'create', 'update', 'enable', 'migrate'}:
+                    await governance.workflow(db, principal, definition,
+                                              previous='' if action == 'create' else _definition(row).security_profile_id,
+                                              scope=scope)
                 if action in {"migrate", "enable"}:
                     blockers = await self.blockers(db, row, definition, principal=principal)
                     if blockers:
@@ -1138,6 +1147,7 @@ class ProductAutomationService:
                 prompt=definition.prompt, model=self.settings.resolve_model(definition.model or None),
                 request_key="automation-" + hashlib.sha256(key.encode()).hexdigest(),
                 connections=connections,
+                security_profile_id=definition.security_profile_id,
             )
             if self.workspace is not None:
                 await self.workspace.bind_automation_turn(db, session, turn, workspace)

@@ -46,7 +46,20 @@ CREDENTIAL_REQUEST_SCHEMA_VERSION = "2026-10-15-product-credential-requests-v10"
 MEMORY_REVIEW_SCHEMA_VERSION = "2026-10-15-product-memory-review-v11"
 DRAIN_SCHEMA_VERSION = "2026-10-15-product-drain-v12"
 GIT_OPERATION_SCHEMA_VERSION = "2026-10-15-product-git-operations-v13"
-PRODUCT_SCHEMA_VERSION = GIT_OPERATION_SCHEMA_VERSION
+EXECUTION_COMPATIBILITY_SCHEMA_VERSION = "2026-10-16-product-execution-v14"
+BILLING_STORAGE_SCHEMA_VERSION = "2026-10-16-product-billing-storage-v15"
+SWARM_SCHEMA_VERSION = "2026-10-16-native-swarms-v16"
+GITHUB_WORKFLOW_SCHEMA_VERSION = "2026-10-16-product-github-workflows-v17"
+DELEGATION_SCHEMA_VERSION = "2026-10-16-interactive-delegation-v18"
+SLACK_ACTIVITY_SCHEMA_VERSION = "2026-10-17-slack-activity-v19"
+SLACK_TURN_SOURCE_SCHEMA_VERSION = "2026-10-17-slack-turn-source-v20"
+MESSAGE_SOURCE_SCHEMA_VERSION = "2026-10-18-message-sources-v21"
+GOAL_SCHEMA_VERSION = "2026-10-17-goals-v22"
+GOVERNANCE_SCHEMA_VERSION = '2026-10-19-product-governance-v23'
+PRODUCT_SCHEMA_VERSION = GOVERNANCE_SCHEMA_VERSION
+SESSION_POLICY_TABLE = 'moyai_product_session_policies'
+SESSION_POLICY_TRIGGER = 'moyai_product_session_policy_immutable'
+SESSION_POLICY_FUNCTION_BODY = "BEGIN RAISE EXCEPTION 'A bound session security policy is immutable' USING ERRCODE='55000'; END"
 RECEIPTS = "moyai_app_schema_versions"
 GRANT_TABLE = "moyai_product_turn_authority"
 GRANT_TRIGGER = "moyai_product_grant_immutable"
@@ -86,6 +99,7 @@ CONTINUATION_TABLES = frozenset({
     "moyai_product_continuations", "moyai_product_workspace_restorations", "moyai_product_execution_contexts",
 })
 SLACK_TABLES = frozenset({"moyai_product_slack_bindings"})
+SLACK_TURN_SOURCE_TABLES = frozenset({"moyai_slack_turn_sources"})
 MEMORY_TABLES = frozenset({"moyai_product_memory_operations", "moyai_product_memory_barriers"})
 AUTOMATION_ACCESS_TABLES = frozenset({"moyai_product_automation_chat_grants"})
 CONTINUATION_CAPTURE_TABLES = frozenset({CONTINUATION_CAPTURE_TABLE})
@@ -94,6 +108,10 @@ MEMORY_REVIEW_TABLES = frozenset({"moyai_product_memory_reviews"})
 DRAIN_STATE_TABLE = "moyai_product_drain_state"
 DRAIN_TABLES = frozenset({DRAIN_STATE_TABLE, "moyai_product_drain_workers", "moyai_product_drain_receipts"})
 GIT_OPERATION_TABLES = frozenset({"moyai_product_git_operations"})
+SWARM_TABLES = frozenset({
+    "moyai_swarm_missions", "moyai_swarm_members", "moyai_swarm_posts",
+    "moyai_swarm_turns", "moyai_swarm_operations",
+})
 MIGRATIONS = (
     (AUTHORITY_SCHEMA_VERSION, AUTHORITY_TABLES),
     (AUTOMATION_SCHEMA_VERSION, AUTOMATION_TABLES),
@@ -108,6 +126,20 @@ MIGRATIONS = (
     (MEMORY_REVIEW_SCHEMA_VERSION, MEMORY_REVIEW_TABLES),
     (DRAIN_SCHEMA_VERSION, DRAIN_TABLES),
     (GIT_OPERATION_SCHEMA_VERSION, GIT_OPERATION_TABLES),
+    # A durable release barrier: v13 candidates cannot resume the new workflow commands.
+    (EXECUTION_COMPATIBILITY_SCHEMA_VERSION, frozenset()),
+    # Passive tables only. Explicit billing_storage commands install mirrors,
+    # backfill records and select the read source after exact validation.
+    (BILLING_STORAGE_SCHEMA_VERSION, frozenset({"moyai_billing_records", "moyai_billing_storage"})),
+    (SWARM_SCHEMA_VERSION, SWARM_TABLES),
+    # New tool schemas/operation kinds cannot be resumed by the previous worker.
+    (GITHUB_WORKFLOW_SCHEMA_VERSION, frozenset()),
+    (DELEGATION_SCHEMA_VERSION, frozenset({"moyai_delegated_sessions", "moyai_delegated_turns"})),
+    (SLACK_ACTIVITY_SCHEMA_VERSION, frozenset({"moyai_slack_activity"})),
+    (SLACK_TURN_SOURCE_SCHEMA_VERSION, SLACK_TURN_SOURCE_TABLES),
+    (MESSAGE_SOURCE_SCHEMA_VERSION, frozenset({"moyai_message_sources", "moyai_delivery_schedule"})),
+    (GOAL_SCHEMA_VERSION, frozenset({"moyai_goals", "moyai_goal_turns", "moyai_goal_receipts"})),
+    (GOVERNANCE_SCHEMA_VERSION, frozenset({SESSION_POLICY_TABLE})),
 )
 
 
@@ -124,6 +156,8 @@ def _schema(value: str | None) -> str:
 
 
 def _is_identity(table: str, column: str) -> bool:
+    if table == "moyai_billing_records":
+        return False  # Shared historical identifiers retain their original unrestricted text.
     return (table == "moyai_users" and column == "id") or column in IDENTITY_COLUMNS
 
 
@@ -135,7 +169,7 @@ def application_metadata(schema: str, *, version: str = PRODUCT_SCHEMA_VERSION) 
         raise ProductSchemaError("Unknown native application migration version.")
     for module in (
         "settings_models", "inference_usage", "pr_publications", "product_automation_models", "product_inference",
-        "product_automation_context_models",
+        "product_automation_context_models", "product_governance_models",
         "product_continuation_models",
         "product_slack_models",
         "product_memory_models",
@@ -144,6 +178,10 @@ def application_metadata(schema: str, *, version: str = PRODUCT_SCHEMA_VERSION) 
         "product_memory_review_models",
         "product_drain_models",
         "product_github_models",
+        "billing_storage_models",
+        "swarm_models",
+        "delegation_models",
+        "goal_models",
     ):
         import_module(f"{__package__}.{module}")
     included = frozenset().union(*(item[1] for item in MIGRATIONS[:versions.index(version) + 1]))
@@ -202,6 +240,21 @@ async def _verify(
     for table in metadata.sorted_tables:
         if not await _has_table(connection, schema, table.name):
             raise ProductSchemaError(f"Required native table is missing: {table.name}.")
+        if table.name == "moyai_inference_usage":
+            kind = await connection.scalar(text(
+                "SELECT relkind::text FROM pg_class WHERE oid=to_regclass(:name)"
+            ), {"name": f'"{schema}"."{table.name}"'})
+            if kind == "v":
+                from .billing_storage import Storage, _state
+                from .billing_storage_cutover import verify_consolidated
+                source = await connection.scalar(text(
+                    f'SELECT source_schema FROM "{schema}".moyai_billing_storage WHERE id=1'
+                ))
+                if not isinstance(source, str):
+                    raise ProductSchemaError("Consolidated billing source receipt is missing.")
+                storage = Storage(source, schema)
+                await verify_consolidated(connection, storage, await _state(connection, storage))
+                continue
         columns = await connection.run_sync(
             lambda conn, name=table.name: inspect(conn).get_columns(name, schema=schema)
         )
@@ -279,6 +332,9 @@ async def _verify(
             CONTINUATION_CAPTURE_TABLE, CONTINUATION_CAPTURE_TRIGGER, 27,
             CONTINUATION_CAPTURE_TRIGGER, CAPTURE_FUNCTION_BODY,
         ))
+    if f'{schema}.{SESSION_POLICY_TABLE}' in metadata.tables:
+        required.append((SESSION_POLICY_TABLE, SESSION_POLICY_TRIGGER, 27,
+                         SESSION_POLICY_TRIGGER, SESSION_POLICY_FUNCTION_BODY))
     for table_name, trigger_name, events, function_name, body in required:
         trigger = (await connection.execute(text(
             "SELECT t.tgtype,t.tgenabled::text AS tgenabled,p.proname,p.prosrc,pn.nspname AS function_schema "
@@ -344,9 +400,10 @@ async def migrate_product_schema(
             ), {"version": revision})).scalar_one_or_none()
             if not existing:
                 # Add only this version's tables. Never re-stamp an earlier receipt.
-                await connection.run_sync(lambda conn, inventory=metadata, selected=tables: inventory.create_all(
-                    conn, tables=[table for table in inventory.sorted_tables if table.name in selected],
-                ))
+                if tables:
+                    await connection.run_sync(lambda conn, inventory=metadata, selected=tables: inventory.create_all(
+                        conn, tables=[table for table in inventory.sorted_tables if table.name in selected],
+                    ))
                 if revision == AUTOMATION_CONTEXT_SCHEMA_VERSION:
                     await connection.execute(text(
                         f'CREATE TRIGGER "{AUTOMATION_CONTEXT_TRIGGER}" BEFORE UPDATE '
@@ -365,6 +422,14 @@ async def migrate_product_schema(
                         f'ON "{schema}"."{CONTINUATION_CAPTURE_TABLE}" FOR EACH ROW '
                         f'EXECUTE FUNCTION "{schema}"."{CONTINUATION_CAPTURE_TRIGGER}"()'
                     ))
+                if revision == GOVERNANCE_SCHEMA_VERSION:
+                    await connection.execute(text(
+                        f'CREATE FUNCTION "{schema}"."{SESSION_POLICY_TRIGGER}"() RETURNS trigger '
+                        f'LANGUAGE plpgsql AS $$ {SESSION_POLICY_FUNCTION_BODY} $$'))
+                    await connection.execute(text(
+                        f'CREATE TRIGGER "{SESSION_POLICY_TRIGGER}" BEFORE UPDATE OR DELETE '
+                        f'ON "{schema}"."{SESSION_POLICY_TABLE}" FOR EACH ROW '
+                        f'EXECUTE FUNCTION "{schema}"."{SESSION_POLICY_TRIGGER}"()'))
                 if revision == DRAIN_SCHEMA_VERSION:
                     from .product_drain_models import BOOTSTRAP_FINGERPRINT
                     # A fresh cutover starts drained. Never seed/repair/resume

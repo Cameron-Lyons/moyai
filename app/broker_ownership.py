@@ -176,7 +176,8 @@ class BrokerRequests:
         while True:
             try:
                 await database(self.check)
-                await self.recover()
+                if not self.closing:
+                    await self.recover()
             except Exception as exc:
                 self.failed = True
                 logger.error('Broker ownership failed; cancelling owned requests: %s',
@@ -218,6 +219,27 @@ class BrokerRequests:
                 task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
 
+    async def quiesce(self):
+        """Planned retirement keeps live requests and their cleanup uncancelled."""
+        self.closing = True
+        current = asyncio.current_task()
+        while tasks := {
+            task for task in set(self.tasks) | set(self.slots._maintenance)
+            if task is not current and not task.done()
+        }:
+            # wait() observes completion without forwarding cancellation to the
+            # accepted HTTP tasks or their accounting/transport cleanup.
+            await asyncio.wait(tasks)
+        maintenance_task = self.maintenance.task
+        await self.maintenance.close()
+        if maintenance_task is not None and not maintenance_task.cancelled():
+            error = maintenance_task.exception()
+            if error is not None:
+                raise error
+        if self.maintenance.owned or self.failed:
+            raise DatabaseError('Broker quiescence did not settle ownership.')
+        await database(self.check)
+
 
 class BrokerOwnershipMiddleware:
     def __init__(self, app, owner):
@@ -238,17 +260,4 @@ class BrokerOwnershipMiddleware:
             self.owner.tasks.discard(task)
 
 
-def initialize_schema(store):
-    store.execute('''CREATE TABLE IF NOT EXISTS broker_work_owners (
-        kind TEXT NOT NULL, work_id TEXT NOT NULL, owner_pid INTEGER NOT NULL,
-        owner_started TEXT NOT NULL, PRIMARY KEY(kind,work_id))''')
-    # Preserve statuses during the offline migration. An explicit orphan record
-    # lets startup recover pre-protocol work without touching live broker rows.
-    # Current broker routes never create executing approvals; legacy ambiguous
-    # external writes become uncertain on recovery and are never replayed.
-    for kind, table, key, status in (
-            ('model', 'model_requests', 'id', 'pending'),
-            ('context', 'context_jobs', 'operation_id', 'running'),
-            ('approval', 'approvals', 'id', 'executing')):
-        store.execute(f"INSERT INTO broker_work_owners(kind,work_id,owner_pid,owner_started) "
-                      f"SELECT ?,{key},0,'' FROM {table} WHERE status=? ON CONFLICT DO NOTHING", (kind, status))
+from .schema_initializers import initialize_broker_ownership as initialize_schema

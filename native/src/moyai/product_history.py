@@ -62,8 +62,22 @@ def session_id(value: str) -> str:
     return value
 
 
+async def prepare_history_query(db: AsyncConnection | AsyncSession) -> None:
+    """Keep short interactive reads out of PostgreSQL's expensive JIT compiler.
+
+    Recursive legacy views have inflated cost estimates even for a small page.
+    SET LOCAL expires with this transaction, including rollback/cancellation;
+    it must not change the pooled connection's defaults or other workloads.
+    """
+    bind = db.get_bind() if isinstance(db, AsyncSession) else db
+    if bind.dialect.name == "postgresql":
+        await db.execute(text("SET LOCAL jit = off"))
+
+
 class ProductHistoryAdapter:
     continuation_access: Any = None
+    slack_access: Any = None
+    decorate_messages: Any = None
     continuation_schema: str | None = None
 
     """SELECT-only, permission-scoped product history over the canonical source."""
@@ -98,6 +112,7 @@ class ProductHistoryAdapter:
                 if self.engine.dialect.name == "postgresql":
                     await conn.execute(text("SET TRANSACTION READ ONLY"))
                     await conn.execute(text("SET LOCAL statement_timeout = '5000ms'"))
+                await prepare_history_query(conn)
                 # No commit, DDL, bootstrap or migration, including on SQLite.
                 yield conn
         except (SQLAlchemyError, TimeoutError):
@@ -107,21 +122,30 @@ class ProductHistoryAdapter:
         t = self.table
         live = "" if deleted else "AND r.deleted_at='' AND r.deletion_requested_at=''"
         ancestor_live = "" if deleted else "OR a.deleted_at!='' OR a.deletion_requested_at!=''"
-        return f"""WITH identities AS (
+        # The canonical ancestry relation is a recursive view. Referencing it
+        # separately for each ACL predicate expands the complete graph repeatedly.
+        # Share one statement-local snapshot without caching authorization across
+        # requests or removing the final live ACL checks.
+        materialized = "MATERIALIZED " if self.engine.dialect.name == "postgresql" else ""
+        return f"""WITH ancestry AS {materialized}(
+            SELECT run_id,ancestor_id FROM {t('run_ancestry')}
+        ), history_roots AS {materialized}(
+            SELECT run_id,root_id FROM {t('run_roots')}
+        ), identities AS (
             SELECT :actor AS id UNION SELECT id FROM {t('users')}
               WHERE kind='slack' AND linked_user_id=:actor
         ), visible AS (
             SELECT r.id, rr.root_id FROM {t('runs')} r
-            JOIN {t('run_roots')} rr ON rr.run_id=r.id
+            JOIN history_roots rr ON rr.run_id=r.id
             JOIN {t('runs')} root ON root.id=rr.root_id AND root.parent_run_id=''
             WHERE (r.private_owner_id='' OR r.private_owner_id=:private_actor)
               AND (root.private_owner_id='' OR root.private_owner_id=:private_actor)
               {live}
-              AND EXISTS(SELECT 1 FROM {t('run_ancestry')} self
+              AND EXISTS(SELECT 1 FROM ancestry self
                   WHERE self.run_id=r.id AND self.ancestor_id=r.id)
-              AND EXISTS(SELECT 1 FROM {t('run_ancestry')} lineage
+              AND EXISTS(SELECT 1 FROM ancestry lineage
                   WHERE lineage.run_id=r.id AND lineage.ancestor_id=root.id)
-              AND NOT EXISTS(SELECT 1 FROM {t('run_ancestry')} lineage
+              AND NOT EXISTS(SELECT 1 FROM ancestry lineage
                   LEFT JOIN {t('runs')} a ON a.id=lineage.ancestor_id
                   WHERE lineage.run_id=r.id AND (a.id IS NULL
                     OR (a.private_owner_id!='' AND a.private_owner_id!=:private_actor)
@@ -199,6 +223,8 @@ class ProductHistoryAdapter:
         guard = getattr(self, "continuation_access", None)
         if guard is not None and run_id not in await guard(conn, principal, [run_id]):
             raise HTTPException(404, "Session not found.")
+        if self.slack_access is not None and run_id not in await self.slack_access(conn, principal, [run_id]):
+            raise HTTPException(404, "Session not found.")
         return dict(row)
 
     async def recheck(self, principal: Principal, ids: list[str], *, deleted: bool = False) -> set[str]:
@@ -213,6 +239,8 @@ class ProductHistoryAdapter:
             guard = getattr(self, "continuation_access", None)
             if guard is not None:
                 valid &= await guard(conn, current, list(valid))
+            if self.slack_access is not None:
+                valid &= await self.slack_access(conn, current, list(valid))
             return valid
 
     async def require(self, principal: Principal, run_id: str) -> Principal:
@@ -322,6 +350,8 @@ class ProductHistoryAdapter:
                 ORDER BY CASE WHEN m.role='user' AND m.started_at='' AND m.status='queued' THEN 1 ELSE 0 END,
                     COALESCE(NULLIF(m.started_at,''),m.created_at),m.id LIMIT :limit OFFSET :offset
             """), {"id": run_id, "chars": MAX_MESSAGE_CHARS, "limit": limit + 1, "offset": offset})).mappings()]
+            if self.decorate_messages is not None:
+                await self.decorate_messages(conn, current, run_id, rows)
             # One bounded query for the whole message page; draft uploads are never visible.
             ids = [r["id"] for r in rows[:limit]]
             attachments: dict[int, list[dict[str, Any]]] = {}

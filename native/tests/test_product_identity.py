@@ -28,7 +28,7 @@ from pydantic_ai import RunContext, RunUsage
 from pydantic_ai.models.test import TestModel
 from pydantic_ai_harness import Memory
 from pydantic_ai_harness.memory import InMemoryStore
-from sqlalchemy import func, select, text
+from sqlalchemy import event, func, select, text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from temporalio import activity
@@ -97,15 +97,26 @@ def settings_for(tmp_path, **overrides):
 
 
 SCHEMA = (
-    ("CREATE TABLE users (id TEXT PRIMARY KEY, kind TEXT NOT NULL, email TEXT NOT NULL DEFAULT '', "
-    "name TEXT NOT NULL, linked_user_id TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)"),
-    ("CREATE TABLE user_roles (email TEXT PRIMARY KEY, role TEXT NOT NULL CHECK(role IN ('admin','member')), "
-    "revision INTEGER NOT NULL, updated_by TEXT NOT NULL, updated_at TEXT NOT NULL)"),
-    ("CREATE TABLE user_role_audit (id INTEGER PRIMARY KEY, email TEXT NOT NULL, previous_role TEXT NOT NULL, "
-    "role TEXT NOT NULL, actor TEXT NOT NULL, created_at TEXT NOT NULL)"),
-    ("CREATE TABLE access_identities (issuer TEXT NOT NULL, subject TEXT NOT NULL, email TEXT NOT NULL, "
-    "user_id TEXT NOT NULL REFERENCES users(id), created_at TEXT NOT NULL, PRIMARY KEY(issuer,subject), "
-    "UNIQUE(issuer,user_id), UNIQUE(issuer,email))"),
+    "CREATE TABLE users (id TEXT PRIMARY KEY, kind TEXT NOT NULL, email TEXT NOT NULL DEFAULT '', name TEXT NOT NULL, linked_user_id TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)",
+    "CREATE TABLE user_roles (email TEXT PRIMARY KEY, role TEXT NOT NULL CHECK(role IN ('admin','member')), revision INTEGER NOT NULL, updated_by TEXT NOT NULL, updated_at TEXT NOT NULL)",
+    'CREATE TABLE user_role_audit (id INTEGER PRIMARY KEY, email TEXT NOT NULL, previous_role TEXT NOT NULL, role TEXT NOT NULL, actor TEXT NOT NULL, created_at TEXT NOT NULL)',
+    'CREATE TABLE access_identities (issuer TEXT NOT NULL, subject TEXT NOT NULL, email TEXT NOT NULL, user_id TEXT NOT NULL REFERENCES users(id), created_at TEXT NOT NULL, PRIMARY KEY(issuer,subject), UNIQUE(issuer,user_id), UNIQUE(issuer,email))',
+    'CREATE TABLE enterprise_roles (id TEXT PRIMARY KEY, name TEXT NOT NULL, description TEXT NOT NULL, permissions TEXT NOT NULL, revision INTEGER NOT NULL, archived INTEGER NOT NULL DEFAULT 0 CHECK(archived IN (0,1)), updated_by TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)',
+    'CREATE TABLE enterprise_role_assignments (email TEXT PRIMARY KEY, role_id TEXT NOT NULL, revision INTEGER NOT NULL, updated_by TEXT NOT NULL, updated_at TEXT NOT NULL)',
+    'CREATE TABLE enterprise_group_roles (group_id TEXT PRIMARY KEY, role_id TEXT, revision INTEGER NOT NULL, updated_by TEXT NOT NULL, updated_at TEXT NOT NULL)',
+    "CREATE TABLE scim_tokens (id TEXT PRIMARY KEY, label TEXT NOT NULL, token_hash TEXT NOT NULL UNIQUE, prefix TEXT NOT NULL, created_by TEXT NOT NULL, created_at TEXT NOT NULL, last_used_at TEXT NOT NULL DEFAULT '', revoked_at TEXT NOT NULL DEFAULT '')",
+    "CREATE TABLE scim_users (id TEXT PRIMARY KEY, external_id TEXT NOT NULL DEFAULT '', user_name TEXT NOT NULL, profile TEXT NOT NULL, active INTEGER NOT NULL CHECK(active IN (0,1)), deleted_at TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, updated_at TEXT NOT NULL, revision INTEGER NOT NULL, access_epoch INTEGER NOT NULL DEFAULT 0)",
+    "CREATE TABLE scim_groups (id TEXT PRIMARY KEY, external_id TEXT NOT NULL DEFAULT '', display_name TEXT NOT NULL, display_key TEXT NOT NULL, deleted_at TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, updated_at TEXT NOT NULL, revision INTEGER NOT NULL)",
+    'CREATE TABLE scim_group_members (group_id TEXT NOT NULL REFERENCES scim_groups(id), user_id TEXT NOT NULL REFERENCES scim_users(id), PRIMARY KEY(group_id,user_id))',
+    "CREATE UNIQUE INDEX idx_scim_users_external ON scim_users(external_id) WHERE external_id!='' AND deleted_at=''",
+    "CREATE UNIQUE INDEX idx_scim_users_name ON scim_users(user_name) WHERE deleted_at=''",
+    "CREATE UNIQUE INDEX idx_scim_groups_external ON scim_groups(external_id) WHERE external_id!='' AND deleted_at=''",
+    "CREATE UNIQUE INDEX idx_scim_groups_display ON scim_groups(display_key) WHERE deleted_at=''",
+    'CREATE TABLE security_profiles (id TEXT PRIMARY KEY, name TEXT NOT NULL, revision INTEGER NOT NULL, enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0,1)), policy TEXT NOT NULL, updated_by TEXT NOT NULL, updated_at TEXT NOT NULL)',
+    'CREATE TABLE security_profile_revisions (profile_id TEXT NOT NULL REFERENCES security_profiles(id), revision INTEGER NOT NULL, policy TEXT NOT NULL, created_by TEXT NOT NULL, created_at TEXT NOT NULL, PRIMARY KEY(profile_id,revision))',
+    "CREATE TABLE security_profile_defaults (id INTEGER PRIMARY KEY CHECK(id=1), revision INTEGER NOT NULL, default_profile_id TEXT NOT NULL DEFAULT '', mandatory_profile_id TEXT NOT NULL DEFAULT '', updated_by TEXT NOT NULL, updated_at TEXT NOT NULL)",
+    "CREATE TABLE spend_limits (id TEXT PRIMARY KEY, kind TEXT NOT NULL CHECK(kind IN ('organization','user-default','session-default','user')), subject TEXT NOT NULL DEFAULT '', limit_usd REAL, revision INTEGER NOT NULL, updated_by TEXT NOT NULL, updated_at TEXT NOT NULL)",
+    "CREATE TABLE governance_audit_events (id TEXT PRIMARY KEY, action TEXT NOT NULL, actor TEXT NOT NULL, resource_type TEXT NOT NULL, resource_id TEXT NOT NULL, details TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL)",
 )
 
 
@@ -204,6 +215,36 @@ async def test_existing_signed_google_identity_exact_id_and_live_roles(product):
     )
     with pytest.raises(HTTPException):
         await product.adapter.require_current(principal.grant)
+
+
+async def test_positive_schema_cache_never_caches_account_authority(product):
+    async with product.writer.begin() as conn:
+        await conn.run_sync(User.__table__.create)
+        await conn.execute(User.__table__.insert().values(
+            id="google:member-sub", username="member", display_name="Member",
+            password="", role="member", enabled=True, auth_version=1,
+        ))
+    statements = []
+    def observed(_conn, _cursor, statement, *_args):
+        statements.append(statement)
+    event.listen(product.source.sync_engine, "before_cursor_execute", observed)
+    try:
+        principal = await product.adapter.current("google:member-sub")
+        await product.adapter.require_current(principal.grant)
+        assert sum("table_info" in sql for sql in statements) == 1
+        assert sum("SELECT role,revision" in sql for sql in statements) == 2
+        async with product.writer.begin() as conn:
+            await conn.execute(text("UPDATE moyai_users SET enabled=false"))
+        with pytest.raises(HTTPException) as denied:
+            await product.adapter.require_current(principal.grant)
+        assert denied.value.status_code == 401
+        async with product.writer.begin() as conn:
+            await conn.execute(text("DROP TABLE moyai_users"))
+        with pytest.raises(HTTPException) as missing:
+            await product.adapter.require_current(principal.grant)
+        assert missing.value.status_code == 503
+    finally:
+        event.remove(product.source.sync_engine, "before_cursor_execute", observed)
 
 
 @pytest.mark.parametrize("headers", [
@@ -471,11 +512,13 @@ async def test_postgres_admission_serializes_with_canonical_role_writes_and_reje
         engine = create_async_engine("postgresql+asyncpg://" + url.split("://", 1)[1])
         async with engine.begin() as db:
             await db.execute(text("CREATE SCHEMA moyai"))
-            for statement in SCHEMA[:2]:
+            await db.execute(text("SET LOCAL search_path TO moyai,public"))
+            for statement in SCHEMA:
                 await db.execute(text(statement.replace("CREATE TABLE ", "CREATE TABLE moyai.", 1)))
             await db.execute(text(
                 "INSERT INTO moyai.users VALUES ('google:admin-sub','google','admin@example.test','Admin',NULL,'c','u')"
             ))
+            await db.execute(text("SET LOCAL search_path TO public"))
             await db.execute(text("CREATE TABLE admissions (id TEXT PRIMARY KEY)"))
         adapter = ProductIdentityAdapter(settings_for(tmp_path), engine)
         principal = await adapter.current("google:admin-sub")
