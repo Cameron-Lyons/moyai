@@ -24,6 +24,8 @@ from .product_slack_conversations import SlackConversation, SlackConversations
 from .product_slack_models import SlackTurnSource
 
 if TYPE_CHECKING:
+    from sqlalchemy.ext.asyncio import AsyncSession
+
     from .product_slack import ProductSlack
 
 
@@ -91,6 +93,8 @@ class SlackMessage:
 class SlackSubmission:
     body: NewMessage
     uploads: list[str]
+    # Connection kind of each automatically selected catalog grant.
+    kinds: dict[str, str]
 
 
 class SlackEvents:
@@ -173,20 +177,38 @@ class SlackEvents:
         attachments = {"uploads": [], "images": [], "context": ""}
         if message.event.get("files"):
             attachments = await self.slack.files.prepare(actor, principal, message.event, message.origin)
-        selections = [grant["id"] for grant in await self.slack.connections.catalog(
-            actor.id, shared_session=True, surface="slack",
-        )]
+        catalog = await self.slack.connections.catalog(actor.id, shared_session=True, surface="slack")
         body = NewMessage.from_event(InboundEvent(
             source="slack", sender_id=actor.id, deduplication_key=message.key,
             text=message.prompt, model_context=attachments["context"],
             attachments=tuple(attachments["images"]),
             provenance={**message.origin, "files": attachments.get("files", [])},
-        ), connections=selections)
-        return SlackSubmission(body, attachments["uploads"])
+        ), connections=[grant["id"] for grant in catalog])
+        return SlackSubmission(body, attachments["uploads"], {grant["id"]: grant["kind"] for grant in catalog})
+
+    async def _automatic(
+        self, db: AsyncSession, session_id: str, principal: ProductPrincipal, submission: SlackSubmission,
+    ) -> NewMessage:
+        """Narrow the automatic catalog selection to what this sender's session admits.
+
+        Slack has no account picker, so a connection the policy or role excludes
+        is left out rather than refusing every message. Retained selections still
+        face admission's strict check.
+        """
+        body = submission.body
+        governance = getattr(self.slack.runtime.database, "governance", None)
+        if governance is None:
+            return body
+        current = await governance.principal(db, principal.grant)
+        policy = await governance.policy(db, session_id)
+        selected = [
+            identity for identity in body.connections if governance.admits(policy, submission.kinds[identity])
+        ] if "connections.read" in current.effective_permissions else []
+        return body.model_copy(update={"connections": selected})
 
     async def _submit(
-        self, actor: User, thread: SlackThread, body: NewMessage, message: SlackMessage,
-        uploads: list[str],
+        self, actor: User, principal: ProductPrincipal, thread: SlackThread, submission: SlackSubmission,
+        message: SlackMessage,
     ) -> Turn:
         async def admit() -> Turn:
             async with self.slack.runtime.database.sessions.begin() as db:
@@ -199,9 +221,12 @@ class SlackEvents:
                     Turn.session_id == thread.session_id, Turn.preparation.is_not(None),
                     Session.workspace.is_not(None),
                 ).order_by(Turn.created_at.desc(), Turn.id.desc()).limit(1))
-                submission = body.model_copy(update={"connections": json.loads(saved)}) if saved is not None else body
+                if saved is not None:
+                    body = submission.body.model_copy(update={"connections": json.loads(saved)})
+                else:
+                    body = await self._automatic(db, thread.session_id, principal, submission)
                 turn = await self.slack.runtime.database.submit(
-                    actor, thread.session_id, submission, db=db,
+                    actor, thread.session_id, body, db=db,
                 )
                 source = await db.get(SlackTurnSource, turn.id)
                 if source is None:
@@ -213,8 +238,8 @@ class SlackEvents:
                         message_ts=message.origin["message_ts"],
                         user_id=message.origin["user_id"],
                     ))
-                if uploads:
-                    await self.slack.files.bind(db, actor.id, thread.session_id, uploads)
+                if submission.uploads:
+                    await self.slack.files.bind(db, actor.id, thread.session_id, submission.uploads)
                 return turn
 
         try:
@@ -252,7 +277,7 @@ class SlackEvents:
         assert submission is not None
         if binding.paused:
             await self.slack.set_paused(binding.session_id, False)
-        await self._submit(actor, thread, submission.body, message, submission.uploads)
+        await self._submit(actor, principal, thread, submission, message)
         self.slack.runtime.slack_activity.wake.set()
         self.slack.delivery_wakeup.set()
         return {"ok": True}

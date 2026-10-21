@@ -66,6 +66,7 @@ TERMINAL = ("completed", "failed", "stopped", "included")
 OLD_TERMINAL = ("idle", "completed", "failed", "cancelled", "interrupted")
 AUTOMATION_ID = r"^[0-9a-f]{32}$"
 REQUEST_KEY = r"^[A-Za-z0-9_-]{8,80}$"
+GOVERNANCE_BLOCKED = "The workflow security policy or the owner's role no longer admits this run."
 Action = Literal["create", "update", "migrate", "enable", "pause", "retire"]
 AUTOMATION_MUTATIONS = frozenset({
     f"automation_{action}" for action in (
@@ -1264,6 +1265,21 @@ class ProductAutomationService:
         ))
         return {"status": status, "session_id": session_id, "turn_id": turn_id}
 
+    async def _admit_governed(self, db: AsyncSession, binding: Binding, **admission: Any) -> tuple[Session, Turn] | None:
+        """Admit an occurrence, or block its binding when governance refuses it.
+
+        Policy and role refusals do not clear on retry. The savepoint discards
+        any partially created session before the caller records its receipt.
+        """
+        try:
+            async with db.begin_nested():
+                return await self.database.admit_automation(db, **admission)
+        except HTTPException as error:
+            if error.status_code not in {403, 409}:
+                raise
+        binding.sync_state, binding.last_error = "blocked", GOVERNANCE_BLOCKED
+        return None
+
     async def admit(
         self, identity: str, generation: int, revision: int, trigger_id: str,
         occurrence: str, scheduled_at: str,
@@ -1306,6 +1322,9 @@ class ProductAutomationService:
                 return await receipt(db, row, binding, trigger_id, occurrence, "blocked", "Original owner authority is no longer current.")
             if datetime.now(UTC) - scheduled.astimezone(UTC) > timedelta(minutes=15):
                 return await receipt(db, row, binding, trigger_id, occurrence, "skipped", "Occurrence exceeded the fifteen-minute catch-up window.")
+            if binding.sync_state == "blocked":
+                # A blocked binding waits for the owner's explicit enable; retrying cannot clear it.
+                return await receipt(db, row, binding, trigger_id, occurrence, "blocked", binding.last_error)
             if binding.sync_state != "ready" or binding.synced_generation != generation:
                 raise RuntimeError("Schedule synchronization is pending.")
             if await self._old_active(db, identity):
@@ -1332,13 +1351,16 @@ class ProductAutomationService:
                 ), {"id": identity, "since": (datetime.now(UTC) - timedelta(hours=1)).isoformat()})
                 if count >= definition.max_runs_per_hour:
                     return await receipt(db, row, binding, trigger_id, key, "skipped", "Hourly invocation limit reached.")
-            session, turn = await self.database.admit_automation(
-                db, grant=original, title=f"Automation · {definition.name}",
+            admitted = await self._admit_governed(
+                db, binding, grant=original, title=f"Automation · {definition.name}",
                 prompt=definition.prompt, model=self.settings.resolve_model(definition.model or None),
                 request_key="automation-" + hashlib.sha256(key.encode()).hexdigest(),
                 connections=connections, session_id=definition.session_id,
                 security_profile_id=definition.security_profile_id,
             )
+            if admitted is None:
+                return await receipt(db, row, binding, trigger_id, key, "blocked", GOVERNANCE_BLOCKED)
+            session, turn = admitted
             if self.workspace is not None:
                 await self.workspace.bind_automation_turn(db, session, turn, workspace)
             return await receipt(

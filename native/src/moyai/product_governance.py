@@ -91,11 +91,19 @@ class ProductGovernance:
         principal.require('sessions.create')
         policy = await self.policy(db, session.id)
         self.require_provider(policy)
-        if policy.connected_apps is not None and any(grant.kind not in policy.connected_apps for grant in grants):
+        if not all(self.admits(policy, grant.kind) for grant in grants):
             raise HTTPException(403, 'A selected connection is disabled by the session security policy.')
         if grants:
             principal.require('connections.read')
         return policy
+
+    @staticmethod
+    def admits(policy, kind):
+        """Whether a session under this policy may select a connection of this kind."""
+        # A GitHub grant under no Git access would only fail every turn's tool
+        # discovery, so it is refused with the other disallowed connections.
+        return (policy.connected_apps is None or kind in policy.connected_apps) and not (
+            kind == 'github' and policy.git_access == 'none')
 
     async def workspace(self, db, scope, context):
         principal = await self.principal(db, scope.product_grant)
@@ -215,7 +223,7 @@ class ProductGovernance:
         binding = await db.run_sync(lambda sync: self.product.profiles.resolve_for_new_session_in(
             CanonicalRead(sync, self.identity), selected))
         self.require_provider(binding.policy)
-        if binding.policy.connected_apps is not None and not set(definition.plugins) <= set(binding.policy.connected_apps):
+        if not all(self.admits(binding.policy, kind) for kind in definition.plugins):
             raise HTTPException(403, 'The workflow connections exceed its security policy.')
         if definition.repo_url and (binding.policy.git_access == 'none' or (
                 binding.policy.connected_apps is not None and 'github' not in binding.policy.connected_apps)):

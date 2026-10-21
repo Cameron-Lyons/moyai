@@ -433,3 +433,27 @@ async def test_event_queue_tracks_resumed_run_in_shared_chat(events):
         (await db.get(Session, session.id)).active_turn = None
         (await db.get(Session, session.id)).status = "idle"
     assert (await ctx.events.admit(second["occurrence"]))["status"] == "admitted"
+
+
+@requires_pg
+async def test_governance_refusal_settles_the_event_blocked_and_drains_its_queue(events):
+    from test_product_governance import attach, profile, source_write
+
+    from moyai.product_automation_models import ProductAutomationBinding as Binding
+    from moyai.product_automations import GOVERNANCE_BLOCKED
+    ctx = events
+    attach(ctx.product)
+    selected = await profile(ctx.product, {})
+    row = await event_automation(ctx, queue_events=True, security_profile_id=selected)
+    await deliver(ctx, row, 1)
+    await deliver(ctx, row, 2)
+    await source_write(ctx.product, "UPDATE moyai.security_profiles SET enabled=0 WHERE id=:id", id=selected)
+    first, second = await pending(ctx)
+    assert (await ctx.events.admit(first["occurrence"]))["status"] == "blocked"
+    # The blocked binding no longer holds later queued events waiting.
+    assert (await ctx.events.admit(second["occurrence"]))["status"] == "skipped"
+    blocked, _skipped = await pending(ctx)
+    assert (blocked["status"], blocked["detail"]) == ("blocked", GOVERNANCE_BLOCKED)
+    async with ctx.product.database.sessions() as db:
+        assert await db.scalar(select(Session.id).limit(1)) is None
+        assert (await db.get(Binding, row["id"])).sync_state == "blocked"

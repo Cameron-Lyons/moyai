@@ -486,3 +486,99 @@ async def test_audit_feed_and_export_apply_the_requested_window(governed):
         assert (await client.get('/api/admin/governance/audit/export', params={'format': 'xml'})).status_code == 422
     assert [(f.after.isoformat(), f.before.isoformat()) for f in seen] == [
         ('2026-10-01T00:00:00+00:00', '2026-10-16T00:00:00+00:00')] * 2
+
+
+async def test_no_git_access_refuses_github_grants_and_workflow_plugins(governed):
+    from moyai.product_automations import AutomationDefinition
+    product, governance = governed, governed.database.governance
+    await defaults(product, await profile(product, {'git_access': 'none'}))
+    session = await product.database.create_session(product.actor, NewSession())
+    async with product.database.sessions.begin() as db:
+        principal = await governance.principal(db, product.principal.grant)
+        await governance.admission(db, session, principal, [SimpleNamespace(kind='linear')])
+        await governance.workflow(db, principal, AutomationDefinition(name='Issues', prompt='Work', plugins=['linear']))
+        with pytest.raises(HTTPException, match='disabled by the session security policy'):
+            await governance.admission(db, session, principal, [SimpleNamespace(kind='github')])
+        with pytest.raises(HTTPException, match='connections exceed'):
+            await governance.workflow(db, principal, AutomationDefinition(name='Git', prompt='Work', plugins=['github']))
+
+
+canonical_connections = automation_fixtures.canonical_connections
+
+
+@pytest.mark.parametrize('permissions', [None, ['sessions.create', 'sessions.read']])
+async def test_slack_auto_selection_keeps_only_connections_the_policy_and_role_allow(
+        automations, canonical_connections, permissions):
+    from sqlalchemy import update
+
+    from moyai.models import Turn
+    from moyai.product_slack_conversations import SlackConversation
+    from moyai.product_slack_events import SlackEvents, SlackMessage
+    ctx = automations
+    product = ctx.product
+    attach(product)
+    for provider in ('linear', 'notion'):
+        await automation_fixtures.save_connection(ctx, provider)
+    await defaults(product, await profile(product, {'connected_apps': ['linear']}))
+    principal = product.principal if permissions is None else await member_role(product, permissions)
+    session = await product.database.create_session(product.actor, NewSession(visibility='shared'))
+    async with product.database.sessions.begin() as db:
+        await db.execute(update(Session).where(Session.id == session.id).values(surface='slack'))
+        grants = await canonical_connections.resolve_grants(
+            product.actor.id, ['linear', 'notion'], shared_session=True, surface='slack', db=db)
+    await automation_fixtures.bind_slack_test_session(product.database, session.id, product.actor)
+
+    async def catalog(actor_id, *, shared_session, surface):
+        return [{'id': grant.id, 'kind': grant.kind} for grant in grants]
+
+    events = SlackEvents(SimpleNamespace(
+        runtime=SimpleNamespace(database=product.database, slack_activity=SimpleNamespace(wake=asyncio.Event())),
+        connections=SimpleNamespace(catalog=catalog), delivery_wakeup=asyncio.Event(),
+    ))
+    origin = {'team_id': 'TTEST0001', 'channel_id': 'DTEST0001', 'thread_ts': '1792255740.000',
+              'message_ts': '1792255800.000', 'user_id': 'UTEST0001', 'event_id': 'governed-slack'}
+    message = SlackMessage({}, None, origin, 'Work', mentioned=True, direct=True, key='governed-slack', command=None)
+    thread = SimpleNamespace(session_id=session.id)
+    await events._admit(message, SlackConversation(thread=thread), product.actor, principal, {'authority': 'a' * 64})
+    async with product.database.sessions() as db:
+        turn = await db.scalar(select(Turn).where(Turn.session_id == session.id))
+    # Slack has no account picker: excluded kinds, or every kind without
+    # connections.read, are left out instead of refusing the message.
+    assert json.loads(turn.connections) == ([grant.id for grant in grants if grant.kind == 'linear']
+                                            if permissions is None else [])
+
+
+@pytest.mark.parametrize('change', ['disabled', 'narrowed'])
+async def test_scheduled_governance_refusal_blocks_the_workflow_instead_of_retrying(automations, change):
+    from datetime import UTC, datetime, timedelta
+
+    from sqlalchemy import func
+
+    from moyai.models import Turn
+    from moyai.product_automation_models import ProductAutomationBinding as Binding
+    from moyai.product_automations import GOVERNANCE_BLOCKED
+    ctx = automations
+    product = ctx.product
+    attach(product)
+    selected = await profile(product, {})
+    chat = None
+    if change == 'narrowed':
+        chat = (await product.database.create_session(product.actor, NewSession(visibility='shared'))).id
+    row, binding = await automation_fixtures.activate(ctx, security_profile_id=selected, session_id=chat)
+    if change == 'disabled':
+        await source_write(product, 'UPDATE moyai.security_profiles SET enabled=0 WHERE id=:id', id=selected)
+    else:  # The chat is now wider than its workflow's policy.
+        await profile(product, {'git_access': 'read'}, identity=selected, revision=2)
+    async with product.database.sessions() as db:
+        sessions = await db.scalar(select(func.count()).select_from(Session))
+    assert (await automation_fixtures.occurrence(ctx, row, binding))['status'] == 'blocked'
+    later = datetime.now(UTC) + timedelta(seconds=1)
+    assert (await automation_fixtures.occurrence(ctx, row, binding, stamp=later))['status'] == 'blocked'
+    async with product.database.sessions() as db:
+        assert await db.scalar(select(func.count()).select_from(Session)) == sessions
+        assert await db.scalar(select(func.count()).select_from(Turn)) == 0
+        current = await db.get(Binding, row['id'])
+        assert (current.sync_state, current.last_error) == ('blocked', GOVERNANCE_BLOCKED)
+    async with product.source.connect() as db:
+        details = (await db.execute(text('SELECT detail FROM moyai.automation_runs'))).scalars().all()
+    assert details == [GOVERNANCE_BLOCKED] * 2

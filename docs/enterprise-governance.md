@@ -81,7 +81,9 @@ live authority before releasing their results.
 Policies constrain connected apps, tool names, managed Git access (`write`,
 `read`, or `none`), and network destinations. For apps, tools, and domains,
 `null` is unrestricted, an empty list permits nothing, and a populated list is an
-allowlist. Intersections can only narrow a bound policy.
+allowlist. Intersections can only narrow a bound policy. Git access `none` also
+refuses GitHub connections. Slack has no account picker, so a Slack message
+selects only the connections its session policy and the sender's role allow.
 
 New native sessions pin the selected/default profile's revision and complete
 policy in one admission transaction. PostgreSQL rejects updates and deletes of
@@ -96,7 +98,9 @@ A workflow may retain its saved profile without regaining policy-management
 permission. Workflow edits recheck selection and connected-app/repository limits
 inside the writer transaction. A workflow created or updated by an agent cannot
 exceed the creating session's effective policy. Both scheduled and event-triggered
-admissions bind that workflow's profile before admitting work.
+admissions bind that workflow's profile before admitting work. A run refused by
+that profile, the effective policy or the owner's role is recorded as blocked,
+and the workflow stays blocked until its owner enables it again.
 
 Native tool catalogs omit disallowed operations. Tool execution checks the policy
 again, including every Temporal activity attempt. Managed connection credential
@@ -127,6 +131,10 @@ do not consume budget. Reported final USD costs come from the native inference
 ledger; no prices are invented for missing receipts. These are admission limits,
 not provider-side prepaid reservations. Already dispatched work is not cancelled
 by a limit change. Without a configured limit, admission reads no usage.
+
+Native Slack intake does not transcribe audio, since gateway transcription is
+neither admitted against these limits nor recorded in the ledger. The original
+file remains available to the agent.
 
 ## Audit and API
 

@@ -144,3 +144,16 @@ async def test_real_file_reader_downloads_inspects_and_retains_before_reuse(slac
         original = await db.get(Upload, first["uploads"][0])
         assert original.name == "notes.txt" and original.media_type == "text/plain"
         assert await slack.runtime.objects.get(original.digest) == content
+
+
+async def test_audio_is_kept_as_an_original_without_an_unledgered_transcription(slack, monkeypatch):
+    from app.audio import AudioTranscriber
+
+    async def paid(*_args):
+        pytest.fail("Slack intake must not send a transcription request outside native inference admission.")
+
+    monkeypatch.setattr(AudioTranscriber, "transcribe", paid)
+    raw = io.BytesIO(b"ID3" + bytes(61))
+    media, preview, excerpt, error = await slack.service.files.reader.inspect("note.mp3", raw, "audio/mpeg")
+    assert (media, preview, excerpt) == ("audio/mpeg", b"", "")
+    assert "original file is available" in error

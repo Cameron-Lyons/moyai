@@ -42,6 +42,17 @@ class FileConnectors:
         return await self.service.execution.call(lambda bound: bound.request(*args, **kwargs))
 
 
+class UnledgeredTranscription:
+    """Keep Slack audio as an original file instead of transcribing it.
+
+    Gateway transcription runs before any role or spend check and outside the
+    native inference ledger, so spend limits and reports could not see it.
+    """
+
+    async def transcribe(self, raw, name, media_type):
+        raise ValueError("Audio transcription is unavailable for Slack messages. The original file is available.")
+
+
 class ProductSlackFiles:
     def __init__(self, slack: ProductSlack):
         self.slack, self.runtime = slack, slack.runtime
@@ -49,6 +60,7 @@ class ProductSlackFiles:
             settings=slack.settings, connectors=FileConnectors(slack),
             status=lambda **_: {"enabled": slack.settings.slack_bot_enabled},
         ))
+        self.reader.transcriber = UnledgeredTranscription()
 
     async def retain(self, actor_id: str, identity: str, name: str, raw: bytes, media: str) -> Upload:
         digest = await self.runtime.objects.put(raw)

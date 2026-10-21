@@ -108,7 +108,7 @@ async def test_second_participant_reaches_execution_in_existing_slack_workspace(
         bot = next(g for g in private if g.policy["product"]["access"] == "bot")
         with monkeypatch.context() as seed:
             async def old_catalog(*args, **kwargs):
-                return [{"id": bot.id}]
+                return [{"id": bot.id, "kind": "slack"}]
             seed.setattr(service.connections, "catalog", old_catalog)
             await service.receive_payload(context_tests.envelope(context_tests.mention_message()))
     else:

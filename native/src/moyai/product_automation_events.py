@@ -678,7 +678,7 @@ class ProductAutomationEvents:
                     "detail": "The Temporal admission workflow ended before a canonical run was recorded."})
 
     async def admit(self, occurrence: str) -> dict:
-        from .product_automations import _definition
+        from .product_automations import GOVERNANCE_BLOCKED, _definition
         service = self.service
         table = service._table("automation_events")
         async with service.database.sessions.begin() as db:
@@ -761,13 +761,16 @@ class ProductAutomationEvents:
             )
             if len(prompt) > 500_000:
                 return await settled("blocked", "Saved instructions and event context exceed the native input limit.")
-            session, turn = await service.database.admit_automation(
-                db, grant=grant, title=f"Automation · {definition.name}", prompt=prompt,
+            admitted = await service._admit_governed(
+                db, binding, grant=grant, title=f"Automation · {definition.name}", prompt=prompt,
                 model=service.settings.resolve_model(definition.model or None),
                 request_key="automation-" + hashlib.sha256(occurrence.encode()).hexdigest(),
                 connections=connections, session_id=definition.session_id,
                 security_profile_id=definition.security_profile_id,
             )
+            if admitted is None:
+                return await settled("blocked", GOVERNANCE_BLOCKED)
+            session, turn = admitted
             if service.workspace is not None:
                 await service.workspace.bind_automation_turn(db, session, turn, workspace)
             return await settled("admitted", "Admitted to the native execution core.", session, turn)
