@@ -95,6 +95,39 @@ jobs:
           name: native-tests-${{ matrix.shard }}
           path: native/test-results/
           if-no-files-found: warn
+  governance:
+    name: Canonical governance services
+    # Native enforcement calls these app/ services (roles, SCIM, policies,
+    # spend limits, audit); no other job runs their suites.
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_PASSWORD: native-test-only
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      MOYAI_TEST_POSTGRES_URL: postgresql://postgres:native-test-only@127.0.0.1:5432/postgres
+      GOVERNANCE_TESTS: >-
+        tests/test_enterprise_roles.py tests/test_scim.py tests/test_security_profiles.py
+        tests/test_spend_limits.py tests/test_governance_audit.py tests/test_governance_schema.py
+        tests/test_governance_foundation.py tests/test_user_roles_governance.py
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: '3.13'
+      - run: uv sync --frozen
+        working-directory: native
+      - run: uv run --project native pytest -q --tb=short $GOVERNANCE_TESTS tests/test_storage_maintenance.py
+      - run: uv run --project native pytest -q --tb=short --postgres-backend $GOVERNANCE_TESTS
   workspace-node:
     name: Coding computer Node (${{ matrix.platform }})
     runs-on: ubuntu-latest
