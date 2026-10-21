@@ -5,10 +5,10 @@ import asyncio
 from typing import Literal
 
 from app.enterprise_roles import GovernanceActor, GroupRoleChange, RoleAssignment, RoleCreate, RoleUpdate
-from app.governance_audit import AuditFilters
+from app.governance_audit import parse_filters
 from app.permissions import BUILTIN_PERMISSIONS, catalog
 from app.scim import TokenCreate
-from app.security_profiles import ProfileDefaults, SaveProfile, validated
+from app.security_profiles import ProfileDefaults, SaveProfile
 from app.spend_limits import SpendLimitChanges
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from fastapi.responses import StreamingResponse
@@ -186,8 +186,8 @@ def routes(runtime):
         return await spend_view(user)
 
     def filters(action, actor_email, resource_type, after, before):
-        return validated(AuditFilters, {'action': action, 'actor': actor_email, 'resource_type': resource_type,
-                                        'after': after, 'before': before})
+        return parse_filters(action=action, actor=actor_email, resource_type=resource_type,
+                             after=after, before=before)
 
     @router.get('/api/admin/governance/audit', operation_id='listGovernanceAudit')
     async def audit(cursor: str | None = None, limit: int = Query(50, ge=1, le=100),

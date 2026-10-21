@@ -1502,7 +1502,7 @@ export type AuditPage = {
      * Entries
      */
     entries: Array<AuditEntry>;
-    facets: AuditFacets;
+    facets: AuditFacets | null;
     /**
      * Next Cursor
      */
@@ -8833,7 +8833,7 @@ export type ScimAdmin = {
     /**
      * Activity
      */
-    activity: Array<AuditEntry>;
+    activity: Array<AuditEntry> | null;
     /**
      * Base Url
      */
@@ -8845,11 +8845,11 @@ export type ScimAdmin = {
     /**
      * Groups
      */
-    groups: Array<ScimGroupSummary>;
+    groups: Array<ScimGroupSummary> | null;
     /**
      * Tokens
      */
-    tokens: Array<ScimToken>;
+    tokens: Array<ScimToken> | null;
     users: ScimUserPage;
 };
 

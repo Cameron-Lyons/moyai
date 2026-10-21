@@ -736,3 +736,52 @@ async def test_continuation_keeps_the_saved_policy_of_a_historical_governed_sess
         policy = await product.database.governance.policy(db, result['id'])
     assert policy.git_access == git_access
     assert policy.tools == (('read_file',) if git_access == 'none' else None)
+
+
+async def test_effective_policy_is_read_once_per_transaction(governed, monkeypatch):
+    """Regression: every tool and model check re-read the policy its transaction had already computed."""
+    product, governance = governed, governed.database.governance
+    session = await product.database.create_session(product.actor, NewSession())
+    profiles, reads = governance.product.profiles, []
+    original = profiles.mandatory_in
+    monkeypatch.setattr(profiles, 'mandatory_in', lambda read: reads.append(read) or original(read))
+    async with product.database.sessions.begin() as db:
+        await governance.principal(db, product.principal)
+        first = await governance.policy(db, session.id)
+        assert await governance.policy(db, session.id) is first and len(reads) == 1
+    await defaults(product, mandatory=await profile(product, {'tools': ['read_file']}))
+    async with product.database.sessions.begin() as db:
+        await governance.principal(db, product.principal)
+        assert (await governance.policy(db, session.id)).tools == ('read_file',) and len(reads) == 2
+
+
+async def test_audit_routes_reject_bad_filters_with_the_tested_sentence(governed):
+    """Regression: the routes validated filters apart from parse_filters and returned a raw error list."""
+    class Unreached:
+        def listing(self, *args):
+            pytest.fail('Invalid audit filters reached the feed.')
+        export = listing
+    window = {'after': '2026-10-02T00:00:00Z', 'before': '2026-10-01T00:00:00Z'}
+    async with governance_client(governed, audit=Unreached()) as client:
+        for path in ('/api/admin/governance/audit', '/api/admin/governance/audit/export'):
+            response = await client.get(path, params=window)
+            assert (response.status_code, response.json()) == (422, {'detail': 'Choose an end time after the start time.'})
+
+
+async def test_load_more_pages_carry_only_their_rows(governed):
+    """Regression: cursor pages had to recompute facets and directory sections that the client discards."""
+    class Audit:
+        def listing(self, filters, cursor, limit):
+            return {'entries': [], 'next_cursor': None, 'facets': None}
+    class Directory:
+        def router(self):
+            from fastapi import APIRouter
+            return APIRouter()
+        def directory(self, cursor, limit, actor):
+            return {'base_url': 'http://127.0.0.1:8787/scim/v2', 'users': {'items': [], 'next_cursor': None},
+                    'groups': None, 'tokens': None, 'activity': None, 'can_create_tokens': True}
+    async with governance_client(governed, audit=Audit(), scim=Directory()) as client:
+        audit = await client.get('/api/admin/governance/audit', params={'cursor': 'next'})
+        assert audit.status_code == 200 and audit.json()['facets'] is None
+        page = (await client.get('/api/admin/scim', params={'cursor': 'next'})).json()
+        assert (page['groups'], page['tokens'], page['activity']) == (None, None, None)

@@ -132,3 +132,28 @@ async def test_production_repository_resolver_skips_connector_errors() -> None:
     resolved = await make_repository_names(connections)([101, 102, 103])
 
     assert resolved == ["org/repo-101", "org/repo-103"]
+
+
+@pytest.mark.asyncio
+async def test_governance_is_checked_once_before_and_once_after_resolution() -> None:
+    """Regression: every GitHub grant opened its own governance transaction twice per model request."""
+    events: list[str] = []
+
+    class Governance:
+        async def connection(self, run_scope: RunScope, grant: Grant) -> None:
+            events.append(f"check:{grant.kind}")
+
+    class Recording(Names):
+        async def __call__(self, repository_ids: Sequence[int]) -> list[str]:
+            events.append("resolve")
+            return await super().__call__(repository_ids)
+
+    rendered = await GitHubRepositories(Recording(["org/repo"]), Governance()).render(scope(
+        github_grant(101, "first"),
+        Grant(id="other", kind="slack", revision=1, credential=""),
+        github_grant(102, "second"),
+        github_grant(103, "third"),
+    ))
+
+    assert rendered.startswith("Connected GitHub repositories for this session: org/repo.")
+    assert events == ["check:github", "resolve", "check:github"]

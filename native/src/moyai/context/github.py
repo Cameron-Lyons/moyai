@@ -52,15 +52,14 @@ class GitHubRepositories(ContextSource):
         ))
         if not repository_ids:
             return ""
+        # Read access depends on the scope and the GitHub kind, never on which
+        # grant, so one check before and after resolving covers every grant.
+        grant = next(grant for grant in scope.grants if grant.kind == "github")
         if self.governance is not None:
-            for grant in scope.grants:
-                if grant.kind == 'github':
-                    await self.governance.connection(scope, grant)
+            await self.governance.connection(scope, grant)
         names = await self.repository_names(repository_ids)
         if self.governance is not None:
-            for grant in scope.grants:
-                if grant.kind == 'github':
-                    await self.governance.connection(scope, grant)
+            await self.governance.connection(scope, grant)
         if not names:
             return ""
         repositories = ", ".join(sorted(names)[:30])

@@ -500,7 +500,10 @@ class GovernanceAudit:
             initialize_schema(store)
 
     def listing(self, filters=None, cursor=None, limit=DEFAULT_LIMIT):
-        """{'entries', 'next_cursor', 'facets'}. 422 for a bad limit or cursor."""
+        """{'entries', 'next_cursor', 'facets'}; facets only on the first page, None with a cursor.
+
+        422 for a bad limit or cursor.
+        """
         filters = _filters(filters)
         if type(limit) is not int or not 1 <= limit <= MAX_LIMIT:
             raise HTTPException(422, f'Choose an audit page size from 1 to {MAX_LIMIT}.')
@@ -508,7 +511,7 @@ class GovernanceAudit:
         with self.store.connect() as conn:
             conn.begin_read()
             items, after = self._page_in(conn, filters, position, limit)
-            facets = self._facets_in(conn)
+            facets = self._facets_in(conn) if position is None else None
         return {'entries': [item.entry for item in items],
                 'next_cursor': self._cursor(after, filters) if after is not None else None,
                 'facets': facets}
@@ -516,10 +519,12 @@ class GovernanceAudit:
     def export(self, filters=None, fmt='csv') -> Iterator[str]:
         """CSV (header first) or NDJSON lines in feed order, at most MAX_EXPORT_ROWS.
 
-        Validation and the first page run before this returns, so failures are
-        ordinary errors rather than a truncated download. Each later page opens
-        its own read snapshot inside next(), so no connection is held between
-        chunks of a slow download.
+        Each chunk holds one page of up to EXPORT_PAGE rows, so a caller that
+        rechecks authority per chunk does so per page, not per row. Validation
+        and the first page run before this returns, so failures are ordinary
+        errors rather than a truncated download. Each later page opens its own
+        read snapshot inside next(), so no connection is held between chunks of
+        a slow download.
         """
         filters = _filters(filters)
         if fmt not in EXPORT_FORMATS:
@@ -529,14 +534,13 @@ class GovernanceAudit:
 
     def _stream(self, filters, fmt, page):
         line = _csv_entry if fmt == 'csv' else _ndjson_entry
-        if fmt == 'csv':
-            yield _csv_line(EXPORT_COLUMNS)
+        header = _csv_line(EXPORT_COLUMNS) if fmt == 'csv' else ''
         sent = 0
         while True:
             items, position = page
-            for item in items:
-                yield line(item.entry)
-            sent += len(items)
+            if chunk := header + ''.join(line(item.entry) for item in items):
+                yield chunk
+            header, sent = '', sent + len(items)
             if position is None or sent >= MAX_EXPORT_ROWS:
                 return
             page = self._page(filters, position, min(EXPORT_PAGE, MAX_EXPORT_ROWS - sent))

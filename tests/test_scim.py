@@ -430,11 +430,11 @@ def test_attribute_projection_matches_groups_without_loading_members(provision, 
     service, client = provision.service, provision.client
     person = user(client, name={'givenName': 'Pat'})
     team = group(client, [person], 'Eng')
-    related, original = [], service.resource_in
-    monkeypatch.setattr(service, 'resource_in', lambda *args, **kwargs: related.append(kwargs.get('related', True)) or original(*args, **kwargs))
+    related, original = [], service._related_in
+    monkeypatch.setattr(service, '_related_in', lambda *args: related.append(args[1]) or original(*args))
     found = client.get('/scim/v2/Groups', params={'excludedAttributes': 'members', 'filter': 'displayName eq "Eng"'})
     assert found.status_code == 200, found.text
-    assert set(found.json()['Resources'][0]) == {'schemas', 'id', 'meta', 'displayName'} and related == [False]
+    assert set(found.json()['Resources'][0]) == {'schemas', 'id', 'meta', 'displayName'} and related == []
     single = client.get('/scim/v2/Groups/' + team['id'], params={'excludedAttributes': CORE + 'Group:Members'}).json()
     assert single['displayName'] == 'Eng' and 'members' not in single
     users = client.get('/scim/v2/Users', params={'attributes': 'userName, NAME'}).json()['Resources']
@@ -651,6 +651,8 @@ def test_admin_directory_pages_users_with_counts_and_constant_statements(provisi
     assert [item['user_name'] for item in second['users']['items'] + third['users']['items']] == [
         'u02@example.com', 'u03@example.com', 'u04@example.com']
     assert third['users']['next_cursor'] is None and second['users']['items'][0]['active'] is False
+    # Load more keeps the first page's sections instead of re-aggregating every membership.
+    assert (second['groups'], second['tokens'], second['activity']) == (None, None, None)
     assert [(row['display_name'], row['member_count'], row['role_id'], row['role_name']) for row in first['groups']] == [
         ('alumni', 1, None, None), ('Engineering', 2, 'reader', 'Reader')]
     assert first['base_url'] == 'http://localhost:8787/scim/v2'
@@ -934,3 +936,29 @@ def test_unencodable_text_and_nul_are_permanent_client_errors(provision, monkeyp
     monkeypatch.setattr(service, 'read', lambda *args: (_ for _ in ()).throw(
         UnicodeEncodeError('utf-8', '\ud800', 0, 1, 'surrogates not allowed')))
     assert scim_type(client.get('/scim/v2/Users')) == 'invalidValue'
+
+
+def test_list_pages_read_resources_and_memberships_in_constant_statements(provision, monkeypatch):
+    """Regression: each listed resource was read, with its groups or members, by its own queries."""
+    client = provision.client
+    pair = [user(client, f'pair{index}@example.com') for index in range(2)]
+    group(client, pair, 'Pair')
+    executed = statements(monkeypatch)
+
+    def page(kind, **params):
+        executed.clear()
+        response = client.get('/scim/v2/' + kind, params=params)
+        assert response.status_code == 200, response.text
+        return len(executed), response.json()['Resources']
+
+    small = page('Users')[0], page('Groups', attributes='displayName,members')[0]
+    more = [user(client, f'more{index}@example.com') for index in range(6)]
+    group(client, more, 'More')
+    group(client, [*pair, *more], 'Everyone')
+    (users_run, users), (groups_run, groups) = page('Users'), page('Groups', attributes='displayName,members')
+    assert (users_run, groups_run) == small and [len(item['groups']) for item in users] == [2] * 8
+    assert sorted((item['displayName'], len(item['members'])) for item in groups) == [
+        ('Everyone', 8), ('More', 6), ('Pair', 2)]
+    # A page holds the same documents as reading each resource on its own.
+    assert users == [client.get('/scim/v2/Users/' + item['id']).json() for item in users]
+    assert groups == [client.get('/scim/v2/Groups/' + item['id']).json() for item in groups]

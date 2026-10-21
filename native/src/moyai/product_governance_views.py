@@ -103,7 +103,8 @@ class AuditFacets(GovernanceView):
 class AuditPage(GovernanceView):
     entries: list[AuditEntry]
     next_cursor: str | None
-    facets: AuditFacets
+    # Only the first page (no cursor) carries facets.
+    facets: AuditFacets | None
 
 
 class ScimUserSummary(GovernanceView):
@@ -147,9 +148,10 @@ class CreatedScimToken(ScimToken):
 class ScimAdmin(GovernanceView):
     base_url: str
     users: ScimUserPage
-    groups: list[ScimGroupSummary]
-    tokens: list[ScimToken]
-    activity: list[AuditEntry]
+    # Only the first page (no cursor) carries the groups, tokens and activity.
+    groups: list[ScimGroupSummary] | None
+    tokens: list[ScimToken] | None
+    activity: list[AuditEntry] | None
     # Only a built-in administrator can create provisioning tokens.
     can_create_tokens: bool
 

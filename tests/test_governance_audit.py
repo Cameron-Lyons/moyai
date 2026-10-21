@@ -124,6 +124,13 @@ def pages(audit, filters=None, limit=7):
     raise AssertionError('Pagination did not finish.')
 
 
+def records(chunks):
+    """NDJSON export records; each is exactly one newline-terminated line."""
+    text = ''.join(chunks)
+    assert text == '' or text.endswith('\n')
+    return [json.loads(line) for line in text.split('\n')[:-1]]
+
+
 def detail(call):
     with pytest.raises(HTTPException) as rejected:
         call()
@@ -366,17 +373,15 @@ def test_ndjson_and_csv_exports_follow_feed_order_in_pages_and_are_capped(store,
     for index in range(41):
         writers[index % 4](store, BASE + timedelta(seconds=random.randint(0, 3), microseconds=random.choice((0, 5))))
     listing = audit.listing(None, None, 200)['entries']
-    lines = list(audit.export(None, 'ndjson'))
-    assert all(line.endswith('\n') and line.count('\n') == 1 for line in lines)
-    assert [json.loads(line) for line in lines] == listing
+    assert records(audit.export(None, 'ndjson')) == listing
     monkeypatch.setattr(governance_audit, 'EXPORT_PAGE', 4)
-    assert [json.loads(line) for line in audit.export(None, 'ndjson')] == listing
+    assert records(audit.export(None, 'ndjson')) == listing
     monkeypatch.setattr(governance_audit, 'MAX_EXPORT_ROWS', 10)
-    assert [json.loads(line) for line in audit.export(None, 'ndjson')] == listing[:10]
+    assert records(audit.export(None, 'ndjson')) == listing[:10]
     rows = list(csv.reader(io.StringIO(''.join(audit.export(None, 'csv')), newline='')))
     assert len(rows) == 11 and [row[0] for row in rows[1:]] == [entry['created_at'] for entry in listing[:10]]
     filters = parse_filters(resource_type='credential')
-    assert [json.loads(line)['source'] for line in audit.export(filters, 'ndjson')] == ['credentials'] * 10
+    assert [entry['source'] for entry in records(audit.export(filters, 'ndjson'))] == ['credentials'] * 10
 
 
 def test_export_validates_before_streaming(audit, monkeypatch):
@@ -410,7 +415,7 @@ def test_reads_never_take_the_writer_lock(store, audit, monkeypatch):
         monkeypatch.setattr(kind, 'begin_write', forbidden)
         monkeypatch.setattr(kind, 'begin_read', lambda self, original=original: reads.append(1) or original(self))
     monkeypatch.setattr(governance_audit, 'EXPORT_PAGE', 3)
-    assert len(pages(audit, limit=3)) == 10 and len(list(audit.export(None, 'csv'))) == 11
+    assert len(pages(audit, limit=3)) == 10 and ''.join(audit.export(None, 'csv')).count('\r\n') == 11
     assert len(reads) == 4 + 4
 
 
@@ -492,7 +497,7 @@ def test_feed_order_is_byte_order_whatever_the_database_collation(store, audit):
     for index in range(80):
         writers[index % 4](store, BASE + timedelta(seconds=random.randint(0, 3), microseconds=random.choice((0, 0, 1, 999999))))
     assert pages(audit, limit=1) == pages(audit, limit=7) == oracle(store)
-    assert [json.loads(line)['id'] for line in audit.export(None, 'ndjson')] == [ident for _, ident in oracle(store)]
+    assert [entry['id'] for entry in records(audit.export(None, 'ndjson'))] == [ident for _, ident in oracle(store)]
 
 
 def test_postgres_feed_pages_use_the_byte_ordered_indexes(store):
@@ -513,3 +518,25 @@ def test_postgres_feed_pages_use_the_byte_ordered_indexes(store):
                     continue
                 plan = '\n'.join(row[0] for row in conn.execute('EXPLAIN ' + statement[0], statement[1]).fetchall())
                 assert index in plan and 'Sort' not in plan.replace('Sort Key', ''), (source.name, plan)
+
+
+def test_exports_release_one_chunk_per_page(store, audit, monkeypatch):
+    """Regression: every row was its own chunk, so the route rechecked live authority and hopped threads per row."""
+    for second in range(10):
+        governance_row(store, BASE + timedelta(seconds=second))
+    monkeypatch.setattr(governance_audit, 'EXPORT_PAGE', 4)
+    chunks = list(audit.export(None, 'ndjson'))
+    assert [chunk.count('\n') for chunk in chunks] == [4, 4, 2]
+    assert records(chunks) == audit.listing(None, None, 200)['entries']
+    chunks = list(audit.export(None, 'csv'))
+    assert [chunk.count('\r\n') for chunk in chunks] == [5, 4, 2]
+    assert chunks[0].startswith(','.join(EXPORT_COLUMNS) + '\r\n')
+
+
+def test_facets_come_only_with_the_first_page(store, audit):
+    """Regression: every load-more page recomputed facets that the client discards."""
+    for second in range(3):
+        governance_row(store, BASE + timedelta(seconds=second))
+    first = audit.listing(None, None, 2)
+    assert first['facets']['actions'] and first['next_cursor']
+    assert audit.listing(None, first['next_cursor'], 2)['facets'] is None

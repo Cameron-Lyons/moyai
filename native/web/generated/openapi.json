@@ -2681,7 +2681,14 @@
             "type": "array"
           },
           "facets": {
-            "$ref": "#/components/schemas/AuditFacets"
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/AuditFacets"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "next_cursor": {
             "anyOf": [
@@ -15700,11 +15707,18 @@
       "ScimAdmin": {
         "properties": {
           "activity": {
-            "items": {
-              "$ref": "#/components/schemas/AuditEntry"
-            },
-            "title": "Activity",
-            "type": "array"
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/AuditEntry"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Activity"
           },
           "base_url": {
             "title": "Base Url",
@@ -15715,18 +15729,32 @@
             "type": "boolean"
           },
           "groups": {
-            "items": {
-              "$ref": "#/components/schemas/ScimGroupSummary"
-            },
-            "title": "Groups",
-            "type": "array"
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/ScimGroupSummary"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Groups"
           },
           "tokens": {
-            "items": {
-              "$ref": "#/components/schemas/ScimToken"
-            },
-            "title": "Tokens",
-            "type": "array"
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/ScimToken"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tokens"
           },
           "users": {
             "$ref": "#/components/schemas/ScimUserPage"

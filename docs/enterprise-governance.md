@@ -159,9 +159,12 @@ file remains available to the agent.
 ## Audit and API
 
 The audit feed combines metadata-only role, SCIM, policy, spend, credential, and
-connection changes. Filters and signed cursors bound each page. CSV/NDJSON exports
-recheck live permission before releasing each chunk. Tokens, credential contents,
-prompts, and policy domain/tool payloads are excluded from governance events.
+connection changes. Filters and signed cursors bound each page. Only the first page
+(no cursor) carries the filter facets, as only the provisioning directory's first
+page carries its groups, tokens and activity. CSV/NDJSON exports stream pages of up
+to 1,000 rows and recheck live permission before releasing each page. Tokens,
+credential contents, prompts, and policy domain/tool payloads are excluded from
+governance events.
 This records configuration history, not a transcript of every agent action.
 
 | Endpoint | Purpose |

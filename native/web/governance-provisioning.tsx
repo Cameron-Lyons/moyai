@@ -63,7 +63,9 @@ export function ProvisioningPage({ canManageRoles }: { canManageRoles: boolean }
         setPages(previous => previous.base === data ? { base: data, items: [...previous.items, ...page.users.items], next: page.users.next_cursor, loaded: true, loading: false, error: "" } : previous)
       }, reason => { if (!controller.signal.aborted) setPages(previous => ({ ...previous, loading: false, error: errorText(reason) })) })
     }
-    const active = data.tokens.filter(token => !token.revoked_at).length
+    // The first page (no cursor) carries the sections; load-more pages only add users.
+    const tokens = data.tokens ?? [], groups = data.groups ?? [], activity = data.activity ?? []
+    const active = tokens.filter(token => !token.revoked_at).length
     return <>
       <div className="ns-gov-intro"><p className="ns-notice">Your identity provider creates, updates and deactivates people and groups through SCIM 2.0. Deactivated people lose access immediately, and their queued or running work is stopped.</p>
         <PageActions resource={resource} /></div>
@@ -73,7 +75,7 @@ export function ProvisioningPage({ canManageRoles }: { canManageRoles: boolean }
       <Section id="gov-tokens" title="Provisioning tokens" description={`${active === 1 ? "1 active token" : `${active} active tokens`}. Tokens are stored as hashes and are shown only when created.`}
         action={data.can_create_tokens && <Button onClick={() => setCreate(true)}><Plus />Create token</Button>}>
         {!data.can_create_tokens && <p className="ns-muted">A built-in administrator creates provisioning tokens. You can review and revoke them.</p>}
-        {data.tokens.length ? <TokenRows tokens={data.tokens} onRevoke={setRevoke} /> : <p className="ns-muted">No provisioning tokens yet.{data.can_create_tokens ? " Create one to connect your identity provider." : ""}</p>}
+        {tokens.length ? <TokenRows tokens={tokens} onRevoke={setRevoke} /> : <p className="ns-muted">No provisioning tokens yet.{data.can_create_tokens ? " Create one to connect your identity provider." : ""}</p>}
       </Section>
       <Section id="gov-directory-users" title="Directory users" description="People provisioned by your identity provider. Their role is managed under Users and Roles & access.">
         <Toolbar search={search} setSearch={setSearch} count={rows.length} label="Search directory users"
@@ -85,10 +87,10 @@ export function ProvisioningPage({ canManageRoles }: { canManageRoles: boolean }
         {next && <Button className="ns-gov-more" variant="outline" disabled={pages.loading} onClick={more}>{pages.loading ? "Loading users…" : "Load more users"}</Button>}
       </Section>
       <Section id="gov-directory-groups" title="Directory groups" description={canManageRoles ? <>Grant a role to a group in <a className="ns-link" href="#settings/roles">Roles & access</a>.</> : "Group role grants are managed by people with the roles.manage permission."}>
-        {data.groups.length ? <DirectoryGroupRows groups={data.groups} /> : <p className="ns-muted">No groups have been provisioned yet.</p>}
+        {groups.length ? <DirectoryGroupRows groups={groups} /> : <p className="ns-muted">No groups have been provisioned yet.</p>}
       </Section>
       <Section id="gov-scim-activity" title="Recent provisioning activity">
-        <ActivityList entries={data.activity} empty="Provisioning changes appear here after your identity provider syncs." />
+        <ActivityList entries={activity} empty="Provisioning changes appear here after your identity provider syncs." />
       </Section>
       {revoke && <GovConfirm title={`Revoke ${revoke.label}?`} label="Revoke token" onReload={resource.refresh} onClose={() => setRevoke(null)}
         description="Your identity provider can no longer sync with this token. People and groups already provisioned are kept. This cannot be undone; create a new token to reconnect."

@@ -5,6 +5,7 @@ import re
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from typing import Any
+from weakref import WeakKeyDictionary
 
 from fastapi import HTTPException
 from sqlalchemy import Numeric, and_, cast, exists, false, func, literal, not_, or_, select, text
@@ -114,15 +115,26 @@ class ProductGovernance:
         await db.flush()
         return row
 
+    # Effective policies of bound sessions, per root transaction. Bindings are
+    # immutable, and the shared gate callers take through principal() keeps
+    # mandatory-profile writers out until the transaction ends, so a repeat
+    # read in one transaction is the same value.
+    _policies: WeakKeyDictionary[Any, dict[str, Any]] = WeakKeyDictionary()
+
     async def policy(self, db, session_id):
         from app.security_profiles import ProfilePolicy, effective, load_policy
         row = await db.get(ProductSessionPolicy, session_id)
-        # Sessions predating the migration had no selected profile. The live
-        # mandatory policy still applies to these historical sessions.
-        saved = load_policy(row.policy) if row else ProfilePolicy()
-        mandatory = await db.run_sync(lambda sync: self.product.profiles.mandatory_in(
-            CanonicalRead(sync, self.identity)))
-        return effective(saved, mandatory.policy if mandatory else None)
+        # bind() may still pin an unbound session later in this transaction.
+        transaction = db.sync_session.get_transaction() if row is not None else None
+        memo = {} if transaction is None else self._policies.setdefault(transaction, {})
+        if session_id not in memo:
+            mandatory = await db.run_sync(lambda sync: self.product.profiles.mandatory_in(
+                CanonicalRead(sync, self.identity)))
+            # Sessions predating the migration had no selected profile. The live
+            # mandatory policy still applies to these historical sessions.
+            memo[session_id] = effective(load_policy(row.policy) if row else ProfilePolicy(),
+                                         mandatory.policy if mandatory else None)
+        return memo[session_id]
 
     @staticmethod
     def require_provider(policy):

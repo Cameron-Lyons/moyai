@@ -655,26 +655,36 @@ class Scim:
         row = conn.execute(f"SELECT * FROM {table} WHERE id=? AND deleted_at=''", (identity,)).fetchone()
         if not row:
             raise ScimError(404, MISSING)
+        return self._resource(row, kind, self._related_in(conn, kind, [identity])[identity] if related else None)
+
+    def _related_in(self, conn, kind, identities):
+        """{id: groups (Users) or members (Groups) in id order} for at most CHUNK resources, in one query."""
+        if kind == 'User':
+            query = '''SELECT m.user_id AS owner,g.id AS id,g.display_name AS display FROM scim_groups g
+                JOIN scim_group_members m ON m.group_id=g.id WHERE m.user_id IN ({}) AND g.deleted_at='' ORDER BY g.id'''
+            path, link = '/Groups/', 'direct'
+        else:
+            query = '''SELECT m.group_id AS owner,u.id AS id,u.user_name AS display FROM scim_users u
+                JOIN scim_group_members m ON m.user_id=u.id WHERE m.group_id IN ({}) AND u.deleted_at='' ORDER BY u.id'''
+            path, link = '/Users/', 'User'
+        related = {identity: [] for identity in identities}
+        for row in conn.execute(query.format(','.join('?' * len(identities))), identities):
+            related[row['owner']].append({'value': row['id'], 'display': row['display'], 'type': link,
+                                          '$ref': self.base_url + path + row['id']})
+        return related
+
+    def _resource(self, row, kind, related):
+        """The SCIM representation of a stored row; related None omits groups or members."""
         result = json.loads(row['profile']) if kind == 'User' else {'displayName': row['display_name']}
         result.update(schemas=[CORE + kind], id=row['id'])
         if row['external_id']:
             result['externalId'] = row['external_id']
         if kind == 'User':
             result.update(userName=row['user_name'], active=bool(row['active']))
-            if related:
-                result['groups'] = [{'value': group['id'], 'display': group['display_name'], 'type': 'direct',
-                                     '$ref': self.base_url + '/Groups/' + group['id']}
-                                    for group in conn.execute('''SELECT g.id,g.display_name FROM scim_groups g
-                                        JOIN scim_group_members m ON m.group_id=g.id WHERE m.user_id=? AND g.deleted_at=''
-                                        ORDER BY g.id''', (identity,))]
-        elif related:
-            result['members'] = [{'value': user['id'], 'display': user['user_name'], 'type': 'User',
-                                  '$ref': self.base_url + '/Users/' + user['id']}
-                                 for user in conn.execute('''SELECT u.id,u.user_name FROM scim_users u
-                                     JOIN scim_group_members m ON m.user_id=u.id WHERE m.group_id=? AND u.deleted_at=''
-                                     ORDER BY u.id''', (identity,))]
+        if related is not None:
+            result['groups' if kind == 'User' else 'members'] = related
         result['meta'] = {'resourceType': kind, 'created': row['created_at'], 'lastModified': row['updated_at'],
-                          'location': self.base_url + '/' + kind + 's/' + identity}
+                          'location': self.base_url + '/' + kind + 's/' + row['id']}
         return result
 
     def write_user_in(self, conn, body, identity, token):
@@ -885,13 +895,15 @@ class Scim:
             args.append(int(value) if isinstance(value, bool) else value)
         total = conn.execute(f'SELECT COUNT(*) AS n FROM {table} WHERE {predicate}', args).fetchone()['n']
         # The offset is below the row count, so it always fits the database integer.
-        ids = [] if count == 0 or start > total else conn.execute(
-            f'SELECT id FROM {table} WHERE {predicate} ORDER BY id LIMIT ? OFFSET ?', [*args, count, start - 1]).fetchall()
+        rows = [] if count == 0 or start > total else conn.execute(
+            f'SELECT * FROM {table} WHERE {predicate} ORDER BY id LIMIT ? OFFSET ?', [*args, count, start - 1]).fetchall()
         # A page of up to MAX_RESULTS groups never materializes their members
         # unless asked (attributes=members); GET /Groups/{id} returns them.
         related = self.related(selection, kind) if kind == 'User' else bool(
             selection is not None and selection[0] and 'members' in selection[1])
-        resources = [self.project(self.resource_in(conn, kind, row['id'], related=related), selection, kind) for row in ids]
+        # One membership query for the whole page, never one per resource.
+        links = self._related_in(conn, kind, [row['id'] for row in rows]) if related and rows else {}
+        resources = [self.project(self._resource(row, kind, links.get(row['id'])), selection, kind) for row in rows]
         return {'schemas': [API + 'ListResponse'], 'totalResults': total, 'startIndex': start,
                 'itemsPerPage': len(resources), 'Resources': resources}
 
@@ -998,13 +1010,16 @@ class Scim:
     # Provisioning administration
 
     def directory(self, cursor=None, limit=50, actor=None):
-        """GET /api/admin/scim. Users are keyset pages by (user_name, id); other sections are complete.
+        """GET /api/admin/scim. Users are keyset pages by (user_name, id).
 
-        actor, when given, must hold scim.manage and decides can_create_tokens.
+        The complete groups, tokens and activity sections come only with the
+        first page; they are None with a cursor. actor, when given, must hold
+        scim.manage and decides can_create_tokens.
         """
         if type(limit) is not int or not 1 <= limit <= 200:
             raise GovernanceInvalid('Choose a page size from 1 to 200.')
         after = _read_cursor(cursor) if cursor else ['', '']
+        groups = tokens = activity = None
         with self.store.connect() as conn:
             conn.begin_read()
             authority = self.roles.enterprise.authorize_in(conn, actor, 'scim.manage') if actor is not None else None
@@ -1014,24 +1029,26 @@ class Scim:
                      WHERE m.user_id=u.id) AS groups_count
                 FROM scim_users u WHERE u.deleted_at='' AND (u.user_name>? OR (u.user_name=? AND u.id>?))
                 ORDER BY u.user_name,u.id LIMIT ?''', (after[0], after[0], after[1], limit + 1)).fetchall()
-            groups = [{'id': row['id'], 'display_name': row['display_name'], 'member_count': int(row['member_count']),
-                       'role_id': row['role_id'], 'role_name': row['role_name'] if row['role_id'] else None}
-                      for row in conn.execute('''SELECT g.id,g.display_name,g.display_key,r.role_id,e.name AS role_name,
-                              COUNT(u.id) AS member_count FROM scim_groups g
-                          LEFT JOIN scim_group_members m ON m.group_id=g.id
-                          LEFT JOIN scim_users u ON u.id=m.user_id AND u.deleted_at='' AND u.active=1
-                          LEFT JOIN enterprise_group_roles r ON r.group_id=g.id
-                          LEFT JOIN enterprise_roles e ON e.id=r.role_id
-                          WHERE g.deleted_at='' GROUP BY g.id,g.display_name,g.display_key,r.role_id,e.name
-                          ORDER BY g.display_key,g.id''')]
-            tokens = [_token_view(row) for row in conn.execute('''SELECT id,label,prefix,created_at,created_by,
-                last_used_at,revoked_at FROM scim_tokens ORDER BY created_at DESC,id DESC''')]
-            activity = [{'id': row['id'], 'source': 'governance', 'action': row['action'], 'actor': row['actor'],
-                         'resource_type': row['resource_type'], 'resource_id': row['resource_id'],
-                         'details': json.loads(row['details']), 'created_at': row['created_at']}
-                        for row in conn.execute('''SELECT * FROM governance_audit_events
-                            WHERE resource_type IN ('scim_user','scim_group','scim_token')
-                            ORDER BY created_at DESC,id DESC LIMIT 20''')]
+            # Load more keeps the first page's sections; recomputing them would re-aggregate every membership.
+            if not cursor:
+                groups = [{'id': row['id'], 'display_name': row['display_name'], 'member_count': int(row['member_count']),
+                           'role_id': row['role_id'], 'role_name': row['role_name'] if row['role_id'] else None}
+                          for row in conn.execute('''SELECT g.id,g.display_name,g.display_key,r.role_id,e.name AS role_name,
+                                  COUNT(u.id) AS member_count FROM scim_groups g
+                              LEFT JOIN scim_group_members m ON m.group_id=g.id
+                              LEFT JOIN scim_users u ON u.id=m.user_id AND u.deleted_at='' AND u.active=1
+                              LEFT JOIN enterprise_group_roles r ON r.group_id=g.id
+                              LEFT JOIN enterprise_roles e ON e.id=r.role_id
+                              WHERE g.deleted_at='' GROUP BY g.id,g.display_name,g.display_key,r.role_id,e.name
+                              ORDER BY g.display_key,g.id''')]
+                tokens = [_token_view(row) for row in conn.execute('''SELECT id,label,prefix,created_at,created_by,
+                    last_used_at,revoked_at FROM scim_tokens ORDER BY created_at DESC,id DESC''')]
+                activity = [{'id': row['id'], 'source': 'governance', 'action': row['action'], 'actor': row['actor'],
+                             'resource_type': row['resource_type'], 'resource_id': row['resource_id'],
+                             'details': json.loads(row['details']), 'created_at': row['created_at']}
+                            for row in conn.execute('''SELECT * FROM governance_audit_events
+                                WHERE resource_type IN ('scim_user','scim_group','scim_token')
+                                ORDER BY created_at DESC,id DESC LIMIT 20''')]
         items = []
         for row in rows[:limit]:
             profile = json.loads(row['profile'])
