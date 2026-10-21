@@ -597,7 +597,8 @@ def _verify_added(
                 SELECT t.tgname,p.prosrc FROM pg_trigger t JOIN pg_proc p ON p.oid=t.tgfoid
                 JOIN pg_namespace pn ON pn.oid=p.pronamespace JOIN pg_language l ON l.oid=p.prolang
                 WHERE t.tgrelid=%s::regclass AND NOT t.tgisinternal AND t.tgtype=27 AND t.tgenabled='O'
-                    AND t.tgqual IS NULL AND t.tgnargs=0 AND p.proname=t.tgname AND pn.nspname=%s
+                    AND t.tgqual IS NULL AND cardinality(t.tgattr::int2[])=0 AND t.tgnargs=0
+                    AND p.proname=t.tgname AND pn.nspname=%s
                     AND l.lanname='plpgsql' AND p.prorettype='trigger'::regtype AND p.pronargs=0
             """, (relation, schema)).fetchall()
             count = connection.execute(

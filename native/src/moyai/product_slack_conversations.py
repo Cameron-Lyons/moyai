@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any
@@ -105,6 +106,7 @@ class SlackConversations:
     async def _session_for_admission(
         self, db: AsyncSession, actor: User, principal: ProductPrincipal, source: dict | None,
         origin: dict[str, str], prompt: str, body: NewMessage | None,
+        narrow: Callable[[AsyncSession, str], Awaitable[NewMessage]] | None = None,
     ) -> Session:
         if source is None:
             session = await self.database.create_session(
@@ -120,7 +122,7 @@ class SlackConversations:
             session_id = mapping.native_session_id
         elif body is not None:
             result = await continuation.continue_for_admission(
-                db, actor, principal, source["run_id"], body, surface="slack", provenance=origin,
+                db, actor, principal, source["run_id"], body, surface="slack", provenance=origin, narrow=narrow,
             )
             session_id = result["id"]
         else:
@@ -163,12 +165,13 @@ class SlackConversations:
         self, conversation: SlackConversation, actor: User, principal: ProductPrincipal,
         origin: dict[str, str], installed: dict, prompt: str, body: NewMessage | None,
         *, wake: bool, uploads: list[str],
+        narrow: Callable[[AsyncSession, str], Awaitable[NewMessage]] | None = None,
     ) -> SlackThread | None:
         """Persist the resolved destination with an already prepared, immutable input."""
         source = conversation.source
         try:
             async with self.database.sessions.begin() as db:
-                session = await self._session_for_admission(db, actor, principal, source, origin, prompt, body)
+                session = await self._session_for_admission(db, actor, principal, source, origin, prompt, body, narrow)
                 await db.flush()
                 if uploads:
                     await self.slack.files.bind(db, actor.id, session.id, uploads)

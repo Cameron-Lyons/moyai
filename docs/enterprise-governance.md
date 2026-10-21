@@ -64,6 +64,11 @@ SCIM does not create an interactive login session. Revoking a token stops that
 provisioning credential without deleting the provisioned directory. With
 Cloudflare Access sign-in, provisioning operations need only that bearer
 credential, not an Access assertion; token administration still requires Access.
+The edge must also let the identity provider reach `/scim/v2` (an Access bypass
+or service-auth policy for that path), because the origin exemption cannot see
+requests Access blocks. Directory writes take the canonical writer lock and
+briefly pause native admissions, so run large initial imports or group
+replacements off-peak.
 
 | Permission | Governance access |
 | --- | --- |
@@ -133,7 +138,8 @@ admission, so concurrent work can cross a limit by its in-flight cost. A request
 stops counting as in flight one minute after the model timeout
 (`MOYAI_MODEL_TIMEOUT`), even if its final status was never recorded. A finished
 request without a reported cost fails closed for every limited scope it counts
-toward while receipt recovery can still settle it, for at most 24 hours.
+toward while receipt recovery can still settle it, for at most 24 hours, or
+one hour once LiteLLM reports it has no log for that request.
 Requests known not to have dispatched, requests the gateway answered with an
 error status (LiteLLM records those at zero spend), and duplicate receipts whose
 charge another request carries do not consume budget. A cost that recovery
@@ -144,6 +150,13 @@ from the native inference ledger; no prices are invented for missing receipts.
 These are admission limits, not provider-side prepaid reservations. Already
 dispatched work is not cancelled by a limit change. Without a configured limit,
 admission reads no usage.
+
+Native turns stream, and a streamed request's cost arrives only in its final
+event. Before configuring a limit, have the gateway report it there (for LiteLLM,
+`include_cost_in_streaming_usage: true` under `litellm_settings`; confirm that a
+test request records a cost on the Spend limits page). Otherwise every finished
+request is unpriced: each limited scope refuses new requests until recovery
+settles the previous ones, and with recovery disabled the limits never block.
 
 A session budget reads only its delegation family, through the family root
 bound with each session. Organization and per-person budgets sum the month's

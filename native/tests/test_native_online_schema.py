@@ -33,6 +33,7 @@ from moyai.product_schema import (
     SESSION_POLICY_FUNCTION_BODY,
     SESSION_POLICY_TABLE,
     SESSION_POLICY_TRIGGER,
+    ProductSchemaError,
     _manifest,
     application_metadata,
     migrate_product_schema,
@@ -133,9 +134,19 @@ async def test_governance_expansion_installs_the_immutable_binding_online(produc
         assert apply(connection, value, guard=lambda _: None)["status"] == "applied"
     # Normal startup verification checks the exact immutability trigger.
     await verify_product_schema(product.source, schema=product.schema, version=GOVERNANCE_SCHEMA_VERSION)
+    trigger, table = sql.Identifier(SESSION_POLICY_TRIGGER), sql.Identifier(product.schema, SESSION_POLICY_TABLE)
     with psycopg.connect(product.settings.postgres_url, autocommit=True) as connection:
-        connection.execute(sql.SQL("DROP TRIGGER {} ON {}").format(
-            sql.Identifier(SESSION_POLICY_TRIGGER), sql.Identifier(product.schema, SESSION_POLICY_TABLE)))
+        # A column-scoped trigger with the reviewed body would leave other columns editable.
+        connection.execute(sql.SQL("DROP TRIGGER {} ON {}").format(trigger, table))
+        connection.execute(sql.SQL("CREATE TRIGGER {} BEFORE UPDATE OF created_at OR DELETE ON {} "
+                                   "FOR EACH ROW EXECUTE FUNCTION {}()").format(
+            trigger, table, sql.Identifier(product.schema, SESSION_POLICY_TRIGGER)))
+        with pytest.raises(OnlineSchemaError, match="target_structure_changed"):
+            inspect(connection, value)
+    with pytest.raises(ProductSchemaError, match="trigger"):
+        await verify_product_schema(product.source, schema=product.schema, version=GOVERNANCE_SCHEMA_VERSION)
+    with psycopg.connect(product.settings.postgres_url, autocommit=True) as connection:
+        connection.execute(sql.SQL("DROP TRIGGER {} ON {}").format(trigger, table))
         with pytest.raises(OnlineSchemaError, match="target_structure_changed"):
             inspect(connection, value)
 

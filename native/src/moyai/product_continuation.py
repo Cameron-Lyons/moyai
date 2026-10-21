@@ -23,6 +23,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from typing import TYPE_CHECKING, Any
 
@@ -502,6 +503,7 @@ class ProductContinuationService:
         accept_recent_history: bool = False, accept_workspace_omissions: bool = False,
         drain_idle_workspace: bool = False,
         received_at: str | None = None,
+        narrow: Callable[[AsyncSession, str], Awaitable[NewMessage]] | None = None,
     ) -> dict[str, Any]:
         if actor.id != principal.id or not db.in_transaction() or db.get_bind().dialect.name != "postgresql":
             raise HTTPException(403, "Continuation needs the same canonical requester and PostgreSQL admission.")
@@ -564,6 +566,9 @@ class ProductContinuationService:
         if governance is not None:
             await governance.bind(db, target, current, ceiling=await self._saved_policy(db, source_id))
         await db.flush()
+        if narrow is not None:
+            # An automatic selection is narrowed to the policy just bound.
+            body = await narrow(db, target.id)
         if target_surface == "slack":
             slack = self.runtime.product_slack
             if slack is None:

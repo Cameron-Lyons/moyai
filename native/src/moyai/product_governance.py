@@ -14,6 +14,9 @@ from .product_governance_models import ProductSessionPolicy
 
 # A request without a reported cost stops blocking budgets after this long.
 RECEIPT_WINDOW = timedelta(days=1)
+# LiteLLM writes spend logs within seconds, so a receipt it still has not
+# logged after this long is reported instead of blocking; recovery keeps trying.
+MISSING_RECEIPT_WINDOW = timedelta(hours=1)
 # A model activity ends at its timeout; this allows for its final ledger write.
 IN_FLIGHT_MARGIN = timedelta(minutes=1)
 # LiteLLM records a gateway error at zero spend, and a duplicate receipt's
@@ -48,7 +51,9 @@ class SpendLedger:
             recoverable = and_(usage.created_at >= (now - RECEIPT_WINDOW).isoformat(), exists().where(
                 request.request_key == usage.request_key, request.gateway_scope == gateway,
                 request.key_hash == key_hash,
-                or_(request.next_attempt_at.is_not(None), request.recovery_error == 'receipt_access_denied')))
+                or_(request.next_attempt_at.is_not(None), request.recovery_error == 'receipt_access_denied'),
+                or_(request.recovery_error.is_distinct_from('not_found'),
+                    usage.created_at >= (now - MISSING_RECEIPT_WINDOW).isoformat())))
         self.spent = func.coalesce(func.sum(cast(usage.cost_usd, Numeric)), 0)
         self.awaiting = func.count().filter(unpriced, recoverable)
         self.unresolved = func.count().filter(unpriced, not_(recoverable))

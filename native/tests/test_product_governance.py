@@ -338,7 +338,7 @@ async def session_limit(product):
     await source_write(product, "INSERT INTO moyai.spend_limits VALUES('session-default','session-default','',10,1,'owner','now')")
 
 
-@pytest.mark.parametrize('outcome', ['parked', 'expired', 'disabled', 'rotated'])
+@pytest.mark.parametrize('outcome', ['parked', 'expired', 'missing', 'disabled', 'rotated'])
 async def test_unpriced_request_blocks_only_while_recovery_can_settle_it(inference, outcome):
     ctx = inference
     attach(ctx.product)
@@ -352,6 +352,15 @@ async def test_unpriced_request_blocks_only_while_recovery_can_settle_it(inferen
             await db.execute(update(ProductInferenceRequest).values(next_attempt_at=None, recovery_error='unverified_zero'))
         elif outcome == 'expired':
             old = (datetime.now(UTC) - timedelta(days=2)).isoformat()
+            await db.execute(update(InferenceUsage).values(created_at=old))
+        elif outcome == 'missing':
+            # LiteLLM never logged it: recovery keeps retrying, but it blocks only for the first hour.
+            await db.execute(update(ProductInferenceRequest).values(recovery_error='not_found'))
+    if outcome == 'missing':
+        with pytest.raises(HTTPException, match='spend limit'):
+            await perform(ctx, logical='still-blocked')
+        async with ctx.product.database.sessions.begin() as db:
+            old = (datetime.now(UTC) - timedelta(hours=2)).isoformat()
             await db.execute(update(InferenceUsage).values(created_at=old))
     if outcome == 'disabled':
         ctx.service.settings.litellm_spend_recovery_enabled = False
@@ -736,6 +745,29 @@ async def test_continuation_keeps_the_saved_policy_of_a_historical_governed_sess
         policy = await product.database.governance.policy(db, result['id'])
     assert policy.git_access == git_access
     assert policy.tools == (('read_file',) if git_access == 'none' else None)
+
+
+async def test_historical_continuation_narrows_an_automatic_selection_after_binding(governed_continuation, monkeypatch):
+    """Regression: a historical Slack thread's first message submitted its whole unfiltered catalog."""
+    import test_product_continuation as continuation_fixtures
+
+    from moyai.models import Turn
+    product, seen = governed_continuation, []
+    original = product.service.continue_for_admission
+
+    async def continue_with_narrowing(db, actor, principal, source_id, body, **kwargs):
+        async def narrow(db, session_id):
+            seen.append(await db.get(ProductSessionPolicy, session_id) is not None)
+            return body.model_copy(update={'connections': []})
+        return await original(db, actor, principal, source_id, body, **kwargs, narrow=narrow)
+
+    monkeypatch.setattr(product.service, 'continue_for_admission', continue_with_narrowing)
+    # Unnarrowed, this unavailable selection would refuse the whole continuation.
+    result = await continuation_fixtures.admit(product, connections=['f' * 32])
+    assert seen == [True]
+    async with product.database.sessions() as db:
+        turn = await db.scalar(select(Turn).where(Turn.session_id == result['id']))
+    assert json.loads(turn.connections) == []
 
 
 async def test_effective_policy_is_read_once_per_transaction(governed, monkeypatch):

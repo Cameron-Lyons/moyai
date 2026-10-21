@@ -259,6 +259,8 @@ class SlackEvents:
                 submission.body if submission else None,
                 wake=message.mentioned or message.command_name == "wake",
                 uploads=submission.uploads if submission else [],
+                narrow=(lambda db, session_id: self._automatic(db, session_id, principal, submission))
+                if submission else None,
             )
             if thread is None:
                 return {"ok": True, "review_required": True}

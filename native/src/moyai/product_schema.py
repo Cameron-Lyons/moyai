@@ -394,7 +394,8 @@ async def _verify(
                          SESSION_POLICY_TRIGGER, SESSION_POLICY_FUNCTION_BODY))
     for table_name, trigger_name, events, function_name, body in required:
         trigger = (await connection.execute(text(
-            "SELECT t.tgtype,t.tgenabled::text AS tgenabled,p.proname,p.prosrc,pn.nspname AS function_schema "
+            "SELECT t.tgtype,t.tgenabled::text AS tgenabled,p.proname,p.prosrc,pn.nspname AS function_schema,"
+            "cardinality(t.tgattr::int2[])=0 AND t.tgqual IS NULL AS unconditional "
             "FROM pg_trigger t JOIN pg_class c ON c.oid=t.tgrelid "
             "JOIN pg_namespace n ON n.oid=c.relnamespace "
             "JOIN pg_proc p ON p.oid=t.tgfoid JOIN pg_namespace pn ON pn.oid=p.pronamespace "
@@ -404,7 +405,7 @@ async def _verify(
         if (
             trigger is None or trigger["tgenabled"] not in {"O", "A"} or trigger["tgtype"] != events
             or trigger["function_schema"] != schema or trigger["proname"] != function_name
-            or trigger["prosrc"].strip() != body
+            or trigger["prosrc"].strip() != body or not trigger["unconditional"]
         ):
             raise ProductSchemaError(f"The immutable product-authority trigger is missing: {trigger_name}.")
 
