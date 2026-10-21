@@ -353,6 +353,8 @@ def _ddl(metadata: MetaData, steps: tuple[Expansion, ...] | None = None) -> list
         for name, trigger, body in step.immutable:
             # The same statements as the offline migration, for a table created above.
             table = next(table for table in metadata.tables.values() if table.name == name)
+            if table.schema is None:
+                raise OnlineSchemaError("native_online_scope_invalid")
             function = f"{preparer.quote_schema(table.schema)}.{preparer.quote(trigger)}"
             statements.append(f"CREATE FUNCTION {function}() RETURNS trigger LANGUAGE plpgsql AS $$ {body} $$")
             statements.append(f"CREATE TRIGGER {preparer.quote(trigger)} BEFORE UPDATE OR DELETE "

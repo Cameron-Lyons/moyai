@@ -10,6 +10,7 @@ from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 from uuid import NAMESPACE_URL, uuid5
 
+from app.audio import AudioTranscriber
 from app.db import database as source_database
 from app.slack_files import SlackFileError, SlackFiles
 from fastapi import HTTPException
@@ -42,7 +43,7 @@ class FileConnectors:
         return await self.service.execution.call(lambda bound: bound.request(*args, **kwargs))
 
 
-class UnledgeredTranscription:
+class UnledgeredTranscription(AudioTranscriber):
     """Keep Slack audio as an original file instead of transcribing it.
 
     Gateway transcription runs before any role or spend check and outside the
@@ -60,7 +61,7 @@ class ProductSlackFiles:
             settings=slack.settings, connectors=FileConnectors(slack),
             status=lambda **_: {"enabled": slack.settings.slack_bot_enabled},
         ))
-        self.reader.transcriber = UnledgeredTranscription()
+        self.reader.transcriber = UnledgeredTranscription(slack.settings)
 
     async def retain(self, actor_id: str, identity: str, name: str, raw: bytes, media: str) -> Upload:
         digest = await self.runtime.objects.put(raw)
