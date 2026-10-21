@@ -68,7 +68,9 @@ const auditPages=[
   [entry('a4','spend_limit.updated','spend_limit','organization',{limit_usd:5000,previous_usd:null})],
 ];
 const rolesView=()=>({roles:state.roles,assignments:state.assignments,group_roles:state.groupRoles,groups:state.groups,grantable:state.role==='admin'?null:state.permissions,builtin_admin:state.role==='admin'});
-const spendView=()=>({limits:state.limits,usage:{organization_month_usd:1234.56,period_start:'2026-10-01T00:00:00+00:00'},can_manage:state.permissions.includes('spend.manage')});
+// Like the server, usage totals (and each row's used_usd) are null for a caller without spend.read.
+const spendView=(usage=true)=>({limits:usage?state.limits:state.limits.map(row=>({...row,used_usd:null})),
+  usage:usage?{organization_month_usd:1234.56,period_start:'2026-10-01T00:00:00+00:00',unknown_requests:0}:null,can_manage:state.permissions.includes('spend.manage')});
 async function handle(req,res,next) {
   const url=new URL(req.url,'http://localhost');
   if(!url.pathname.startsWith('/api/'))return next();
@@ -117,9 +119,11 @@ async function handle(req,res,next) {
       return json({base_url:'https://moyai.example.test/scim/v2',users:{items:page&&state.emptyNextPage?[]:scimUsers[page],next_cursor:page?null:'users-2'},
         groups:state.groups.map(group=>{const grant=state.groupRoles.find(row=>row.group_id===group.id&&row.role_id);return {...group,role_id:grant?.role_id??null,role_name:grant?.role_name??null};}),
         tokens:state.tokens,activity:[entry('s1','scim_user.deactivated','scim_user','u2',{},'Okta production'),entry('s2','scim_token.created','scim_token','tok-1')],can_create_tokens:state.role==='admin'});}
+    // 201 with the token record plus its one-time secret, as a single object.
     if(p==='/api/admin/scim/tokens'&&method==='POST'){const token={id:'tok-2',label:data.label,prefix:'moyai_scim_new1',created_at:stamp,created_by:'admin@example.test',last_used_at:null,revoked_at:null};
-      state.tokens=[token,...state.tokens];return json({id:token.id,label:token.label,prefix:token.prefix,created_at:stamp,token:'moyai_scim_new1_SYNTHETIC_ONE_TIME_SECRET'},201);}
+      state.tokens=[token,...state.tokens];return json({...token,token:'moyai_scim_new1_SYNTHETIC_ONE_TIME_SECRET'},201);}
     const tokenMatch=p.match(/^\/api\/admin\/scim\/tokens\/([^/]+)$/);
+    // 200 with the revoked token record.
     if(tokenMatch&&method==='DELETE'){const token=state.tokens.find(row=>row.id===decodeURIComponent(tokenMatch[1]));token.revoked_at=stamp;return json(token);}
   }
   // Security policies
@@ -140,15 +144,19 @@ async function handle(req,res,next) {
   if(p.startsWith('/api/admin/spend-limits')) {
     if(!has('spend.read'))return deny();
     if(method==='GET')return json(spendView());
+    // Writes always return the full listing; usage depends on the caller's spend.read.
+    const listing=()=>spendView(!state.withoutSpendRead);
     if(!has('spend.manage'))return deny();
     if(method==='PUT'){for(const change of data.changes){const row=state.limits.find(item=>item.id===change.id);
         if((row?.revision??0)!==change.revision)return json({detail:STALE},409);}
       for(const change of data.changes){const row=state.limits.find(item=>item.id===change.id);
         if(row)Object.assign(row,{limit_usd:change.limit_usd,revision:row.revision+1,updated_at:stamp});
         else state.limits.push({id:change.id,kind:'user',subject:change.id.slice(5),limit_usd:change.limit_usd,revision:1,updated_at:stamp,updated_by:'admin@example.test',used_usd:0});}
-      return json(state.configOnly?{limits:state.limits}:spendView());}
+      return json(listing());}
     const match=p.match(/^\/api\/admin\/spend-limits\/(.+)$/);
-    if(match&&method==='DELETE'){const id=decodeURIComponent(match[1]);state.limits=state.limits.filter(row=>row.id!==id);return json(state.configOnly?{id,deleted:true}:spendView());}
+    if(match&&method==='DELETE'){const id=decodeURIComponent(match[1]),row=state.limits.find(item=>item.id===id);
+      if(!row||Number(url.searchParams.get('revision'))!==row.revision)return json({detail:STALE},409);
+      state.limits=state.limits.filter(item=>item.id!==id);return json(listing());}
   }
   // Audit log
   if(p==='/api/admin/governance/audit/export') {
@@ -318,6 +326,7 @@ test('provisioning: copy the SCIM URL, show a new token once, page directory use
   const reveal=page.getByRole('dialog',{name:'Copy your provisioning token'});await reveal.waitFor();
   assert.deepEqual(last('/api/admin/scim/tokens','POST').body,{label:'Entra staging'});
   await reveal.getByRole('alert').getByText('This token is shown only once.').waitFor();
+  // The one-time view reads the label and secret from the created token object.
   const secret=reveal.getByRole('textbox',{name:'Bearer token for Entra staging'});assert.equal(await secret.inputValue(),'moyai_scim_new1_SYNTHETIC_ONE_TIME_SECRET');
   assert.equal(await secret.evaluate(el=>el===document.activeElement),true);
   assert.equal(await reveal.getByRole('button',{name:'Close'}).count(),0,'only Done closes the one-time view');
@@ -335,6 +344,8 @@ test('provisioning: copy the SCIM URL, show a new token once, page directory use
   await page.getByRole('button',{name:'Revoke Okta production'}).click();const revoke=page.getByRole('dialog',{name:'Revoke Okta production?'});
   await revoke.getByText(/can no longer sync with this token/).waitFor();await revoke.getByRole('button',{name:'Revoke token'}).click();await revoke.waitFor({state:'hidden'});
   assert.ok(last('/api/admin/scim/tokens/tok-1','DELETE'));
+  await page.getByRole('button',{name:'Revoke Okta production'}).waitFor({state:'detached'});
+  assert.equal(await page.getByRole('row').filter({hasText:'Okta production'}).getByText('Revoked',{exact:true}).count(),1,'the revoked token is listed as revoked');
   await page.getByRole('region',{name:'Directory groups'}).getByText('Contractor').waitFor();
 });
 
@@ -400,10 +411,15 @@ test('spend limits: blank means no limit, overrides add/edit/remove, and only ch
   assert.equal(last('/api/admin/spend-limits/user:carol@example.test','DELETE').query,'?revision=3');
   await table.getByText('carol@example.test').waitFor({state:'detached'});
   assert.equal(spendReads(),reads,'saves that return the full listing replace it without another read');
-  state.configOnly=true;
+  const summary=page.getByRole('definition').filter({hasText:'$1,234.56'});assert.equal(await summary.count(),1);
+  state.withoutSpendRead=true;
   await page.getByRole('button',{name:'Edit limit for dan@example.test'}).click();const bare=page.getByRole('dialog',{name:'Edit limit for dan@example.test'});
   await bare.getByRole('textbox',{name:'Monthly limit (USD)'}).fill('40');await bare.getByRole('button',{name:'Save limit'}).click();await bare.waitFor({state:'hidden'});
-  await waitFor(()=>spendReads()===reads+1,'a configuration-only response is read again');await table.getByText('$40.00').waitFor();
+  await table.getByText('$40.00').waitFor();
+  await page.locator('dl[aria-label="Organization spend this month"]').waitFor({state:'detached'});
+  assert.equal(await summary.count(),0,'usage totals are hidden when the listing has none');
+  assert.equal(await table.getByRole('row').filter({hasText:'dan@example.test'}).getByRole('cell',{name:'—',exact:true}).count(),1,'per-person spend is unknown without usage');
+  assert.equal(spendReads(),reads,'a listing without usage still replaces the page without another read');
 });
 
 test('audit log: filters, date validation, cursor paging and exports',async t=>{

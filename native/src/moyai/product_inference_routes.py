@@ -20,7 +20,7 @@ from pydantic import TypeAdapter, ValidationError
 from starlette.responses import Response, StreamingResponse
 
 from .contracts import RunScope
-from .inference_usage import INFERENCE_ACTIVITY, InferenceActivity, InferenceUsageTransport
+from .inference_usage import INFERENCE_ACTIVITY, InferenceActivity
 from .models import now
 from .product_inference import InferenceAdmissionError, drain
 
@@ -28,7 +28,7 @@ if TYPE_CHECKING:
     from .inference_usage import UsageCapture
     from .product_inference import ProductInferenceService
 
-MAX_REQUEST_BYTES = 8 * 1024 * 1024
+MAX_MEMORY_REVIEW_RESPONSE_BYTES = 8 * 1024 * 1024
 MAX_ENVELOPE_BYTES = 64 * 1024
 ROUTES = {"responses", "responses/compact", "chat/completions"}
 SCOPE = TypeAdapter(RunScope)
@@ -45,8 +45,6 @@ def broker_request(
     if activity.logical_identity is None or activity.scope.product_grant is None:
         raise InferenceAdmissionError("Native broker requests require original product activity authority.")
     content = request.content
-    if len(content) > MAX_REQUEST_BYTES:
-        raise InferenceAdmissionError("The native model request exceeds the broker request limit.")
     prefix = httpx2.URL(service.settings.litellm_api_base).path.rstrip("/") + "/"
     route = request.url.path.removeprefix(prefix)
     if route not in ROUTES:
@@ -109,12 +107,17 @@ async def _maintenance_response(
     service: ProductInferenceService, activity: InferenceActivity, route: str, content: bytes,
 ) -> Response:
     """One reclaimable owner spans admission, provider I/O, accounting and close."""
+    # Shutdown removes the slot runner. Check before constructing its coroutine;
+    # registration has no intervening await and perform() checks admission again.
+    if not service.started or service.slots is None:
+        return Response(status_code=409, headers={"x-moyai-inference-denied": "1"})
+
     async def perform() -> Response:
+        try:
+            client = service.upstream_client()
+        except InferenceAdmissionError:
+            return Response(status_code=409, headers={"x-moyai-inference-denied": "1"})
         token = INFERENCE_ACTIVITY.set(activity)
-        client = httpx2.AsyncClient(
-            transport=InferenceUsageTransport(require_admission=True),
-            timeout=service.database.settings.model_timeout_seconds, follow_redirects=False,
-        )
         upstream = None
         try:
             upstream = await client.send(client.build_request(
@@ -126,7 +129,7 @@ async def _maintenance_response(
             ), stream=True)
             body = bytearray()
             async for chunk in upstream.aiter_raw():
-                if len(body) + len(chunk) > MAX_REQUEST_BYTES:
+                if len(body) + len(chunk) > MAX_MEMORY_REVIEW_RESPONSE_BYTES:
                     raise InferenceAdmissionError("The memory-review response exceeds its bound.")
                 body.extend(chunk)
             headers = {name: upstream.headers[name] for name in (
@@ -185,8 +188,6 @@ def product_inference_routes(service: ProductInferenceService) -> APIRouter:
             return Response(status_code=403, headers={"x-moyai-inference-denied": "1"})
         content = bytearray()
         async for chunk in request.stream():
-            if len(content) + len(chunk) > MAX_REQUEST_BYTES:
-                raise HTTPException(413, "The model request exceeds the broker request limit.")
             content.extend(chunk)
         try:
             scope, identity, logical, ordinal, foreground = _verify(
@@ -206,11 +207,11 @@ def product_inference_routes(service: ProductInferenceService) -> APIRouter:
         )
         if scope.surface == "memory_review":
             return await _maintenance_response(service, activity, route, bytes(content))
+        try:
+            client = service.upstream_client()
+        except InferenceAdmissionError:
+            return Response(status_code=409, headers={"x-moyai-inference-denied": "1"})
         token = INFERENCE_ACTIVITY.set(activity)
-        client = httpx2.AsyncClient(
-            transport=InferenceUsageTransport(require_admission=True),
-            timeout=service.database.settings.model_timeout_seconds, follow_redirects=False,
-        )
         try:
             upstream = await client.send(client.build_request(
                 "POST", service.settings.litellm_api_base.rstrip("/") + "/" + route,

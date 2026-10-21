@@ -27,9 +27,20 @@ import json
 import re
 from importlib import import_module
 
-from sqlalchemy import MetaData, String, Text, UniqueConstraint, inspect, text
+from sqlalchemy import (
+    Boolean,
+    CheckConstraint,
+    Integer,
+    MetaData,
+    String,
+    Text,
+    UniqueConstraint,
+    inspect,
+    text,
+)
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
+from sqlalchemy.schema import CreateColumn
 
 from .models import Base, now
 
@@ -55,10 +66,11 @@ SLACK_ACTIVITY_SCHEMA_VERSION = "2026-10-17-slack-activity-v19"
 SLACK_TURN_SOURCE_SCHEMA_VERSION = "2026-10-17-slack-turn-source-v20"
 MESSAGE_SOURCE_SCHEMA_VERSION = "2026-10-18-message-sources-v21"
 GOAL_SCHEMA_VERSION = "2026-10-17-goals-v22"
-GOVERNANCE_SCHEMA_VERSION = '2026-10-19-product-governance-v23'
+AUTOMATION_CHAT_SCHEMA_VERSION = "2026-10-19-automation-chats-v23"
+GOVERNANCE_SCHEMA_VERSION = "2026-10-21-product-governance-v24"
 PRODUCT_SCHEMA_VERSION = GOVERNANCE_SCHEMA_VERSION
-SESSION_POLICY_TABLE = 'moyai_product_session_policies'
-SESSION_POLICY_TRIGGER = 'moyai_product_session_policy_immutable'
+SESSION_POLICY_TABLE = "moyai_product_session_policies"
+SESSION_POLICY_TRIGGER = "moyai_product_session_policy_immutable"
 SESSION_POLICY_FUNCTION_BODY = "BEGIN RAISE EXCEPTION 'A bound session security policy is immutable' USING ERRCODE='55000'; END"
 RECEIPTS = "moyai_app_schema_versions"
 GRANT_TABLE = "moyai_product_turn_authority"
@@ -139,8 +151,15 @@ MIGRATIONS = (
     (SLACK_TURN_SOURCE_SCHEMA_VERSION, SLACK_TURN_SOURCE_TABLES),
     (MESSAGE_SOURCE_SCHEMA_VERSION, frozenset({"moyai_message_sources", "moyai_delivery_schedule"})),
     (GOAL_SCHEMA_VERSION, frozenset({"moyai_goals", "moyai_goal_turns", "moyai_goal_receipts"})),
+    (AUTOMATION_CHAT_SCHEMA_VERSION, frozenset({"moyai_product_automation_turns"})),
     (GOVERNANCE_SCHEMA_VERSION, frozenset({SESSION_POLICY_TABLE})),
 )
+
+# Existing tables can gain reviewed plain nullable columns without changing
+# their historical manifests. Register each (table, column) at its first
+# migration version, alongside a frozen online expansion. No entries are
+# needed for columns introduced with their table.
+COLUMN_MIGRATIONS: dict[str, frozenset[tuple[str, str]]] = {}
 
 
 class ProductSchemaError(RuntimeError):
@@ -159,6 +178,43 @@ def _is_identity(table: str, column: str) -> bool:
     if table == "moyai_billing_records":
         return False  # Shared historical identifiers retain their original unrestricted text.
     return (table == "moyai_users" and column == "id") or column in IDENTITY_COLUMNS
+
+
+def _historical_columns(metadata: MetaData, *, version: str) -> None:
+    versions = [item[0] for item in MIGRATIONS]
+    introduced: set[tuple[str, str]] = set()
+    for birth, columns in COLUMN_MIGRATIONS.items():
+        if birth not in versions or introduced.intersection(columns):
+            raise ProductSchemaError("Native columns require one reviewed migration version.")
+        introduced.update(columns)
+        for table_name, column_name in columns:
+            earlier_tables = frozenset().union(*(tables for _, tables in MIGRATIONS[:versions.index(birth)]))
+            if table_name not in earlier_tables:
+                raise ProductSchemaError("Column migrations must extend an earlier table.")
+            table = next((table for table in metadata.tables.values() if table.name == table_name), None)
+            if table is None:
+                continue  # The table itself did not exist at this version.
+            column = table.columns.get(column_name)
+            if column is None or (
+                not column.nullable or column.primary_key or column.foreign_keys or column.unique or column.index
+                or column.server_default is not None or column.server_onupdate is not None
+                or column.computed is not None or column.identity is not None or column.constraints
+                or type(column.type) not in {String, Text, Integer, Boolean}
+                or any(column_name in index.columns or any(
+                    re.search(r"\b" + re.escape(column_name) + r"\b", str(expression))
+                    for expression in index.expressions
+                ) for index in table.indexes)
+                or any(column_name in getattr(constraint, "columns", ()) or (
+                    isinstance(constraint, CheckConstraint)
+                    and re.search(r"\b" + re.escape(column_name) + r"\b", str(constraint.sqltext))
+                ) for constraint in table.constraints)
+            ):
+                raise ProductSchemaError("Historical column filtering only supports plain nullable additions.")
+            if versions.index(birth) <= versions.index(version):
+                continue
+            # This is an independent inventory copy, never the ORM's table.
+            # SQLAlchemy exposes the mutable collection internally on Table.
+            table._columns.remove(column)
 
 
 def application_metadata(schema: str, *, version: str = PRODUCT_SCHEMA_VERSION) -> MetaData:
@@ -198,6 +254,7 @@ def application_metadata(schema: str, *, version: str = PRODUCT_SCHEMA_VERSION) 
         for column in copy.columns:
             if _is_identity(table.name, column.name):
                 column.type = String(512)
+    _historical_columns(metadata, version=version)
     return metadata
 
 
@@ -404,6 +461,13 @@ async def migrate_product_schema(
                     await connection.run_sync(lambda conn, inventory=metadata, selected=tables: inventory.create_all(
                         conn, tables=[table for table in inventory.sorted_tables if table.name in selected],
                     ))
+                for table_name, column_name in sorted(COLUMN_MIGRATIONS.get(revision, ())):
+                    table = metadata.tables[f"{schema}.{table_name}"]
+                    dialect = postgresql.dialect()
+                    declaration = str(CreateColumn(table.columns[column_name]).compile(dialect=dialect))
+                    await connection.exec_driver_sql(
+                        f"ALTER TABLE {dialect.identifier_preparer.format_table(table)} ADD COLUMN {declaration}"
+                    )
                 if revision == AUTOMATION_CONTEXT_SCHEMA_VERSION:
                     await connection.execute(text(
                         f'CREATE TRIGGER "{AUTOMATION_CONTEXT_TRIGGER}" BEFORE UPDATE '

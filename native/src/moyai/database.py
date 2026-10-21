@@ -22,6 +22,7 @@ from sqlalchemy.dialects.postgresql import insert as postgres_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy.orm import defer
 
 from .answer_settlement import AnswerSettlement
 from .contracts import (
@@ -38,6 +39,7 @@ from .contracts import (
 from .delegation_authority import DelegatedAuthority, saved_authority, session_context
 from .delegation_models import DelegatedSession, DelegatedTurn
 from .dispatch_wakeups import notify_dispatch
+from .failed_action_attempts import settle_failed_action_attempts
 from .goal_models import Goal
 from .goals import Goals
 from .goals import dispatchable as goal_dispatchable
@@ -60,6 +62,7 @@ from .models import (
     now,
 )
 from .postgres import create_engine
+from .product_automation_models import ProductAutomationTurn
 from .product_identity import ProductGrant, ProductIdentityAdapter
 from .security import Security, password_hash
 from .settings import Settings
@@ -80,6 +83,11 @@ def grant_fingerprint(grants: list[Grant]) -> str:
     ).encode()).hexdigest()
 
 
+# Read projections and authorization do not need the agent's private checkpoint.
+# Fail explicitly if a caller accidentally tries to use an omitted field.
+SESSION_METADATA = (defer(Session.conversation, raiseload=True), defer(Session.snapshot, raiseload=True))
+
+
 class Database:
     def __init__(self, settings: Settings, security: Security):
         self.settings = settings
@@ -90,6 +98,8 @@ class Database:
         self.product_identity: ProductIdentityAdapter | None = None
         self.governance: ProductGovernance | None = None
         self.slack_access: Any = None
+        self.slack_prefetch: Any = None
+        self.slack_mentions: Any = None
         self.product_connections: ProductConnections | None = None
         self.product_drain: ProductDrainService | None = None
         self.product_inference: ProductInferenceService | None = None
@@ -208,15 +218,22 @@ class Database:
     async def _check_product_turn(
         self, db: AsyncSession, turn: Turn, expected: ProductGrant | None,
     ) -> ProductGrant | None:
+        grant = await self._check_product_turn_binding(db, turn, expected)
+        if self.product_authority_enabled:
+            # One native connection/transaction avoids recursive pool checkouts.
+            await self._identity().authorize_admission(db, grant)
+        return grant
+
+    async def _check_product_turn_binding(
+        self, db: AsyncSession, turn: Turn, expected: ProductGrant | None,
+    ) -> ProductGrant | None:
+        """Check immutable provenance; callers must separately check live authority."""
         try:
             grant = await self._saved_product_grant(db, turn)
         except PermissionError as error:
             raise HTTPException(403, str(error)) from error
-        if self.product_authority_enabled:
-            if expected != grant:
-                raise HTTPException(403, "The task's original product authority cannot be replaced.")
-            # One native connection/transaction avoids recursive pool checkouts.
-            await self._identity().authorize_admission(db, grant)
+        if self.product_authority_enabled and expected != grant:
+            raise HTTPException(403, "The task's original product authority cannot be replaced.")
         return grant
 
     @staticmethod
@@ -255,48 +272,63 @@ class Database:
         if limited:
             raise HTTPException(429, "Too many sign-in attempts. Wait one minute.")
 
-    async def allowed_session(self, db: AsyncSession, session_id: str, actor: User) -> Session:
+    async def allowed_session(
+        self, db: AsyncSession, session_id: str, actor: User, *, metadata_only: bool = False,
+    ) -> Session:
         """Authorize a fresh reader or input, including its current source audience."""
-        session = await self.execution_session(db, session_id, actor)
-        await self.check_source_audience(db, session, actor)
+        session = await self.execution_session(db, session_id, actor, metadata_only=metadata_only)
+        await self.check_source_audience(db, session, actor, metadata_only=metadata_only)
         member = await db.get(SwarmMember, session_id)
         if member is not None and member.mission_id != session_id:
-            root = await db.get(Session, member.mission_id)
+            root = await db.get(Session, member.mission_id, options=SESSION_METADATA if metadata_only else ())
             assert root is not None  # Checked by execution_session.
-            await self.check_source_audience(db, root, actor)
+            await self.check_source_audience(db, root, actor, metadata_only=metadata_only)
         return session
 
-    async def execution_session(self, db: AsyncSession, session_id: str, actor: User) -> Session:
+    async def prefetch_session_audiences(
+        self, actor: User, session_ids: list[str], *, deleted: bool = False,
+    ) -> None:
+        """Call before entering a read/admission transaction; final checks remain inside it."""
+        prefetch = getattr(self, "slack_prefetch", None)
+        if self.product_authority_enabled and prefetch is not None and session_ids:
+            await prefetch(actor, session_ids, deleted=deleted)
+
+    async def execution_session(
+        self, db: AsyncSession, session_id: str, actor: User, *, metadata_only: bool = False,
+    ) -> Session:
         """Local session checks for work whose saved turn authority is revalidated by the caller.
 
         Provider audience lookups belong at read/admission boundaries, not inside
         every worker/tool authorization. The original product grant and selected
         connection checks still fence execution, including Slack disconnection.
         """
-        session = await db.get(Session, session_id)
-        if (
-            session is None or session.deleted
-            or (session.visibility == "private" and session.owner_id != actor.id)
-        ):
+        session = await db.get(Session, session_id, options=SESSION_METADATA if metadata_only else ())
+        if session is None or session.deleted:
             raise HTTPException(404, "Conversation not found.")
+        if session.visibility == "private" and session.owner_id != actor.id:
+            link = await db.get(DelegatedSession, session.id)
+            if link is None or not await self.same_person(db, actor, session.owner_id):
+                raise HTTPException(404, "Conversation not found.")
         member = await db.get(SwarmMember, session_id)
         if member is not None and member.mission_id != session_id:
-            root = await db.get(Session, member.mission_id)
+            root = await db.get(Session, member.mission_id, options=SESSION_METADATA if metadata_only else ())
             if root is None or root.deleted or (root.visibility == "private" and root.owner_id != actor.id):
                 raise HTTPException(404, "Conversation not found.")
         return session
 
-    async def check_source_audience(self, db: AsyncSession, session: Session, actor: User) -> None:
+    async def check_source_audience(
+        self, db: AsyncSession, session: Session, actor: User, *, metadata_only: bool = False,
+    ) -> None:
         delegated = await db.get(DelegatedSession, session.id)
         member = await db.get(SwarmMember, session.id) if session.surface == "slack" else None
         parent_id = delegated.parent_session_id if delegated else member.mission_id if member else None
         if parent_id and parent_id != session.id:
-            parent = await db.get(Session, parent_id)
+            parent = await db.get(Session, parent_id, options=SESSION_METADATA if metadata_only else ())
             if parent is None:
                 raise HTTPException(404, "Conversation not found.")
             # Inherit provider audience, not the parent's navigation state. An
             # archived/deleted web parent must not hide its owner's private child.
-            await self.check_source_audience(db, parent, actor)
+            await self.check_source_audience(db, parent, actor, metadata_only=metadata_only)
             return
         if (session.surface == "slack" and self.product_authority_enabled
                 and (self.slack_access is None or not await self.slack_access(db, session, actor))):
@@ -354,8 +386,13 @@ class Database:
                         SwarmMember.session_id == Session.id, SwarmMember.position > 0,
                     ).exists(),
                 )
+            ids = list(await db.scalars(query.with_only_columns(Session.id)))
+        await self.prefetch_session_audiences(actor, ids, deleted=deleted)
+        async with self.sessions() as db:
             visible = []
-            for session in await db.scalars(query):
+            # Revalidate planned rows without admitting newly ranked audiences
+            # that were never prepared while this request awaited the provider.
+            for session in await db.scalars(query.where(Session.id.in_(ids))):
                 try:
                     if deleted:
                         if not await self.same_person(db, actor, session.owner_id):
@@ -370,16 +407,17 @@ class Database:
                     visible.append(session)
             return visible
 
-    async def session(self, actor: User, session_id: str) -> Session:
+    async def session(self, actor: User, session_id: str, *, metadata_only: bool = False) -> Session:
+        await self.prefetch_session_audiences(actor, [session_id])
         async with self.sessions() as db:
-            return await self.allowed_session(db, session_id, actor)
+            return await self.allowed_session(db, session_id, actor, metadata_only=metadata_only)
 
     async def messages(self, actor: User, session_id: str, *, after: int = 0) -> list[dict[str, Any]]:
-        from .message_sources import public_message, source_view
-        from .models import MessageSource
+        from .message_sources import public_messages, source_view
 
+        await self.prefetch_session_audiences(actor, [session_id])
         async with self.sessions() as db:
-            await self.allowed_session(db, session_id, actor)
+            await self.allowed_session(db, session_id, actor, metadata_only=True)
             rows = list((await db.scalars(select(Message).where(
                 Message.session_id == session_id, Message.id > after
             ).order_by(Message.id).limit(200))).all())
@@ -395,15 +433,14 @@ class Database:
                 User.id.in_({row.author_id for row in rows if row.author_id}),
             ))}
             identities = {key: await self.same_person(db, actor, key) for key in authors}
-            sources = {item.message_identity: item for item in await db.scalars(select(MessageSource).where(
-                MessageSource.message_identity.in_([row.identity for row in rows]),
-            ))}
+            projected = await public_messages(self, db, rows)
             originals = {item.id: item for item in await db.scalars(select(Upload).where(
                 Upload.session_id == session_id,
             ))}
+            goal = await db.get(Goal, session_id)
             result = []
             for row in rows:
-                content, source = await public_message(self, db, row, sources=sources)
+                content, source = projected[row.id]
                 files = pictures.get(row.turn_id, [])
                 if source and source.get("deleted"):
                     files = []
@@ -415,17 +452,28 @@ class Database:
                     "id": row.id, "turn_id": row.turn_id, "role": row.role,
                     "author_id": row.author_id, "author_name": author.display_name if author else None,
                     "is_self": identities.get(row.author_id or "", False), "content": content,
+                    "sent_as_goal": row.role == "user" and bool(
+                        (source or {}).get("sent_as_goal") or (goal and row.turn_id == goal.source_turn_id)
+                    ),
                     "created_at": row.created_at, **source_view(source, session_id=session_id, message_id=row.id),
                     **({"source": "delegation"} if row.identity.startswith("delegation:") else {}),
                     "attachments": files if row.role == "user" or row.identity.startswith("delegation:") else [],
                 })
-            return result
+        # Release the transcript connection before consulting the product
+        # cache/provider, then recheck access after the asynchronous lookup.
+        if self.slack_mentions is not None and await self.slack_mentions(
+            result, {key: value[1] for key, value in projected.items()},
+        ):
+            await self.session(actor, session_id, metadata_only=True)
+        return result
 
     async def same_person(self, db: AsyncSession, actor: User, author_id: str | None) -> bool:
         """Presentation/capability relationship, never a replacement execution grant."""
         if actor.id == author_id:
             return True
         if not author_id or self.product_identity is None:
+            return False
+        if not author_id.startswith("slack:") and not actor.id.startswith("slack:"):
             return False
         if not db.in_transaction():
             await db.begin()
@@ -442,6 +490,7 @@ class Database:
     async def submit(
         self, actor: User, session_id: str, body: NewMessage, *, db: AsyncSession | None = None,
         swarm_generated: bool = False,
+        automation_generated: bool = False,
         delegated_authority: DelegatedAuthority | None = None,
         received_at: str | None = None,
     ) -> Turn:
@@ -457,10 +506,11 @@ class Database:
             # The caller must roll back/retry its complete occurrence admission.
             return await self._submit(
                 actor, session_id, body, fingerprint, db=db, swarm_generated=swarm_generated,
+                automation_generated=automation_generated,
                 delegated_authority=delegated_authority,
                 received_at=received_at, admitted_at=admitted_at,
             )
-        if swarm_generated or delegated_authority is not None:
+        if swarm_generated or automation_generated or delegated_authority is not None:
             raise ValueError("Generated input requires its admission transaction.")
         try:
             return await self._submit(
@@ -475,15 +525,20 @@ class Database:
                     Turn.request_key == body.request_key,
                 ))
                 if existing and existing.request_fingerprint == fingerprint:
-                    return existing
+                    provenance = await lookup.get(ProductAutomationTurn, existing.id)
+                    if provenance is None or provenance.origin_turn_id != existing.id:
+                        return existing
             raise HTTPException(409, "A conflicting request was submitted.") from None
 
     async def _submit(
         self, actor: User, session_id: str, body: NewMessage, fingerprint: str,
         *, db: AsyncSession | None = None, received_at: str | None = None,
         swarm_generated: bool = False, admitted_at: str | None = None,
+        automation_generated: bool = False,
         delegated_authority: DelegatedAuthority | None = None,
     ) -> Turn:
+        if db is None and not swarm_generated and not automation_generated and delegated_authority is None:
+            await self.prefetch_session_audiences(actor, [session_id])
         async with self._admission_session(db) as transaction:
             product_grant = await self._actor_product_grant(transaction, actor)
             # Account changes and admission must serialize across API/worker
@@ -503,12 +558,15 @@ class Database:
             if locked is None:
                 raise HTTPException(404, "Conversation not found.")
             await transaction.refresh(session)
+            await settle_failed_action_attempts(transaction, session_id)
             existing = await transaction.scalar(select(Turn).where(
                 Turn.session_id == session_id, Turn.actor_id == actor.id,
                 Turn.request_key == body.request_key,
             ))
             if existing:
-                if existing.request_fingerprint != fingerprint:
+                provenance = await transaction.get(ProductAutomationTurn, existing.id)
+                generated_origin = bool(provenance and provenance.origin_turn_id == existing.id)
+                if existing.request_fingerprint != fingerprint or generated_origin != automation_generated:
                     raise HTTPException(409, "This request identity already belongs to another message.")
                 if self.product_authority_enabled:
                     await self._check_product_turn(transaction, existing, product_grant)
@@ -517,6 +575,8 @@ class Database:
             if model not in self.settings.models:
                 raise HTTPException(422, "Choose an enabled model.")
             context = delegated_authority.context if delegated_authority else await self.execution_context(transaction, session)
+            if automation_generated:
+                context = ExecutionContext("shared", "automation")
             if context.surface == "slack" and body.connections and self.product_connections is None:
                 raise HTTPException(
                     403, "Use a private web conversation for connected accounts. "
@@ -550,7 +610,7 @@ class Database:
                 from .questions import can_reply_with_text, pending_questions, text_results
                 pending = pending_questions(self, active)
                 eligible = (
-                    not swarm_generated and active.actor_id == actor.id
+                    not swarm_generated and not automation_generated and active.actor_id == actor.id
                     and active.model == model and not body.attachments
                     and set(json.loads(active.connections)) == set(selected_ids)
                     and can_reply_with_text(pending)
@@ -571,7 +631,7 @@ class Database:
                 model=model, mode=body.mode, connections=json.dumps(selected_ids),
                 workflow_id=f"moyai-turn-{turn_id}",
             )
-            if body.mode == "asap" and session.active_turn:
+            if body.mode == "asap" and session.active_turn and not automation_generated:
                 active = await transaction.get(Turn, session.active_turn)
                 same_authority = True
                 if active and self.product_authority_enabled:
@@ -591,6 +651,8 @@ class Database:
                     turn.status = "steering"
             transaction.add(turn)
             await transaction.flush()
+            if automation_generated:
+                transaction.add(ProductAutomationTurn(turn_id=turn.id, origin_turn_id=turn.id))
             if turn.status == "steering":
                 await self._record_guidance(transaction, turn, session.revision)
             from .performance import admission
@@ -600,7 +662,8 @@ class Database:
             )
             self._bind_product_grant(transaction, turn, product_grant)
             await self.swarms.bind(transaction, mission, turn, generated=swarm_generated)
-            await self.goals.bind(transaction, turn)
+            if not automation_generated:
+                await self.goals.bind(transaction, turn)
             for position, image_id in enumerate(body.attachments):
                 # Reserve the upload's destination atomically before publishing
                 # it into a conversation, including concurrent first attachment.
@@ -612,12 +675,13 @@ class Database:
                     raise HTTPException(404, "A file is unavailable in this conversation.")
                 transaction.add(TurnImage(turn_id=turn.id, upload_id=image_id, position=position))
             transaction.add(Message(
-                session_id=session_id, turn_id=turn_id, author_id=None if swarm_generated else actor.id,
-                role="system" if swarm_generated else "user", content=self.security.seal(body.authored_text),
-                identity=f"{'swarm' if swarm_generated else 'user'}:{turn_id}",
+                session_id=session_id, turn_id=turn_id, author_id=None if swarm_generated or automation_generated else actor.id,
+                role="system" if swarm_generated or automation_generated else "user", content=self.security.seal(body.authored_text),
+                identity=f"{'automation' if automation_generated else 'swarm' if swarm_generated else 'user'}:{turn_id}",
             ))
             from .message_sources import record_source
-            await record_source(self, transaction, f"{'swarm' if swarm_generated else 'user'}:{turn_id}", body)
+            if not automation_generated:
+                await record_source(self, transaction, f"{'swarm' if swarm_generated else 'user'}:{turn_id}", body)
             session.updated_at = now()
             if session.title == "New conversation":
                 from .skill_mentions import display_text
@@ -628,8 +692,8 @@ class Database:
 
     async def admit_automation(
         self, db: AsyncSession, *, grant: ProductGrant, title: str, prompt: str,
-        model: str, request_key: str, connections: list[str] | None = None,
-        security_profile_id: str = '',
+        model: str, request_key: str, security_profile_id: str, connections: list[str] | None = None,
+        session_id: str | None = None,
     ) -> tuple[Session, Turn]:
         """Admit using the original owner grant in the caller's occurrence transaction.
 
@@ -657,15 +721,31 @@ class Database:
             if actor is None:
                 raise HTTPException(401, "The automation owner must be enrolled before enabling it.")
             cast(Any, actor).product_grant = grant
-            session = await self.create_session(actor, NewSession(
-                title=title, model=model, visibility="shared", security_profile_id=security_profile_id,
-            ), db=db, trusted_profile=True)
-            session.surface = "automation"
+            if session_id:
+                session = await self.automation_session(db, actor.id, session_id)
+                if self.governance is not None:
+                    await self.governance.continuation(db, session.id, security_profile_id)
+            else:
+                session = await self.create_session(actor, NewSession(
+                    title=title, model=model, visibility="shared", security_profile_id=security_profile_id,
+                ), db=db, trusted_profile=True)
+                session.surface = "automation"
             turn = await self.submit(actor, session.id, NewMessage(
                 prompt=prompt, model=model, request_key=request_key, connections=connections or [],
-            ), db=db)
+            ), db=db, automation_generated=True)
             await db.flush()
             return session, turn
+
+    async def automation_session(self, db: AsyncSession, owner_id: str, session_id: str) -> Session:
+        session = await db.scalar(select(Session).where(Session.id == session_id).with_for_update())
+        if (
+            session is None or session.deleted or session.archived or session.owner_id != owner_id
+            or session.visibility != "shared" or session.surface != "web"
+            or await db.get(DelegatedSession, session_id) is not None
+            or await db.get(SwarmMember, session_id) is not None
+        ):
+            raise HTTPException(409, "Choose an active shared chat you own. Private, Slack and delegated chats cannot receive scheduled runs.")
+        return session
 
     async def resolve_grants(
         self, db: AsyncSession, actor_id: str, ids: list[str], *, shared_session: bool = False,
@@ -690,12 +770,21 @@ class Database:
             ))
         return grants
 
-    async def execution_context(self, db: AsyncSession, session: Session) -> ExecutionContext:
+    async def execution_context(self, db: AsyncSession, session: Session, *, turn_id: str | None = None) -> ExecutionContext:
+        if turn_id and await db.get(ProductAutomationTurn, turn_id) is not None:
+            turn = await db.get(Turn, turn_id)
+            if (
+                session.deleted or session.archived or session.visibility != "shared"
+                or turn is None or session.owner_id != turn.actor_id
+                or session.surface not in {"web", "automation"}
+            ):
+                raise PermissionError("Scheduled work requires its original shared chat.")
+            return ExecutionContext("shared", "automation")
         return await session_context(self, db, session)
 
     async def scope_grants(self, db: AsyncSession, scope: RunScope, session: Session) -> list[Grant]:
         """Resolve under persisted execution policy, never private-child presentation."""
-        context = await self.execution_context(db, session)
+        context = await self.execution_context(db, session, turn_id=scope.turn_id)
         if scope.execution_context is not None and scope.execution_context != context:
             raise PermissionError("This execution's original policy context changed.")
         if context != ExecutionContext(session.visibility, session.surface):
@@ -760,6 +849,10 @@ class Database:
 
     async def steer_queued(self, actor: User, turn_id: str) -> Turn:
         """Promote saved input into the SDK's existing durable enqueue path."""
+        async with self.sessions() as lookup:
+            session_id = await lookup.scalar(select(Turn.session_id).where(Turn.id == turn_id))
+        if session_id is not None:
+            await self.prefetch_session_audiences(actor, [session_id])
         async with self._admission_session(None) as db:
             actor_grant = await self._actor_product_grant(db, actor)
             turn = await db.get(Turn, turn_id)
@@ -873,19 +966,20 @@ class Database:
             await db.refresh(session)
             if session.active_turn != turn.id or turn.status not in ("starting", "running"):
                 raise PermissionError("This turn is no longer authorized to execute.")
-            context = await self.execution_context(db, session)
+            context = await self.execution_context(db, session, turn_id=turn.id)
             grants = await self.resolve_grants(
                 db, actor.id, json.loads(turn.connections), shared_session=context.visibility == "shared",
                 surface=context.surface,
             )
             scope = RunScope(
-                session.id, turn.id, actor.id, turn.model, grants, session.visibility, session.surface,
+                session.id, turn.id, actor.id, turn.model, grants, session.visibility,
+                "automation" if context.surface == "automation" else session.surface,
                 product_grant=product_grant,
                 swarm_id=member.mission_id if member else None,
                 swarm_name=member.name if member else None,
                 delegation_depth=delegation.depth if delegation else 0,
                 delegation_generated=generated_delegation is not None,
-                execution_context=context if delegation else None,
+                execution_context=context if delegation or context.surface == "automation" else None,
             )
             goal = await self.goals.authorize(db, turn)
             if goal is not None:
@@ -910,9 +1004,13 @@ class Database:
                     (g.id, g.revision) for g in grants
                 ]:
                     raise PermissionError("Connection access changed during preparation.")
-                if delegation:
+                if delegation or context.surface == "automation":
                     prepared.scope.execution_context = context
                 return prepared
+            if turn.deferred_results:
+                from .delegation import resumed_agents
+                scope.background_agents = list(await resumed_agents(self, db, scope))
+                scope.background_delegation = bool(scope.background_agents)
             conversation = None
             if (
                 session.last_actor_id == actor.id and session.last_model == turn.model
@@ -921,14 +1019,16 @@ class Database:
             ):
                 conversation = self.security.unseal(session.conversation).decode()
             elif session.conversation:
-                public = await db.scalars(select(Message).where(
+                from .message_sources import public_messages
+
+                public = list(await db.scalars(select(Message).where(
                     Message.session_id == session.id, Message.turn_id != turn.id,
                     Message.created_at < turn.created_at,
-                ).order_by(Message.id))
+                ).order_by(Message.id)))
+                projected = await public_messages(self, db, public)
                 history = []
                 for message in public:
-                    from .message_sources import public_message
-                    content, _ = await public_message(self, db, message)
+                    content, _ = projected[message.id]
                     if message.role == "assistant":
                         history.append(ModelResponse(parts=[TextPart(content=content)]))
                     else:
@@ -1038,8 +1138,11 @@ class Database:
     async def settle(self, turn_id: str, *, snapshot: str | None = None, warning: str | None = None) -> None:
         await self.answers.settle(turn_id, snapshot=snapshot, warning=warning)
 
-    async def fail(self, turn_id: str, message: str, *, only_unsettled: bool = False) -> None:
-        await self.answers.fail(turn_id, message, only_unsettled=only_unsettled)
+    async def fail(
+        self, turn_id: str, message: str, *, only_unsettled: bool = False,
+        diagnostics: dict[str, Any] | None = None,
+    ) -> None:
+        await self.answers.fail(turn_id, message, only_unsettled=only_unsettled, diagnostics=diagnostics)
 
     async def stop(self, actor: User, session_id: str) -> str | None:
         if await self.swarms.stop_session(actor, session_id):
@@ -1069,6 +1172,7 @@ class Database:
 
     async def delete_session(self, actor: User, session_id: str) -> None:
         """Hide a session and fence work atomically; the existing Stop dispatcher cancels execution."""
+        await self.prefetch_session_audiences(actor, [session_id])
         async with self._admission_session(None) as db:
             member = await self.swarms.member(db, session_id)
             # Keep the mission-before-session lock order and commit the deletion
@@ -1105,6 +1209,7 @@ class Database:
             ).values(status="stopped", finished_at=now()))
 
     async def restore_session(self, actor: User, session_id: str) -> None:
+        await self.prefetch_session_audiences(actor, [session_id], deleted=True)
         async with self.sessions.begin() as db:
             owned = await db.get(Session, session_id)
             if owned is None or not await self.same_person(db, actor, owned.owner_id):
@@ -1234,6 +1339,8 @@ class Database:
                 ))
                 if existing and existing.request_fingerprint == fingerprint:
                     return existing
+            if isinstance(error, HTTPException):
+                raise
             raise HTTPException(409, "This answer conflicts with an already admitted request.") from error
 
     async def _resume(
@@ -1242,6 +1349,8 @@ class Database:
         *, received_at: str | None = None, admitted_at: str | None = None,
         transaction: AsyncSession | None = None, reply: NewMessage | None = None,
     ) -> Turn:
+        if transaction is None:
+            await self.prefetch_session_audiences(actor, [session_id])
         async with self._admission_session(transaction) as db:
             product_grant = await self._actor_product_grant(db, actor)
             locked_actor = await db.scalar(update(User).where(
@@ -1295,6 +1404,8 @@ class Database:
             ).values(active_turn=turn_id, status="queued", updated_at=now()).returning(Session.id))
             if claimed is None:
                 raise HTTPException(409, "Another response already resumed this request.")
+            from .browser_login import handoff_login_control
+            await handoff_login_control(self, db, actor, previous, results)
             db.add(turn)
             await db.flush()
             from .performance import admission
@@ -1312,9 +1423,21 @@ class Database:
                 await record_source(self, db, f"user:{turn.id}", reply)
             if member is not None:
                 await self.swarms.bind(db, mission, turn, generated=True)
-            await self.goals.bind(db, turn, resumed_from=previous.id)
+            automated = await db.get(ProductAutomationTurn, previous.id)
+            if automated is None:
+                await self.goals.bind(db, turn, resumed_from=previous.id)
             delegated = await db.get(DelegatedTurn, previous.id)
             if delegated is not None:
                 db.add(DelegatedTurn(turn_id=turn.id, session_id=delegated.session_id))
+            from .agent_messages import resume_mail
+            completed_agents = await resume_mail(db, self, previous, turn)
+            if original.scope.background_delegation:
+                from .delegation import bind_background_resume
+                original.scope.background_agents = [
+                    child for child in original.scope.background_agents if child not in completed_agents
+                ]
+                await bind_background_resume(self, db, previous, turn, original.scope)
+            if automated is not None:
+                db.add(ProductAutomationTurn(turn_id=turn.id, origin_turn_id=automated.origin_turn_id))
             previous.status = "resumed"
             return turn

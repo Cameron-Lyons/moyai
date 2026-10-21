@@ -1,7 +1,7 @@
 import React, { useEffect, useRef, useState } from "react"
 import { FileText, LoaderCircle, Paperclip, Upload, X } from "lucide-react"
 import { Button } from "@/components/ui/button"
-import { apiRequest } from "./api"
+import { uploadFile as sendUpload } from "./generated/api"
 import { isFileDrag, isInlineImage, receiveFileDrop } from "./attachment-files"
 import { AttachmentUploads, type DraftFile, type UploadedFile } from "./attachment-uploads"
 import "./attachments.css"
@@ -9,10 +9,11 @@ import "./attachments.css"
 export type { UploadedFile } from "./attachment-uploads"
 
 async function uploadFile(file: File, signal: AbortSignal): Promise<UploadedFile> {
-  return apiRequest<UploadedFile>(`/uploads?name=${encodeURIComponent(file.name || "clipboard.png")}`, {
-    method: "POST", headers: { "Content-Type": file.type || "application/octet-stream" },
-    body: file, signal,
+  const { data } = await sendUpload({
+    query: { name: file.name || "clipboard.png" }, body: file, signal,
+    headers: { "Content-Type": file.type || "application/octet-stream" },
   })
+  return data
 }
 
 export function useAttachments(onError: (message: string) => void) {
@@ -104,7 +105,7 @@ export function useFileDrop(add: (files: File[]) => Promise<void>, onError: (mes
 }
 
 export function FileDropOverlay() {
-  return <div className="file-drop-overlay" role="status"><Upload size={28} /><strong>Drop files to attach</strong><span>Up to 8 files · 20 MB each · Images up to 8 MB</span></div>
+  return <div className="file-drop-overlay" role="status"><Upload size={28} /><strong>Drop files to attach</strong><span>Up to 8 files · 20 MB each</span></div>
 }
 
 export function AttachButton({ add, disabled, compact = false }: { add: (files: File[]) => Promise<void>; disabled?: boolean; compact?: boolean }) {

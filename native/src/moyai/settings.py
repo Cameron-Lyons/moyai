@@ -37,9 +37,7 @@ class Settings(BaseSettings):
     encryption_key: SecretStr = Field(default=SecretStr(""), validation_alias="ENCRYPTION_KEY")
     workspace_password: SecretStr = Field(default=SecretStr(""), validation_alias="WORKSPACE_PASSWORD")
     administrator: str = Field(default="admin", validation_alias="MOYAI_ADMIN_USER")
-    gateway_url: str = Field(
-        default="https://gateway-dev.litellm-sandbox.ai/v1", validation_alias="LITELLM_API_BASE"
-    )
+    gateway_url: str = Field(default="", validation_alias="LITELLM_API_BASE")
     gateway_key: SecretStr = Field(default=SecretStr(""), validation_alias="LITELLM_API_KEY")
     default_model: str = Field(
         default="openai/gpt-6-astra", validation_alias=AliasChoices("MOYAI_MODEL", "AGENT_MODEL")
@@ -56,6 +54,7 @@ class Settings(BaseSettings):
         default="", pattern=r"^(?:[A-Za-z0-9][A-Za-z0-9_-]{0,127})?$",
         validation_alias="MOYAI_WORKER_BUILD_ID",
     )
+    worker_adoption_bridge: bool = Field(default=False, validation_alias="MOYAI_WORKER_ADOPTION_BRIDGE")
     temporal_api_key: SecretStr = Field(default=SecretStr(""), validation_alias="TEMPORAL_API_KEY")
     temporal_tls: bool = Field(default=False, validation_alias="TEMPORAL_TLS")
     compress_temporal_payloads: bool = Field(
@@ -81,6 +80,10 @@ class Settings(BaseSettings):
     modal_app: str = Field(
         default="moyai-pydantic",
         validation_alias=AliasChoices("MOYAI_MODAL_APP", "MODAL_APP_NAME"),
+    )
+    modal_runtime: Literal["gvisor", "vm"] = Field(
+        default="vm",
+        validation_alias=AliasChoices("MOYAI_MODAL_RUNTIME", "MODAL_FUNCTION_RUNTIME"),
     )
     sandbox_provider: Literal["modal", "lambda"] = Field(default="modal", validation_alias="SANDBOX_PROVIDER")
     lambda_region: str = Field(default="us-east-1", validation_alias="LAMBDA_REGION")
@@ -130,6 +133,8 @@ class Settings(BaseSettings):
     def worker_version_is_complete(self) -> Settings:
         if bool(self.worker_deployment) != bool(self.worker_build_id):
             raise ValueError("Worker deployment name and build ID must be configured together.")
+        if self.worker_adoption_bridge and (self.product_mode != "existing" or not self.worker_deployment):
+            raise ValueError("Worker adoption bridging requires an existing product and an explicit worker version.")
         return self
 
     @property
@@ -189,6 +194,8 @@ class Settings(BaseSettings):
             self.lambda_region, self.lambda_image, self.lambda_image_version, self.lambda_checkpoint_bucket,
         )):
             raise ValueError("Lambda requires LAMBDA_REGION, LAMBDA_IMAGE, LAMBDA_IMAGE_VERSION and LAMBDA_CHECKPOINT_BUCKET.")
+        if not self.gateway_url.strip():
+            raise ValueError("Set LITELLM_API_BASE before starting an execution worker.")
         if not self.gateway_key.get_secret_value() and not (
             self.product_mode == "existing" and brokered
         ):

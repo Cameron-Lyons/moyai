@@ -17,6 +17,38 @@ reconciliation, identity mappings and cost recovery remain unchanged. Operationa
 admission/turn tables retain their current purpose. This work does not recover
 lost costs or change which history the native usage UI displays.
 
+## Report reads
+
+Usage, billing and CSV reports fetch accounting observations in batches of 2,000
+within their read-only snapshots. The batch size is not a report limit: a date
+range with more than 50,000 records includes every matching charge. Exact-ID
+counterparts are still loaded before reconciliation and date attribution.
+Request-detail pagination does not change aggregate totals.
+
+Reconciliation reads the selected period once. Further rounds look up only new
+aliases outside that period, keeping cross-date evidence without rereading the
+same in-range rows. PostgreSQL batches up to 10,000 counterpart identities and
+uses array parameters for admission lookups. All retained evidence belongs to
+one report's snapshots; subsequent requests read current costs and permissions.
+
+Reconciliation retains the report's evidence in memory; batching bounds the
+database fetch buffer, not total report memory. PostgreSQL resolves all requested
+historical session families with one array-bound query, so the recursive ancestry
+view is expanded once rather than once per 200 sessions.
+
+Accounting reports have no fixed execution deadline. Billing read transactions
+disable the inherited five-second PostgreSQL statement timeout and JIT compilation;
+those settings revert when the transaction ends. Caller cancellation still
+releases readers. The previous fixed 15-second report and five-second statement
+limits no longer apply to these billing reads. Connection-pool acquisition,
+authentication and other application queries retain their own limits.
+
+Database timeouts return a distinct message suggesting a retry. Server logs
+contain phase timings and the exception type, without query text, parameters,
+account IDs or credentials. The reconciliation-round limit and ambiguous-identity
+checks still fail visibly without substituting partial totals. Explicit `max_records` bounds remain
+available for diagnostic readers.
+
 ## Provision
 
 Use the existing PostgreSQL connection and explicit distinct schemas:

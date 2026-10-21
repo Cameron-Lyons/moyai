@@ -9,11 +9,13 @@ from fastapi import HTTPException
 from temporalio import activity
 from temporalio.exceptions import ApplicationError
 
+from .agent_messages import read_agent_mail, read_agent_mail_v2
 from .answer_settlement import SNAPSHOT_WARNING
 from .computer_keepalive import keep_computer_alive
 from .contracts import CompletedTurn, PreparedTurn, SteeringInput
 from .history_handoff import HISTORY_ACTIVITIES
 from .images import hydrate
+from .maintenance_workspace import MAINTENANCE_ACTIVITIES
 from .runtime import current
 from .workspace_recovery import prepare_workspace
 
@@ -100,8 +102,14 @@ async def settle_answer(turn_id: str) -> None:
 
 
 @activity.defn(name="moyai_fail_turn_v1")
-async def fail_turn(turn_id: str, message: str) -> None:
-    await current().database.fail(turn_id, message)
+async def fail_turn(turn_id: str, message: str, diagnostics: dict | None = None) -> None:
+    await current().database.fail(turn_id, message, diagnostics=diagnostics)
+
+
+@activity.defn(name="moyai_preserve_failed_workspace_v1")
+async def preserve_failed_workspace(turn_id: str) -> None:
+    from .failure_checkpoint import preserve_failed_workspace as preserve
+    await preserve(current(), turn_id)
 
 
 @activity.defn(name="moyai_stopped_turn_v1")
@@ -132,6 +140,8 @@ async def steering_receipt(turn_id: str, enqueue_id: str | None) -> None:
 
 ACTIVITIES = [
     prepare_turn, save_answer, save_computer, settle_answer, fail_turn, stopped_turn,
-    prepare_steering, steering_receipt, keep_computer_alive, *HISTORY_ACTIVITIES,
+    prepare_steering, steering_receipt, keep_computer_alive, preserve_failed_workspace,
+    *HISTORY_ACTIVITIES, *MAINTENANCE_ACTIVITIES,
+    read_agent_mail, read_agent_mail_v2,
 ]
 

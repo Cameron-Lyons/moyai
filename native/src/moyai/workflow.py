@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Sequence
-from contextlib import suppress
+from collections.abc import AsyncIterator, Sequence
+from contextlib import asynccontextmanager, suppress
 from dataclasses import asdict, replace
 from datetime import timedelta
 from typing import Any
@@ -35,15 +35,29 @@ with workflow.unsafe.imports_passed_through():
     from pydantic_ai.usage import UsageLimits
     from pydantic_ai.workspaces import WorkspaceRef, WorkspaceUnavailableError
 
+    from .agent_messages import (
+        DELIVERY_VERSION,
+        AgentMail,
+        MailObsolete,
+        MailRead,
+        MailReady,
+        model_message,
+        read_agent_mail_v2,
+        receipts,
+    )
     from .computer_keepalive import VERSION as COMPUTER_KEEPALIVE_VERSION
     from .computer_keepalive import Keepalive
     from .contracts import CompletedTurn, PreparedTurn, RunScope, SteeringInput
     from .deployment_handoff import VERSION as DEPLOYMENT_HANDOFF_VERSION
     from .deployment_handoff import DeploymentHandoff
+    from .failure_diagnostics import FAILURE_VERSION, capture_failure
     from .history_handoff import VERSION as HISTORY_VERSION
     from .history_handoff import AgentCheckpoint, CheckpointSave, HistoryHandoff, HistoryLimits
     from .images import prompt_content
+    from .input_identity import identified_prompt
     from .live_events import public_event_sink
+    from .maintenance_workspace import VERSION as MAINTENANCE_WORKSPACE_VERSION
+    from .maintenance_workspace import MaintenanceResume, wait_reason
     from .product_continuation_errors import public_preparation_message
     from .product_drain import DRAIN_VERSION, DrainDecision
     from .request_limits import unlimited_model_requests
@@ -63,6 +77,18 @@ PREPARE = {
     "schedule_to_close_timeout": timedelta(minutes=20),
     "heartbeat_timeout": timedelta(seconds=30),
 }
+MAINTENANCE_FILES = {
+    "start_to_close_timeout": timedelta(minutes=17),
+    "schedule_to_close_timeout": timedelta(minutes=20),
+    "retry_policy": RetryPolicy(maximum_attempts=1),
+}
+MAINTENANCE_RESTORE = {
+    # Lambda permits 3 minutes to run, 3 to bootstrap, then 15 to restore.
+    # Leave bounded room for provider/storage requests and publication.
+    "start_to_close_timeout": timedelta(minutes=25),
+    "schedule_to_close_timeout": timedelta(minutes=30),
+    "retry_policy": RetryPolicy(maximum_attempts=1),
+}
 
 
 @workflow.defn(name="MoyaiPydanticTurnV1")
@@ -77,6 +103,11 @@ class TurnWorkflow(PydanticAIWorkflow):
             drain_timeout=timedelta(seconds=1),
         )
         self.agent_run: AgentRun[RunScope, str | DeferredToolRequests] | None = None
+        self.scope: RunScope | None = None
+        self.pending_agent_mail: list[int] = list(handoff.pending_agent_mail) if handoff else []
+        self.enqueued_agent_mail: set[int] = set()
+        self.mail_handlers: set[int] = set()
+        self.mail_closing = False
         self.finished = False
         self.steered: set[str] = set(handoff.steered) if handoff else set()
         self.pending_steering: list[str] = list(handoff.pending_steering) if handoff else []
@@ -144,6 +175,141 @@ class TurnWorkflow(PydanticAIWorkflow):
                 return
             await workflow.sleep(state.delay)
 
+    async def resume_maintenance_workspace(self, handoff: HistoryHandoff) -> AgentCheckpoint:
+        previous = workflow.info().continued_run_id
+        if previous is None:
+            raise ValueError("A maintenance workspace requires its direct workflow continuation.")
+        while True:
+            notice = self.maintenance_notice
+            try:
+                state = await workflow.execute_activity(
+                    "moyai_load_maintenance_checkpoint_v1",
+                    args=[self.turn_id, handoff.checkpoint, previous],
+                    result_type=MaintenanceResume, **MAINTENANCE_RESTORE,
+                )
+            except ActivityError as error:
+                if (
+                    isinstance(error.cause, ApplicationError)
+                    and error.cause.type == "MoyaiMaintenanceRestorePending"
+                ):
+                    await workflow.sleep(5)
+                    continue
+                raise
+            if not state.paused:
+                if state.checkpoint is None:
+                    raise ValueError("The maintenance continuation has no verified workspace binding.")
+                return state.checkpoint
+            await workflow.wait_condition(lambda notice=notice: self.maintenance_notice != notice)
+
+    async def preserve_maintenance_workspace(
+        self, checkpoint: AgentCheckpoint, boundary: str,
+    ) -> CheckpointSave:
+        """Keep the live graph quiescent when a lease/provider refuses capture."""
+        while True:
+            notice = self.maintenance_notice
+            try:
+                return await workflow.execute_activity(
+                    "moyai_save_maintenance_checkpoint_v1",
+                    args=[checkpoint, boundary],
+                    result_type=CheckpointSave, **MAINTENANCE_FILES,
+                )
+            except ActivityError as error:
+                if is_cancelled_exception(error):
+                    raise asyncio.CancelledError from error
+                if error.cause is None or wait_reason(error.cause) is None:
+                    raise
+                workflow.logger.warning("Workspace capture is blocked; the settled graph remains waiting.")
+            # A lease expiry or provider recovery need not change the maintenance
+            # generation. A durable timer makes those cases retryable as well.
+            try:
+                await workflow.wait_condition(
+                    lambda notice=notice: self.maintenance_notice != notice,
+                    timeout=timedelta(seconds=5),
+                )
+            except TimeoutError:
+                pass
+
+    @workflow.signal
+    async def agent_message(self, message_id: int) -> None:
+        if message_id in self.enqueued_agent_mail or message_id in self.mail_handlers:
+            return
+        recoverable = workflow.patched(DELIVERY_VERSION)
+        if message_id not in self.pending_agent_mail:
+            self.pending_agent_mail.append(message_id)
+        if self.handing_off:
+            return
+        self.mail_handlers.add(message_id)
+        try:
+            # Signal order is durable. Preserve it while loading encrypted
+            # payloads so a quick completion read cannot overtake progress.
+            await workflow.wait_condition(lambda: (
+                self.finished or self.handing_off or (recoverable and self.mail_closing)
+                or (self.agent_run is not None and self.pending_agent_mail[0] == message_id)
+            ))
+            if (
+                self.finished or self.handing_off or (recoverable and self.mail_closing)
+                or self.agent_run is None or self.scope is None
+            ):
+                return
+            mail = await self.load_agent_mail(message_id, recoverable=recoverable)
+            if self.handing_off or (recoverable and (self.finished or self.mail_closing)):
+                return
+            if mail is not None:
+                try:
+                    self.agent_run.enqueue(model_message(mail), priority="asap")
+                except UserError:
+                    return  # Preserve durable mail without starting another turn.
+                self.enqueued_agent_mail.add(message_id)
+            self.pending_agent_mail.remove(message_id)
+        finally:
+            self.mail_handlers.discard(message_id)
+
+    async def load_agent_mail(self, message_id: int, *, recoverable: bool) -> AgentMail | None:
+        """Resolve the queue head without surrendering ownership on a failed read."""
+        while True:
+            if recoverable and (self.finished or self.handing_off or self.mail_closing):
+                return None
+            try:
+                if not recoverable:
+                    # Recorded executions keep their original activity and
+                    # empty-read semantics. New signals use the typed protocol.
+                    legacy = await workflow.execute_activity(
+                        "moyai_read_agent_mail_v1", args=[self.scope, message_id], result_type=MailRead, **CONTROL,
+                    )
+                    return legacy.mail
+                result = await workflow.execute_activity(
+                    read_agent_mail_v2, args=[self.scope, message_id], **CONTROL,
+                )
+                if isinstance(result, MailReady):
+                    return result.mail
+                if isinstance(result, MailObsolete):
+                    return None
+                # Unavailable is a live authorization refusal, not a receipt.
+            except ActivityError:
+                workflow.logger.warning("Agent mail read failed; retaining delivery intent.")
+            if self.finished or self.handing_off or (recoverable and self.mail_closing):
+                return None
+            if recoverable:
+                # Retry through Temporal, without waking the model or delaying
+                # shutdown/history handoff behind a non-interruptible timer.
+                with suppress(TimeoutError):
+                    await workflow.wait_condition(
+                        lambda: self.finished or self.handing_off or self.mail_closing, timeout=5,
+                    )
+            else:
+                await workflow.sleep(5)
+
+    @asynccontextmanager
+    async def agent_mail_lifetime(self) -> AsyncIterator[None]:
+        try:
+            yield
+        finally:
+            # AgentEventStream.close waits for every signal handler, including
+            # mail. Close delivery before that outer context exits, even when
+            # agent startup or cancellation raises before self.finished is set.
+            # Legacy histories ignore this state through DELIVERY_VERSION.
+            self.mail_closing = True
+
     @workflow.signal
     async def steer(self, turn_id: str) -> None:
         if turn_id in self.steered:
@@ -171,9 +337,12 @@ class TurnWorkflow(PydanticAIWorkflow):
         enqueue_id = None
         if not self.finished and self.agent_run is not None:
             try:
+                content = prompt_content(value.prompt, value.images) or ""
+                if workflow.patched("moyai-steering-part-identity-v1"):
+                    content = identified_prompt(content, value.turn_id, self.turn_id)
                 enqueue_id = self.agent_run.enqueue(
                     ModelRequest(
-                        parts=[UserPromptPart(content=prompt_content(value.prompt, value.images) or "")],
+                        parts=[UserPromptPart(content=content)],
                         metadata={
                             "moyai_input_id": value.turn_id, "moyai_parent_turn_id": self.turn_id,
                         },
@@ -191,8 +360,10 @@ class TurnWorkflow(PydanticAIWorkflow):
     async def run(self, turn_id: str, handoff: HistoryHandoff | None = None) -> dict:
         prepared: PreparedTurn | None = None
         keepalive: asyncio.Task[None] | None = None
+        preserve_maintenance = False
         try:
             history_handoff = workflow.patched(HISTORY_VERSION)
+            preserve_maintenance = workflow.patched(MAINTENANCE_WORKSPACE_VERSION) and history_handoff
             deployment_handoff = workflow.patched(DEPLOYMENT_HANDOFF_VERSION)
             if self.deployment_handoff and not self.deployment_handoff.applies_to(
                 workflow.info().get_current_deployment_version(),
@@ -201,10 +372,15 @@ class TurnWorkflow(PydanticAIWorkflow):
             checkpoint_workspace = workflow.patched(WORKSPACE_CHECKPOINT_VERSION)
             keep_computer = workflow.patched(COMPUTER_KEEPALIVE_VERSION)
             maintenance = workflow.patched(DRAIN_VERSION)
-            if maintenance:
+            if maintenance and not (handoff is not None and handoff.maintenance_workspace):
                 await self.maintenance_checkpoint(turn_id, "before_prepare")
             resumed: AgentCheckpoint | None = None
-            if handoff is not None:
+            if handoff is not None and handoff.maintenance_workspace:
+                if not preserve_maintenance:
+                    raise ValueError("This worker cannot restore a maintenance workspace.")
+                resumed = await self.resume_maintenance_workspace(handoff)
+                prepared = resumed.prepared
+            elif handoff is not None:
                 resumed = await workflow.execute_activity(
                     "moyai_load_history_checkpoint_v1", args=[turn_id, handoff.checkpoint],
                     result_type=AgentCheckpoint, **CONTROL,
@@ -242,19 +418,26 @@ class TurnWorkflow(PydanticAIWorkflow):
             initial_requests = conversation.usage.requests
             checkpoint_ref: str | None = None
             checkpoint_release: DeploymentHandoff | None = None
-            async with self.events, public_event_sink(self.events.stream), runtime.agent.iter(
-                None if resumed else prompt_content(prepared.prompt, prepared.images),
-                conversation=conversation,
-                run_id=prepared.scope.root_run_id,
-                model=runtime.models[prepared.scope.model],
-                deps=prepared.scope,
-                deferred_tool_results=deferred_results,
-                workspace=workspace,
-                usage_limits=UsageLimits(
-                    request_limit=None if unlimited_model_requests() else runtime.settings.model_request_limit,
-                ),
-            ) as agent_run:
+            checkpoint_maintenance = False
+            async with (
+                self.events,
+                self.agent_mail_lifetime(),
+                public_event_sink(self.events.stream),
+                runtime.agent.iter(
+                    None if resumed else prompt_content(prepared.prompt, prepared.images),
+                    conversation=conversation,
+                    run_id=prepared.scope.root_run_id,
+                    model=runtime.models[prepared.scope.model],
+                    deps=prepared.scope,
+                    deferred_tool_results=deferred_results,
+                    workspace=workspace,
+                    usage_limits=UsageLimits(
+                        request_limit=None if unlimited_model_requests() else runtime.settings.model_request_limit,
+                    ),
+                ) as agent_run,
+            ):
                 self.agent_run = agent_run
+                self.scope = prepared.scope
                 if resumed is not None:
                     # These are the pinned SDK's exported graph/context records.
                     # Carry budgets and step IDs instead of granting fresh retries.
@@ -265,21 +448,37 @@ class TurnWorkflow(PydanticAIWorkflow):
                     )
                 for steering_id in list(self.pending_steering):
                     await self.steer(steering_id)
+                for message_id in list(self.pending_agent_mail):
+                    await self.agent_message(message_id)
                 # This is the public SDK iterator, not another model/tool dispatch loop.
                 boundary = 0
                 async for node in agent_run:
                     # This is an SDK graph boundary, not another agent loop.
                     # A running delegation batch settles before this returns.
                     # Completed answers/deferrals still finish their bookkeeping.
+                    maintenance_generation = None
                     if maintenance and agent_run.result is None:
-                        await self.maintenance_checkpoint(turn_id, f"native_node:{boundary}")
-                        boundary += 1
+                        if preserve_maintenance:
+                            # A new SDK run can resume a settled request, carrying
+                            # its original tool results and retry budgets. Do not
+                            # snapshot an unfinished model/tool batch.
+                            if isinstance(node, ModelRequestNode) and not agent_run.pending_messages:
+                                decision = await workflow.execute_activity(
+                                    "moyai_maintenance_boundary_v1",
+                                    args=[turn_id, f"native_node:{boundary}"],
+                                    result_type=DrainDecision, **CONTROL,
+                                )
+                                if decision.paused:
+                                    maintenance_generation = decision.generation
+                        else:
+                            # Old histories retain their exact activity sequence.
+                            await self.maintenance_checkpoint(turn_id, f"native_node:{boundary}")
                     if (
                         limits is not None and isinstance(node, ModelRequestNode)
-                        and agent_run.usage.requests > initial_requests
+                        and (maintenance_generation is not None or agent_run.usage.requests > initial_requests)
                         and not agent_run.pending_messages
                         and (
-                            self.history_full(limits)
+                            maintenance_generation is not None or self.history_full(limits)
                             or (deployment_handoff and self.deployment_handoff is not None)
                         )
                     ):
@@ -290,19 +489,26 @@ class TurnWorkflow(PydanticAIWorkflow):
                         # Poll handlers do not mutate the agent. Keep them live
                         # until persistence succeeds; detaching is irreversible.
                         await workflow.wait_condition(
-                            lambda: not self.steered.intersection(self.pending_steering),
+                            lambda: not self.steered.intersection(self.pending_steering) and not self.mail_handlers,
                         )
                         checkpoint = self.checkpoint(prepared, agent_run, node)
                         if deployment_handoff:
                             checkpoint.deployment_handoff = self.deployment_handoff
                             checkpoint.allow_history_only = self.history_full(limits)
                         try:
-                            saved = await workflow.execute_activity(
-                                "moyai_save_history_checkpoint_v1",
-                                checkpoint,
-                                result_type=CheckpointSave, **CONTROL,
-                            )
+                            if maintenance_generation is not None:
+                                saved = await self.preserve_maintenance_workspace(
+                                    checkpoint, f"native_node:{boundary}",
+                                )
+                            else:
+                                saved = await workflow.execute_activity(
+                                    "moyai_save_history_checkpoint_v1",
+                                    checkpoint,
+                                    result_type=CheckpointSave, **CONTROL,
+                                )
                         except ActivityError as error:
+                            if maintenance_generation is not None:
+                                raise  # Only cancellation/authority failures escape the waiting loop.
                             if (
                                 isinstance(error.cause, ApplicationError)
                                 and error.cause.type == "MoyaiHistoryAuthorizationDenied"
@@ -314,10 +520,12 @@ class TurnWorkflow(PydanticAIWorkflow):
                             saved = CheckpointSave()
                         if saved.reference is not None:
                             checkpoint_ref = saved.reference
+                            checkpoint_maintenance = maintenance_generation is not None
                             # Recorded v1 saves lack deployment_allowed. Their
                             # successful reference already passed the v1 gate.
                             checkpoint_release = (
-                                checkpoint.deployment_handoff if saved.deployment_allowed is not False else None
+                                checkpoint.deployment_handoff
+                                if not checkpoint_maintenance and saved.deployment_allowed is not False else None
                             )
                             self.events.stream.detach_pollers()
                             await workflow.wait_condition(workflow.all_handlers_finished)
@@ -327,6 +535,9 @@ class TurnWorkflow(PydanticAIWorkflow):
                         self.handing_off = False
                         for steering_id in list(self.pending_steering):
                             await self.steer(steering_id)
+                        for message_id in list(self.pending_agent_mail):
+                            await self.agent_message(message_id)
+                    boundary += 1
                 result = agent_run.result
                 if result is None and checkpoint_ref is None:
                     raise RuntimeError("The SDK ended without a run result.")
@@ -343,6 +554,7 @@ class TurnWorkflow(PydanticAIWorkflow):
                         turn_id, HistoryHandoff(
                             checkpoint=checkpoint_ref, stream_state=self.events.stream.get_state(),
                             steered=sorted(self.steered), pending_steering=list(self.pending_steering),
+                            pending_agent_mail=list(self.pending_agent_mail),
                             deployment_handoff=checkpoint_release or self.previous_deployment_handoff,
                             # A signal can arrive while the snapshot is being
                             # saved. Carry the latest unconsumed intent after
@@ -352,6 +564,7 @@ class TurnWorkflow(PydanticAIWorkflow):
                                 self.deployment_handoff
                                 if self.deployment_handoff != checkpoint_release else None
                             ),
+                            maintenance_workspace=checkpoint_maintenance,
                         ),
                     ],
                     # Ordinary history rollover retains its pinned version.
@@ -440,11 +653,23 @@ class TurnWorkflow(PydanticAIWorkflow):
                 "The agent could not complete this turn. "
                 "Inspect the saved activity before repeating a possibly completed action."
             )
-            if prepared is None and workflow.patched("moyai-public-preparation-errors-v1"):
+            if (prepared is None or preserve_maintenance) and workflow.patched("moyai-public-preparation-errors-v1"):
                 message = public_preparation_message(error) or message
+            if prepared is not None and workflow.patched("moyai-failure-workspace-checkpoint-v1"):
+                # Capture before failure settlement clears active ownership. A
+                # capture failure must never prevent the original error settling.
+                with suppress(ActivityError):
+                    await workflow.execute_activity(
+                        "moyai_preserve_failed_workspace_v1", turn_id,
+                        start_to_close_timeout=timedelta(
+                            minutes=17 if prepared.workspace and prepared.workspace.get("provider") == "lambda" else 3,
+                        ),
+                        retry_policy=RetryPolicy(maximum_attempts=1),
+                    )
             await workflow.execute_activity(
                 "moyai_fail_turn_v1",
-                args=[turn_id, message],
+                args=[turn_id, message, capture_failure(error)] if workflow.patched(FAILURE_VERSION)
+                else [turn_id, message],
                 **CONTROL,
             )
             if isinstance(error, ApplicationError):
@@ -478,6 +703,16 @@ class TurnWorkflow(PydanticAIWorkflow):
         # The next request holds the normalized results of the settled batch;
         # it has not been appended to all_messages() yet.
         messages = [*run.all_messages(), node.request]
+        if prepared.scope.agent_messages:
+            # The SDK can emit the final-drain event just before this graph
+            # boundary. Its message is already in this snapshot even if the
+            # event consumer has not yet acknowledged it.
+            _, completed = receipts(messages)
+            prepared = replace(prepared, scope=replace(
+                prepared.scope, background_agents=[
+                    child for child in prepared.scope.background_agents if child not in completed
+                ],
+            ))
         manager = run.ctx.deps.tool_manager
         retries = {
             name: count for name, count in (manager.ctx.retries if manager.ctx else {}).items()

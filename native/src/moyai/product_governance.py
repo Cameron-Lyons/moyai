@@ -223,6 +223,19 @@ class ProductGovernance:
         if scope is not None and intersect(await self.policy(db, scope.session_id), binding.policy) != binding.policy:
             raise HTTPException(403, 'A workflow cannot exceed the security policy of its creating session.')
 
+    async def continuation(self, db, session_id, requested=''):
+        """Admit a run in an existing chat only while the chat is no wider than its workflow.
+
+        A chat's binding is immutable, so it cannot adopt the workflow's profile.
+        """
+        from app.security_profiles import intersect
+        binding = await db.run_sync(lambda sync: self.product.profiles.resolve_for_new_session_in(
+            CanonicalRead(sync, self.identity), requested))
+        current = await self.policy(db, session_id)
+        if intersect(current, binding.policy) != current:
+            raise HTTPException(403, 'This chat allows more than the workflow security policy. '
+                                     'Choose a chat started under that policy, or a new chat for each run.')
+
 
 def permission_for_user(user, permission):
     from app.permissions import BUILTIN_PERMISSIONS

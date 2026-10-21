@@ -12,7 +12,7 @@ from urllib.parse import urlsplit
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, Field, TypeAdapter, field_validator
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, field_validator
 from pydantic_ai.workspaces import Workspace, WorkspaceRef, WorkspaceUnavailableError
 from pydantic_ai_harness import ModalSandbox
 from sqlalchemy import delete, select, update
@@ -48,7 +48,7 @@ class DesktopCommandFailed(HTTPException):
 
 
 class ComputerCommand(BaseModel):
-    action: Literal["start", "claim", "release", "heartbeat", "open", "terminal", "click", "type", "key", "scroll"]
+    action: Literal["start", "claim", "release", "handoff", "heartbeat", "open", "terminal", "click", "type", "key", "scroll"]
     x: int = Field(default=0, ge=0, lt=1280)
     y: int = Field(default=0, ge=0, lt=800)
     button: Literal[1, 2, 3] = 1
@@ -75,6 +75,25 @@ class ComputerCommand(BaseModel):
             if parsed.scheme not in {"https", "http"} or not parsed.hostname or parsed.username or parsed.password:
                 raise ValueError("Use an HTTP(S) address without embedded credentials.")
         return value
+
+
+class ComputerState(BaseModel):
+    model_config = ConfigDict(json_schema_serialization_defaults_required=True)
+    available: bool
+    has_workspace: bool
+    controlled: bool
+    can_release: bool = False
+    busy: bool
+    controller: str | None
+
+
+class ComputerControlResult(BaseModel):
+    model_config = ConfigDict(json_schema_serialization_defaults_required=True)
+    controlled: bool
+    # Guest readiness; absent for claim/release/heartbeat. Frames travel through noVNC.
+    available: bool | None = None
+    width: int | None = None
+    height: int | None = None
 
 
 async def authorize(runtime: Runtime, session_id: str, user: User) -> Session:
@@ -120,6 +139,14 @@ async def lease(runtime: Runtime, session_id: str, user: User, action: str, clie
         ).values(revision=Session.revision + 1).returning(Session.id))
         if locked is None:
             raise HTTPException(404, "Conversation not found.")
+        from .maintenance_workspace import maintenance_workspace
+
+        session = await db.get(Session, session_id, populate_existing=True)
+        assert session is not None
+        if not session.workspace:
+            raise HTTPException(409, "This conversation no longer has a computer.")
+        if action not in {"release", "handoff"} and maintenance_workspace(session.snapshot) is not None:
+            raise HTTPException(409, "This computer is preserved for maintenance. Wait for execution to resume.")
         current = await db.get(ComputerLease, session_id)
         reference = TypeAdapter(WorkspaceRef).validate_json(session.workspace)
         desktop = await db.get(ComputerDesktop, session_id)
@@ -137,9 +164,13 @@ async def lease(runtime: Runtime, session_id: str, user: User, action: str, clie
             raise HTTPException(409, "A computer action is still settling. Inspect the screen before taking control.")
         if pending and pending.expires_at > stamp and action not in {"claim", "heartbeat"}:
             raise HTTPException(409, "Wait for the current desktop action to settle before continuing or releasing control.")
-        if action == "release":
+        if action in {"release", "handoff"}:
+            if action == "handoff" and current and current.expires_at > stamp and current.actor_id != user.id:
+                raise HTTPException(409, "Another person is controlling this computer.")
             if current and current.actor_id == user.id:
-                if desktop.control_client and desktop.control_client != client_id:
+                # Only an explicit handoff may return this person's control
+                # from another tab. Delayed unmount cleanup stays client-bound.
+                if action == "release" and desktop.control_client and desktop.control_client != client_id:
                     raise HTTPException(409, "Release control from the browser that owns it.")
                 await db.delete(current)
                 desktop.control_epoch = new_id()
@@ -238,8 +269,8 @@ def routes(runtime: Runtime, actor, *, cookie_name: str = "moyai_session") -> AP
     router.include_router(stream_routes(runtime, cookie_name=cookie_name))
     router.include_router(browser_routes(runtime, actor))
 
-    @router.get("/api/sessions/{session_id}/computer")
-    async def state(session_id: str, client_id: str = "", user: User = Depends(actor)):
+    @router.get("/api/sessions/{session_id}/computer", operation_id="getComputer")
+    async def state(session_id: str, client_id: str = "", user: User = Depends(actor)) -> ComputerState:
         session = await authorize(runtime, session_id, user)
         async with runtime.database.sessions() as db:
             current = await db.get(ComputerLease, session_id)
@@ -253,18 +284,21 @@ def routes(runtime: Runtime, actor, *, cookie_name: str = "moyai_session") -> AP
             if controller and controller.id == user.id and (desktop is None or not desktop.control_client):
                 controller = None
         reference = TypeAdapter(WorkspaceRef).validate_json(session.workspace) if session.workspace else None
-        return {"available": bool(
-                    desktop and reference and desktop.workspace_id == reference.id and desktop.version == DESKTOP_VERSION
-                ), "has_workspace": bool(reference),
-                "controlled": controlled, "busy": bool(session.active_turn),
-                "controller": controller.display_name if controller else None}
+        return ComputerState(
+            available=bool(
+                desktop and reference and desktop.workspace_id == reference.id and desktop.version == DESKTOP_VERSION
+            ), has_workspace=bool(reference),
+            controlled=controlled, can_release=bool(current and current.actor_id == user.id and current.expires_at > time.time()),
+            busy=bool(session.active_turn),
+            controller=controller.display_name if controller else None,
+        )
 
-    @router.post("/api/sessions/{session_id}/computer")
-    async def control(session_id: str, body: ComputerCommand, user: User = Depends(actor)):
+    @router.post("/api/sessions/{session_id}/computer", operation_id="controlComputer")
+    async def control(session_id: str, body: ComputerCommand, user: User = Depends(actor)) -> ComputerControlResult:
         operation = await lease(runtime, session_id, user, body.action, body.client_id)
         session = await authorize(runtime, session_id, user)
-        if body.action in {"claim", "release", "heartbeat"}:
-            return {"controlled": body.action != "release"}
+        if body.action in {"claim", "release", "handoff", "heartbeat"}:
+            return ComputerControlResult(controlled=body.action not in {"release", "handoff"})
         duration = 600 if body.action == "start" else 30
         try:
             async with asyncio.timeout(duration):
@@ -300,6 +334,6 @@ def routes(runtime: Runtime, actor, *, cookie_name: str = "moyai_session") -> AP
                     desktop.workspace_id = TypeAdapter(WorkspaceRef).validate_json(session.workspace).id
                     desktop.version = DESKTOP_VERSION
         # Frames travel through noVNC. A start response only needs readiness.
-        return {key: item for key, item in {**value, "controlled": True}.items() if key != "frame"}
+        return ComputerControlResult.model_validate({**value, "controlled": True})
 
     return router

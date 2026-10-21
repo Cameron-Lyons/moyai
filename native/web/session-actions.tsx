@@ -4,9 +4,11 @@ import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover"
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog"
-import { api } from "./api"
-import { preferencePatch, type SessionPreferenceUpdates } from "./session-preferences"
+import { createSessionFolder, deleteSessionFolder, renameSessionFolder, type PullRequestStatus, type SessionFolderView } from "./generated/api"
+import { deleteSession, restoreSession, updateSession, type SessionEdit } from "./generated/api"
+import { sessionUpdatePatch, type SessionUpdates } from "./session-updates"
 import { downloadDebugTrace } from "./debug-trace"
+import { ApiError } from "./api"
 
 export type SidebarSession = {
   id: string; title: string; owner_id: string; status: string; archived: boolean; deleted?: boolean
@@ -14,19 +16,20 @@ export type SidebarSession = {
   surface?: string
   parent_session_id?: string | null
   source?: "native" | "legacy"; key?: string; url?: string; read_only?: boolean; deleting?: boolean; folder_id?: string | null
-  pull_requests?: { url: string; title: string; repository: string; number: number; state: "open" | "closed" | "merged" | "unknown"; draft: boolean; accessible: boolean; error?: string }[]
+  pull_requests?: PullRequestStatus[]
 }
 export const sessionIsReadOnly = (row: SidebarSession) => row.source === "legacy" || row.read_only === true
 export const sessionKey = (row: SidebarSession) => row.key ?? `${row.source ?? "native"}:${row.id}`
 export const sessionHash = (row: SidebarSession) => `${row.source === "legacy" ? "run=" : ""}${encodeURIComponent(row.id)}`
-export type SessionFolder = { id: string; name: string }
+export type SessionFolder = SessionFolderView
 type Action = "rename" | "move" | "archive" | "delete" | "restore" | "folder-create" | "folder-rename" | "folder-remove"
 type Editor = { action: Action; session?: SidebarSession; folder?: SessionFolder }
 type Actions = {
   userId: string; busy: boolean
-  preferenceSession: (row: SidebarSession) => SidebarSession
+  updates: SessionUpdates
+  optimisticSession: <T extends SidebarSession>(row: T) => T
   openEditor: (editor: Editor) => void
-  edit: (row: SidebarSession, body: object, message: string) => Promise<boolean>
+  edit: (row: SidebarSession, body: SessionEdit, message: string) => Promise<boolean>
   copy: (row: SidebarSession) => void
   openComputer: (id: string) => void
   newSession: () => void
@@ -61,7 +64,7 @@ export function SessionMenu({ session, header = false, onOpenSideChat }: {
   session: SidebarSession; header?: boolean; onOpenSideChat?: () => void
 }) {
   const actions = useSessionActions()
-  const row = actions.preferenceSession(session)
+  const row = actions.optimisticSession(session)
   const [traceBusy, setTraceBusy] = useState(false)
   const [traceError, setTraceError] = useState("")
   const owner = row.can_manage ?? row.owner_id === actions.userId
@@ -102,9 +105,9 @@ export function SessionMenu({ session, header = false, onOpenSideChat }: {
   }}</ActionMenu>
 }
 
-export function SessionActionsProvider({ userId, folders, refresh, preferences, preferenceSession, onOpenComputer, onNewSession, onDeleted, children }: {
+export function SessionActionsProvider({ userId, folders, refresh, updates, optimisticSession, onOpenComputer, onNewSession, onDeleted, children }: {
   userId: string; folders: SessionFolder[]; refresh: () => Promise<void>
-  preferences: SessionPreferenceUpdates; preferenceSession: (row: SidebarSession) => SidebarSession
+  updates: SessionUpdates; optimisticSession: <T extends SidebarSession>(row: T) => T
   onOpenComputer: (id: string) => void; onNewSession: () => void; onDeleted: (id: string) => void
   children: React.ReactNode
 }) {
@@ -114,32 +117,49 @@ export function SessionActionsProvider({ userId, folders, refresh, preferences, 
   const busyRef = useRef(false)
   const [error, setError] = useState("")
   const [notice, setNotice] = useState("")
-  const active = useRef(true), preferenceSequence = useRef(0)
+  const [renameRetry, setRenameRetry] = useState<{ row: SidebarSession; title: string } | null>(null)
+  const active = useRef(true), editSequence = useRef(0)
+  const latestEdits = useRef(new Map<string, number>())
   useEffect(() => {
     active.current = true
-    return () => { active.current = false }
+    const clear = () => { ++editSequence.current; latestEdits.current.clear(); setRenameRetry(null); setError(""); setNotice("") }
+    window.addEventListener("moyai:access-changed", clear)
+    window.addEventListener("moyai:signed-out", clear)
+    return () => {
+      active.current = false
+      window.removeEventListener("moyai:access-changed", clear)
+      window.removeEventListener("moyai:signed-out", clear)
+    }
   }, [])
-  const openEditor = (value: Editor) => { if (busyRef.current || (value.session && sessionIsReadOnly(value.session))) return; setError(""); setName(value.action === "folder-create" ? "" : value.folder?.name ?? value.session?.title ?? ""); setEditor(value.session ? { ...value, session: preferenceSession(value.session) } : value) }
+  const openEditor = (value: Editor) => { if (busyRef.current || (value.session && sessionIsReadOnly(value.session))) return; setError(""); setName(value.action === "folder-create" ? "" : value.folder?.name ?? value.session?.title ?? ""); setEditor(value.session ? { ...value, session: optimisticSession(value.session) } : value) }
   async function mutate(action: () => Promise<unknown>, message: string) {
     if (busyRef.current) return false
     busyRef.current = true
-    setBusy(true); setError(""); setNotice("")
+    ++editSequence.current
+    setBusy(true); setError(""); setNotice(""); setRenameRetry(null)
     try { await action(); setEditor(null); await refresh(); setNotice(message); return true }
     catch (error) { setError(String(error)); return false }
     finally { busyRef.current = false; setBusy(false) }
   }
-  async function edit(row: SidebarSession, body: object, message: string) {
+  async function edit(row: SidebarSession, body: SessionEdit, message: string) {
     if (sessionIsReadOnly(row) || busyRef.current) return false
-    const patch = preferencePatch(body)
-    if (!patch) return mutate(() => api(`/sessions/${row.id}`, "PATCH", body), message)
-    const sequence = ++preferenceSequence.current
-    setEditor(null); setError(""); setNotice("")
+    const patch = sessionUpdatePatch(body)
+    if (!patch) return mutate(() => updateSession({ path: { session_id: row.id }, body }), message)
+    if (patch.title !== undefined && (row.owner_id !== userId || row.deleted || row.deleting)) return false
+    const sequence = ++editSequence.current
+    const key = `${row.id}:${patch.title === undefined ? "preferences" : "title"}`
+    latestEdits.current.set(key, sequence)
+    setEditor(null); setError(""); setNotice(""); setRenameRetry(null)
     try {
-      await preferences.update(row.id, patch)
-      if (active.current && sequence === preferenceSequence.current) setNotice(message)
+      await updates.update(row, patch)
+      if (active.current && sequence === editSequence.current) setNotice(message)
       return true
     } catch (error) {
-      if (active.current && !(error instanceof DOMException && error.name === "AbortError")) setError(String(error))
+      if (active.current && latestEdits.current.get(key) === sequence && !(error instanceof DOMException && error.name === "AbortError")) {
+        setError(patch.title === undefined ? String(error) : `Could not rename to “${patch.title}”. ${String(error)}`)
+        if (patch.title !== undefined && !(error instanceof ApiError && [401, 403, 404].includes(error.status)))
+          setRenameRetry({ row, title: patch.title })
+      }
       return false
     }
   }
@@ -150,14 +170,16 @@ export function SessionActionsProvider({ userId, folders, refresh, preferences, 
   })[editor.action] : ""
   const named = editor && ["rename", "folder-create", "folder-rename"].includes(editor.action)
   return <ActionsContext.Provider value={{
-    userId, busy, preferenceSession, openEditor, edit, openComputer: onOpenComputer, newSession: onNewSession,
+    userId, busy, updates, optimisticSession, openEditor, edit, openComputer: onOpenComputer, newSession: onNewSession,
     copy: row => { void navigator.clipboard.writeText(`${location.origin}/#${sessionHash(row)}`).then(
       () => setNotice("Session link copied."),
       () => setError("Could not copy the link. Open the session and copy its address."),
     ) },
   }}>
     {children}
-    {(notice || (error && !editor)) && <div className={`action-toast ${error && !editor ? "error" : ""}`} role={error && !editor ? "alert" : "status"}>{error && !editor ? error : notice}<Button type="button" size="icon-sm" variant="ghost" aria-label="Dismiss notification" onClick={() => { setNotice(""); setError("") }}><X size={14} /></Button></div>}
+    {(notice || (error && !editor)) && <div className={`action-toast ${error && !editor ? "error" : ""}`} role={error && !editor ? "alert" : "status"}>{error && !editor ? error : notice}
+      {error && !editor && renameRetry && <Button type="button" variant="ghost" size="sm" onClick={() => void edit(renameRetry.row, { title: renameRetry.title }, "Session renamed.")}>Retry rename</Button>}
+      <Button type="button" size="icon-sm" variant="ghost" aria-label="Dismiss notification" onClick={() => { setNotice(""); setError(""); setRenameRetry(null) }}><X size={14} /></Button></div>}
     <Dialog open={Boolean(editor)} onOpenChange={open => { if (!open && !busy) { setEditor(null); setError("") } }}>
       <DialogContent className="sidebar-editor"><DialogHeader><DialogTitle>{title}</DialogTitle><DialogDescription>
         {editor?.action === "delete" ? "Stops active and queued work and removes this session for everyone. Saved history and files are kept. You can restore it from Deleted sessions."
@@ -176,15 +198,15 @@ export function SessionActionsProvider({ userId, folders, refresh, preferences, 
         if (!editor) return
         if (editor.action === "rename") void edit(editor.session!, { title: name.trim() }, "Session renamed.")
         else if (editor.action === "archive") void edit(editor.session!, { archived: !editor.session!.archived }, editor.session!.archived ? "Session restored." : "Session archived.")
-        else if (editor.action === "delete") void mutate(async () => { await api(`/sessions/${editor.session!.id}`, "DELETE"); onDeleted(editor.session!.id) }, "Moved to Deleted sessions.")
-        else if (editor.action === "restore") void mutate(() => api(`/sessions/${editor.session!.id}/restore`, "POST"), "Restored to active sessions.")
-        else if (editor.action === "folder-remove") void mutate(() => api(`/session-folders/${editor.folder!.id}`, "DELETE"), "Folder removed. Sessions are still saved.")
-        else if (editor.action === "folder-rename") void mutate(() => api(`/session-folders/${editor.folder!.id}`, "PATCH", { name }), "Folder renamed.")
+        else if (editor.action === "delete") void mutate(async () => { await deleteSession({ path: { session_id: editor.session!.id } }); onDeleted(editor.session!.id) }, "Moved to Deleted sessions.")
+        else if (editor.action === "restore") void mutate(() => restoreSession({ path: { session_id: editor.session!.id } }), "Restored to active sessions.")
+        else if (editor.action === "folder-remove") void mutate(() => deleteSessionFolder({ path: { folder_id: editor.folder!.id } }), "Folder removed. Sessions are still saved.")
+        else if (editor.action === "folder-rename") void mutate(() => renameSessionFolder({ path: { folder_id: editor.folder!.id }, body: { name } }), "Folder renamed.")
         else void mutate(async () => {
-          const created = await api<SessionFolder>("/session-folders", "POST", { name })
+          const { data: created } = await createSessionFolder({ body: { name } })
           if (editor.session) {
             setEditor({ action: "move", session: editor.session }); await refresh()
-            await api(`/sessions/${editor.session.id}`, "PATCH", { folder: created.name })
+            await updateSession({ path: { session_id: editor.session.id }, body: { folder: created.name } })
           }
         }, editor.session ? "Folder created and session moved." : "Folder created.")
       }}>

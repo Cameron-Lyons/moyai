@@ -3,8 +3,18 @@
 Moyai discovers connected tools through Pydantic AI's local `search_tools`
 capability. Selected connections remain available, but their full schemas are
 deferred until a search reveals matching tools. The model can discover additional
-tools later in the same turn. GitHub definitions identify their selected repository
-so a search can distinguish otherwise identical tools from different connections.
+tools later in the same turn. Canonical GitHub connections expose one
+`github_<operation>` definition across the selected repositories. Native workflows
+and search tools take `repository` or `repository_id`; other provider reads retain
+their `owner` and `repo` inputs. The server resolves each call to an admitted grant.
+Native workflow dispatch reconstructs local schemas without GitHub MCP discovery.
+Provider reads retain live provider schema validation.
+
+Each target retains its allowlist, read-only policy, and approval requirements.
+Shared write validation resolves the target before reserving an effect, so an
+approval request does not leave a pending write. Recorded connection-prefixed
+calls retain their original repository, schemas, approvals, and receipt identity.
+Token-backed noncanonical accounts retain their connection-specific tool names.
 
 The local search path is intentional. Provider-native search can still upload the
 entire deferred corpus on every inference request. Moyai sends the local search
@@ -17,6 +27,21 @@ Each worker keeps a bounded, in-memory catalog containing tool definitions and
 retry limits, without credentials, live transports, executable tools, or validators.
 The key includes the complete admitted turn scope: actor, turn, model, visibility,
 surface and grant snapshots. Delegates with that same scope can reuse it.
+
+Canonical product catalogs containing GitHub additionally reuse definitions across
+turns in the **same session**. This is an explicit opt-in for Moyai's adapters:
+their REST/publication schemas are fixed, and GitHub read schemas come from the
+selected account. Their definitions do not depend on a turn ID. Every other
+admitted identity/authority field remains in the key, including actor, product identity version, model,
+visibility, surface, delegation provenance and complete grant/policy snapshots.
+Arbitrary provider catalogs and catalogs without GitHub retain the turn key.
+
+Every canonical catalog listing checks the current running turn and account
+authority before returning definitions, including cache hits and after discovery
+awaits. Failed authorization evicts the shared entry. Execution reconstructs the
+current turn's validators and publication closures; approvals, effect receipts,
+credentials and provider transports are never reused across turns. Credential
+refresh and provider permission checks still occur when tools execute.
 
 Entries expire after five minutes and the cache is limited to 32 catalogs and
 16 MB of serialized definitions. Concurrent discovery of the same scope shares
@@ -60,6 +85,9 @@ replay its history. They verify selective discovery, two reads after one catalog
 load, targeted reconstruction with another connection selected, and preservation
 of canonical read/write tool policy. Cache tests cover validation, live revocation,
 metadata changes, actor/grant isolation, expiry, eviction and cancelled discovery.
+Canonical catalog tests also compare actual adapter definitions across turns,
+check session/identity/provenance isolation, and verify fresh execution context,
+credential rotation, revocation during discovery, and invalidation on schema drift.
 
 For canonical PostgreSQL authority coverage, point `MOYAI_TEST_POSTGRES` at a
 disposable local database and run `native/tests/test_product_authority.py`.

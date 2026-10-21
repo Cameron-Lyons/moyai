@@ -15,6 +15,7 @@ import json
 import re
 import secrets
 import time
+from collections.abc import Callable, Sequence
 from dataclasses import replace
 from functools import wraps
 from typing import TYPE_CHECKING, Any, Literal, cast
@@ -29,9 +30,11 @@ from fastapi.routing import APIRoute
 from pydantic import BaseModel, ConfigDict, Field, SecretStr
 from pydantic_ai import RunContext, Tool
 from pydantic_ai.exceptions import ToolFailed
+from pydantic_ai.tools import ToolDefinition
 from pydantic_ai.toolsets import AbstractToolset, FunctionToolset
 from pydantic_ai.toolsets.abstract import ToolsetTool
 
+from .connection_catalog import CatalogToolset, ConnectionCatalog, ConnectionDefinitionChanged
 from .contracts import Grant, RunScope
 from .product_connector_execution import CanonicalConnectorExecution
 
@@ -84,7 +87,7 @@ class ProductConnections:
 
     def _grants(
         self, actor_id: str, *, shared_session: bool, surface: str,
-        source_store: Any = None, source_connectors: Any = None,
+        source_store: Any = None, source_connectors: Any = None, selected_ids: Sequence[str] = (),
     ) -> list[Grant]:
         from app.connection_authority import authority
         from app.connector_errors import ConnectorError
@@ -98,7 +101,9 @@ class ProductConnections:
                 continue
             rows = store.rows("SELECT * FROM connections WHERE provider=?", (provider,))
             personal = connectors.personal_slack
-            owner = personal.owner(actor_id) if provider == "slack" else None
+            # Slack conversations use the installed organization account. A
+            # participant's private-web setup must not change shared authority.
+            owner = personal.owner(actor_id) if provider == "slack" and surface != "slack" else None
             personal_row = personal.row(owner) if owner else None
             selected: list[tuple[Any, str | None, str]] = []
             if personal_row and personal_row["encrypted"] is not None:
@@ -112,6 +117,13 @@ class ProductConnections:
                         selected.append((rows[0], None, "bot"))
             elif rows:
                 selected.append((rows[0], None, "organization"))
+                if provider == "slack" and surface == "slack" and selected_ids:
+                    organization = json.loads(self.security.decrypt(rows[0]["encrypted"]))
+                    if (organization.get("bot") or {}).get("access_token"):
+                        # Existing turns/workspaces may retain the former
+                        # bot-only grant. Resolve its exact ID without adding
+                        # it to the catalog or broadening its permissions.
+                        selected.append((rows[0], None, "bot"))
             audit = store.rows(
                 "SELECT MAX(id) AS revision FROM connection_audit WHERE provider=?", (provider,),
             )[0]["revision"]
@@ -138,6 +150,8 @@ class ProductConnections:
                         reference["app_version"] = app_version
                     digest = hashlib.sha256(json.dumps(reference, sort_keys=True).encode()).hexdigest()
                     identity = str(uuid5(NAMESPACE_URL, "moyai/canonical-connection/" + digest))
+                    if surface == "slack" and access == "bot" and identity not in selected_ids:
+                        continue
                     result.append(Grant(
                         id=identity, kind=provider, revision=int(digest[:7], 16) + 1,
                         credential="", read_only=reference["read_only"],
@@ -170,7 +184,7 @@ class ProductConnections:
                 )
                 return self._grants(
                     actor_id, shared_session=shared_session, surface=surface,
-                    source_store=source, source_connectors=connectors,
+                    source_store=source, source_connectors=connectors, selected_ids=selections,
                 )
 
             # run_sync adapts the canonical pure helpers to async SQL on this
@@ -179,6 +193,7 @@ class ProductConnections:
         else:
             available = await source_database(
                 self._grants, actor_id, shared_session=shared_session, surface=surface,
+                selected_ids=selections,
             )
         selected: dict[str, Grant] = {}
         for selection in dict.fromkeys(selections):
@@ -466,6 +481,48 @@ class CommittedSourceWrites:
         return None
 
 
+class ProductCatalogToolset(CatalogToolset):
+    """Reuse canonical definitions across turns, never a turn's execution state.
+
+    Only Moyai's canonical adapters opt in. Their schemas depend on the selected
+    grants (including read/write policy), not the turn ID: REST tools come from
+    fixed schemas; GitHub reads come from the admitted account's MCP catalog;
+    publication definitions are fixed even though their closures enforce the
+    current turn's approval/effect receipts. Those closures are never cached.
+
+    Keep session, actor, product identity, provenance and the complete grant
+    snapshot in the key. Arbitrary provider/context-dependent toolsets continue
+    to use CatalogToolset's full-turn key.
+    """
+
+    def __init__(
+        self, catalog: ConnectionCatalog, ctx: RunContext[RunScope],
+        factory: Callable[[str | None], AbstractToolset[RunScope]],
+        *, reconstruct: Callable[[ToolDefinition], AbstractToolset[RunScope] | None] | None = None,
+    ):
+        super().__init__(catalog, ctx, factory, reconstruct=reconstruct)
+        self.key = catalog.key(replace(ctx, deps=replace(ctx.deps, turn_id="")))
+
+    async def get_tools(self, ctx: RunContext[RunScope]) -> dict[str, ToolsetTool[RunScope]]:
+        from .runtime import current
+
+        service = current().product_connections
+        if service is None or not ctx.deps.grants or any(
+            not grant.policy.get("product") for grant in ctx.deps.grants
+        ):
+            raise PermissionError("Canonical product connections are required for schema reuse.")
+        try:
+            tools = await super().get_tools(ctx)
+            # A cache entry is not proof that this turn is still running or that
+            # its requester/account is still authorized. Check the full current
+            # scope at the release boundary, including on hits and after awaits.
+            await service.check(ctx.deps, ctx.deps.grants[0])
+            return tools
+        except (PermissionError, HTTPException):
+            self.catalog.discard(self.key)
+            raise
+
+
 class ProductGitHubToolset(AbstractToolset[RunScope]):
     """Scoped native reads plus canonical publication/approval operations."""
 
@@ -491,7 +548,7 @@ class ProductGitHubToolset(AbstractToolset[RunScope]):
         return github.get_toolset()
 
     async def get_tools(self, ctx: RunContext[RunScope]) -> dict[str, ToolsetTool[RunScope]]:
-        from .connections import PROHIBITED_TOOLS, read_only_tool
+        from .connection_policy import PROHIBITED_TOOLS, read_only_tool
 
         native = await self._native()
         async with native:
@@ -522,7 +579,7 @@ class ProductGitHubToolset(AbstractToolset[RunScope]):
     async def call_tool(
         self, name: str, tool_args: dict[str, Any], ctx: RunContext[RunScope], tool: ToolsetTool[RunScope],
     ) -> Any:
-        from .connections import read_only_tool
+        from .connection_policy import read_only_tool
 
         own = await self.publications.get_tools(ctx)
         if name in own:
@@ -550,10 +607,14 @@ class ProductGitHubToolset(AbstractToolset[RunScope]):
         async with native:
             definitions = await native.get_tools(ctx)
             current = definitions.get(name)
-            if current is None or read_only_tool(current.tool_def) != read_only_tool(tool.tool_def):
-                raise ToolFailed("The provider tool definition changed. No action was sent.")
+            if current is None or (
+                read_only_tool(current.tool_def) != read_only_tool(tool.tool_def)
+                or current.tool_def.parameters_json_schema != tool.tool_def.parameters_json_schema
+            ):
+                raise ConnectionDefinitionChanged("The provider tool definition changed. Discover its tools again; no action was sent.")
             await self.service.check(self.scope, self.grant)
-            result = await native.call_tool(name, tool_args, ctx, current)
+            arguments = current.args_validator.validate_python(tool_args)
+            result = await native.call_tool(name, arguments, ctx, current)
             if not write:
                 await self.service.check(self.scope, self.grant)
             return result
@@ -568,6 +629,63 @@ class PolicyChange(BaseModel):
     model_config = ConfigDict(extra="forbid")
     enabled: bool
     read_only: bool
+
+
+class OrganizationConnectionResponse(BaseModel):
+    model_config = ConfigDict(json_schema_serialization_defaults_required=True)
+
+
+class OrganizationConnectionTool(OrganizationConnectionResponse):
+    name: str
+    write: bool
+    requires_approval: bool
+    description: str
+
+
+class OrganizationConnectionRepository(OrganizationConnectionResponse):
+    id: int
+    full_name: str
+
+
+class OrganizationConnectionPolicy(OrganizationConnectionResponse):
+    enabled: bool
+    read_only: bool
+    checked_at: str | None
+    check_status: str | None
+
+
+class OrganizationConnection(OrganizationConnectionPolicy):
+    """One organization account; credentials stay on the server."""
+
+    id: Provider
+    connected: bool
+    scope: Literal["organization"]
+    oauth_configured: bool
+    label: str
+    updated_at: str | None
+    identity: str
+    tools: list[OrganizationConnectionTool]
+    # GitHub only.
+    repositories: list[OrganizationConnectionRepository] | None = None
+    app_registered: bool | None = None
+
+
+class OrganizationConnectionConnected(OrganizationConnectionResponse):
+    connected: bool
+    label: str
+
+
+class OrganizationConnectionDisconnected(OrganizationConnectionResponse):
+    connected: bool
+
+
+class OrganizationConnectionCheck(OrganizationConnectionResponse):
+    healthy: bool
+    label: str
+
+
+class OrganizationConnectionOAuthStart(OrganizationConnectionResponse):
+    url: str
 
 
 class ConnectionRoute(APIRoute):
@@ -635,16 +753,18 @@ def routes(service: ProductConnections) -> APIRouter:
             router.add_api_route(
                 route.path, offloaded_github(route.endpoint, route.path), methods=list(route.methods or {"GET"}),
                 name=route.name, status_code=route.status_code,
+                response_model=route.response_model, operation_id=route.operation_id,
+                openapi_extra=route.openapi_extra, include_in_schema=route.include_in_schema,
             )
     personal_callback = connectors.personal_slack.routes(router)
 
-    @router.get("/api/product/connections")
-    async def accounts(request: Request):
+    @router.get("/api/product/connections", operation_id="listOrganizationConnections")
+    async def accounts(request: Request) -> list[OrganizationConnection]:
         await source_database(security.require, request)
-        return await service.accounts()
+        return [OrganizationConnection.model_validate(row) for row in await service.accounts()]
 
-    @router.post("/api/connections/{provider}")
-    async def connect(provider: Provider, body: TokenConnection, request: Request):
+    @router.post("/api/connections/{provider}", operation_id="connectOrganizationConnection")
+    async def connect(provider: Provider, body: TokenConnection, request: Request) -> OrganizationConnectionConnected:
         await source_database(security.require, request, mutation=True, admin=True)
         if provider == "github":
             raise HTTPException(400, "Install the organization GitHub App; raw tokens are not accepted.")
@@ -655,10 +775,10 @@ def routes(service: ProductConnections) -> APIRouter:
         await source_database(save_if_unchanged, store, security, provider, value, label, expected)
         await source_database(connectors.record_check, provider, "healthy")
         await source_database(connectors.audit, provider, "Connected for the organization")
-        return {"connected": True, "label": label}
+        return OrganizationConnectionConnected(connected=True, label=label)
 
-    @router.delete("/api/connections/{provider}")
-    async def disconnect(provider: Provider, request: Request):
+    @router.delete("/api/connections/{provider}", operation_id="disconnectOrganizationConnection")
+    async def disconnect(provider: Provider, request: Request) -> OrganizationConnectionDisconnected:
         await source_database(security.require, request, mutation=True, admin=True)
         async with connectors.locks[provider]:
             def revoke():
@@ -669,19 +789,19 @@ def routes(service: ProductConnections) -> APIRouter:
             await source_database(revoke)
         await source_database(connectors.expire_approvals, provider)
         await source_database(connectors.audit, provider, "Disconnected from the organization")
-        return {"connected": False}
+        return OrganizationConnectionDisconnected(connected=False)
 
-    @router.patch("/api/connections/{provider}/policy")
-    async def policy(provider: Provider, body: PolicyChange, request: Request):
+    @router.patch("/api/connections/{provider}/policy", operation_id="updateOrganizationConnectionPolicy")
+    async def policy(provider: Provider, body: PolicyChange, request: Request) -> OrganizationConnectionPolicy:
         await source_database(security.require, request, mutation=True, admin=True)
         await source_database(set_policy, store, security, provider, body.enabled, body.read_only)
         if not body.enabled or body.read_only:
             await source_database(connectors.expire_approvals, provider)
         await source_database(connectors.audit, provider, "Updated organization connection policy")
-        return await source_database(connectors.policy, provider)
+        return OrganizationConnectionPolicy.model_validate(await source_database(connectors.policy, provider))
 
-    @router.post("/api/connections/{provider}/check")
-    async def check(provider: Provider, request: Request):
+    @router.post("/api/connections/{provider}/check", operation_id="checkOrganizationConnection")
+    async def check(provider: Provider, request: Request) -> OrganizationConnectionCheck:
         await source_database(security.require, request, mutation=True, admin=True)
         try:
             if provider == "github":
@@ -695,10 +815,10 @@ def routes(service: ProductConnections) -> APIRouter:
             await source_database(connectors.record_check, provider, "needs_attention")
             raise
         await source_database(connectors.record_check, provider, "healthy")
-        return {"healthy": True, "label": label}
+        return OrganizationConnectionCheck(healthy=True, label=label)
 
-    @router.post("/api/connections/{provider}/oauth")
-    async def oauth(provider: Provider, request: Request):
+    @router.post("/api/connections/{provider}/oauth", operation_id="startOrganizationConnectionOAuth")
+    async def oauth(provider: Provider, request: Request) -> OrganizationConnectionOAuthStart:
         sid = await source_database(security.require, request, mutation=True, admin=True)
         if not connectors.configured_oauth(provider):
             raise HTTPException(409, "Configure this app's OAuth client or connect using a token.")
@@ -708,7 +828,7 @@ def routes(service: ProductConnections) -> APIRouter:
             store.execute, "INSERT INTO oauth_states VALUES(?,?,?,?)",
             (digest(state), provider, digest(sid), time.time() + 600),
         )
-        return {"url": connectors.authorization_url(provider, state)}
+        return OrganizationConnectionOAuthStart(url=connectors.authorization_url(provider, state))
 
     @router.get("/oauth/{provider}/callback")
     async def callback(provider: Provider, request: Request, state: str = "", code: str = "", error: str = ""):

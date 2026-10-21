@@ -1,15 +1,19 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import shutil
+from functools import wraps
 from pathlib import Path
 
 import product_database_fixtures as database_fixtures
+import pytest
 import pytest_asyncio
 from pydantic_ai.capabilities import LocalWorkspace
 from pydantic_ai.messages import ModelResponse, TextPart
 from pydantic_ai.models.function import FunctionModel
 from sqlalchemy import select
+from temporalio.worker import Replayer, Worker
 
 from moyai.contracts import NewMessage, NewSession
 from moyai.models import User
@@ -18,6 +22,26 @@ from moyai.settings import Settings
 
 prepared_product_database = database_fixtures.prepared_product_database
 product_database_template = database_fixtures.product_database_template
+
+
+@pytest.fixture(autouse=True)
+def collect_temporal_cycles(monkeypatch):
+    collected = False
+
+    def before_temporal(init):
+        @wraps(init)
+        def initialize(*args, **kwargs):
+            nonlocal collected
+            if not collected:
+                # Pay for earlier tests' cycles before a worker/replayer starts
+                # its two-second watchdog. Ordinary tests need no full-heap scan.
+                gc.collect()
+                collected = True
+            return init(*args, **kwargs)
+        return initialize
+
+    for temporal_class in (Worker, Replayer):
+        monkeypatch.setattr(temporal_class, "__init__", before_temporal(temporal_class.__init__))
 
 
 @pytest_asyncio.fixture

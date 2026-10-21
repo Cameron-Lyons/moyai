@@ -38,17 +38,18 @@ from pydantic_ai_harness import (
 )
 from pydantic_ai_harness.ask_user import AskUserRequest, Question
 from pydantic_ai_harness.conversation_search import SnapshotHistorySource
+from pydantic_ai_harness.planning import PlanItem
 from temporalio import workflow
 from temporalio.common import RetryPolicy
-from temporalio.exceptions import ActivityError, ApplicationError
 
 from .artifacts import artifact_capability
 from .browser import browser_capability
 from .browser_login import BrowserLogin
 from .bundled_skills import bundled_skill_catalog
+from .coding_image import with_node
 from .commentary import Commentary
 from .computer_startup import OnDemandDurability, on_demand_coder
-from .connection_catalog import ConnectionToolSearch
+from .connection_catalog import ConnectionToolSearch, connection_search
 from .connections import connection_tools
 from .contracts import GuidanceChanged, RunScope
 from .database import Database
@@ -67,6 +68,7 @@ from .stores import NativeStores
 from .swarm_tools import SwarmCapability
 from .tools import WORKSPACE_TOOLS
 from .tools.desktop import desktop_capability
+from .tools.tool_caller import ToolCaller
 
 PACKAGE_ROOT = Path(__file__).resolve().parent / "resources"
 if not PACKAGE_ROOT.is_dir():
@@ -200,8 +202,25 @@ class WorkflowPlanning(Planning[RunScope]):
     @cached_property
     def registered_toolset(self) -> AbstractToolset[RunScope]:
         native = super().get_toolset()
-        if not isinstance(native, AbstractToolset):
+        if not isinstance(native, FunctionToolset):
             raise TypeError("The native planning capability changed its toolset contract.")
+        if "write_plan" in native.tools and "read_plan" in native.tools:
+            original = native.tools.pop("write_plan")
+            read = native.tools["read_plan"].function
+
+            async def write_plan(ctx: RunContext[RunScope], items: list[PlanItem]) -> str:
+                result = await original.function(ctx, items)
+                if not result.startswith("Plan updated:"):
+                    return result
+                if workflow.in_workflow() and not workflow.patched("moyai-planning-persisted-ids-v1"):
+                    # Old histories proceed directly to finish_tool_effect.
+                    # The additional durable read must not appear on replay.
+                    return result
+                # Read the persisted IDs, including IDs replayed by the durable
+                # store. Ordinal display numbers cannot address granular edits.
+                return "Plan updated.\n\n" + await read(ctx)
+
+            native.add_function(write_plan, description=original.description)
         return native.with_metadata(temporal=False)
 
     def get_toolset(self) -> AbstractToolset[RunScope]:
@@ -224,6 +243,7 @@ class Authority(AbstractCapability[RunScope]):
 
     def __init__(self, database: Database):
         self.database = database
+        self.tool_caller = ToolCaller()
 
     def get_model_settings(self):
         def for_request(ctx: RunContext[RunScope]) -> OpenAIResponsesModelSettings:
@@ -319,12 +339,7 @@ class Authority(AbstractCapability[RunScope]):
         # admission identity. Already-running delegates retain their old identity.
         token = DELEGATED_INPUT.set(input_identity(ctx)) if call.tool_name == "delegate_task" else None
         try:
-            return await handler(args)
-        except ActivityError as error:
-            cause = error.cause
-            if isinstance(cause, ApplicationError) and cause.type == "MoyaiGuidanceChanged":
-                raise ToolFailed("New guidance arrived before dispatch; this action did not execute.") from error
-            raise
+            return await self.tool_caller.call(call, tool_def, args, handler)
         finally:
             if token is not None:
                 DELEGATED_INPUT.reset(token)
@@ -349,11 +364,12 @@ def workspace_image() -> modal.Image:
     """The same image definition for lazy startup and deployment prewarming."""
     image = (
         modal.Image.debian_slim(python_version="3.13")
-        .apt_install("git", "ripgrep", "curl", "jq", "util-linux", "nodejs", "npm",
+        .apt_install("git", "ripgrep", "curl", "jq", "util-linux",
                      "xvfb", "openbox", "xterm", "xdotool", "chromium", "tint2", "x11vnc",
                      "x11-xserver-utils", "fonts-dejavu-core")
         .pip_install("uv", "pytest", "pillow==12.3.0", "websockify==0.13.0", "playwright==1.63.0")
     )
+    image = with_node(image)
     for tool in WORKSPACE_TOOLS:
         image = tool.install(image)
     return (
@@ -420,7 +436,7 @@ def make_agent(
             *product_capabilities,
             connection_tools(database.security),
             ConnectionToolSearch(
-                strategy="keywords", max_results=6,
+                strategy=connection_search, max_results=6,
                 tool_description=(
                     "Find tools for the selected connected accounts. Search by service, repository, "
                     "and action before calling a connected tool. Only matching definitions are loaded."

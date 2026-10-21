@@ -9,13 +9,15 @@ const ts=require('typescript');
 const React=require('react');
 const {renderToStaticMarkup}=require('react-dom/server');
 const root=path.resolve(__dirname,'..');
-let server,gov,settings,permissions,homeSubmission;
+let server,gov,settings,permissions,sdk,homeSubmission;
 test.before(async()=>{
   const {createServer}=await import('vite');
   server=await createServer({configFile:path.join(root,'native/web/vite.config.ts'),optimizeDeps:{noDiscovery:true,include:[]},server:{middlewareMode:true},appType:'custom'});
   gov=await server.ssrLoadModule('/governance.tsx');
   settings=await server.ssrLoadModule('/settings.tsx');
   permissions=await server.ssrLoadModule('/permissions.ts');
+  sdk=await server.ssrLoadModule('/generated/api/index.ts');
+  (await server.ssrLoadModule('/generated/api/client.gen.ts')).client.setConfig({baseUrl:'https://moyai.test'});
   const source=ts.createSourceFile('home.tsx',fs.readFileSync(path.join(root,'native/web/home.tsx'),'utf8'),ts.ScriptTarget.Latest,true,ts.ScriptKind.TSX);
   const fn=source.statements.find(node=>ts.isFunctionDeclaration(node)&&node.name?.text==='homeSubmission');assert.ok(fn);
   const code=ts.transpileModule(fn.getText(source),{compilerOptions:{target:ts.ScriptTarget.ES2022,module:ts.ModuleKind.ESNext}}).outputText;
@@ -92,17 +94,27 @@ test('spend amounts: blank is no limit, zero blocks, and only changed rows are s
   assert.equal(gov.limitText(null),'No limit');assert.equal(gov.limitText(0),'Blocked ($0.00)');assert.equal(gov.usd(1234.5),'$1,234.50');
 });
 
-test('audit filters use whole UTC days, a 100-day window, normalized actors and matching export paths',()=>{
+test('audit filters use whole UTC days, a 100-day window, normalized actors and matching export paths',async t=>{
   const filters={action:'role.created',actor:' Admin@Example.test ',resource_type:'role',from:'2026-07-08',to:'2026-10-15'};
-  const params=gov.auditParams(filters);
-  assert.equal(params.get('after'),'2026-07-08T00:00:00Z');assert.equal(params.get('before'),'2026-10-16T00:00:00Z');assert.equal(params.get('actor'),'admin@example.test');
-  assert.throws(()=>gov.auditParams({...filters,from:'2026-07-07'}),/at most 100 days/);
-  assert.throws(()=>gov.auditParams({...filters,from:'2026-10-16'}),/on or before/);
-  assert.throws(()=>gov.auditParams({...filters,from:'07/08/2026'}),/YYYY-MM-DD/);
-  assert.equal(gov.auditPath(gov.emptyAuditFilters),'/admin/governance/audit?limit=50');
-  assert.match(gov.auditPath(gov.emptyAuditFilters,'opaque/cursor+1'),/cursor=opaque%2Fcursor%2B1$/);
+  const query=gov.auditQuery(filters);
+  assert.deepEqual(query,{action:'role.created',actor:'admin@example.test',resource_type:'role',after:'2026-07-08T00:00:00Z',before:'2026-10-16T00:00:00Z'});
+  assert.throws(()=>gov.auditQuery({...filters,from:'2026-07-07'}),/at most 100 days/);
+  assert.throws(()=>gov.auditQuery({...filters,from:'2026-10-16'}),/on or before/);
+  assert.throws(()=>gov.auditQuery({...filters,from:'07/08/2026'}),/YYYY-MM-DD/);
+  assert.deepEqual(gov.auditQuery(gov.emptyAuditFilters),{},'blank filters send no parameters');
+  assert.deepEqual(gov.auditPageQuery(gov.emptyAuditFilters),{limit:50});
+  assert.deepEqual(gov.auditPageQuery(filters,'opaque/cursor+1'),{...query,limit:50,cursor:'opaque/cursor+1'});
+  // The generated client sends the page query with the opaque cursor encoded.
+  const fetch=t.mock.method(global,'fetch',async()=>new Response(JSON.stringify({entries:[],next_cursor:null,facets:{actions:[],resource_types:[]}}),{headers:{'Content-Type':'application/json'}}));
+  assert.deepEqual((await sdk.listGovernanceAudit({query:gov.auditPageQuery(filters,'opaque/cursor+1')})).data.entries,[]);
+  assert.equal(fetch.mock.callCount(),1);
+  const sent=new URL(fetch.mock.calls[0].arguments[0].url);
+  assert.equal(sent.pathname,'/api/admin/governance/audit');assert.match(sent.search,/cursor=opaque%2Fcursor%2B1(&|$)/);
+  assert.deepEqual(Object.fromEntries(sent.searchParams),{action:'role.created',actor:'admin@example.test',resource_type:'role',after:'2026-07-08T00:00:00Z',before:'2026-10-16T00:00:00Z',limit:'50',cursor:'opaque/cursor+1'});
   const exported=new URL(gov.auditExportPath(filters,'ndjson'),'https://moyai.test');
-  assert.equal(exported.pathname,'/admin/governance/audit/export');assert.equal(exported.searchParams.get('after'),'2026-07-08T00:00:00Z');assert.equal(exported.searchParams.get('format'),'ndjson');assert.equal(exported.searchParams.get('action'),'role.created');
+  assert.equal(exported.pathname,'/admin/governance/audit/export');
+  assert.deepEqual(Object.fromEntries(exported.searchParams),{action:'role.created',actor:'admin@example.test',resource_type:'role',after:'2026-07-08T00:00:00Z',before:'2026-10-16T00:00:00Z',format:'ndjson'},'the export uses the same filters');
+  assert.equal(gov.auditExportPath(gov.emptyAuditFilters,'csv'),'/admin/governance/audit/export?format=csv');
   assert.equal(gov.actionLabel('scim_token.revoked'),'SCIM token revoked');assert.equal(gov.actionLabel(''),'Change recorded');
   assert.equal(gov.detailText(['a','b']),'a, b');assert.equal(gov.detailText(null),'None');
 });
@@ -138,8 +150,10 @@ test('policy rows mark defaults, keep defaults enabled and summarize empty lists
 test('spend and audit rows: read-only viewers get no actions and details are escaped text',()=>{
   const overrides=render(gov.OverrideRows,{rows:[limit({id:'user:carol@example.test',kind:'user',subject:'carol@example.test',limit_usd:50,used_usd:60})],canManage:false,onEdit(){},onRemove(){}});
   assert.doesNotMatch(overrides,/>Edit<|>Remove</);assert.match(overrides,/Limit reached/);assert.doesNotMatch(overrides,/Actions/);
-  const summary=render(gov.SpendSummary,{data:{limits:limits(),usage:{organization_month_usd:6000,period_start:'2026-10-01T00:00:00Z'},can_manage:true}});
+  const summary=render(gov.SpendSummary,{data:{limits:limits(),usage:{organization_month_usd:6000,period_start:'2026-10-01T00:00:00Z',unknown_requests:0},can_manage:true}});
   assert.match(summary,/Limit reached/);assert.match(summary,/\$0\.00/);
+  assert.match(render(gov.SpendSummary,{data:{limits:limits(),usage:{organization_month_usd:10,period_start:'2026-10-01T00:00:00Z',unknown_requests:2},can_manage:true}}),/Pending cost reconciliation/);
+  assert.equal(render(gov.SpendSummary,{data:{limits:limits().map(row=>({...row,used_usd:null})),usage:null,can_manage:true}}),'','no summary without spend.read usage');
   const audit=render(gov.AuditRows,{entries:[{id:'a',source:'governance',action:'role.created',actor:'',resource_type:'role',resource_id:'<script>',details:{note:'<img src=x onerror=bad()>'},created_at:stamp}]});
   assert.doesNotMatch(audit,/<script>|<img/);assert.match(audit,/&lt;script&gt;/);assert.match(audit,/System/);assert.match(audit,/Role created/);
 });

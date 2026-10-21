@@ -179,14 +179,17 @@ SESSION_TOOLS = (
     # Harness Coder: FileSystem, every registrable Shell tool, and SubAgents.
     'read_file', 'write_file', 'edit_file', 'list_files', 'grep',
     'shell', 'run_command', 'start_command', 'check_command', 'stop_command', 'delegate_task',
+    # Native background subagents and agent messages within the admitted session tree.
+    'spawn_agent', 'wait_agent', 'send_message',
     # Harness Planning (enable_subtasks=True), AskUser and ConversationSearch.
     'write_plan', 'read_plan', 'add_task', 'update_task_status', 'update_task_statuses',
     'remove_task', 'add_subtask', 'set_dependency', 'get_available_tasks',
     'ask_user_question', 'search_conversation_history',
     # Pydantic AI discovery of deferred tools.
     'search_tools',
-    # Native session capabilities: artifacts, input attachments and the shared browser.
+    # Native session capabilities: artifacts, input attachments, the shared browser and desktop.
     'save_artifact', 'attach_link', 'attachment_copy', 'browser_open', 'browser_read', 'browser_action',
+    'desktop_read', 'desktop_action',
 )
 TOOL_PERMISSIONS = {
     **dict.fromkeys(('get_goal', 'swarm_board', 'swarm_read'), 'sessions.read'),
@@ -194,7 +197,7 @@ TOOL_PERMISSIONS = {
                      'swarm_finish', 'swarm_publish'), 'sessions.manage'),
     **dict.fromkeys(('skill_list', 'skill_read'), 'skills.read'),
     **dict.fromkeys(('skill_create', 'skill_update', 'skill_delete'), 'skills.manage'),
-    **dict.fromkeys(('checkout', 'stack', 'stacks'), 'connections.read'),
+    **dict.fromkeys(('checkout', 'github_checkout', 'stack', 'stacks'), 'connections.read'),
     **dict.fromkeys(('add_to_stack', 'close_pull_request', 'convert_pull_request_to_draft',
                      'create_branch', 'create_review', 'create_stack', 'delete_pending_review',
                      'edit_pending_review', 'open_pull_request', 'publish_branch', 'rebase_pull_request',
@@ -227,15 +230,23 @@ GITHUB_PUBLICATION_TOOLS = frozenset({
 })
 # Every tool name native agents register outside connector toolsets.
 NATIVE_TOOL_NAMES = frozenset(TOOL_PERMISSIONS)
-CONNECTOR_PROVIDERS = ('github', 'linear', 'notion', 'slack')
-# Connector tools reach the model as `<kind>_<first 8 grant-id characters>_<tool>`.
+# Scoped connector tools reach the model as `<kind>_<first 8 grant-id characters>_<tool>`.
 CONNECTOR_TOOL = re.compile(r'(github|linear|notion|slack)_([0-9a-f]{8})_([a-z][a-z0-9_]*)')
 
 
 def connector_tool(name):
     """(provider, unprefixed tool name) for a grant-prefixed connector tool, else None."""
-    match = CONNECTOR_TOOL.fullmatch(name) if isinstance(name, str) else None
-    return (match[1], match[3]) if match else ('github', name) if name in GITHUB_PUBLICATION_TOOLS else None
+    if not isinstance(name, str):
+        return None
+    if match := CONNECTOR_TOOL.fullmatch(name):
+        return match[1], match[3]
+    if name in GITHUB_PUBLICATION_TOOLS:
+        return 'github', name
+    # Shared repository tools (and github_checkout) are routed by a plain
+    # `github_` prefix to whichever selected repository the call names.
+    if name.startswith('github_') and len(name) > len('github_'):
+        return 'github', name.removeprefix('github_')
+    return None
 
 
 def tool_permission(name, *, read_only=None):

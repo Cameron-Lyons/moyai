@@ -11,13 +11,14 @@ import re
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 from app.database import SQL_PARTS
 from app.memory import Memory as CanonicalMemory
 from app.memory import Note, Preferences, Revision
 from cryptography.fernet import InvalidToken
 from fastapi import APIRouter, HTTPException, Request
+from pydantic import BaseModel, ConfigDict
 from sqlalchemy import func, select, text, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -35,6 +36,106 @@ SOURCE_TABLES = frozenset({
     "memory_selections", "messages",
 })
 CAPABILITIES = {"read": True, "create": True, "update": True, "delete": True, "preferences": True, "review": False}
+
+
+class ProductMemoryResponse(BaseModel):
+    model_config = ConfigDict(json_schema_serialization_defaults_required=True)
+
+
+class ProductMemorySource(ProductMemoryResponse):
+    """Saved provenance. Fields beyond these vary by source and are passed through."""
+
+    model_config = ConfigDict(json_schema_serialization_defaults_required=True, extra="allow")
+    type: str
+    quote: str | None = None
+    evidence: str | None = None
+    scope: str | None = None
+    run_id: str | None = None
+    session_id: str | None = None
+    engine: str | None = None
+    url: str | None = None
+
+
+class ProductMemoryNote(ProductMemoryResponse):
+    id: str
+    key: str
+    title: str
+    content: str
+    kind: Literal["preference", "feedback", "project", "reference"]
+    repo_url: str
+    source: ProductMemorySource
+    revision: int
+    created_at: str
+    updated_at: str
+    expires_at: str
+    # Set only when the note's source message can no longer be verified.
+    review_required: bool | None = None
+
+
+class ProductMemoryScope(ProductMemoryResponse):
+    kind: Literal["personal"]
+    owner_id: str
+
+
+class ProductMemoryPreferences(ProductMemoryResponse):
+    enabled: bool
+    auto_save: bool
+    revision: int
+
+
+class ProductMemoryCapabilities(ProductMemoryResponse):
+    read: bool
+    create: bool
+    update: bool
+    delete: bool
+    preferences: bool
+    review: bool
+
+
+class ProductMemoryRuntime(ProductMemoryResponse):
+    recall: bool
+    auto_save: bool
+    background_review: bool
+    note: str | None = None
+
+
+class ProductMemoryReviewRun(ProductMemoryResponse):
+    status: str
+    updated_at: str
+    saved_count: int
+
+
+class ProductMemoryReviewStatus(ProductMemoryResponse):
+    enabled: bool
+    configured: bool
+    pending: int
+    latest: ProductMemoryReviewRun | None
+    backend: Literal["native_temporal", "legacy_retained"]
+    legacy_pending: int
+    legacy_latest: ProductMemoryReviewRun | None
+
+
+class ProductMemoryLibrary(ProductMemoryResponse):
+    source: Literal["canonical"]
+    # None (with empty memories and no capabilities) for shared sign-ins.
+    scope: ProductMemoryScope | None
+    supported_scopes: list[str] | None = None
+    preferences: ProductMemoryPreferences | None
+    memories: list[ProductMemoryNote]
+    capabilities: ProductMemoryCapabilities
+    runtime: ProductMemoryRuntime
+    review: ProductMemoryReviewStatus | None = None
+    note: str
+
+
+class ProductMemorySaveResult(ProductMemoryResponse):
+    saved: bool
+    id: str
+    revision: int
+
+
+class ProductMemoryForgetResult(ProductMemoryResponse):
+    forgotten: bool
 
 
 class SourceMemoryConnection:
@@ -197,10 +298,11 @@ class ProductMemoryService:
         native_review = await self.native_review.status(owner) if self.native_review is not None else None
         _, prefs, rows = await self.snapshot(grant)
         memories = [self._unpack(row) for row in rows]
-        from .message_sources import valid_memory_source
+        from .message_sources import valid_memory_sources
         async with self.database.sessions() as db:
-            for note in memories:
-                if not await valid_memory_source(self.database, db, note):
+            valid = await valid_memory_sources(self.database, db, memories)
+            for note, supported in zip(memories, valid, strict=True):
+                if not supported:
                     note["review_required"] = True
         return {
             "source": "canonical", "scope": {"kind": "personal", "owner_id": owner},
@@ -335,29 +437,29 @@ def routes(service: ProductMemoryService) -> APIRouter:
                 await service.identity.project_native_user(db, principal)
         return principal
 
-    @router.get("")
-    async def listing(request: Request):
+    @router.get("", operation_id="listProductMemories")
+    async def listing(request: Request) -> ProductMemoryLibrary:
         principal = await authenticated(request)
-        return await service.listing(principal.grant)
+        return ProductMemoryLibrary.model_validate(await service.listing(principal.grant))
 
-    @router.put("/preferences")
-    async def preferences(body: Preferences, request: Request):
+    @router.put("/preferences", operation_id="updateProductMemoryPreferences")
+    async def preferences(body: Preferences, request: Request) -> ProductMemoryPreferences:
         principal = await authenticated(request, mutation=True)
-        return await service.preferences(principal.grant, body)
+        return ProductMemoryPreferences.model_validate(await service.preferences(principal.grant, body))
 
-    @router.post("", status_code=201)
-    async def create(body: Note, request: Request):
+    @router.post("", status_code=201, operation_id="createProductMemory")
+    async def create(body: Note, request: Request) -> ProductMemorySaveResult:
         principal = await authenticated(request, mutation=True)
-        return await service.save(principal.grant, body)
+        return ProductMemorySaveResult.model_validate(await service.save(principal.grant, body))
 
-    @router.put("/{note_id}")
-    async def update_note(note_id: str, body: Note, request: Request):
+    @router.put("/{note_id}", operation_id="updateProductMemory")
+    async def update_note(note_id: str, body: Note, request: Request) -> ProductMemorySaveResult:
         principal = await authenticated(request, mutation=True)
-        return await service.save(principal.grant, body, note_id=note_id)
+        return ProductMemorySaveResult.model_validate(await service.save(principal.grant, body, note_id=note_id))
 
-    @router.delete("/{note_id}")
-    async def forget(note_id: str, body: Revision, request: Request):
+    @router.delete("/{note_id}", operation_id="deleteProductMemory")
+    async def forget(note_id: str, body: Revision, request: Request) -> ProductMemoryForgetResult:
         principal = await authenticated(request, mutation=True)
-        return await service.forget(principal.grant, note_id, body.revision)
+        return ProductMemoryForgetResult.model_validate(await service.forget(principal.grant, note_id, body.revision))
 
     return router

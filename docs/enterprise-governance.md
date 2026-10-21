@@ -8,12 +8,14 @@ not required.
 ## Deployment and migration
 
 Apply canonical schema revision **23** and native application migration
-**2026-10-19-product-governance-v23** during the coordinated maintenance window
+**2026-10-21-product-governance-v24** during the coordinated maintenance window
 in [the deployment contract](pydantic-deployment.md). Canonical revision 23 combines
 upstream revision 22 with the governance branch's older revision 22; neither older
-layout is admitted as the combined release. The native migration adds an immutable
-session-policy table and preserves the previous 22 migration receipts. Normal
-startup verifies both schemas; it does not run migrations.
+layout is admitted as the combined release. The native migration follows upstream
+v23 (automation chats), adds an immutable session-policy table and preserves the
+previous 23 migration receipts. It installs a trigger, so it is not an
+[online expansion](native-online-schema.md). Normal startup verifies both schemas;
+it does not run migrations.
 
 The canonical upgrade retains existing governance configuration and audit events,
 copies the older `floor_profile_id` into the mandatory policy, and adds SCIM

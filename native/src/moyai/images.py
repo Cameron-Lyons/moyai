@@ -13,6 +13,7 @@ from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from PIL import Image, UnidentifiedImageError
+from pydantic import BaseModel, ConfigDict
 from pydantic_ai import ConversationTypeAdapter
 from pydantic_ai.messages import BinaryContent, ModelRequest, UserPromptPart
 
@@ -22,7 +23,6 @@ from .models import Upload, User
 if TYPE_CHECKING:
     from .runtime import Runtime
 
-MAX_IMAGE_BYTES = 8 * 1024 * 1024
 MAX_UPLOAD_BYTES = 20 * 1024 * 1024
 MEDIA_TYPES = {"PNG": "image/png", "JPEG": "image/jpeg", "GIF": "image/gif", "WEBP": "image/webp"}
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
@@ -72,6 +72,10 @@ async def hydrate(runtime: Runtime, value: PreparedTurn | SteeringInput) -> None
     if isinstance(value, PreparedTurn) and value.conversation:
         conversation = ConversationTypeAdapter.validate_json(value.conversation)
         changed = False
+        inherited_images = {
+            (image.digest, image.media_type) for image in value.images
+            if value.scope.delegation_generated and image.media_type in MEDIA_TYPES.values()
+        }
         for message in conversation.messages:
             identity = (message.metadata or {}).get("moyai_public_turn")
             if isinstance(message, ModelRequest) and identity:
@@ -82,31 +86,57 @@ async def hydrate(runtime: Runtime, value: PreparedTurn | SteeringInput) -> None
                         if isinstance(part, UserPromptPart) and isinstance(part.content, str):
                             part.content = prompt_content(part.content, images) or ""
                             changed = True
+            if inherited_images and isinstance(message, ModelRequest):
+                for part in message.parts:
+                    if isinstance(part, UserPromptPart) and not isinstance(part.content, str):
+                        content = []
+                        for item in part.content:
+                            if isinstance(item, BinaryContent) and (
+                                runtime.security.object_id(item.data), item.media_type
+                            ) in inherited_images:
+                                # The child keeps its own upload references and receives
+                                # these bytes in the assignment appended to this history.
+                                content.append("This image is attached to the delegated assignment below.")
+                                changed = True
+                            else:
+                                content.append(item)
+                        part.content = content
         if changed:
             value.conversation = ConversationTypeAdapter.dump_json(conversation).decode()
+
+
+class UploadedFile(BaseModel):
+    model_config = ConfigDict(json_schema_serialization_defaults_required=True)
+    id: str
+    name: str
+    media_type: str
+    size: int
+
+
+# The handler streams the raw request body; declare it so the client sends bytes.
+UPLOAD_BODY = {"requestBody": {"required": True, "content": {
+    "application/octet-stream": {"schema": {"type": "string", "format": "binary"}},
+}}}
 
 
 def routes(runtime: Runtime, actor) -> APIRouter:
     router = APIRouter()
 
-    @router.post("/api/uploads", status_code=201)
-    async def upload(request: Request, name: str = "clipboard.png", user: User = Depends(actor)):
+    @router.post("/api/uploads", status_code=201, operation_id="uploadFile", openapi_extra=UPLOAD_BODY)
+    async def upload(request: Request, name: str = "clipboard.png", user: User = Depends(actor)) -> UploadedFile:
         if not name or name in {".", ".."} or len(name) > 200 or any(ord(char) < 32 or ord(char) == 127 for char in name) or "/" in name or "\\" in name:
             raise HTTPException(422, "Use a filename up to 200 characters without directories or control characters.")
         declared = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
         expected_image = declared in MEDIA_TYPES.values() or PurePosixPath(name).suffix.lower() in IMAGE_EXTENSIONS
-        limit = MAX_IMAGE_BYTES if expected_image else MAX_UPLOAD_BYTES
         raw = bytearray()
         async for chunk in request.stream():
-            if len(raw) + len(chunk) > limit:
-                raise HTTPException(413, "Images must be 8 MB or smaller." if expected_image else "Files must be 20 MB or smaller.")
+            if len(raw) + len(chunk) > MAX_UPLOAD_BYTES:
+                raise HTTPException(413, "Files must be 20 MB or smaller.")
             raw.extend(chunk)
         raster = raw.startswith((b"\x89PNG\r\n\x1a\n", b"\xff\xd8\xff", b"GIF87a", b"GIF89a")) or (
             raw.startswith(b"RIFF") and raw[8:12] == b"WEBP"
         )
         if expected_image or raster:
-            if len(raw) > MAX_IMAGE_BYTES:
-                raise HTTPException(413, "Images must be 8 MB or smaller.")
             try:
                 media_type = await asyncio.to_thread(image_type, bytes(raw))
             except ValueError as error:
@@ -120,10 +150,15 @@ def routes(runtime: Runtime, actor) -> APIRouter:
             row = Upload(owner_id=user.id, name=name, digest=digest, media_type=media_type, size=len(raw))
             db.add(row)
             await db.flush()
-            return {"id": row.id, "name": row.name, "media_type": row.media_type, "size": row.size}
+            return UploadedFile(id=row.id, name=row.name, media_type=row.media_type, size=row.size)
 
     @router.get("/api/uploads/{upload_id}")
     async def content(upload_id: str, user: User = Depends(actor)):
+        async with runtime.database.sessions() as db:
+            candidate = await db.get(Upload, upload_id)
+            session_id = candidate.session_id if candidate else None
+        if session_id is not None:
+            await runtime.database.prefetch_session_audiences(user, [session_id])
         async with runtime.database.sessions() as db:
             row = await db.get(Upload, upload_id)
             if row is None:

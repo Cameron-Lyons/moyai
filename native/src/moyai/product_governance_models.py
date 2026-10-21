@@ -15,7 +15,8 @@ from .models import Base, now
 class ProductSessionPolicy(Base):
     """The security profile snapshot bound when a product session is created.
 
-    Immutable on PostgreSQL: a v23 trigger rejects every UPDATE and DELETE.
+    Immutable on PostgreSQL: the governance v24 migration installs a trigger that
+    rejects every UPDATE and DELETE.
     Execution intersects this binding with the current mandatory profile, so
     later governance changes can narrow a session's policy but never widen it.
     """

@@ -181,12 +181,16 @@ def test_every_native_tool_has_an_explicit_permission():
     assert exposed - NATIVE_TOOL_NAMES == set()
     # Static net: any tool a native module registers must be explicit too.
     registered = set()
-    for path in (ROOT / 'native/src/moyai').glob('*.py'):
+    for path in (ROOT / 'native/src/moyai').rglob('*.py'):
         for node in ast.walk(ast.parse(path.read_text())):
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and any(
-                    isinstance(target := (item.func if isinstance(item, ast.Call) else item), ast.Attribute)
-                    and target.attr == 'tool' for item in node.decorator_list):
-                registered.add(node.name)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                for item in node.decorator_list:
+                    target = item.func if isinstance(item, ast.Call) else item
+                    if isinstance(target, ast.Attribute) and target.attr == 'tool':
+                        # A name= override is what the model sees and what policies govern.
+                        named = next((keyword.value.value for keyword in getattr(item, 'keywords', ())
+                                      if keyword.arg == 'name' and isinstance(keyword.value, ast.Constant)), None)
+                        registered.add(named or node.name)
             if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in {'Capability', 'Tool'}:
                 arguments = [*node.args[:1]] if node.func.id == 'Tool' else [
                     *next((keyword.value.elts for keyword in node.keywords
@@ -214,12 +218,21 @@ def test_connector_tools_follow_the_canonical_read_write_catalog():
     assert tool_permission('github_0a1b2c3d_create_pull_request') == 'connections.write'
     assert tool_permission('github_0a1b2c3d_request_pull_request_write_access') == 'connections.write'
     assert tool_permission('github_0a1b2c3d_publication_status') == 'connections.read'
+    # Shared repository tools are routed as `github_<operation>`, so app and Git
+    # policies and connections.write govern them like the grant-prefixed names.
+    assert connector_tool('github_checkout') == ('github', 'checkout')
+    assert tool_permission('github_checkout') == 'connections.read'
+    for operation in ('create_pull_request', 'publish_branch', 'open_pull_request', 'submit_review', 'create_stack'):
+        assert connector_tool('github_' + operation) == ('github', operation)
+        assert tool_permission('github_' + operation) == 'connections.write', operation
+    assert tool_permission('github_get_file_contents', read_only=True) == 'connections.read'
+    assert tool_permission('github_get_file_contents') == 'connections.write'
     # Provider tools outside the canonical catalog are writes unless their server-built definition is read-only.
     assert tool_permission('github_0a1b2c3d_get_file_contents') == 'connections.write'
     assert tool_permission('github_0a1b2c3d_get_file_contents', read_only=True) == 'connections.read'
     assert tool_permission('notion_0a1b2c3d_future_write', read_only=False) == 'connections.write'
     # Unknown names are session work, never "no check".
-    for name in ('future_unknown_capability', 'github_not_a_grant_prefix', '', None, 7):
+    for name in ('future_unknown_capability', 'github_', '', None, 7):
         assert tool_permission(name) == DEFAULT_TOOL_PERMISSION
 
 

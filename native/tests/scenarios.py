@@ -37,7 +37,12 @@ def integration_model(scenario: str, *, gates: tuple[asyncio.Event, asyncio.Even
         }
         if scenario == "steer":
             if "VERIFY_CORRECTED_CHILD" in prompts:
-                if "write_file" not in completed:
+                # Inherited parent history includes the fenced old write.
+                # Only this child's own result completes its corrected action.
+                if not any(
+                    isinstance(part, ToolReturnPart) and part.tool_call_id == "child-write"
+                    for message in messages for part in message.parts
+                ):
                     return ModelResponse(parts=[ToolCallPart(
                         "write_file", {"path": "steered.txt", "content": "corrected"},
                         tool_call_id="child-write",
@@ -59,7 +64,11 @@ def integration_model(scenario: str, *, gates: tuple[asyncio.Event, asyncio.Even
             and "Return the phrase native-child-result." in str(part.content)
             for message in messages for part in message.parts
         ):
-            if scenario == "tools" and "write_plan" not in completed:
+            # The parent's inherited plan is not this child's own plan.
+            if scenario == "tools" and not any(
+                isinstance(part, ToolReturnPart) and part.tool_call_id == "child-plan"
+                for message in messages for part in message.parts
+            ):
                 return ModelResponse(parts=[ToolCallPart(
                     "write_plan", {"items": [{"content": "Inspect the delegated task", "status": "completed"}]},
                     tool_call_id="child-plan",
@@ -75,6 +84,8 @@ def integration_model(scenario: str, *, gates: tuple[asyncio.Event, asyncio.Even
             )])
         if scenario == "history":
             if "NEW GUIDANCE" in prompts:
+                if "read_plan" not in completed:
+                    return ModelResponse(parts=[ToolCallPart("read_plan", {}, tool_call_id="after-new-guidance")])
                 return ModelResponse(parts=[TextPart("Guidance preserved after handoff.")])
             if "load_capability" not in completed:
                 loader = next(tool for tool in info.function_tools if tool.name == "load_capability")

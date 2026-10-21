@@ -2,9 +2,10 @@
 // function validates locally with plain-language errors; the server remains
 // authoritative and re-validates every field.
 import type {
-  AssignmentBody, AuditFilters, CreateRoleBody, DefaultsBody, GitAccess, GroupRole, GroupRoleBody, PermissionInfo,
-  ProfilePolicy, Role, RoleAssignment, SaveProfileBody, SecurityProfile, SpendLimit, SpendLimitChange, UpdateRoleBody,
-} from "./governance-types"
+  ExportGovernanceAuditData, GovernanceGroupRole, GovernanceRole, GovernanceRoleAssignment, GroupRoleChange, PermissionInfo, PolicyView,
+  ProfileDefaults, ProfilePolicy, RoleAssignment, RoleCreate, RoleUpdate, SaveProfile, SecurityProfileView, SpendLimitChange, SpendLimitView,
+} from "./generated/api"
+import type { AuditExportFormat, AuditFilterQuery, AuditFilters, AuditQuery, ConnectedApp, GitAccess } from "./governance-types"
 
 export const ROLE_ID_PATTERN = /^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$/
 const EMAIL_PATTERN = /^[a-z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-z0-9.-]+\.[a-z0-9-]+$/
@@ -26,7 +27,10 @@ export function roleIdFromName(name: string): string {
 }
 
 export type RoleDraft = { id: string; name: string; description: string; permissions: string[] }
-export function roleBody(draft: RoleDraft, existing: Role | undefined, catalog: readonly PermissionInfo[]): CreateRoleBody | UpdateRoleBody {
+/** An edit sends the displayed revision and never the role ID; creation sends the ID. */
+export function roleBody(draft: RoleDraft, existing: GovernanceRole, catalog: readonly PermissionInfo[]): RoleUpdate
+export function roleBody(draft: RoleDraft, existing: undefined, catalog: readonly PermissionInfo[]): RoleCreate
+export function roleBody(draft: RoleDraft, existing: GovernanceRole | undefined, catalog: readonly PermissionInfo[]): RoleCreate | RoleUpdate {
   const name = draft.name.trim(), description = draft.description.trim()
   if (name.length < 2 || name.length > 100) throw new Error("Use a role name between 2 and 100 characters.")
   if (description.length > 500) throw new Error("Keep the description to 500 characters or fewer.")
@@ -50,20 +54,20 @@ export function permissionLabel(catalog: readonly PermissionInfo[], id: string):
   return catalog.find(item => item.id === id)?.label || id
 }
 
-export function assignmentBody(email: string, roleId: string, existing: RoleAssignment | undefined): AssignmentBody {
+export function assignmentBody(email: string, roleId: string, existing: GovernanceRoleAssignment | undefined): RoleAssignment {
   if (!roleId) throw new Error("Choose a role.")
   if (roleId === "admin") throw new Error("Grant administrator access on the Users page.")
   return existing
     ? { email: existing.email, role_id: roleId, revision: existing.revision, role_revision: existing.role_revision }
     : { email: normalizeEmail(email), role_id: roleId, revision: 0, role_revision: null }
 }
-export function groupRoleBody(roleId: string, existing: GroupRole | undefined): GroupRoleBody {
+export function groupRoleBody(roleId: string, existing: GovernanceGroupRole | undefined): GroupRoleChange {
   if (roleId === "admin" || roleId === "member") throw new Error("Choose a custom role, or no additional role.")
   return { role_id: roleId || null, revision: existing?.revision ?? 0 }
 }
 
 /** Whether archiving would leave directly assigned people without permissions. */
-export function roleUsage(role: Role, assignments: readonly RoleAssignment[], groups: readonly GroupRole[]) {
+export function roleUsage(role: GovernanceRole, assignments: readonly GovernanceRoleAssignment[], groups: readonly GovernanceGroupRole[]) {
   return { people: assignments.filter(row => row.role_id === role.id).length, groups: groups.filter(row => row.role_id === role.id).length }
 }
 
@@ -72,12 +76,12 @@ export function roleUsage(role: Role, assignments: readonly RoleAssignment[], gr
 export type ScopeMode = "all" | "selected" | "none"
 export type PolicyDraft = {
   name: string; enabled: boolean; git_access: GitAccess
-  apps: ScopeMode; app_ids: string[]; tools: ScopeMode; tool_ids: string[]
+  apps: ScopeMode; app_ids: ConnectedApp[]; tools: ScopeMode; tool_ids: string[]
   network: "all" | "listed" | "none"; domains: string
 }
-const modeOf = (value: string[] | null): ScopeMode => value === null ? "all" : value.length ? "selected" : "none"
-export function policyDraft(profile?: SecurityProfile): PolicyDraft {
-  const policy = profile?.policy ?? { connected_apps: null, tools: null, git_access: "write", network_domains: null }
+const modeOf = (value: readonly string[] | null): ScopeMode => value === null ? "all" : value.length ? "selected" : "none"
+export function policyDraft(profile?: SecurityProfileView): PolicyDraft {
+  const policy: PolicyView = profile?.policy ?? { connected_apps: null, tools: null, git_access: "write", network_domains: null }
   return {
     name: profile?.name ?? "", enabled: profile?.enabled ?? true, git_access: policy.git_access,
     apps: modeOf(policy.connected_apps), app_ids: policy.connected_apps ?? [],
@@ -103,11 +107,11 @@ export function parseDomains(text: string): { domains: string[]; invalid: string
   return { domains: [...domains].sort(), invalid }
 }
 
-export function policyBody(draft: PolicyDraft, existing: SecurityProfile | undefined): SaveProfileBody {
+export function policyBody(draft: PolicyDraft, existing: SecurityProfileView | undefined): SaveProfile {
   const name = draft.name.trim()
   if (!name || name.length > 80) throw new Error("Use a policy name between 1 and 80 characters.")
   if (!["write", "read", "none"].includes(draft.git_access)) throw new Error("Choose a Git access level.")
-  const scoped = (mode: ScopeMode, ids: string[], noun: string, none: string) => {
+  const scoped = <T extends string>(mode: ScopeMode, ids: readonly T[], noun: string, none: string): T[] | null => {
     if (mode === "all") return null
     if (mode === "none") return []
     const selected = [...new Set(ids)].sort()
@@ -131,15 +135,15 @@ export function policyBody(draft: PolicyDraft, existing: SecurityProfile | undef
   return { name, enabled: draft.enabled, policy, revision: existing?.revision ?? 0 }
 }
 
-export function defaultsBody(defaultId: string, mandatoryId: string, revision: number, profiles: readonly SecurityProfile[]): DefaultsBody {
+export function defaultsBody(defaultId: string, mandatoryId: string, revision: number, profiles: readonly SecurityProfileView[]): ProfileDefaults {
   const enabled = new Set(profiles.filter(profile => profile.enabled).map(profile => profile.id))
   for (const id of [defaultId, mandatoryId]) if (id && !enabled.has(id)) throw new Error("Choose an enabled security policy.")
   return { default_profile_id: defaultId, mandatory_profile_id: mandatoryId, revision }
 }
 
 const gitLabels: Record<GitAccess, string> = { write: "Read and write", read: "Read only", none: "No Git access" }
-export function policySummary(policy: ProfilePolicy, appLabel: (id: string) => string = id => id) {
-  const list = (value: string[] | null, all: string, none: string, many: (count: number) => string, names?: (ids: string[]) => string) =>
+export function policySummary(policy: PolicyView, appLabel: (id: ConnectedApp) => string = id => id) {
+  const list = <T extends string>(value: T[] | null, all: string, none: string, many: (count: number) => string, names?: (ids: T[]) => string) =>
     value === null ? all : !value.length ? none : names && value.length <= 3 ? names(value) : many(value.length)
   return {
     apps: list(policy.connected_apps, "All connected apps", "No connected apps", count => `${count} apps`, ids => ids.map(appLabel).join(", ")),
@@ -167,7 +171,7 @@ export function parseUsd(text: string): number | null {
 export const usdInput = (value: number | null) => value === null ? "" : value.toFixed(2)
 
 /** Only changed rows are sent, each with the revision that was displayed. */
-export function spendChanges(limits: readonly SpendLimit[], drafts: Record<string, string>): SpendLimitChange[] {
+export function spendChanges(limits: readonly SpendLimitView[], drafts: Record<string, string>): SpendLimitChange[] {
   const changes: SpendLimitChange[] = []
   for (const [id, text] of Object.entries(drafts)) {
     const row = limits.find(limit => limit.id === id)
@@ -177,7 +181,7 @@ export function spendChanges(limits: readonly SpendLimit[], drafts: Record<strin
   }
   return changes
 }
-export function overrideChange(email: string, text: string, existing: SpendLimit | undefined): SpendLimitChange {
+export function overrideChange(email: string, text: string, existing: SpendLimitView | undefined): SpendLimitChange {
   if (existing) return { id: existing.id, limit_usd: parseUsd(text), revision: existing.revision }
   return { id: `user:${normalizeEmail(email)}`, limit_usd: parseUsd(text), revision: 0 }
 }
@@ -188,12 +192,12 @@ export const emptyAuditFilters: AuditFilters = { action: "", actor: "", resource
 const DAY = 86_400_000
 const dateValue = (value: string) => /^\d{4}-\d{2}-\d{2}$/.test(value) && Number.isFinite(Date.parse(`${value}T00:00:00Z`)) ? Date.parse(`${value}T00:00:00Z`) : NaN
 
-/** Query string for the audit feed and export (dates are whole UTC days). */
-export function auditParams(filters: AuditFilters): URLSearchParams {
-  const params = new URLSearchParams()
-  if (filters.action) params.set("action", filters.action)
-  if (filters.actor.trim()) params.set("actor", filters.actor.trim().toLowerCase())
-  if (filters.resource_type) params.set("resource_type", filters.resource_type)
+/** Filters shared by the audit feed and its export (dates are whole UTC days). */
+export function auditQuery(filters: AuditFilters): AuditFilterQuery {
+  const query: AuditFilterQuery = {}
+  if (filters.action) query.action = filters.action
+  if (filters.actor.trim()) query.actor = filters.actor.trim().toLowerCase()
+  if (filters.resource_type) query.resource_type = filters.resource_type
   const from = filters.from ? dateValue(filters.from) : NaN, to = filters.to ? dateValue(filters.to) : NaN
   if (filters.from && !Number.isFinite(from)) throw new Error("Enter the start date as YYYY-MM-DD.")
   if (filters.to && !Number.isFinite(to)) throw new Error("Enter the end date as YYYY-MM-DD.")
@@ -201,20 +205,22 @@ export function auditParams(filters: AuditFilters): URLSearchParams {
     if (from > to) throw new Error("Choose a start date on or before the end date.")
     if ((to + DAY - from) / DAY > 100) throw new Error("Choose a date range of at most 100 days.")
   }
-  if (Number.isFinite(from)) params.set("after", new Date(from).toISOString().replace(".000Z", "Z"))
-  if (Number.isFinite(to)) params.set("before", new Date(to + DAY).toISOString().replace(".000Z", "Z"))
-  return params
+  if (Number.isFinite(from)) query.after = new Date(from).toISOString().replace(".000Z", "Z")
+  if (Number.isFinite(to)) query.before = new Date(to + DAY).toISOString().replace(".000Z", "Z")
+  return query
 }
-export function auditPath(filters: AuditFilters, cursor?: string | null): string {
-  const params = auditParams(filters)
-  params.set("limit", "50")
-  if (cursor) params.set("cursor", cursor)
-  return `/admin/governance/audit?${params}`
+/** One page of the audit feed (listGovernanceAudit). */
+export function auditPageQuery(filters: AuditFilters, cursor?: string | null): AuditQuery {
+  return { ...auditQuery(filters), limit: 50, ...(cursor ? { cursor } : {}) }
 }
-export function auditExportPath(filters: AuditFilters, format: "csv" | "ndjson"): string {
-  const params = auditParams(filters)
-  params.set("format", format)
-  return `/admin/governance/audit/export?${params}`
+// The export is a file download (apiDownload), not a generated JSON call; its
+// path and parameters are still checked against the generated operation.
+const AUDIT_EXPORT: ExportGovernanceAuditData["url"] = "/api/admin/governance/audit/export"
+export function auditExportPath(filters: AuditFilters, format: AuditExportFormat): string {
+  const query: NonNullable<ExportGovernanceAuditData["query"]> = { ...auditQuery(filters), format }
+  const params = new URLSearchParams()
+  for (const [key, value] of Object.entries(query)) if (value !== undefined && value !== null) params.set(key, String(value))
+  return `${AUDIT_EXPORT.slice("/api".length)}?${params}`
 }
 /** "role_assignment.updated" → "Role assignment updated". */
 const ACRONYMS: Record<string, string> = { scim: "SCIM", usd: "USD", id: "ID", sso: "SSO", aws: "AWS" }

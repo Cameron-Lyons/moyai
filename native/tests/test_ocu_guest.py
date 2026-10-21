@@ -1,5 +1,9 @@
 import base64
 import importlib.util
+import os
+import shutil
+import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -10,6 +14,55 @@ guest = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(guest)
 
 
+def test_ocu_child_uses_system_python_without_changing_workspace_or_node(monkeypatch, tmp_path):
+    """Exercise the subprocess boundary with a shadowing workspace Python."""
+    executables = tmp_path / "bin"
+    executables.mkdir()
+    wrong_python = executables / "python3"
+    wrong_python.write_text("#!/bin/sh\necho 'No module named gi' >&2\nexit 1\n")
+    wrong_python.chmod(0o755)
+    node = executables / "node"
+    node.write_text("#!/bin/sh\necho workspace-node\n")
+    node.chmod(0o755)
+    ocu_cli = executables / "ocu"
+    ocu_cli.write_text(f"""#!{sys.executable}
+import json, subprocess, sys
+for line in sys.stdin:
+    request = json.loads(line)
+    if "id" not in request:
+        continue
+    if request["method"] == "tools/list":
+        result = {{"tools": [{{"name": "get_app_state", "inputSchema": {{"properties": {{}}}}}}]}}
+    elif request["method"] == "tools/call":
+        result = {{
+            "python": subprocess.check_output(["python3", "-c", "import sys; print(sys.executable)"], text=True).strip(),
+            "node": subprocess.check_output(["node"], text=True).strip(),
+        }}
+    else:
+        result = {{}}
+    print(json.dumps({{"id": request["id"], "result": result}}), flush=True)
+""")
+    ocu_cli.chmod(0o755)
+    path = str(executables) + os.pathsep + os.environ.get("PATH", os.defpath)
+    monkeypatch.setenv("PATH", path)
+    monkeypatch.setattr(guest, "SYSTEM_PYTHON", sys.executable)
+
+    assert subprocess.run(["python3", "-c", "import gi"], check=False, capture_output=True).returncode == 1
+    ocu = guest.Ocu()
+    try:
+        result = ocu.call("list_apps", {})
+        assert Path(result["python"]).resolve() == Path(sys.executable).resolve()
+        assert result["node"] == "workspace-node"
+        assert os.environ["PATH"] == path
+        assert shutil.which("python3") == str(wrong_python)
+        # Later requests still need the private lookup directory.
+        assert ocu.call("list_apps", {}) == result
+    finally:
+        ocu.process.terminate()
+        ocu.process.wait(timeout=5)
+        ocu.python_bin.cleanup()
+
+
 class Ocu(guest.Ocu):
     def __init__(self):
         self.observation = None
@@ -18,11 +71,12 @@ class Ocu(guest.Ocu):
         self.image = b"test-image"
         self.calls = []
         self.failure = False
+        self.result_text = "done"
 
     def call(self, tool, args):
         self.calls.append((tool, args))
         if tool != "get_app_state":
-            return {"isError": self.failure, "content": [{"type": "text", "text": "done"}]}
+            return {"isError": self.failure, "content": [{"type": "text", "text": self.result_text}]}
         return {"content": [{"type": "text", "text": self.text},
                             {"type": "image", "mimeType": "image/png",
                              "data": base64.b64encode(self.image).decode()}]}
@@ -89,3 +143,17 @@ def test_native_error_after_input_stays_uncertain_and_invalidates_observation():
                      "element_index": "1", "context": "turn"}, time.time() + 10)
     assert ocu.observation is None
     assert sum(tool == "click" for tool, _ in ocu.calls) == 1
+
+
+def test_known_pre_dispatch_refusal_refreshes_state_without_retrying():
+    ocu = Ocu()
+    state = ocu.observe("Test", "turn")
+    ocu.failure = True
+    ocu.result_text = guest.NOT_DISPATCHED + "The requested app is not active."
+    result = ocu.perform({"action": "press_key", "app": "Test", "observation": state["observation"],
+                          "key": "ctrl+a", "context": "turn"}, time.time() + 10)
+    assert result["action_executed"] is False
+    assert result["available"] is True
+    assert result["observation"] != state["observation"]
+    assert result["message"] == "The requested app is not active."
+    assert sum(tool == "press_key" for tool, _ in ocu.calls) == 1

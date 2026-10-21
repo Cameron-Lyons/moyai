@@ -6,6 +6,8 @@ import asyncio
 import copy
 import hashlib
 import json
+import math
+import re
 import time
 from collections import OrderedDict
 from collections.abc import Callable, Sequence
@@ -22,6 +24,63 @@ from pydantic_ai.toolsets.abstract import ToolsetTool
 from pydantic_core import SchemaValidator, core_schema
 
 from .contracts import RunScope
+
+
+class ConnectionDefinitionChanged(ToolFailed):
+    """Provider discovery must refresh before another dispatch."""
+
+
+def connection_search(
+    _ctx: RunContext[RunScope], queries: Sequence[str], tools: Sequence[ToolDefinition],
+) -> list[str]:
+    """Rank requested operations and repository names above shared boilerplate.
+
+    Each query gets a first match before filling the result window, and duplicate
+    operations from other accounts cannot crowd every distinct operation out.
+    This only orders already-authorized definitions; it never grants access.
+    """
+    def words(value: str) -> set[str]:
+        return set(re.findall(r"[a-z0-9]+", value.lower()))
+
+    documents = {tool.name: words(f"{tool.name} {tool.description or ''}") for tool in tools}
+    frequencies: dict[str, int] = {}
+    for terms in documents.values():
+        for term in terms:
+            frequencies[term] = frequencies.get(term, 0) + 1
+    ranked = []
+    for query in queries:
+        terms = words(query)
+        scores = []
+        for tool in tools:
+            overlap = terms & documents[tool.name]
+            if not overlap:
+                continue
+            name_words = words(tool.name)
+            score = sum((3 if word in name_words else 1) * math.log(2 + len(tools) / frequencies[word]) for word in overlap)
+            operation = re.sub(r"^[a-z]+_[a-z0-9]{8}_", "", tool.name).removeprefix("github_")
+            operation_terms = words(operation)
+            exact_operation = bool(operation_terms) and operation_terms <= terms
+            repository = re.match(r"Connected GitHub repository: (.*?)\. ", tool.description or "")
+            if repository:
+                score += 20 * len(terms & words(repository[1]))
+            # Operation matches precede repository-label matches regardless of
+            # the number of words in a repository name.
+            scores.append((exact_operation, score, tool.name))
+        ranked.append(sorted(scores, key=lambda item: (-item[0], -item[1], item[2])))
+    result = list(dict.fromkeys(matches[0][2] for matches in ranked if matches))
+    operations = {re.sub(r"^[a-z]+_[a-z0-9]{8}_", "", name) for name in result}
+    rest = sorted((item for matches in ranked for item in matches), key=lambda item: (-item[0], -item[1], item[2]))
+    duplicates = []
+    for _exact_operation, _score, name in rest:
+        if name in result or name in duplicates:
+            continue
+        operation = re.sub(r"^[a-z]+_[a-z0-9]{8}_", "", name)
+        if operation in operations:
+            duplicates.append(name)
+        else:
+            result.append(name)
+            operations.add(operation)
+    return result + duplicates
 
 
 class ConnectionToolSearch(ToolSearch[RunScope]):
@@ -71,7 +130,10 @@ class ConnectionCatalog:
         # Continue-As-New increments the segment of the same admitted turn.
         # Neither changes connector authority or definitions.
         # Keep all admitted identity/grant/provenance fields in the cache key.
-        for field in ("interactive_delegation", "workflow_public_events", "history_segment"):
+        for field in (
+            "interactive_delegation", "workflow_public_events", "history_segment",
+            "background_delegation", "background_agents", "agent_messages", "message_watches",
+        ):
             value.pop(field)
         return hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
 
@@ -120,10 +182,12 @@ class CatalogToolset(AbstractToolset[RunScope]):
     def __init__(
         self, catalog: ConnectionCatalog, ctx: RunContext[RunScope],
         factory: Callable[[str | None], AbstractToolset[RunScope]],
+        *, reconstruct: Callable[[ToolDefinition], AbstractToolset[RunScope] | None] | None = None,
     ):
         self.catalog = catalog
         self.key = catalog.key(ctx)
         self.factory = factory
+        self.reconstruct = reconstruct
         self.native: AbstractToolset[RunScope] | None = None
         self.selection: str | None = None
         self.live_tools: dict[str, ToolsetTool[RunScope]] | None = None
@@ -138,13 +202,14 @@ class CatalogToolset(AbstractToolset[RunScope]):
         return None
 
     async def _live(
-        self, ctx: RunContext[RunScope], name: str | None = None,
+        self, ctx: RunContext[RunScope], name: str | None = None, definition: ToolDefinition | None = None,
     ) -> dict[str, ToolsetTool[RunScope]]:
         if self.native is not None and self.selection is not None and self.selection != name:
             await self.native.__aexit__(None, None, None)
             self.native, self.live_tools = None, None
         if self.native is None:
-            native = await self.factory(name).for_run(ctx)
+            reconstructed = self.reconstruct(definition) if self.reconstruct and definition else None
+            native = await (reconstructed if reconstructed is not None else self.factory(name)).for_run(ctx)
             await native.__aenter__()
             self.native = native
             self.selection = name
@@ -182,7 +247,7 @@ class CatalogToolset(AbstractToolset[RunScope]):
     async def get_tool_for_tool_def(
         self, tool_def: ToolDefinition, ctx: RunContext[RunScope],
     ) -> ToolsetTool[RunScope]:
-        current = (await self._live(ctx, tool_def.name)).get(tool_def.name)
+        current = (await self._live(ctx, tool_def.name, tool_def)).get(tool_def.name)
         if current is None or (
             current.tool_def.parameters_json_schema != tool_def.parameters_json_schema
             or current.tool_def.kind != tool_def.kind
@@ -200,4 +265,12 @@ class CatalogToolset(AbstractToolset[RunScope]):
         # listing. Durable calls already validated against this native validator.
         args = current.args_validator.validate_python(tool_args)
         assert self.native is not None
-        return await self.native.call_tool(name, args, ctx, current)
+        native = self.native
+        try:
+            return await native.call_tool(name, args, ctx, current)
+        except ConnectionDefinitionChanged:
+            self.catalog.discard(self.key)
+            if self.native is native:
+                self.native, self.live_tools, self.selection = None, None, None
+                await native.__aexit__(None, None, None)
+            raise

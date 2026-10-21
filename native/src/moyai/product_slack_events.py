@@ -12,7 +12,7 @@ from agentchat.channels.slack.host import SlackHost, SlackHostEvent
 from app.db import database as source_database
 from app.slack_format import ASIDE_PREFIXES
 from fastapi import HTTPException
-from sqlalchemy import update
+from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
 
 from .contracts import NewMessage
@@ -98,36 +98,6 @@ class SlackEvents:
         self.slack = slack
         self.conversations = SlackConversations(slack)
 
-    async def acknowledge_intake(self, payload: dict[str, Any]) -> None:
-        settings = self.slack.settings
-        if not settings.slack_bot_enabled or not settings.slack_session_users:
-            return
-        from .product_slack import SlackInstallationUnavailable
-
-        try:
-            installed = await source_database(self.slack.installation)
-        except SlackInstallationUnavailable:
-            return
-        if isinstance(payload.get("event"), dict) and payload["event"].get("subtype") in {
-            "message_changed", "message_deleted",
-        }:
-            return
-        try:
-            event = self._eligible_event(payload, installed)
-            if event is None:
-                return
-            message = SlackMessage.parse(payload, event, installed)
-        except HTTPException:
-            return
-        if message is None:
-            return
-        if message.origin["channel_id"].startswith("D") and (
-            not message.direct or not settings.slack_dm_enabled or not settings.slack_thread_chat_enabled
-        ):
-            return
-        if message.mentioned or message.direct:
-            await self.slack.acknowledge(message.source, installed)
-
     async def receive(self, payload: dict[str, Any]) -> dict[str, Any]:
         if payload.get("type") == "native_interaction":
             await self.slack.interact(payload["payload"])
@@ -164,7 +134,6 @@ class SlackEvents:
         )
         if conversation is None:
             return {"ok": True}
-        await self.slack.acknowledge(message.source, installed)
         return await self._admit(message, conversation, actor, principal, installed)
 
     def _eligible_event(self, payload: dict, installed: dict) -> dict | None:
@@ -221,8 +190,18 @@ class SlackEvents:
     ) -> Turn:
         async def admit() -> Turn:
             async with self.slack.runtime.database.sessions.begin() as db:
+                # Continue the computer's existing account selection, including
+                # older bot-only threads. Admission still checks every grant
+                # against this sender's current authority and workspace scope.
+                saved = await db.scalar(select(Turn.connections).join(
+                    Session, Session.id == Turn.session_id,
+                ).where(
+                    Turn.session_id == thread.session_id, Turn.preparation.is_not(None),
+                    Session.workspace.is_not(None),
+                ).order_by(Turn.created_at.desc(), Turn.id.desc()).limit(1))
+                submission = body.model_copy(update={"connections": json.loads(saved)}) if saved is not None else body
                 turn = await self.slack.runtime.database.submit(
-                    actor, thread.session_id, body, db=db,
+                    actor, thread.session_id, submission, db=db,
                 )
                 source = await db.get(SlackTurnSource, turn.id)
                 if source is None:
@@ -273,8 +252,7 @@ class SlackEvents:
         assert submission is not None
         if binding.paused:
             await self.slack.set_paused(binding.session_id, False)
-        turn = await self._submit(actor, thread, submission.body, message, submission.uploads)
-        await self.slack.queue(turn, thread, "accepted", {"text": "Moyai received your message."})
+        await self._submit(actor, thread, submission.body, message, submission.uploads)
         self.slack.runtime.slack_activity.wake.set()
         self.slack.delivery_wakeup.set()
         return {"ok": True}

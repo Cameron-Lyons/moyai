@@ -9,8 +9,9 @@ import hashlib
 import re
 
 CORE_IDENTITY = "pydantic-v1"
-# Interactive delegation tools and their admission schema require coordinated owners.
-NATIVE_PROTOCOL_REVISION = 5
+# Maintenance continuations require snapshot-aware workers and coordinated owners.
+# An older worker cannot interpret the new continuation envelope or activities.
+NATIVE_PROTOCOL_REVISION = 6
 FRAMEWORK_VERSIONS = {
     "pydantic-ai": "2.55.0",
     "pydantic-ai-harness": "0.55.0",
@@ -19,6 +20,10 @@ FRAMEWORK_VERSIONS = {
 
 
 def core_contract(settings):
+    bridge = getattr(settings, "moyai_worker_adoption_bridge", False)
+    deployment = getattr(settings, "moyai_worker_deployment", "")
+    if bridge and (getattr(settings, "moyai_core", "legacy") != "pydantic" or not deployment):
+        raise ValueError("Worker adoption bridging requires the native core and an explicit deployment.")
     if getattr(settings, "moyai_core", "legacy") == "legacy":
         return None
     if settings.moyai_core != "pydantic":
@@ -46,11 +51,13 @@ def core_contract(settings):
         "object_format": settings.moyai_native_object_format,
         "object_prefix": prefix,
     }
-    deployment = getattr(settings, "moyai_worker_deployment", "")
-    if deployment:
+    if deployment and not bridge:
         # The fleet identity and handoff protocol must agree across roles.
         # Build IDs intentionally differ during a reviewed release overlap.
         contract["worker_deployment"] = {
             "name": deployment, "protocol": "moyai-deployment-checkpoint-v1",
         }
+    # An explicit bridge retains the legacy contract; startup must additionally
+    # authorize the exact image/generation/deployment through WorkerAdoption.
+    # Ordinary versioned configurations retain their existing named contract.
     return contract

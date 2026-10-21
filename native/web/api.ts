@@ -20,19 +20,22 @@ function responseFailure(status: number): string {
   return `The request could not be completed (HTTP ${status}). Please try again.`
 }
 
-const aborted = (error: unknown, signal?: AbortSignal | null) => signal?.aborted || (error instanceof Error && error.name === "AbortError")
-
-/** One attempt only: callers must not silently replay a possibly accepted write. */
-async function send(path: string, options: RequestInit): Promise<Response> {
+/**
+ * The single transport for /api: CSRF headers, one attempt, and ApiError on any
+ * failure. Shared by the generated client (api-client.ts) and legacy api<T>().
+ * One attempt only: callers must not silently replay a possibly accepted write.
+ */
+export async function send(input: string | Request, init: RequestInit = {}): Promise<Response> {
   const requestCsrf = csrf
-  const headers = new Headers(options.headers)
+  const signal = typeof input === "string" ? init.signal : input.signal
+  const headers = typeof input === "string" ? new Headers(init.headers) : input.headers
   headers.set("X-Moyai-CSRF", requestCsrf)
   headers.set("X-CSRF-Token", requestCsrf)
   let response: Response
   try {
-    response = await fetch(`/api${path}`, { ...options, headers })
+    response = await (typeof input === "string" ? fetch(input, { ...init, headers }) : fetch(input))
   } catch (error) {
-    if (aborted(error, options.signal)) throw error
+    if (signal?.aborted || (error instanceof Error && error.name === "AbortError")) throw error
     throw new ApiError("Could not reach Moyai. Check your connection and try again.", 0)
   }
   if (response.ok) return response
@@ -40,33 +43,51 @@ async function send(path: string, options: RequestInit): Promise<Response> {
   try {
     value = await response.json()
   } catch (error) {
+    if (signal?.aborted || (error instanceof Error && error.name === "AbortError")) throw error
     // Error pages and empty error bodies must retain their HTTP status. Never
     // show their raw text/HTML (which may contain proxy or backend details).
-    if (aborted(error, options.signal)) throw error
   }
   if (response.status === 401 && csrf === requestCsrf) window.dispatchEvent(new Event("moyai:signed-out"))
   throw new ApiError(detailMessage(value) ?? responseFailure(response.status), response.status)
 }
 
-export async function apiRequest<T>(path: string, options: RequestInit = {}): Promise<T> {
-  const headers = new Headers(options.headers)
-  if (!headers.has("Content-Type")) headers.set("Content-Type", "application/json")
-  const response = await send(path, { ...options, headers })
-  if (response.status === 204 || response.status === 205 || options.method === "HEAD") return undefined as T
+export async function readJson(response: Response, signal?: AbortSignal | null): Promise<unknown> {
   try {
-    return await response.json() as T
+    return await response.json()
   } catch (error) {
-    if (aborted(error, options.signal)) throw error
+    if (signal?.aborted || (error instanceof Error && error.name === "AbortError")) throw error
     throw new ApiError("Moyai returned an unreadable response. Please try again.", response.status)
   }
 }
 
+/** Validate JSON before the SDK can treat an empty body or proxy page as data. */
+export async function sendJson(input: string | Request, init: RequestInit = {}): Promise<Response> {
+  const response = await send(input, init)
+  const method = typeof input === "string" ? init.method : input.method
+  // The generated SDK also exposes SSE. Never consume a live stream as JSON.
+  const streaming = response.headers.get("Content-Type")?.split(";")[0].trim().toLowerCase() === "text/event-stream"
+  if (!streaming && response.status !== 204 && response.status !== 205 && method !== "HEAD") {
+    await readJson(response.clone(), typeof input === "string" ? init.signal : input.signal)
+  }
+  return response
+}
+
 /** File download with the same headers and error policy; the name comes from Content-Disposition. */
-export async function apiDownload(path: string): Promise<{ blob: Blob; filename: string }> {
-  const response = await send(path, {})
+export async function apiDownload(path: string, signal?: AbortSignal): Promise<{ blob: Blob; filename: string }> {
+  const response = await send(`/api${path}`, { signal })
   return { blob: await response.blob(), filename: /filename="([^"]+)"/.exec(response.headers.get("Content-Disposition") ?? "")?.[1] ?? "" }
 }
 
+/** Legacy: `T` is an unchecked cast. New code calls the generated SDK from ./generated/api. */
+export async function apiRequest<T>(path: string, options: RequestInit = {}): Promise<T> {
+  const headers = new Headers(options.headers)
+  if (!headers.has("Content-Type")) headers.set("Content-Type", "application/json")
+  const response = await send(`/api${path}`, { ...options, headers })
+  if (response.status === 204 || response.status === 205 || options.method === "HEAD") return undefined as T
+  return await readJson(response, options.signal) as T
+}
+
+/** Legacy: see apiRequest. */
 export function api<T>(path: string, method = "GET", body?: unknown, signal?: AbortSignal): Promise<T> {
   return apiRequest<T>(path, { method, signal, body: body === undefined ? undefined : JSON.stringify(body) })
 }

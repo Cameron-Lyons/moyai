@@ -9,9 +9,13 @@ The application has one Python installation, one lockfile, and one React fronten
 An existing deployment keeps its users, permissions, historical sessions,
 credentials and accounting through the shared product services.
 
-![Moyai home with the session sidebar and task composer](docs/assets/native/home.png)
+<picture>
+  <source media="(prefers-color-scheme: light)" srcset="docs/assets/native/home-light.png">
+  <img src="docs/assets/native/home.png" width="1280" alt="Moyai's composer with a keyboard-shortcut task ready to send, a model selector, and a widened sidebar of recent and participated sessions.">
+</picture>
 
-*Current frontend with synthetic accounts and session data.*
+*The current composer, captured at 2× resolution in light and dark mode. Account,
+model, and session data are synthetic; the task is an unsent demo draft.*
 
 ## Quickstart
 
@@ -150,6 +154,8 @@ development. Preserve `.data` and its generated encryption key across restarts.
   member computers, and durable Pause/Resume/time controls on Pydantic AI.
 - [Architecture](docs/architecture.md): how requests move through the system and
   which data belongs to each service.
+- [Full Linux computers](docs/modal-runtime.md): select Modal's VM runtime for
+  Chromium/WebRTC and other workloads that need a full Linux kernel.
 - [Docker installation](deploy/docker/README.md): self-hosted installation and upgrades.
 - Managed deployment workflows and runbooks are maintained in a private repository.
 - [Verification](docs/verification.md): tests, packaging and Docker checks.

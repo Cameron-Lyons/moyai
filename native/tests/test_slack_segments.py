@@ -9,7 +9,7 @@ import pytest
 from sqlalchemy import select
 from test_product_slack import bind
 from test_slack_progress import bridge as canonical_bridge
-from test_slack_progress import queued, transport
+from test_slack_progress import queued, replies_without_web_inputs, transport
 from test_slack_progress import slack as canonical_slack
 
 from moyai.commentary import Commentary
@@ -52,7 +52,7 @@ async def test_steering_freezes_previous_slot_and_final_replaces_new_slot(runtim
 
     await bind(slack, active)
     deliver = slack.service.deliver if product else lambda client, row: deliver_one(runtime, client, row)
-    initial = await queued(runtime, active, product=product, kind="anchor", text="Received.")
+    initial = await queued(runtime, active, product=product, kind="anchor", text="Inspecting the relevant code.")
     update = await queued(runtime, active, product=product, kind="one", text="Checking the file.")
     stale = await queued(runtime, active, product=product, kind="stale", text="Never replace the preserved update.")
     requests, messages, handle = transport()
@@ -67,7 +67,7 @@ async def test_steering_freezes_previous_slot_and_final_replaces_new_slot(runtim
         }])
         await stage_progress(runtime, product=product)
         await pending(runtime, deliver, client)
-        replies = [message for message in messages.values() if "(from Moyai)" not in message["text"]]
+        replies = await replies_without_web_inputs(runtime, active[1].id, messages)
         assert len(replies) == 2
         assert len(messages) == 2
         assert messages[earlier_ts]["text"] == "Checking the file."
@@ -80,7 +80,7 @@ async def test_steering_freezes_previous_slot_and_final_replaces_new_slot(runtim
         else:
             await stage_deliveries(runtime)
         await pending(runtime, deliver, client)
-        replies = [message for message in messages.values() if "(from Moyai)" not in message["text"]]
+        replies = await replies_without_web_inputs(runtime, active[1].id, messages)
         assert len(replies) == 2
         assert len(messages) == (4 if product else 2)
         assert messages[earlier_ts]["text"] == "Checking the file."
@@ -129,7 +129,7 @@ async def test_steering_between_target_read_and_claim_cannot_edit_old_slot(runti
 async def test_ambiguous_previous_update_is_reconciled_before_new_slot(runtime, active, slack, product):
     await bind(slack, active)
     deliver = slack.service.deliver if product else lambda client, row: deliver_one(runtime, client, row)
-    initial = await queued(runtime, active, product=product, kind="anchor", text="Received.")
+    initial = await queued(runtime, active, product=product, kind="anchor", text="Inspecting the relevant code.")
     update = await queued(runtime, active, product=product, kind="one", text="Last visible update.")
     requests, messages, handle = transport()
 
@@ -143,6 +143,9 @@ async def test_ambiguous_previous_update_is_reconciled_before_new_slot(runtime, 
         await deliver(client, initial)
         await deliver(client, update)
         await steer(runtime, active, slack)
+        await Commentary(runtime.database).save(active[2].scope, 2, [{
+            "id": "new-segment", "text": "Checking the new input.", "created_at": now(),
+        }])
         await stage_progress(runtime, product=product)
         await pending(runtime, deliver, client)
         assert len(messages) == 1
@@ -178,7 +181,7 @@ async def test_fast_final_after_steering_posts_once_without_touching_previous_sl
         await pending(runtime, deliver, client)
         assert len(messages) == (4 if product else 2)
         assert next(iter(messages.values()))["text"] == "Preserved progress."
-        replies = [message for message in messages.values() if "(from Moyai)" not in message["text"]]
+        replies = await replies_without_web_inputs(runtime, active[1].id, messages)
         assert len(replies) == 2
         final = replies[-1]
         assert "useful results" in final["text"]

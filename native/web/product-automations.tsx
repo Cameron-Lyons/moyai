@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useId, useRef, useState } from "react"
-import { AlertCircle, CalendarClock, ChevronLeft, History, Plus, RefreshCw, Search, Trash2 } from "lucide-react"
+import { CalendarClock, ChevronLeft, History, Plus, RefreshCw, Search, Trash2 } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Textarea } from "@/components/ui/textarea"
@@ -9,14 +9,20 @@ import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } f
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
 import { automationDefaultSchedule, automationEventFields, automationSetupNotes, automationSources, automationTriggers } from "./automation-helpers.js"
 import { automationHistoryMerge, automationRunStatus, automationTiming } from "./automation-helpers.js"
-import { api, ApiError, csrfToken } from "./api"
+import { ApiError, csrfToken } from "./api"
 import {
-  AutomationRequestKeys, automationActions, automationBlocker, automationMetadata, automationSamplePayload, automationStatus, calendarFrequencies, changeAutomationEvent, changeAutomationEventField, changeAutomationRepository, eventFieldVisible, historySessionHash,
+  configureProductAutomationWebhook, createProductAutomation, getMe, getProductAutomationPreview, getProductAutomationWebhook,
+  listProductAutomationHistory, listProductAutomations, migrateProductAutomation, runProductAutomation, setProductAutomationState,
+  testProductAutomationEvent, updateProductAutomation, listSessions, type SessionListItem,
+} from "./generated/api"
+import {
+  AutomationRequestKeys, automationActions, automationBlocker, automationMetadata, automationSamplePayload, automationStatus, calendarFrequencies, changeAutomationEvent, changeAutomationEventField, changeAutomationRepository, eventFieldVisible, historySessionHash, isAutomationProvider,
   onceUtcInput, onceUtcInstant, validateAutomation,
   type AutomationDefinition, type AutomationHistoryPage, type AutomationInventory, type AutomationPreview,
   type AutomationTiming, type AutomationTrigger, type AutomationEvent, type ProductAutomation, type AutomationRunResult,
-  type AutomationWebhookInfo, type AutomationWebhookResult, type AutomationTestResult, type AutomationEnvironment, type AutomationConnection,
+  type AutomationWebhookResult, type AutomationEnvironment, type AutomationConnection,
 } from "./product-automation-data"
+import { listOrganizationConnections, listProductEnvironments } from "./generated/api"
 import "./product-automations.css"
 
 const base = "/product/automations"
@@ -24,7 +30,9 @@ const timeLabel = (value: string) => Number.isFinite(Date.parse(value)) ? new Da
 const errorLabel = (reason: unknown) => reason instanceof ApiError && reason.status === 404
   ? "This automation service or saved definition is not available."
   : reason instanceof Error ? reason.message : "The request could not be completed."
-function useRead<T>(path: string | null) {
+/** `path` identifies the resource; `load` fetches it with a generated SDK call. */
+function useRead<T>(path: string | null, load: (signal: AbortSignal) => Promise<T>) {
+  const loader = useRef(load); loader.current = load
   const [version, setVersion] = useState(0)
   const [state, setState] = useState<{ path: string | null; data?: T; loading: boolean; error: string }>({ path: null, loading: false, error: "" })
   useEffect(() => {
@@ -32,7 +40,7 @@ function useRead<T>(path: string | null) {
     const controller = new AbortController()
     const requestAuth = csrfToken()
     setState(previous => ({ path, data: previous.path === path ? previous.data : undefined, loading: true, error: "" }))
-    void api<T>(path, "GET", undefined, controller.signal).then(data => {
+    void loader.current(controller.signal).then(data => {
       if (!controller.signal.aborted && csrfToken() === requestAuth) setState({ path, data, loading: false, error: "" })
     }, error => { if (!controller.signal.aborted && csrfToken() === requestAuth) setState({ path, loading: false, error: errorLabel(error) }) })
     return () => controller.abort()
@@ -57,7 +65,7 @@ export function ProductAutomationList({ rows, onReview }: { rows: ProductAutomat
     <CalendarClock className="ns-record-icon" aria-hidden="true" /><div className="ns-record-copy">
       <div className="ns-record-title"><h2>{row.name}</h2><span className="ns-badge">{automationStatus(row)}</span></div>
       <ul className="pa-triggers">{row.triggers.map(trigger => <li key={trigger.id}><TriggerSummary trigger={trigger} /></li>)}</ul>
-      {!row.native && <p className="ns-muted">Review migration before this workflow can run on the new runtime.</p>}
+      {!row.native && <p>Review migration before this workflow can run on the new runtime.</p>}
       {row.owned === false && <p className="ns-muted">Shared definition · Owner-managed</p>}
       {row.native?.last_error && <p className="pa-warning" role="status">{row.native.last_error}</p>}
     </div><div className="ns-row-actions"><Button variant="outline" size="sm" onClick={() => onReview(row.id)}>Review<span className="visually-hidden"> {row.name}</span></Button></div>
@@ -86,7 +94,7 @@ export function ProductAutomationsPage({ userId }: { userId: string }) {
         let offset = 0, result: AutomationInventory | undefined
         const rows = new Map<string, ProductAutomation>()
         for (let page = 0; page < pages; page++) {
-          const next = await api<AutomationInventory>(`${base}?limit=50&offset=${offset}`, "GET", undefined, controller.signal)
+          const { data: next } = await listProductAutomations({ query: { limit: 50, offset }, signal: controller.signal })
           if (controller.signal.aborted || csrfToken() !== requestAuth) return
           if (next.source !== "canonical_product") throw new Error("The server did not return canonical product automations.")
           for (const row of next.automations) rows.set(row.id, row)
@@ -106,7 +114,7 @@ export function ProductAutomationsPage({ userId }: { userId: string }) {
     || filter === "blocked" && row.native?.sync_state === "blocked"
   )) ?? []
   return <section className="product-automations" aria-label="Saved product automations">
-    <p className="ns-notice"><AlertCircle size={16} />Existing definitions and run history stay saved. Migration is explicit and starts paused. Definitions and scheduled sessions are shared workspace resources.</p>
+    <p className="ns-help">Automations and their chats are shared with your workspace.</p>
     <div className="ns-toolbar">
       <div className="ns-search"><Search size={16} /><Input type="search" aria-label="Search automations" placeholder="Search automations…" value={search} onChange={event => setSearch(event.target.value)} /></div>
       <Choice label="Automation state" value={filter} onChange={setFilter} options={[{ value: "all", label: "All states" }, { value: "unmigrated", label: "Not migrated" }, { value: "active", label: "Enabled" }, { value: "paused", label: "Paused" }, { value: "blocked", label: "Blocked" }]} />
@@ -115,9 +123,8 @@ export function ProductAutomationsPage({ userId }: { userId: string }) {
     </div>
     {state.loading && <p className="ns-muted" role="status">Loading saved automations…</p>}
     {state.error && <p className="ns-error" role="alert">{state.error} <Button variant="outline" onClick={refresh}>Retry</Button></p>}
-    {state.data?.reason && <p className="ns-notice">{state.data.reason}</p>}
-    {state.data && <><p className="ns-muted">{rows.length} shown{state.data.next_offset !== null ? " · More workflows available" : ""}</p>
-      {rows.length ? <ProductAutomationList rows={rows} onReview={id => open("review", id)} /> : <div className="ns-empty"><h2>{search || filter !== "all" ? "No matching automations" : "No saved automations"}</h2><p>{search || filter !== "all" ? "Try another search or clear the filters." : "Create a calendar workflow and review it before migration and activation."}</p>{(search || filter !== "all") && <Button variant="outline" onClick={() => { setSearch(""); setFilter("all") }}>Clear filters</Button>}</div>}
+    {state.data && <><p className="ns-muted pa-result-count">{rows.length} shown{state.data.next_offset !== null ? " · More workflows available" : ""}</p>
+      {rows.length ? <ProductAutomationList rows={rows} onReview={id => open("review", id)} /> : <div className="ns-empty"><h2>{search || filter !== "all" ? "No matching automations" : "No saved automations"}</h2><p>{search || filter !== "all" ? "Try another search or clear the filters." : "Create an automation to schedule recurring work."}</p>{(search || filter !== "all") && <Button variant="outline" onClick={() => { setSearch(""); setFilter("all") }}>Clear filters</Button>}</div>}
       {state.data.next_offset !== null && <Button className="pa-load-more" variant="outline" disabled={state.loading} onClick={() => setPages(value => value + 1)}>Load more automations</Button>}
     </>}
       {dialog && <AutomationDialog key={dialog.id ?? "new"} mode={dialog.mode} id={dialog.id} canCreate={state.data?.capabilities?.create === true} eventChoices={state.data?.event_choices ?? {}}
@@ -131,13 +138,14 @@ export function AutomationReadiness({ preview }: { preview: AutomationPreview })
     <p>{preview.sharing_notice || "Definitions and scheduled sessions are shared workspace resources."}</p>
     {preview.blockers.length > 0 && <ul className="pa-blockers">{preview.blockers.map(code => <li key={code}>{automationBlocker(code)}</li>)}</ul>}
     {preview.native?.last_error && <p className="pa-warning" role="status">{preview.native.last_error}</p>}
-    {preview.native && <p className="ns-muted">{automationStatus(preview)}{preview.native.sync_state !== "ready" ? " · Refresh to check scheduler synchronization." : ""}</p>}
-    <p className="ns-muted">Readiness checks the saved triggers, account access, repository and environment setup, and permissions. Resolve reported blockers before activation.</p>
+    {preview.native && <p>{automationStatus(preview)}{preview.native.sync_state !== "ready" ? " · Refresh to check scheduler synchronization." : ""}</p>}
+    <p>Readiness checks the saved triggers, account access, repository and environment setup, and permissions. Resolve reported blockers before activation.</p>
   </div>
 }
 function HistoryRows({ id, version }: { id: string; version: number }) {
   const [cursor, setCursor] = useState<string | null>(null), [saved, setSaved] = useState<AutomationHistoryPage["history"]>([])
-  const resource = useRead<AutomationHistoryPage>(`${base}/${encodeURIComponent(id)}/history?limit=20${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}`)
+  const resource = useRead(`${base}/${encodeURIComponent(id)}/history?limit=20${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}`,
+    signal => listProductAutomationHistory({ path: { identity: id }, query: { limit: 20, ...cursor ? { cursor } : {} }, signal }).then(({ data }) => data))
   useEffect(() => { setCursor(null); setSaved([]); resource.refresh() }, [id, version])
   useEffect(() => { if (resource.error) setSaved([]) }, [resource.error])
   const rows = resource.error ? [] : resource.data ? automationHistoryMerge(saved, resource.data.history) : saved
@@ -157,7 +165,8 @@ function EventTools({ preview, busy, version, onSetup }: {
   preview: AutomationPreview; busy: boolean; version: number
   onSetup: (provider: string, secret: string, done: (result: AutomationWebhookResult) => void) => Promise<void>
 }) {
-  const resource = useRead<AutomationWebhookInfo>(`${base}/${encodeURIComponent(preview.id)}/webhook`)
+  const resource = useRead(`${base}/${encodeURIComponent(preview.id)}/webhook`,
+    signal => getProductAutomationWebhook({ path: { identity: preview.id }, signal }).then(({ data }) => data))
   const [provider, setProvider] = useState(""), [secret, setSecret] = useState(""), [generated, setGenerated] = useState("")
   const [setupNotice, setSetupNotice] = useState(""), [sampleIndex, setSampleIndex] = useState("0")
   const [payload, setPayload] = useState<string | null>(null), [eventHeader, setEventHeader] = useState<string | null>(null)
@@ -212,9 +221,9 @@ function EventTools({ preview, busy, version, onSetup }: {
         const controller = new AbortController(), requestAuth = csrfToken()
         request.current?.abort(); request.current = controller; setTesting(true); setTestError(""); setTestResult("")
         try {
-          const result = await api<AutomationTestResult>(`${base}/${encodeURIComponent(preview.id)}/test-event`, "POST", {
+          const { data: result } = await testProductAutomationEvent({ path: { identity: preview.id }, body: {
             provider: sample.provider, event_header: eventHeader ?? sample.event_header, payload: automationSamplePayload(currentPayload),
-          }, controller.signal)
+          }, signal: controller.signal })
           if (controller.signal.aborted || csrfToken() !== requestAuth) return
           if (result.started !== false) throw new Error("The service did not confirm a filter-only test.")
           setTestResult(result.matches ? `${result.context?.matched_trigger_ids ? `Matched ${result.context.matched_trigger_ids.length} trigger(s).` : "The saved filters matched."} No session was started.` : "No match. No session was started.")
@@ -245,10 +254,12 @@ function AutomationDialog({ id, mode, canCreate, eventChoices, onMode, onSaved, 
   eventChoices: Record<string, [string, string][]>
   onSaved: () => void; onClose: () => void; opener: React.MutableRefObject<HTMLElement | null>
 }) {
-  const preview = useRead<AutomationPreview>(id ? `${base}/${encodeURIComponent(id)}/preview` : null)
-  const models = useRead<{ models: string[]; default_model: string }>("/me")
-  const environments = useRead<AutomationEnvironment[]>(mode !== "review" ? "/product/environments" : null)
-  const connections = useRead<AutomationConnection[]>(mode !== "review" ? "/product/connections" : null)
+  const preview = useRead(id ? `${base}/${encodeURIComponent(id)}/preview` : null,
+    signal => getProductAutomationPreview({ path: { identity: id! }, signal }).then(({ data }) => data))
+  const models = useRead("/me", signal => getMe({ signal }).then(({ data }) => data))
+  const chats = useRead(mode !== "review" ? "/sessions" : null, signal => listSessions({ signal }).then(({ data }) => data))
+  const environments = useRead(mode !== "review" ? "/product/environments" : null, signal => listProductEnvironments({ signal }).then(({ data }) => data))
+  const connections = useRead<AutomationConnection[]>(mode !== "review" ? "/product/connections" : null, signal => listOrganizationConnections({ signal }).then(({ data }) => data))
   const [busy, setBusy] = useState(false), [error, setError] = useState(""), [historyVersion, setHistoryVersion] = useState(0)
   const [confirm, setConfirm] = useState<"migrate" | "enable" | "pause" | "run" | "retire" | null>(null)
   const [runResult, setRunResult] = useState<AutomationRunResult | null>(null)
@@ -256,12 +267,13 @@ function AutomationDialog({ id, mode, canCreate, eventChoices, onMode, onSaved, 
   const title = useRef<HTMLHeadingElement>(null)
   useEffect(() => { alive.current = true; return () => { alive.current = false } }, [])
   useEffect(() => { if (mode === "review") title.current?.focus() }, [mode])
-  async function write<T = unknown>(path: string, method: string, body: object, close: boolean, done?: (result: T) => void) {
+  /** `intent` names the change; a retry of the same intent and body reuses its request key. */
+  async function write<B extends object, T>(intent: string, body: B, send: (body: B & { request_key: string }) => Promise<{ data: T }>, close: boolean, done?: (result: T) => void) {
     if (pending.current) return
     const requestAuth = csrfToken()
     pending.current = true; setBusy(true); setError("")
     try {
-      const result = await api<T>(path, method, { ...body, request_key: keys.current.forIntent(path, body) })
+      const { data: result } = await send({ ...body, request_key: keys.current.forIntent(intent, body) })
       if (!alive.current || csrfToken() !== requestAuth) return
       keys.current.complete()
       done?.(result)
@@ -292,6 +304,7 @@ function AutomationDialog({ id, mode, canCreate, eventChoices, onMode, onSaved, 
       <AutomationReadiness preview={ready} />
       <ul className="pa-triggers">{automationTriggers(ready.definition).map(trigger => <li key={trigger.id}><TriggerSummary trigger={trigger} /></li>)}</ul>
       <details><summary>Workflow instructions</summary><pre>{ready.definition.prompt}</pre></details>
+      <p>{ready.definition.session_id ? <><a className="ns-link" href={`#${encodeURIComponent(ready.definition.session_id)}`} onClick={onClose}>Continue existing chat</a> · Each run uses this chat’s history and computer.</> : "New chat each run · Runs start with fresh conversation history."}</p>
       <UnsupportedSettings definition={ready.definition} />
       <div className="ns-row-actions pa-actions">
         {actions?.edit && <Button variant="outline" disabled={busy || preview.loading} onClick={() => { setError(""); onMode("edit") }}>Edit definition</Button>}
@@ -303,41 +316,48 @@ function AutomationDialog({ id, mode, canCreate, eventChoices, onMode, onSaved, 
         {actions?.retire && <Button variant="outline" disabled={busy || preview.loading} onClick={() => setConfirm("retire")}>Retire automation</Button>}
       </div>
       {confirm && <div className="pa-confirm" role="group" aria-label="Confirm automation change">
-        <h3>{{ migrate: "Move execution to the new runtime?", enable: "Enable this shared automation?", pause: "Pause future automation work?", run: "Start one shared session now?", retire: "Retire this automation?" }[confirm]}</h3>
+        <h3>{{ migrate: "Move execution to the new runtime?", enable: "Enable this shared automation?", pause: "Pause future automation work?", run: "Run this automation now?", retire: "Retire this automation?" }[confirm]}</h3>
         <p>{confirm === "migrate" ? "The service will pause the old schedule and bind this saved definition to the new runtime. It stays paused until you explicitly resume it. Existing history is retained."
-          : confirm === "enable" ? "Future occurrences create shared workspace sessions with these instructions. The service rechecks your access and this definition before admission."
-            : confirm === "run" ? "This starts one session using the saved definition and connected accounts. Model usage may incur costs. It does not enable recurring execution."
+          : confirm === "enable" ? "Future occurrences run in the selected chat destination. The service rechecks your access and this definition before admission."
+            : confirm === "run" ? "This runs the saved definition in its selected chat destination. Model usage may incur costs. It does not enable recurring execution."
               : confirm === "retire" ? "This removes the native execution binding from future scheduling. The canonical definition and recorded history are retained."
                 : "Future scheduling will pause. Work already admitted and saved history are kept."}</p>
         <div className="ns-dialog-actions"><Button autoFocus variant="outline" disabled={busy} onClick={() => setConfirm(null)}>Cancel</Button><Button disabled={busy || preview.loading || !actions?.[confirm]} onClick={() => {
-          if (actions?.[confirm]) void write<AutomationRunResult>(`${base}/${encodeURIComponent(id!)}/${confirm}`, "POST", { revision: ready.revision, ...(confirm === "migrate" ? { activate: false } : {}) }, false, confirm === "run" ? setRunResult : undefined)
+          if (!actions?.[confirm]) return
+          const path = { identity: id! }, intent = `${base}/${encodeURIComponent(id!)}/${confirm}`
+          if (confirm === "run") void write(intent, { revision: ready.revision }, body => runProductAutomation({ path, body }), false, setRunResult)
+          else if (confirm === "migrate") void write(intent, { revision: ready.revision, activate: false }, body => migrateProductAutomation({ path, body }), false)
+          else void write(intent, { revision: ready.revision }, body => setProductAutomationState({ path: { ...path, action: confirm }, body }), false)
         }}>{busy ? "Saving…" : { migrate: "Migrate and keep paused", enable: "Enable automation", pause: "Pause automation", run: "Run once", retire: "Retire automation" }[confirm]}</Button></div>
       </div>}
       {runResult && <p className="ns-notice" role="status">Run status: {runResult.status}. {runResult.session_id && <a className="ns-link" href={`#${encodeURIComponent(runResult.session_id)}`} onClick={onClose}>Open session</a>}</p>}
       {ready.definition.triggers.some(trigger => trigger.event) && (caps?.webhook || caps?.test_event) && <EventTools preview={ready} busy={busy || preview.loading} version={historyVersion}
-        onSetup={(provider, secret, done) => write<AutomationWebhookResult>(`${base}/${encodeURIComponent(id!)}/webhook`, "POST", { revision: ready.revision, provider, secret }, false, done)} />}
+        onSetup={(provider, secret, done) => write(`${base}/${encodeURIComponent(id!)}/webhook`, { revision: ready.revision, provider, secret }, body => configureProductAutomationWebhook({ path: { identity: id! }, body }), false, done)} />}
       <HistoryRows id={id!} version={historyVersion} />
     </>}
     {mode !== "review" && models.data && (mode === "new" ? canCreate : ready && caps?.update) && <DefinitionEditor
       key={mode === "new" ? "new" : `${ready!.id}:${ready!.revision}`} existing={mode === "new" ? undefined : ready!.definition} models={models.data.models} defaultModel={models.data.default_model} eventChoices={eventChoices}
+      chats={(chats.data ?? []).filter(chat => chat.owner_id === models.data!.user.id && chat.visibility === "shared" && chat.surface === "web" && !chat.archived && !chat.deleted)} chatError={chats.error} chatLoading={chats.loading} onRefreshChats={chats.refresh}
       environments={environments.data ?? []} environmentError={environments.error} environmentLoading={environments.loading} onRefreshEnvironments={environments.refresh} busy={busy}
       connections={connections.data ?? []} connectionError={connections.error} connectionLoading={connections.loading} onRefreshConnections={connections.refresh}
       onCancel={mode === "new" ? onClose : () => { setError(""); onMode("review") }}
-      onSave={definition => write(id ? `${base}/${encodeURIComponent(id)}` : base, id ? "PUT" : "POST", { revision: ready?.revision ?? 0, definition }, true)} />}
+      onSave={definition => id
+        ? write(`${base}/${encodeURIComponent(id)}`, { revision: ready?.revision ?? 0, definition }, body => updateProductAutomation({ path: { identity: id }, body }), true)
+        : write(base, { revision: 0, definition }, body => createProductAutomation({ body }), true)} />}
     {mode !== "review" && !models.data && models.loading && <p role="status">Loading available models…</p>}
   </DialogContent></Dialog>
 }
 
 export function UnsupportedSettings({ definition }: { definition: AutomationDefinition }) {
   const entries = [
-    definition.plugins.length ? ["Connections", definition.plugins.join(", ")] : null,
-    definition.repo_url || definition.github_repository_id ? ["Repository", definition.repo_url || `Repository ID ${definition.github_repository_id}`] : null,
-    ["Environment", definition.environment_id],
+    !definition.session_id && definition.plugins.length ? ["Connections", definition.plugins.join(", ")] : null,
+    !definition.session_id && (definition.repo_url || definition.github_repository_id) ? ["Repository", definition.repo_url || `Repository ID ${definition.github_repository_id}`] : null,
+    definition.session_id ? ["Project and connections", "From the selected chat"] : ["Environment", definition.environment_id],
     definition.mode !== "modal" ? ["Execution mode", definition.mode] : null,
     definition.self_management.instructions || definition.self_management.schedule ? ["Self-management", "Instructions or schedule permissions are enabled."] : null,
     Object.keys(definition.metadata).length ? ["Metadata", Object.entries(definition.metadata).map(([key, value]) => `${key}: ${value}`).join("\n")] : null,
     ["Hourly limit", definition.max_runs_per_hour === null ? "No cap" : `${definition.max_runs_per_hour} runs`],
-    ["Event handling", definition.queue_events ? "Queue while another run is active" : "Allow overlapping runs"],
+    ["Event handling", definition.session_id ? "Wait for the selected chat to be idle" : definition.queue_events ? "Queue while another run is active" : "Allow overlapping runs"],
   ].filter((entry): entry is string[] => Boolean(entry))
   return entries.length > 0 && <div className="pa-preserved"><h3>Saved execution settings</h3><p>These settings are part of the saved definition. Current readiness determines whether they can be used.</p><dl>{entries.map(([name, value]) => <React.Fragment key={name}><dt>{name}</dt><dd>{value}</dd></React.Fragment>)}</dl></div>
 }
@@ -385,7 +405,7 @@ export function EventFields({ event, choices, disabled, onChange }: {
         maxLength={eventFieldLimits[field]} placeholder={placeholder} disabled={disabled} value={typeof event[field] === "string" || typeof event[field] === "number" ? String(event[field]) : ""}
         onChange={input => onChange(changeAutomationEventField(event, field, field === "priority" ? input.target.value === "" ? null : Number(input.target.value) : input.target.value))} />
     </div>)}</div>
-    {["slack", "github", "gitlab"].includes(event.provider) && eventFieldVisible(event, "sender_type") && <div className="ns-field"><label htmlFor={`${id}-sender`}>Sender</label><Choice id={`${id}-sender`} label="Event sender" value={typeof event.sender_type === "string" ? event.sender_type : "any"} disabled={disabled} options={[{ value: "any", label: "Anyone" }, { value: "human", label: "People only" }, { value: "bot", label: "Bots only" }]} onChange={value => onChange({ ...event, sender_type: value })} /></div>}
+    {["slack", "github", "gitlab"].includes(event.provider) && eventFieldVisible(event, "sender_type") && <div className="ns-field"><label htmlFor={`${id}-sender`}>Sender</label><Choice id={`${id}-sender`} label="Event sender" value={typeof event.sender_type === "string" ? event.sender_type : "any"} disabled={disabled} options={[{ value: "any", label: "Anyone" }, { value: "human", label: "People only" }, { value: "bot", label: "Bots only" }]} onChange={value => onChange(changeAutomationEventField(event, "sender_type", value))} /></div>}
     {event.provider === "slack" && eventFieldVisible(event, "include_thread_replies") && <CheckField label="Include thread replies" checked={event.include_thread_replies === true} disabled={disabled} onChange={value => onChange({ ...event, include_thread_replies: value })} />}
     {event.provider === "session" && <p className="ns-field-hint">Watches new human messages in shared sessions after activation. Leave the session ID blank for all eligible sessions, or use the exact original 32-character ID or native UUID. Existing messages are not replayed.</p>}
     {event.provider === "slack" && <p className="ns-field-hint">Uses the installed organization Slack app and allowed users. Add the bot to watched channels and configure the required event subscriptions and scopes.</p>}
@@ -393,15 +413,16 @@ export function EventFields({ event, choices, disabled, onChange }: {
   </div>
 }
 
-export function DefinitionEditor({ existing, models, defaultModel, eventChoices = {}, environments = [], environmentError = "", environmentLoading = false, onRefreshEnvironments, connections = [], connectionError = "", connectionLoading = false, onRefreshConnections, busy, onCancel, onSave }: {
+export function DefinitionEditor({ existing, models, defaultModel, chats = [], chatError = "", chatLoading = false, onRefreshChats, eventChoices = {}, environments = [], environmentError = "", environmentLoading = false, onRefreshEnvironments, connections = [], connectionError = "", connectionLoading = false, onRefreshConnections, busy, onCancel, onSave }: {
   existing?: AutomationDefinition; models: string[]; defaultModel: string; busy: boolean
+  chats?: SessionListItem[]; chatError?: string; chatLoading?: boolean; onRefreshChats?: () => void
   eventChoices?: Record<string, [string, string][]>
   environments?: AutomationEnvironment[]; environmentError?: string; environmentLoading?: boolean; onRefreshEnvironments?: () => void
   connections?: AutomationConnection[]; connectionError?: string; connectionLoading?: boolean; onRefreshConnections?: () => void
   onCancel: () => void; onSave: (definition: AutomationDefinition) => Promise<void>
 }) {
   const [definition, setDefinition] = useState<AutomationDefinition>(() => existing ? structuredClone(existing) : {
-    name: "", prompt: "", model: defaultModel, mode: "modal", harness: "pydantic-v1", repo_url: "", github_repository_id: null,
+    name: "", prompt: "", session_id: null, security_profile_id: "", model: defaultModel, mode: "modal", harness: "pydantic-v1", repo_url: "", github_repository_id: null,
     environment_id: "auto", plugins: [], metadata: {}, queue_events: false, max_runs_per_hour: 50,
     self_management: { instructions: false, schedule: false },
     triggers: [{ id: crypto.randomUUID(), schedule: { ...automationDefaultSchedule(), cron: "", run_at: null } }],
@@ -416,6 +437,12 @@ export function DefinitionEditor({ existing, models, defaultModel, eventChoices 
   const changeTrigger = (id: string, trigger: AutomationTrigger) => changeTriggers(definition.triggers.map(item => item.id === id ? trigger : item))
   const sourceOptions = [{ value: "schedule", label: "Schedule" }, ...Object.keys(eventChoices).filter(provider => automationEventFields[provider]).map(value => ({ value, label: automationSources[value] || value }))]
   const availableModels = [...new Set([definition.model, ...models])].map(value => ({ value: value || "__default__", label: value ? `${value}${models.includes(value) ? "" : " (not currently enabled)"}` : "Workspace default" }))
+  const chatOptions = [
+    { value: "__new__", label: "New chat each run" },
+    ...chats.map(chat => ({ value: chat.id, label: chat.title })),
+    ...(definition.session_id && !chats.some(chat => chat.id === definition.session_id)
+      ? [{ value: definition.session_id, label: "Saved chat (unavailable in recent chats)" }] : []),
+  ]
   const environmentOptions = [
     { value: "auto", label: "Automatic · Match repository or workspace default" },
     { value: "none", label: "Base tools · No project environment" },
@@ -428,16 +455,21 @@ export function DefinitionEditor({ existing, models, defaultModel, eventChoices 
     try { const saved = { ...definition, metadata: automationMetadata(metadata) }; validateAutomation(saved, Date.now(), !existing); await onSave(saved) }
     catch (reason) { setError(errorLabel(reason)) }
   }}>
-    <p className="ns-notice">Instructions and resulting sessions are shared with workspace members. Save only information intended for this workspace.</p>
+    <p className="ns-help">Instructions and resulting chats are shared with your workspace.</p>
     <div className="ns-fields">
       <div className="ns-field"><label htmlFor={`${id}-name`}>Automation name</label><Input id={`${id}-name`} ref={nameRef} value={definition.name} required minLength={2} maxLength={100} disabled={busy} onChange={event => change({ name: event.target.value })} /></div>
       <div className="ns-field"><label htmlFor={`${id}-prompt`}>Instructions</label><Textarea id={`${id}-prompt`} rows={6} required minLength={3} maxLength={500000} disabled={busy} value={definition.prompt} onChange={event => change({ prompt: event.target.value })} /></div>
+      <div className="ns-field"><label htmlFor={`${id}-destination`}>Run in</label><Choice id={`${id}-destination`} label="Run in" value={definition.session_id || "__new__"} options={chatOptions} disabled={busy || chatLoading} onChange={value => change({ session_id: value === "__new__" ? null : value })} />
+        <p className="ns-field-hint">{definition.session_id ? "Each run continues this chat with its earlier messages, results, computer and connected accounts. Runs wait while the chat is busy." : "Each run starts a new chat with fresh conversation history. Choose a recent shared chat you own to keep context between runs."}</p>
+        {chatLoading && <p role="status" className="ns-field-hint">Loading recent chats…</p>}
+        {chatError && <p className="ns-error" role="alert">{chatError}{onRefreshChats && <Button type="button" variant="outline" onClick={onRefreshChats}>Retry chats</Button>}</p>}
+      </div>
       <div className="ns-field"><label htmlFor={`${id}-model`}>Model</label><Choice id={`${id}-model`} label="Automation model" value={definition.model || "__default__"} options={availableModels} disabled={busy} onChange={value => change({ model: value === "__default__" ? "" : value })} /></div>
-      <div className="ns-field"><label htmlFor={`${id}-repository`}>Repository</label><Input id={`${id}-repository`} type="url" maxLength={500} placeholder="https://github.com/owner/repository" value={definition.repo_url} disabled={busy} onChange={event => setDefinition(previous => changeAutomationRepository(previous, event.target.value))} /><p className="ns-field-hint">Public repositories use a credential-free checkout. Private repositories require their selected GitHub connection. Choose a validated environment below when the workflow needs prepared dependencies.</p></div>
+      {!definition.session_id && <><div className="ns-field"><label htmlFor={`${id}-repository`}>Repository</label><Input id={`${id}-repository`} type="url" maxLength={500} placeholder="https://github.com/owner/repository" value={definition.repo_url} disabled={busy} onChange={event => setDefinition(previous => changeAutomationRepository(previous, event.target.value))} /><p className="ns-field-hint">Public repositories use a credential-free checkout. Private repositories require their selected GitHub connection. Choose a validated environment below when the workflow needs prepared dependencies.</p></div>
       <div className="ns-field"><label htmlFor={`${id}-environment`}>Execution environment</label><Choice id={`${id}-environment`} label="Execution environment" value={definition.environment_id} options={environmentOptions} disabled={busy || environmentLoading} onChange={value => change({ environment_id: value })} />
         {environmentLoading && <p className="ns-field-hint" role="status">Loading saved environments…</p>}
         {environmentError && <p className="ns-error" role="alert">{environmentError}{onRefreshEnvironments && <Button type="button" variant="outline" onClick={onRefreshEnvironments}>Retry environments</Button>}</p>}
-        <p className="ns-field-hint">The service checks the selected environment and its validated build before admission. Selecting base tools removes the saved environment dependency.</p></div>
+        <p className="ns-field-hint">The service checks the selected environment and its validated build before admission. Selecting base tools removes the saved environment dependency.</p></div></>}
     </div>
     <fieldset className="pa-trigger-editor"><legend>Start when any trigger matches</legend>
       {definition.triggers.map((trigger, index) => {
@@ -447,7 +479,7 @@ export function DefinitionEditor({ existing, models, defaultModel, eventChoices 
           <div className="ns-field"><label htmlFor={`${id}-source-${trigger.id}`}>Source</label><Choice id={`${id}-source-${trigger.id}`} label={`Trigger ${index + 1} source`} value={source} disabled={busy} options={known ? sourceOptions : [...sourceOptions, { value: source, label: `Saved source · ${automationSources[source] || source}` }]} onChange={value => {
             changeTrigger(trigger.id, value === "schedule"
               ? { id: trigger.id, schedule: { ...automationDefaultSchedule(), cron: "", run_at: null } }
-              : { id: trigger.id, event: { provider: value, event: eventChoices[value]?.[0]?.[0] || "*" } })
+              : isAutomationProvider(value, eventChoices) ? { id: trigger.id, event: { provider: value, event: eventChoices[value]?.[0]?.[0] || "*" } } : trigger)
           }} /></div>
           {trigger.schedule ? <TimingFields label={`Trigger ${index + 1}`} disabled={busy} timing={trigger.schedule} onChange={schedule => changeTrigger(trigger.id, { ...trigger, schedule })} />
             : trigger.event && known ? <EventFields event={trigger.event} choices={eventChoices[source] || []} disabled={busy} onChange={event => changeTrigger(trigger.id, { ...trigger, event })} />
@@ -456,17 +488,17 @@ export function DefinitionEditor({ existing, models, defaultModel, eventChoices 
       })}
       <Button type="button" variant="outline" disabled={busy || definition.triggers.length >= 16} onClick={() => changeTriggers([...definition.triggers, { id: crypto.randomUUID(), schedule: { ...automationDefaultSchedule(), cron: "", run_at: null } }])}><Plus size={16} />Add trigger</Button>
     </fieldset>
-    <section className="pa-editor-section"><h3>Connections and tools</h3><p className="ns-field-hint">Choose which connected apps this workflow may use. The service rechecks account permissions for shared automation sessions before activation.</p>
+    {!definition.session_id && <section className="pa-editor-section"><h3>Connections and tools</h3><p className="ns-field-hint">Choose which connected apps this workflow may use. The service rechecks account permissions for shared automation sessions before activation.</p>
       {connectionLoading && <p role="status" className="ns-muted">Loading connected apps…</p>}
       {connectionError && <p className="ns-error" role="alert">{connectionError}{onRefreshConnections && <Button type="button" variant="outline" onClick={onRefreshConnections}>Retry connections</Button>}</p>}
-      {["linear", "github", "slack", "notion"].map(provider => {
+      {(["linear", "github", "slack", "notion"] as const).map(provider => {
         const account = connections.find(connection => connection.id === provider), selected = definition.plugins.includes(provider)
         return <div className="pa-connection" key={provider}><CheckField label={`${automationSources[provider] || (provider === "notion" ? "Notion" : provider)} · ${account ? !account.connected ? "Not connected" : !account.enabled ? "Disabled" : account.read_only ? "Read only" : "Connected" : "Availability unavailable"}`}
           checked={selected} disabled={busy || (!selected && (connectionLoading || !account?.connected || !account.enabled))} onChange={checked => change({ plugins: checked ? [...definition.plugins, provider] : definition.plugins.filter(value => value !== provider) })} />
           {Boolean(account?.tools?.length) && <details><summary>{account!.tools!.length} tools</summary><ul>{account!.tools!.map((tool, index) => <li key={`${tool.name}:${index}`}>{tool.name && <code>{tool.name} </code>}{tool.description}</li>)}</ul></details>}
         </div>
       })}
-    </section>
+    </section>}
     <section className="pa-editor-section"><h3>Self-management</h3><p className="ns-field-hint">Allow this automation and its workers to change only the selected parts of this workflow. Schedule changes may affect frequency and cost within your invocation limit.</p>
       <CheckField label="May revise its instructions" disabled={busy} checked={definition.self_management.instructions} onChange={instructions => change({ self_management: { ...definition.self_management, instructions } })} />
       <CheckField label="May adjust existing schedules" disabled={busy} checked={definition.self_management.schedule} onChange={schedule => change({ self_management: { ...definition.self_management, schedule } })} />
@@ -481,7 +513,7 @@ export function DefinitionEditor({ existing, models, defaultModel, eventChoices 
     </section>
     <section className="pa-editor-section"><h3>Limits and queueing</h3>
       <div className="ns-field"><label htmlFor={`${id}-limit`}>Maximum runs per hour</label><Input id={`${id}-limit`} type="number" min={1} step={1} disabled={busy} value={definition.max_runs_per_hour ?? ""} placeholder="No hourly cap" onChange={event => { capEdited.current = true; change({ max_runs_per_hour: event.target.value === "" ? null : Number(event.target.value) }) }} /><p className="ns-field-hint">Shared across all triggers. Clear for no hourly cap. Defaults to 50, or 150 for Slack message watching.</p></div>
-      <CheckField label="Queue overlapping event runs" checked={definition.queue_events} disabled={busy} onChange={queue_events => change({ queue_events })} /><p className="ns-field-hint">Events wait for the previous run when queueing is selected. Scheduled runs remain independent; workspace capacity limits still apply.</p>
+      <CheckField label="Queue overlapping event runs" checked={definition.queue_events} disabled={busy} onChange={queue_events => change({ queue_events })} /><p className="ns-field-hint">Events wait for the previous run when queueing is selected. Runs that continue the same chat always wait for that chat to be idle. Workspace capacity limits still apply.</p>
     </section>
     {definition.mode !== "modal" && <p className="pa-warning">This saved execution mode ({definition.mode}) is unsupported by the native service. Its value is retained; migration remains blocked.</p>}
     {!models.length && <p className="pa-warning">No models are currently available. Activation remains unavailable until model access is configured.</p>}

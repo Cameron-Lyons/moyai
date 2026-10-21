@@ -25,7 +25,7 @@ function Fixture() {
   const [options, setOptions] = useState({ workers:20, budget_seconds:0, worker_models:[] });
   const [space, setSpace] = useState(false);
   window.swarmFixture = { setId, setSpace };
-  if (location.search === '?home') return <Home models={['test-model']} defaultModel="test-model"
+  if (location.search === '?home') return <Home recentSessions={[]} recentLoading={false} onSearchSessions={() => {}} models={['test-model']} defaultModel="test-model"
     onCreated={async () => {}} onStarted={value => { window.startedConversation = value; }} />;
   return <main>
     <SwarmSetup value={options} onChange={setOptions} models={['openai/test','anthropic/test']} disabled={false} />
@@ -70,7 +70,7 @@ before(async () => {
       entries: ["native/web/main.tsx"],
       include: ["three", "three/examples/jsm/loaders/GLTFLoader.js"],
     },
-    server: { host: "127.0.0.1", port: 0, strictPort: true },
+    server: { host: "127.0.0.1", port: 0, strictPort: false },
     plugins: [tailwindcss(), {
       name: "swarm-component-regression",
       resolveId(id) { if (id === moduleUrl) return entry; },
@@ -98,7 +98,7 @@ after(async () => {
 async function pageFor(t, width = 1440, handler) {
   const context = await browser.newContext({ viewport: { width, height: 900 } });
   const page = await context.newPage();
-  await page.route("**/api/**", handler || (route => route.fulfill({ json: mission() })));
+  await page.route(/^https?:\/\/[^/]+\/api\//, handler || (route => route.fulfill({ json: mission() })));
   t.after(async () => { await page.unrouteAll({ behavior: "wait" }); await context.close(); });
   await page.goto(address);
   return page;

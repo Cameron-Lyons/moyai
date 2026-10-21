@@ -7,7 +7,7 @@ import json
 import re
 import secrets
 from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 from temporalio import activity, workflow
 from temporalio.common import RetryPolicy
@@ -18,7 +18,7 @@ with workflow.unsafe.imports_passed_through():
     from app.automation_webhook_auth import MAX_BODY, verify_webhook
     from fastapi import APIRouter, HTTPException, Request
     from pydantic import BaseModel, ConfigDict, Field, SecretStr
-    from sqlalchemy import func, select, text
+    from sqlalchemy import func, or_, select, text
     from temporalio.client import WorkflowExecutionStatus
     from temporalio.exceptions import WorkflowAlreadyStartedError
     from temporalio.service import RPCError
@@ -29,6 +29,7 @@ with workflow.unsafe.imports_passed_through():
     from .product_automation_models import ProductAutomationBinding as Binding
     from .product_automation_models import ProductAutomationOccurrence as Occurrence
     from .product_automation_models import ProductAutomationOperation as Operation
+    from .product_automation_models import ProductAutomationTurn
     from .product_config import CORE_IDENTITY
     from .product_identity import ProductGrant
 
@@ -56,6 +57,63 @@ class TestEvent(BaseModel):
     provider: str = Field(max_length=32)
     event_header: str = Field(default="", max_length=80)
     payload: dict
+
+
+_OUTPUT = ConfigDict(json_schema_serialization_defaults_required=True)
+
+
+class ProductAutomationWebhookExample(BaseModel):
+    model_config = _OUTPUT
+    trigger_id: str
+    payload: dict[str, Any]
+    event_header: str
+
+
+class ProductAutomationWebhookProvider(BaseModel):
+    model_config = _OUTPUT
+    provider: str
+    ready: bool
+    url: str
+    examples: list[ProductAutomationWebhookExample]
+
+
+class ProductAutomationEventDelivery(BaseModel):
+    model_config = _OUTPUT
+    status: str
+    detail: str
+    received_at: str
+
+
+class ProductAutomationWebhookInfo(BaseModel):
+    model_config = _OUTPUT
+    providers: list[ProductAutomationWebhookProvider]
+    ready: bool
+    deliveries: list[ProductAutomationEventDelivery]
+
+
+class ProductAutomationWebhookResult(BaseModel):
+    model_config = _OUTPUT
+    id: str
+    revision: int
+    provider: str
+    paused: bool
+    configured: bool
+    registered_at_provider: bool
+    secret: str
+
+
+class ProductAutomationTestContext(BaseModel):
+    """Normalized provider context; its other keys depend on the provider."""
+
+    model_config = ConfigDict(extra="allow", json_schema_serialization_defaults_required=True)
+    matched_trigger_ids: list[str]
+
+
+class ProductAutomationTestResult(BaseModel):
+    model_config = _OUTPUT
+    matches: bool
+    context: ProductAutomationTestContext | None
+    started: Literal[False]
 
 
 class ProductAutomationEvents:
@@ -467,8 +525,6 @@ class ProductAutomationEvents:
         session = await db.scalar(select(Session).where(Session.id == identity).with_for_update())
         if not session or session.deleted or session.visibility != "shared" or session.surface != "web":
             return None
-        if await db.scalar(select(Occurrence.occurrence).where(Occurrence.session_id == identity).limit(1)):
-            return None
         return session
 
     async def capture_sessions(self, *, limit: int = 20) -> None:
@@ -499,7 +555,8 @@ class ProductAutomationEvents:
                 ).order_by(Message.id).limit(max(1, min(limit, 20)))))
                 for message in messages:
                     turn = await db.get(Turn, message.turn_id)
-                    if message.role == "user" and message.author_id and turn and turn.parent_turn is None:
+                    if (message.role == "user" and message.author_id and turn and turn.parent_turn is None
+                            and await db.get(ProductAutomationTurn, turn.id) is None):
                         session = await self._human_session(db, message.session_id)
                         if session is not None:
                             original = await self.continuations.canonical_original_id(session.id, db=db) if self.continuations else None
@@ -670,9 +727,14 @@ class ProductAutomationEvents:
                 return {"status": "waiting"}
             if await service._old_active(db, row["id"]):
                 return {"status": "waiting"}
-            if definition.queue_events and await db.scalar(select(Occurrence.occurrence).join(
-                Turn, Turn.id == Occurrence.turn_id,
-            ).where(Occurrence.automation_id == row["id"], Turn.status.not_in(TERMINAL)).limit(1)):
+            if definition.queue_events and await db.scalar(select(Turn.id).outerjoin(
+                ProductAutomationTurn, ProductAutomationTurn.turn_id == Turn.id,
+            ).join(Occurrence, Occurrence.turn_id == func.coalesce(ProductAutomationTurn.origin_turn_id, Turn.id)).where(
+                Occurrence.automation_id == row["id"], Turn.status.not_in(TERMINAL),
+                # Mapped resumptions have their own live turn; old occurrences
+                # retain the previous conservative queue behavior.
+                or_(Turn.status != "resumed", ProductAutomationTurn.turn_id.is_(None)),
+            ).limit(1)):
                 return {"status": "waiting"}
             if definition.queue_events and await db.scalar(text(
                 f"SELECT 1 FROM {table} WHERE automation_id=:id AND status IN ('native_pending','native_dispatched') "
@@ -703,7 +765,7 @@ class ProductAutomationEvents:
                 db, grant=grant, title=f"Automation · {definition.name}", prompt=prompt,
                 model=service.settings.resolve_model(definition.model or None),
                 request_key="automation-" + hashlib.sha256(occurrence.encode()).hexdigest(),
-                connections=connections,
+                connections=connections, session_id=definition.session_id,
                 security_profile_id=definition.security_profile_id,
             )
             if service.workspace is not None:
@@ -748,19 +810,19 @@ def routes(events: ProductAutomationEvents) -> APIRouter:
     async def default_webhook(identity: str, request: Request):
         return await events.receive(identity, "", request)
 
-    @router.get("/api/product/automations/{identity}/webhook")
-    async def info(identity: str, request: Request):
+    @router.get("/api/product/automations/{identity}/webhook", operation_id="getProductAutomationWebhook")
+    async def info(identity: str, request: Request) -> ProductAutomationWebhookInfo:
         actor = await events.service.identity.authenticate(request)
-        return await events.info(actor.grant, identity)
+        return ProductAutomationWebhookInfo.model_validate(await events.info(actor.grant, identity))
 
-    @router.post("/api/product/automations/{identity}/webhook")
-    async def configure(identity: str, body: WebhookSetup, request: Request):
+    @router.post("/api/product/automations/{identity}/webhook", operation_id="configureProductAutomationWebhook")
+    async def configure(identity: str, body: WebhookSetup, request: Request) -> ProductAutomationWebhookResult:
         actor = await events.service.identity.authenticate(request, mutation=True)
-        return await events.configure(actor.grant, identity, body)
+        return ProductAutomationWebhookResult.model_validate(await events.configure(actor.grant, identity, body))
 
-    @router.post("/api/product/automations/{identity}/test-event")
-    async def test_event(identity: str, body: TestEvent, request: Request):
+    @router.post("/api/product/automations/{identity}/test-event", operation_id="testProductAutomationEvent")
+    async def test_event(identity: str, body: TestEvent, request: Request) -> ProductAutomationTestResult:
         actor = await events.service.identity.authenticate(request, mutation=True)
-        return await events.test_event(actor.grant, identity, body)
+        return ProductAutomationTestResult.model_validate(await events.test_event(actor.grant, identity, body))
 
     return router

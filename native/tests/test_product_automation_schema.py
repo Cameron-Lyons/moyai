@@ -171,7 +171,7 @@ async def admit_with_receipt(product, db, automation_id, occurrence):
     await fence_source(db)
     session, turn = await product.database.admit_automation(
         db, grant=product.principal.grant, title="Scheduled task", prompt="Work",
-        model="test", request_key=occurrence,
+        model="test", request_key=occurrence, security_profile_id="",
     )
     await db.execute(text(
         "INSERT INTO moyai.automation_runs VALUES (:occurrence,:id,4,NULL,'started','','now')"
@@ -284,7 +284,7 @@ async def test_occurrence_cannot_mint_authority_after_revocation(admitted_produc
         async with product.database.sessions.begin() as db:
             await fence_source(db)
             await product.database.admit_automation(
-                db, grant=grant, title="Old saved task", prompt="Work", model="test", request_key="old",
+                db, grant=grant, title="Old saved task", prompt="Work", model="test", request_key="old", security_profile_id="",
             )
     assert denied.value.status_code == 401
     async with product.database.sessions() as db:
@@ -296,6 +296,7 @@ async def test_admission_rejects_missing_or_wrong_native_transaction(admitted_pr
     product = admitted_product
     arguments = {
         "grant": product.principal.grant, "title": "Task", "prompt": "Work", "model": "test", "request_key": "bad-tx",
+        "security_profile_id": "",
     }
     async with product.database.sessions() as db:
         with pytest.raises(ValueError, match="transaction"):
@@ -316,6 +317,7 @@ async def test_automation_admission_requires_exclusive_source_fence_before_share
         with pytest.raises(ValueError, match="canonical product writer lock first"):
             await product.database.admit_automation(
                 db, grant=product.principal.grant, title="Unfenced", prompt="Work", model="test", request_key="unfenced",
+                security_profile_id="",
             )
     async with product.database.sessions() as db:
         assert await db.scalar(select(func.count()).select_from(Session)) == 0
@@ -346,7 +348,7 @@ async def test_shared_automation_owner_stays_shared_and_keeps_saved_authority(ad
     async with product.database.sessions.begin() as db:
         await fence_source(db)
         session, turn = await product.database.admit_automation(
-            db, grant=principal.grant, title="Shared", prompt="Work", model="test", request_key="shared",
+            db, grant=principal.grant, title="Shared", prompt="Work", model="test", request_key="shared", security_profile_id="",
         )
     assert session.surface == "automation" and session.visibility == "shared"
     async with product.database.sessions() as db:

@@ -15,15 +15,21 @@ import time
 from typing import TYPE_CHECKING, Any, Protocol
 from uuid import NAMESPACE_URL, uuid5
 
+import httpx
 import modal
 from fastapi import HTTPException
+from grpclib.const import Status
+from grpclib.exceptions import GRPCError
 from pydantic import TypeAdapter
+from pydantic_ai import ConversationTypeAdapter
 from pydantic_ai.workspaces import WorkspaceRef
 from pydantic_ai_harness import ModalSandbox
 from sqlalchemy import delete, literal, select, update
 
 from .contracts import PreparedTurn, RunScope
-from .models import ComputerOperation, Message, Session, Turn, now
+from .failed_action_attempts import settle_failed_action_attempts
+from .failure_diagnostics import FAILURE_KIND, safe_failure_metadata
+from .models import ComputerOperation, Event, Message, Session, Turn, now
 from .product_continuation_errors import preparation_blocked
 from .workspace_recovery import (
     checkpoint,
@@ -38,9 +44,23 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 SNAPSHOT_WARNING = (
-    "The response was saved, but the computer checkpoint could not be confirmed. "
-    "Keep this computer available; automatic restoration is unavailable."
+    "Your response and saved downloads are safe, but the remote computer's files could not be backed up. "
+    "Ask Moyai to save any files you still need as downloads before the computer expires."
 )
+# Stay within the existing Temporal activity deadlines, leaving time to settle
+# the saved answer. The workflow's existing keepalive covers this entire window.
+CHECKPOINT_BUDGET = {"modal": 165, "lambda": 1000}
+
+
+def transient_checkpoint_error(error: Exception) -> bool:
+    if isinstance(error, modal.exception.SandboxTimeoutError):
+        return False  # The computer expired; retrying cannot bring it back.
+    if isinstance(error, GRPCError):
+        return error.status in {Status.UNAVAILABLE, Status.DEADLINE_EXCEEDED, Status.RESOURCE_EXHAUSTED}
+    return isinstance(error, (
+        TimeoutError, ConnectionError, httpx.TransportError,
+        modal.exception.ConnectionError, modal.exception.TimeoutError,
+    ))
 
 
 class SnapshotCapture(Protocol):
@@ -93,16 +113,28 @@ class AnswerSettlement:
             await self.settle(turn_id)
             return
         try:
-            if await self._save_checkpoint(turn_id, reference, product=product):
-                return
-            image = await self.snapshots.capture(ref, require_live=False)
+            async with asyncio.timeout(CHECKPOINT_BUDGET[ref.provider]):
+                for attempt in range(3):
+                    try:
+                        if await self._save_checkpoint(turn_id, reference, product=product):
+                            return
+                        break
+                    except Exception as error:
+                        if attempt == 2 or not transient_checkpoint_error(error):
+                            raise
+                        logger.warning(
+                            "Retrying computer checkpoint: turn=%s provider=%s attempt=%s error=%s",
+                            turn_id, ref.provider, attempt + 1, type(error).__name__,
+                        )
+                        await asyncio.sleep(2 ** attempt)
+                # Older workflows retain their historical capture behavior.
+                image = await self.snapshots.capture(ref, require_live=False)
         except Exception:
-            logger.warning("Computer snapshot settlement failed; the answer remains saved.", exc_info=True)
-            await self.settle(
-                turn_id,
-                warning="The response was saved, but its computer checkpoint could not be confirmed. "
-                        "Keep this computer available; automatic restoration is unavailable.",
+            logger.warning(
+                "Computer snapshot settlement failed; the answer remains saved. turn=%s provider=%s",
+                turn_id, ref.provider, exc_info=True,
             )
+            await self.settle(turn_id, warning=SNAPSHOT_WARNING)
             return
         await self.settle(turn_id, snapshot=image)
 
@@ -118,6 +150,8 @@ class AnswerSettlement:
         }
         if checkpoint_workspace:
             result_identity["checkpoint_workspace"] = True
+        if deferred and scope.background_delegation:
+            result_identity["background_agents"] = scope.background_agents
         fingerprint = hashlib.sha256(json.dumps(result_identity, sort_keys=True).encode()).hexdigest()
         checkpointing = checkpoint_workspace and bool(workspace and workspace.get("provider") in {"modal", "lambda"})
         async with self.database.sessions.begin() as db:
@@ -166,9 +200,23 @@ class AnswerSettlement:
                 return False
             turn.result_accepted = True
             turn.status = "waiting" if deferred and not checkpointing else "saving"
+            completed_agents: set[str] = set()
+            if scope.agent_messages:
+                from .agent_messages import acknowledge_mail, receipts
+                ids, completed_agents = receipts(ConversationTypeAdapter.validate_json(conversation).messages)
+                # Persist consumption with the snapshot, including final-drain
+                # messages whose SDK delivery event has not reached its hook.
+                await acknowledge_mail(db, scope.session_id, scope.turn_id, ids)
             if deferred:
                 from .questions import record_optional_deadline
                 record_optional_deadline(self.database, db, turn)
+                if scope.background_delegation and turn.preparation:
+                    prepared = TypeAdapter(PreparedTurn).validate_json(self.database.security.unseal(turn.preparation))
+                    prepared.scope.background_delegation = True
+                    prepared.scope.background_agents = [
+                        child for child in scope.background_agents if child not in completed_agents
+                    ]
+                    turn.preparation = self.database.security.seal(TypeAdapter(PreparedTurn).dump_json(prepared))
             if checkpointing:
                 if turn.preparation is None or workspace is None:
                     raise ValueError("A checkpoint requires the original prepared workspace.")
@@ -189,6 +237,8 @@ class AnswerSettlement:
                     ))
                 if self.database.product_memory_review is not None:
                     await self.database.product_memory_review.enqueue_in(db, turn, session)
+                await db.flush()
+                await settle_failed_action_attempts(db, session.id, accepted_turn_id=turn.id)
             return True
 
     async def _save_checkpoint(self, turn_id: str, reference: dict, *, product: bool) -> bool:
@@ -297,7 +347,10 @@ class AnswerSettlement:
             session.status = "stopped" if stopped else "idle"
             session.active_turn = None
 
-    async def fail(self, turn_id: str, message: str, *, only_unsettled: bool = False) -> None:
+    async def fail(
+        self, turn_id: str, message: str, *, only_unsettled: bool = False,
+        diagnostics: dict[str, Any] | None = None,
+    ) -> None:
         async with self.database._admission_session(None) as db:
             # Resolve ownership without caching a mutable Turn. Stop, deletion
             # and answer publication fence the session first; take that same
@@ -327,9 +380,19 @@ class AnswerSettlement:
             turn.status = "failed"
             turn.error = message
             turn.finished_at = now()
+            details = safe_failure_metadata(diagnostics)
+            identity = f"failure-diagnostics:{turn.id}"
+            if details and not await db.scalar(select(Event.id).where(Event.identity == identity)):
+                db.add(Event(
+                    session_id=session_id, turn_id=turn.id, kind=FAILURE_KIND, identity=identity,
+                    content=self.database.security.seal(details),
+                ))
+            await db.flush()
+            await settle_failed_action_attempts(db, session_id)
             if session and session.active_turn == turn.id:
                 session.active_turn = None
                 session.status = "failed"
+                session.updated_at = turn.finished_at or now()
 
     async def stopped(self, turn_id: str, conversation: str | None = None) -> None:
         async with self.database._admission_session(None) as db:
@@ -364,3 +427,4 @@ class AnswerSettlement:
             turn.finished_at = now()
             session.active_turn = None
             session.status = "stopped"
+            session.updated_at = turn.finished_at or now()

@@ -3,12 +3,13 @@ import asyncio
 import hashlib
 import json
 import re
+from typing import TypeGuard
 
 from .connector_errors import ConnectorError
 from .db import now
 
 
-def positive_id(value):
+def positive_id(value: object) -> TypeGuard[int]:
     return type(value) is int and value > 0
 
 
@@ -44,7 +45,7 @@ class GitHubRepositories:
     def connected_targets(self, credentials):
         return self.connected_ids(credentials)
 
-    def target(self, repository='', credentials=None, *, connection=None):
+    def target(self, repository: int | str | None = '', credentials=None, *, connection=None) -> int:
         credentials = credentials if credentials is not None else self.saved_credentials(connection=connection)
         ids = self.connected_ids(credentials)
         if repository in ('', None):
@@ -298,9 +299,11 @@ class GitHubRepositories:
         return repo
 
     async def refresh_connection(self):
+        from .github import require_protection_permission
         credentials = await self.ensure_connection()
         expected = self.connection_version()
-        await self.installation(credentials)
+        installed = await self.installation(credentials)
+        require_protection_permission(installed.get('permissions'))
         selected = self.connected_ids(credentials)
         repositories = []
         # Listing needs only metadata. GitHub accepts at most 500 IDs per token;

@@ -3,6 +3,7 @@
 const assert = require('node:assert/strict');
 const {test,before,after} = require('node:test');
 const path = require('node:path');
+const fs = require('node:fs/promises');
 const {chromium} = require('playwright');
 let server,browser,base,state;
 const sessionId='a'.repeat(32), legacyId='b'.repeat(32), turnId='turn-root';
@@ -13,6 +14,13 @@ function reset(overrides={}) {
     messages:[{id:1,turn_id:turnId,role:'user',author_id:'viewer',content:'Inspect this repository.'}], requests:[], streams:[], ...overrides};
 }
 function session(id=sessionId) {return {id,title:'Current native work',owner_id:state.ownerId??'viewer',visibility:'private',surface:'web',model:'test-model',status:state.status,active_turn:['running','saving','waiting'].includes(state.status)?turnId:null,archived:false,pinned:false,...(state.swarm?{swarm_id:sessionId}:{}),...(state.sessionOverrides?.[id]||{}),...(state.titles?.[id]===undefined?{}:{title:state.titles[id]})};}
+function pendingView(pending) {
+  return pending && {...pending,questions:pending.calls.filter(call=>call.tool_name==='ask_user_question').map(call=>({
+    id:call.tool_call_id,questions:(typeof call.args==='string'?JSON.parse(call.args):call.args).questions.map(question=>({
+      ...question,multi_select:question.multi_select??false,options:question.options.map(option=>({description:null,...option})),
+    })),
+  }))};
+}
 async function handle(req,res,next) {
   const url=new URL(req.url,'http://localhost');
   if(!url.pathname.startsWith('/api/'))return next();
@@ -20,7 +28,7 @@ async function handle(req,res,next) {
   const data=body?JSON.parse(body):null;
   state.requests.push({path:url.pathname,query:url.search,method:req.method,body:data,headers:req.headers});
   if(state.holds?.[url.pathname])await state.holds[url.pathname];
-  const json=(value,status=200)=>{res.writeHead(status,{'Content-Type':'application/json','Cache-Control':'no-store'});res.end(JSON.stringify(value));};
+  const json=(value,status=200)=>{res.writeHead(status,{'Content-Type':'application/json','Cache-Control':'no-store'});res.end(JSON.stringify(url.pathname==='/api/history/sessions'&&status===200?{ancestors:[],...value}:value));};
   const failure=state.httpErrors?.[`${req.method}:${url.pathname}`];
   if(failure) {
     if(failure.network){req.socket.destroy();return;}
@@ -32,7 +40,7 @@ async function handle(req,res,next) {
   if(url.pathname==='/api/auth/google/start')return json({url:'https://accounts.google.com/fixture'});
   if(url.pathname==='/api/logout'){state.signedIn=false;return json({signed_out:true});}
   if(!state.signedIn)return json({detail:'Sign in.'},401);
-  if(url.pathname==='/api/me')return json({user:{id:'viewer',name:'Test viewer',role:'admin',individual:state.individual},csrf:'fixture-csrf',models:state.models||['test-model'],default_model:'test-model',product_mode:state.mode,preferences:state.preferences||{delivery_mode:'when_idle',connection_ids:null}});
+  if(url.pathname==='/api/me')return json({user:{id:'viewer',name:state.viewerName||'Test viewer',role:'admin',individual:state.individual},csrf:'fixture-csrf',models:state.models||['test-model'],default_model:state.defaultModel||'test-model',product_mode:state.mode,preferences:state.preferences||{delivery_mode:'when_idle',connection_ids:null}});
   if(url.pathname==='/api/sessions'&&req.method==='POST'){state.createdSession=true;const id='c'.repeat(32);state.sessionOverrides={...state.sessionOverrides,[id]:{...state.sessionOverrides?.[id],model:data.model||'test-model'}};return json(session(id));}
   if(url.pathname==='/api/sessions')return json(state.denied?[]:[session(),...(state.createdSession?[session('c'.repeat(32))]:[])]);
   if(url.pathname==='/api/connections') {
@@ -47,7 +55,7 @@ async function handle(req,res,next) {
     const rows=[{...session(legacyId),key:'legacy:'+legacyId,source:'legacy',url:'/#run='+legacyId,title:'Saved earlier investigation',read_only:true,match:{snippet:'Body-only needle <img src=x onerror=alert(1)>'}},
       {...session(),key:'native:'+sessionId,source:'native',url:'/#'+sessionId}];
     if(state.createdSession)rows.push({...session('c'.repeat(32)),key:'native:'+'c'.repeat(32),source:'native',url:'/#'+'c'.repeat(32)});
-    if(url.pathname==='/api/history/sessions'&&url.searchParams.get('limit')==='100'&&state.inventoryPages) {
+    if(url.pathname==='/api/history/sessions'&&url.searchParams.get('limit')==='20'&&state.inventoryPages) {
       const page=url.searchParams.get('cursor')==='page-2'?1:0;
       return json({sessions:state.inventoryPages[page],has_more:page===0,next_cursor:page===0?'page-2':null});
     }
@@ -99,8 +107,21 @@ async function handle(req,res,next) {
       return json({id:'resumed-turn',status:'queued'},202);
     }
     if(url.pathname.endsWith('/workspace'))return json(state.workspace||state.workspaceData||{links:[],files:[],sources:[],subagents:[],subagents_limited:false});
-    if(url.pathname.endsWith('/computer'))return json({available:false,has_workspace:true,controlled:false,busy:false});
+    if(url.pathname.endsWith('/computer')) {
+      if(req.method==='POST'&&data.action==='handoff') {
+        state.computer={...state.computer,controlled:false,can_release:false,controller:null};
+        return json({controlled:false,available:null,width:null,height:null});
+      }
+      return json({available:false,has_workspace:true,controlled:false,can_release:false,busy:false,controller:null,...state.computer});
+    }
     if(url.pathname.endsWith('/swarm'))return json(state.swarm);
+    const failure=url.pathname.match(/^\/api\/sessions\/([^/]+)\/turns\/([^/]+)\/failure$/);
+    if(failure) {
+      const value=state.failureDetailsBySession?.[failure[1]]||state.failureDetails;
+      if(state.failureHolds?.[failure[1]])await state.failureHolds[failure[1]];
+      if(state.failureError)return json({detail:'Failure details temporarily unavailable.'},state.failureError);
+      return value?json(value):json({detail:'Failure not found.'},404);
+    }
     if(url.pathname.includes('/actions/')) {
       const key=decodeURIComponent(url.pathname.split('/actions/')[1]);
       if(state.actionHolds?.[key])await state.actionHolds[key];
@@ -108,7 +129,7 @@ async function handle(req,res,next) {
       const value=state.actionDetails?.[key];
       return value ? json(value) : json({detail:'Action not found.'},404);
     }
-    if(url.pathname.endsWith('/progress/'+turnId))return json(state.workProgress||{messages:[{id:'saved-progress',phase:'commentary',text:'I will inspect.'}]});
+    if(/\/progress\/[^/]+$/.test(url.pathname))return json(state.workProgressByTurn?.[url.pathname.split('/').at(-1)]||state.workProgress||{messages:[{id:'saved-progress',phase:'commentary',text:'I will inspect.'}]});
     if(url.pathname.endsWith('/events')) {
       res.writeHead(200,{'Content-Type':'text/event-stream','Cache-Control':'no-cache','Connection':'keep-alive'});
       res.write('event: connected\ndata: {}\n\n'); clients.add(res);
@@ -123,7 +144,7 @@ async function handle(req,res,next) {
           state.goalAccepted=true;
           if(data.prompt==='/goal pause')state.goal={...state.goal,status:'paused'};
           else if(data.prompt==='/goal resume')state.goal={...state.goal,status:'active'};
-          else if(data.prompt.startsWith('/goal edit '))state.goal={...state.goal,objective:data.prompt.slice(11),generation:state.goal.generation+1};
+          else if(data.prompt.startsWith('/goal edit '))state.goal={...state.goal,objective:data.prompt.slice(11).replace(/^--budget (?:none|[0-9]+) /,''),generation:state.goal.generation+1};
           return json({goal:state.goal});
         }
         if(state.afterWriteErrors)state.httpErrors={...state.httpErrors,...state.afterWriteErrors};
@@ -154,8 +175,8 @@ async function handle(req,res,next) {
     if(req.method==='PATCH') {
       if(state.holdPreference&&(data.pinned!==undefined||data.folder!==undefined))await state.holdPreference;
       if(state.preferenceError&&(data.pinned!==undefined||data.folder!==undefined))return json({detail:'Could not save sidebar preference.'},503);
-      if(state.holdRename)await state.holdRename;
-      if(state.renameError)return json({detail:'Could not save the session name.'},503);
+      if(state.holdRename&&data.title!==undefined)await state.holdRename;
+      if(state.renameError||state.renameErrors?.includes(data.title))return json({detail:'Could not save the session name.'},503);
       const id=url.pathname.split('/')[3];
       if(data.title!==undefined)state.titles={...state.titles,[id]:data.title};
       if(data.pinned!==undefined||data.folder!==undefined) {
@@ -169,15 +190,32 @@ async function handle(req,res,next) {
     if(state.answerAccepted&&state.answerRefreshError)return json({detail:'Could not refresh the conversation.'},503);
     if(state.goalAccepted&&state.goalRefreshError)return json({detail:'Could not refresh the goal.'},503);
     const row=session(url.pathname.split('/')[3]);
-    const result={session:row,reference:{...row,source:'native',url:'/#'+row.id,...state.reference},turns:state.turnsBySession?.[row.id]||state.turns||[{id:turnId,actor_id:'viewer',status:state.status,connections:[],usage:{}}],activity:[],pending:state.pending,can_answer:state.canAnswer,can_reply_with_text:state.canReply,question_deadline:state.questionDeadline,has_unsettled_effects:state.effects?.length>0,effects:state.effects};
+    const result={session:row,reference:{...row,source:'native',url:'/#'+row.id,...state.reference},turns:state.turnsBySession?.[row.id]||state.turns||[{id:turnId,actor_id:'viewer',status:state.status,connections:[],usage:{}}],activity:[],pending:pendingView(state.pending),can_answer:state.canAnswer,can_reply_with_text:state.canReply,question_deadline:state.questionDeadline,has_unsettled_effects:state.effects?.length>0,effects:state.effects};
     if(url.searchParams.get('include_messages')==='true'&&!state.omitInitialMessages)
       result.messages=(state.messagesBySession?.[row.id]||state.messages).slice(0,state.paginate?200:undefined);
-    if(state.slackDelivery)result.slack_delivery=state.slackDelivery;
+    if(state.slackDelivery)result.slack_delivery={rejected_files:0,file_error_codes:[],...state.slackDelivery};
     if(state.goal)result.goal=state.goal;
     if(state.holdSessionRead)await state.holdSessionRead;
     return json(result);
   }
   return json({detail:'Fixture endpoint not implemented: '+url.pathname},404);
+}
+// Synthetic presentation data only. No provider requests or real account details.
+function resetReadmeDemo() {
+  reset({status:'idle',viewerName:'Alex Morgan',models:['Claude Sonnet 4.5'],defaultModel:'Claude Sonnet 4.5'});
+  const examples=[
+    ['Polish command palette','idle'],
+    ['Fix streaming reconnects','running'],
+    ['Add keyboard navigation','idle'],
+    ['Review API migration','idle'],
+    ['Refresh onboarding copy','idle'],
+    ['Trace gateway latency','idle'],
+  ];
+  state.inventoryRows=examples.map(([title,status],index)=>({
+    ...session((index+1).toString(16).repeat(32)),title,status,source:'native',
+    ...(index>=4?{owner_id:'demo-teammate',participated:true}:{}),
+    updated_at:new Date(Date.now()-(index+1)*3600000).toISOString(),
+  }));
 }
 async function waitFor(predicate,label='condition',timeout=10000) {const end=Date.now()+timeout;while(!predicate()){if(Date.now()>end)throw new Error('Timed out: '+label);await new Promise(resolve=>setTimeout(resolve,25));}}
 function emit(value,id,event) {for(const client of clients)client.write(`${id===undefined?'':`id: ${id}\n`}${event?`event: ${event}\n`:''}data: ${JSON.stringify(value)}\n\n`);}
@@ -230,10 +268,37 @@ for(const width of [1440,768,320])test(`browser sign-in opens Computer and submi
   }
   await page.getByRole('heading',{name:'Browser sign-in needed',exact:true}).waitFor();
   assert.equal(await page.locator('.browser-login-request').getByText('Inspect the protected report.',{exact:true}).count(),1);
+  assert.match(await page.locator('.browser-login-request').innerText(),/Moyai will take back control and continue/);
   assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=window.innerWidth),true);
   await page.getByRole('button',{name:'I’ve signed in',exact:true}).click();
   await waitFor(()=>state.requests.some(row=>row.path.endsWith('/answers')));
   assert.deepEqual(state.requests.find(row=>row.path.endsWith('/answers')).body.browser_logins,{'login-call':'signed_in'});
+});
+for(const width of [1440,768,320])test(`release control stays visible without hover and works while disconnected at ${width}px`,async t=>{
+  reset({status:'waiting',canAnswer:true,pending:loginRequest(),computer:{controlled:true,controller:'Test viewer'}});
+  const page=await pageFor(t,'#'+sessionId,width);
+  const release=page.getByRole('button',{name:'Release control',exact:true});
+  await release.waitFor({state:'visible'});
+  await page.mouse.move(0,0);
+  assert.equal(await release.evaluate(element=>getComputedStyle(element).opacity),'1');
+  assert.equal(await release.isEnabled(),true);
+  assert.equal(await page.getByText('You have control',{exact:true}).isVisible(),true);
+  assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=window.innerWidth),true);
+  await release.focus();
+  await page.keyboard.press('Enter');
+  await waitFor(()=>state.requests.some(row=>row.path.endsWith('/computer')&&row.body?.action==='handoff'));
+  await release.waitFor({state:'hidden'});
+  assert.equal(state.requests.some(row=>row.path.endsWith('/answers')),false);
+});
+test('another tab owned by the same person has a visible release action',async t=>{
+  reset({status:'waiting',canAnswer:true,pending:loginRequest(),computer:{controlled:false,can_release:true,controller:'Test viewer'}});
+  const page=await pageFor(t);
+  const release=page.getByRole('button',{name:'Release control',exact:true});
+  await release.waitFor({state:'visible'});
+  assert.equal(await page.getByText('You have control in another tab',{exact:true}).isVisible(),true);
+  await release.click();
+  await release.waitFor({state:'hidden'});
+  assert.equal(state.requests.filter(row=>row.body?.action==='handoff').length,1);
 });
 test('browser sign-in respects panel dismissal, can reopen, and restores after reload',async t=>{
   reset({status:'waiting',canAnswer:true,pending:loginRequest()});
@@ -322,12 +387,7 @@ async function clickSidebarPin(page, name) {
   await page.getByRole('button',{name,exact:true}).click({timeout:5000});
 }
 
-async function groupSidebarByFolder(page) {
-  await page.getByRole('combobox',{name:'Group conversations',exact:true}).click();
-  await page.getByRole('option',{name:'By folder',exact:true}).click();
-}
-
-test('status groups reflect current work and keep filed, pinned and participated sessions reachable once',async t=>{
+test('Recent and Participated list sessions once with status and PR metadata',async t=>{
   reset({status:'idle',folders:[{id:'today',name:'Today'}]});
   const waiting='waiting',working='working',review='review',draft='draft',shared='shared',hidden='hidden',child='child';
   state.inventoryRows=[
@@ -343,24 +403,51 @@ test('status groups reflect current work and keep filed, pinned and participated
   const pr=(draft=false)=>({url:'https://github.com/example/project/pull/1',repository:'example/project',number:1,title:'Review the change',state:'open',draft,accessible:true});
   state.prStatuses={[review]:[pr()],[draft]:[pr(true)]};
   const page=await pageFor(t,'#');
-  const group=key=>page.locator(`[data-status-group="${key}"]`);
   const row=id=>page.locator(`[data-session-key="native:${id}"]`);
-  await group('in-review').locator(`[data-session-key="native:${review}"]`).waitFor();
-  assert.equal(await group('needs-you').locator(`[data-session-key="native:${waiting}"]`).isVisible(),true);
-  assert.equal(await group('needs-you').locator(`[data-session-key="native:${sessionId}"]`).isVisible(),true);
-  assert.equal(await group('in-progress').locator(`[data-session-key="native:${working}"]`).isVisible(),true);
-  for(const id of [draft,shared])assert.equal(await group('backlog').locator(`[data-session-key="native:${id}"]`).isVisible(),true);
+  assert.equal(await page.getByRole('combobox',{name:'Group conversations',exact:true}).count(),0);
+  for(const name of [/^Needs you(?:\s|$)/,/^In progress(?:\s|$)/,/^In review(?:\s|$)/,/^Backlog(?:\s|$)/]) {
+    assert.equal(await page.getByRole('button',{name}).count(),0);
+  }
+  const recent=page.getByRole('button',{name:/^Recent /}),participated=page.getByRole('button',{name:/^Participated /});
+  await recent.waitFor();await participated.waitFor();
+  assert.equal(await recent.getAttribute('aria-expanded'),'true');
+  assert.equal(await participated.getAttribute('aria-expanded'),'true');
+  const sectionNames=await page.locator('.session-group-toggle > span').allTextContents();
+  assert.ok(sectionNames.indexOf('Participated')<sectionNames.indexOf('Recent'));
+  const assertRecentAlignment=async target=>{
+    const heading=target.getByRole('button',{name:/^Recent /});
+    const label=heading.locator('span').filter({hasText:/^Recent$/});
+    const firstRow=target.locator('#sessions-recent > .session-branch > .session-row').first();
+    await firstRow.waitFor();
+    const toggle=firstRow.locator('.session-children-toggle');
+    const adornment=await toggle.count()?toggle:firstRow.locator('.session-bullet');
+    const [labelBox,titleBox,metaBox,headingIconBox,adornmentBox]=await Promise.all([
+      label.boundingBox(),
+      firstRow.locator('.session-title').boundingBox(),
+      firstRow.locator('.session-row-meta > .session-meta-item').first().boundingBox(),
+      heading.locator('.session-leading').boundingBox(),
+      adornment.boundingBox(),
+    ]);
+    const center=box=>box.x+box.width/2;
+    assert.ok(Math.abs(labelBox.x-titleBox.x)<=1,'Recent label aligns with session title');
+    assert.ok(Math.abs(labelBox.x-metaBox.x)<=1,'Recent label aligns with session metadata');
+    assert.ok(Math.abs(center(headingIconBox)-center(adornmentBox))<=1,'Recent icon aligns with row adornment');
+  };
+  await assertRecentAlignment(page);
+  const mobilePage=await pageFor(t,'#',320);
+  await mobilePage.getByRole('button',{name:'Toggle conversations',exact:true}).click();
+  await assertRecentAlignment(mobilePage);
+  assert.equal(await page.locator('#sessions-participated').locator(`[data-session-key="native:${shared}"]`).isVisible(),true);
   assert.equal(await row(hidden).count(),0);
   for(const id of [sessionId,waiting,working,review,draft,shared,child])assert.equal(await row(id).count(),1);
-  await groupSidebarByFolder(page);
-  await page.getByRole('button',{name:/^Today /}).click();
-  assert.equal(await page.locator('#sessions-today').locator(`[data-session-key="native:${sessionId}"]`).isVisible(),true);
-  assert.equal(await row(sessionId).count(),1);
-  await page.getByRole('combobox',{name:'Group conversations',exact:true}).click();
-  await page.getByRole('option',{name:'By status',exact:true}).click();
+  await page.getByRole('button',{name:/^Pinned /}).click();
+  const reviewMeta=row(review).locator('.session-row-meta');
+  await reviewMeta.getByText('PR ready',{exact:true}).waitFor();
+  assert.equal((await reviewMeta.innerText()).includes('ago'),false);
+  assert.equal(await row(waiting).locator('.session-row-meta').innerText(),'Needs input');
   state.inventoryRows.find(item=>item.id===waiting).status='running';
   await page.evaluate(()=>document.dispatchEvent(new Event('visibilitychange')));
-  await group('in-progress').locator(`[data-session-key="native:${waiting}"]`).waitFor();
+  await row(waiting).locator('.session-row-meta').getByText('Running',{exact:true}).waitFor();
   assert.equal(await row(waiting).count(),1);
 });
 
@@ -379,15 +466,14 @@ function sidebarDefaultsFixture() {
   return child;
 }
 
-for(const width of [1440,768,320])test(`sidebar starts with status groups open and keeps child routes collapsed at ${width}px`,async t=>{
+for(const width of [1440,768,320])test(`sidebar defaults to Recent and Participated open and keeps child routes collapsed at ${width}px`,async t=>{
   const child=sidebarDefaultsFixture();
   const page=await pageFor(t,'#',width);
   if(width===320)await page.getByRole('button',{name:'Toggle conversations',exact:true}).click();
-  for(const name of [/^Needs you /,/^In progress /,/^In review /,/^Backlog /]) {
+  for(const name of [/^Recent /,/^Participated /]) {
     const group=page.getByRole('button',{name});await group.waitFor();
     assert.equal(await group.getAttribute('aria-expanded'),'true');
   }
-  assert.equal(await page.getByRole('button',{name:/^Recent /}).count(),0);
   assert.equal(await page.locator('[data-session-key]').count(),5);
   const expand=page.getByRole('button',{name:'Expand subagents for Current native work',exact:true});
   await expand.waitFor();
@@ -408,7 +494,6 @@ for(const width of [1440,768,320])test(`sidebar starts with status groups open a
 test('explicit sidebar expansion survives reload and polling without opening new branches',async t=>{
   sidebarDefaultsFixture();
   const page=await pageFor(t,'#');
-  await groupSidebarByFolder(page);
   await page.getByRole('button',{name:'Expand subagents for Current native work',exact:true}).click();
   await page.getByRole('button',{name:/^Participated /}).click();
   await page.getByRole('button',{name:/^Today /}).click();
@@ -416,7 +501,7 @@ test('explicit sidebar expansion survives reload and polling without opening new
   await page.reload();
   await page.getByRole('button',{name:/^Today /}).waitFor();
   assert.equal(await page.getByRole('button',{name:/^Recent /}).getAttribute('aria-expanded'),'false');
-  assert.equal(await page.getByRole('button',{name:/^Participated /}).getAttribute('aria-expanded'),'true');
+  assert.equal(await page.getByRole('button',{name:/^Participated /}).getAttribute('aria-expanded'),'false');
   assert.equal(await page.getByRole('button',{name:/^Today /}).getAttribute('aria-expanded'),'true');
   await page.getByRole('button',{name:/^Recent /}).click();
   await page.getByRole('button',{name:'Collapse subagents for Current native work',exact:true}).waitFor();
@@ -441,11 +526,50 @@ for(const stored of ['legacy','malformed','unavailable'])test(`sidebar safely ad
       localStorage.setItem('moyai-subagents:another-user',JSON.stringify({version:1,expanded:['native:'+'a'.repeat(32)]}));
     }
   },stored));
-  await groupSidebarByFolder(page);
   await page.getByRole('button',{name:'Expand subagents for Current native work',exact:true}).click();
   await page.getByRole('button',{name:'Collapse subagents for Current native work',exact:true}).waitFor();
   assert.equal(await page.getByRole('button',{name:/^Recent /}).getAttribute('aria-expanded'),'true');
-  assert.equal(await page.getByRole('button',{name:/^Participated /}).getAttribute('aria-expanded'),'false');
+  assert.equal(await page.getByRole('button',{name:/^Participated /}).getAttribute('aria-expanded'),'true');
+});
+
+test('home shows five recent owned roots from one bounded inventory page without waiting for catalogs',async t=>{
+  let release;const held=new Promise(resolve=>{release=resolve;});t.after(()=>release());
+  reset({status:'idle',holds:{'/api/session-folders':held}});
+  const owned=Array.from({length:7},(_,index)=>({...session(`owned-${index}`),source:'native',title:`Recent work ${index}`,updated_at:new Date(100000+index*1000).toISOString()}));
+  state.inventoryPages=[[
+    {...session('shared'),source:'native',owner_id:'teammate',participated:true,updated_at:new Date(900000).toISOString()},
+    {...session('child'),source:'native',parent_session_id:sessionId,updated_at:new Date(900000).toISOString()},
+    {...session('archived'),source:'native',archived:true,updated_at:new Date(900000).toISOString()},
+    {...session('deleted'),source:'native',deleted:true,updated_at:new Date(900000).toISOString()},
+    ...owned,
+    {...session(legacyId),source:'legacy',title:'Linked identity history',owner_id:'old-identity',created_by_me:true,updated_at:new Date(200000).toISOString(),url:'/#run='+legacyId},
+    {...session('not-mine'),source:'native',created_by_me:false,updated_at:new Date(900000).toISOString()},
+  ],[{...session('older'),source:'native',title:'Older page'}]];
+  const page=await pageFor(t,'#'),recent=page.getByRole('region',{name:'Recent sessions',exact:true});
+  await recent.getByRole('link',{name:'Linked identity history',exact:true}).waitFor();
+  assert.deepEqual(await recent.getByRole('link').allTextContents(),['Linked identity history','Recent work 6','Recent work 5','Recent work 4','Recent work 3']);
+  assert.equal(await recent.getByRole('link',{name:'Linked identity history',exact:true}).getAttribute('href'),'#run='+legacyId);
+  const reads=state.requests.filter(row=>row.path==='/api/history/sessions');
+  assert.equal(reads.length,1,'home and sidebar share the initial page');
+  const query=new URLSearchParams(reads[0].query);
+  assert.equal(query.get('limit'),'20');assert.equal(query.get('scope'),'mine');assert.equal(query.has('cursor'),false);
+  assert.equal(state.requests.some(row=>row.path.startsWith('/api/sessions/')),false,'no conversation detail prefetch');
+  assert.equal(await page.getByRole('button',{name:'Show more sessions',exact:true}).isVisible(),true);
+  await recent.getByRole('link',{name:'Linked identity history',exact:true}).click();
+  await page.getByText('Historical saved answer',{exact:true}).waitFor();
+});
+
+test('home recent sessions stays nonblocking while loading and supports empty results and search',async t=>{
+  let release;const held=new Promise(resolve=>{release=resolve;});t.after(()=>release());
+  reset({status:'idle',inventoryRows:[],holds:{'/api/history/sessions':held}});
+  const page=await pageFor(t,'#'),recent=page.getByRole('region',{name:'Recent sessions',exact:true});
+  await recent.getByText('Loading recent sessions…',{exact:true}).waitFor();
+  const input=page.getByRole('textbox',{name:'Message Moyai'});await input.fill('Keep this draft');
+  release();state.holds={};
+  await recent.getByText('No recent sessions in this view. Search to find more.',{exact:true}).waitFor();
+  assert.equal(await input.innerText(),'Keep this draft');
+  await recent.getByRole('button',{name:'Search sessions',exact:true}).click();
+  await page.getByRole('dialog',{name:'Commands and session search'}).waitFor();
 });
 
 test('background inventory refresh stays quiet while explicit pagination shows loading and recovers from failure',async t=>{
@@ -471,7 +595,7 @@ test('background inventory refresh stays quiet while explicit pagination shows l
   await more.waitFor();assert.equal(await more.isEnabled(),true);
   state.inventoryError=false;state.holds={};
   await more.click();
-  await page.getByRole('link',{name:/Older work/}).waitFor();
+  await page.getByRole('navigation',{name:'Conversations',exact:true}).getByRole('link',{name:/Older work/}).waitFor();
   assert.equal(await loading.count(),0);
 });
 
@@ -479,23 +603,23 @@ test('an empty sidebar shows initial loading but remains settled during later ba
   let release;const held=new Promise(resolve=>{release=resolve;});t.after(()=>release());
   reset({status:'idle',inventoryRows:[],holds:{'/api/history/sessions':held}});
   const page=await pageFor(t,'#');
-  await page.locator('.session-list').getByText('Loading sessions…',{exact:true}).waitFor();
+  const recent=page.locator('#sessions-recent');
+  await recent.getByText('Loading sessions…',{exact:true}).waitFor();
   release();state.holds={};
-  await page.getByText('No sessions here yet.',{exact:true}).waitFor();
+  await recent.getByText('No sessions here yet.',{exact:true}).waitFor();
   let releaseRefresh;const refreshHeld=new Promise(resolve=>{releaseRefresh=resolve;});t.after(()=>releaseRefresh());
   state.holds={'/api/history/sessions':refreshHeld};
   const count=state.requests.filter(r=>r.path==='/api/history/sessions').length;
   await page.evaluate(()=>document.dispatchEvent(new Event('visibilitychange')));
   await waitFor(()=>state.requests.filter(r=>r.path==='/api/history/sessions').length>count);
   assert.equal(await page.getByText('Loading sessions…',{exact:true}).count(),0);
-  assert.equal(await page.getByText('No sessions here yet.',{exact:true}).isVisible(),true);
+  assert.equal(await recent.getByText('No sessions here yet.',{exact:true}).isVisible(),true);
 });
 
 test('sidebar pin and unpin render before a held save without blocking other actions or refreshing catalogs',async t=>{
   let release;const held=new Promise(resolve=>{release=resolve;});t.after(()=>release());
   reset({status:'idle',holdPreference:held});
   const page=await pageFor(t);
-  await groupSidebarByFolder(page);
   await page.getByRole('button',{name:'Pin Current native work',exact:true}).waitFor();
   const catalogReads=()=>state.requests.filter(row=>['/api/connections','/api/session-folders','/api/history/sessions'].includes(row.path)).length;
   const reads=catalogReads();
@@ -523,7 +647,6 @@ test('sidebar drag into and out of a folder renders while saves are held and pre
   reset({status:'idle',holdPreference:held,folders:[{id:'today',name:'Today'}],
     inventoryRows:[{...session(id),title:'Folder latency test',pinned:true,folder:'',source:'native'}]});
   const page=await pageFor(t,'#');
-  await groupSidebarByFolder(page);
   await page.getByRole('button',{name:/^Pinned /}).click();
   const row=page.locator(`[data-session-key="native:${id}"]`);
   await row.waitFor();
@@ -546,7 +669,6 @@ test('a rejected sidebar save restores placement and shows an error',async t=>{
   let release;const held=new Promise(resolve=>{release=resolve;});t.after(()=>release());
   reset({status:'idle',holdPreference:held,preferenceError:true});
   const page=await pageFor(t);
-  await groupSidebarByFolder(page);
   await clickSidebarPin(page,'Pin Current native work');
   await page.getByRole('button',{name:/^Pinned /}).click();
   await page.getByRole('button',{name:'Unpin Current native work',exact:true}).waitFor({timeout:500});
@@ -606,7 +728,7 @@ test('header editing cancels Escape, ignores blank and unchanged names, and reta
   assert.equal(renameRequests().length,0);
 });
 
-test('header draft survives polls and failed saves, and IME Enter does not commit',async t=>{
+test('header draft survives polls and IME input; failed saves roll back with an explicit retry',async t=>{
   reset({renameError:true});const page=await pageFor(t);const input=await editTitle(page);
   await input.fill('Keep this draft');
   const reads=()=>state.requests.filter(row=>row.path===`/api/sessions/${sessionId}`&&row.method==='GET').length;
@@ -616,9 +738,13 @@ test('header draft survives polls and failed saves, and IME Enter does not commi
   await input.dispatchEvent('keydown',{key:'Enter',code:'Enter',isComposing:true});
   assert.equal(renameRequests().length,0);
   await input.press('Enter');await page.getByRole('alert').filter({hasText:'Could not save the session name.'}).waitFor();
-  assert.equal(await input.inputValue(),'Keep this draft');
+  await input.waitFor({state:'hidden'});
+  assert.equal(await page.locator('.topbar h1').innerText(),'Background title');
+  assert.equal(await page.title(),'Background title · Moyai');
   state.renameError=false;
-  await input.press('Enter');await page.getByRole('button',{name:'Rename session: Keep this draft',exact:true}).waitFor();
+  await page.getByRole('button',{name:'Retry rename',exact:true}).click();
+  await page.getByRole('button',{name:'Rename session: Keep this draft',exact:true}).waitFor();
+  await waitFor(()=>renameRequests().length===2);
   assert.equal(renameRequests().length,2);
 });
 
@@ -627,15 +753,88 @@ test('pending header save cannot be submitted twice or rename a newly opened ses
   t.after(()=>release());const page=await pageFor(t);const input=await editTitle(page);
   await input.fill('Saved on the first session');await input.press('Enter');
   await waitFor(()=>renameRequests().length===1,'pending title write');
-  await input.press('Enter');await input.press('Tab');
+  await page.getByRole('button',{name:'Rename session: Saved on the first session',exact:true}).waitFor({timeout:500});
+  await input.waitFor({state:'hidden'});
   assert.equal(renameRequests().length,1);
   await page.locator(`.session-row a[href="#${'c'.repeat(32)}"]`).click();
   await page.waitForURL('**/#'+'c'.repeat(32));
   await page.getByRole('button',{name:'Rename session: Current native work',exact:true}).waitFor();
   release();
   await waitFor(()=>state.titles?.[sessionId]==='Saved on the first session','original write committed');
-  await waitFor(()=>state.requests.filter(row=>row.path==='/api/history/sessions').length>1,'sidebar refreshed');
+  await page.locator(`.session-row a[href="#${sessionId}"]`).getByText('Saved on the first session',{exact:true}).waitFor();
   assert.equal(await page.locator('.topbar h1').innerText(),'Current native work');
+  assert.equal(state.titles?.['c'.repeat(32)],undefined);
+});
+
+for(const gesture of ['Enter','blur'])test(`header ${gesture} immediately updates every title while the write is held and does not refresh catalogs`,async t=>{
+  let release;reset({holdRename:new Promise(resolve=>{release=resolve;})});
+  t.after(()=>release());const page=await pageFor(t);const input=await editTitle(page);
+  await page.locator('.session-row.selected .session-title').waitFor();
+  const catalogs=()=>state.requests.filter(req=>['/api/history/sessions','/api/connections','/api/session-folders'].includes(req.path)).length;
+  const before=catalogs();
+  await input.fill('Immediate title');
+  if(gesture==='Enter')await input.press('Enter');
+  else await page.getByRole('textbox',{name:'Message Moyai',exact:true}).click();
+  await page.getByRole('button',{name:'Rename session: Immediate title',exact:true}).waitFor({timeout:500});
+  assert.equal(await page.title(),'Immediate title · Moyai');
+  assert.equal(await page.locator('.session-row.selected .session-title').innerText(),'Immediate title');
+  await waitFor(()=>renameRequests().length===1);
+  assert.equal(state.titles?.[sessionId],undefined,'the server has not saved yet');
+  assert.equal(catalogs(),before,'rename does not refetch the catalog');
+  release();
+  await waitFor(()=>state.titles?.[sessionId]==='Immediate title');
+  await page.getByRole('status').filter({hasText:'Session renamed.'}).waitFor();
+  assert.equal(catalogs(),before,'acknowledgment does not refetch the catalog either');
+});
+
+test('rapid header renames serialize and an earlier failure cannot undo or offer a retry over the newer name',async t=>{
+  let release;reset({holdRename:new Promise(resolve=>{release=resolve;}),renameErrors:['First name']});
+  t.after(()=>release());const page=await pageFor(t);
+  const first=await editTitle(page);await first.fill('First name');await first.press('Enter');
+  await page.getByRole('button',{name:'Rename session: First name',exact:true}).waitFor({timeout:500});
+  const second=await editTitle(page);await second.fill('Second name');await second.press('Enter');
+  await page.getByRole('button',{name:'Rename session: Second name',exact:true}).waitFor({timeout:500});
+  await waitFor(()=>renameRequests().length===1);
+  release();await waitFor(()=>state.titles?.[sessionId]==='Second name');
+  await page.getByRole('status').filter({hasText:'Session renamed.'}).waitFor();
+  assert.deepEqual(renameRequests().map(row=>row.body.title),['First name','Second name']);
+  assert.equal(await page.getByRole('button',{name:'Retry rename',exact:true}).count(),0);
+  assert.equal(await page.locator('.topbar h1').innerText(),'Second name');
+  assert.equal(await page.locator('.session-row.selected .session-title').innerText(),'Second name');
+  await page.reload();await page.getByRole('button',{name:'Rename session: Second name',exact:true}).waitFor();
+});
+
+test('a failed newer rename rolls header, sidebar and browser title back to the last acknowledged name',async t=>{
+  reset({renameErrors:['Rejected name']});const page=await pageFor(t);
+  const first=await editTitle(page);await first.fill('Saved name');await first.press('Enter');
+  await waitFor(()=>state.titles?.[sessionId]==='Saved name');
+  const second=await editTitle(page);await second.fill('Rejected name');await second.press('Enter');
+  await page.getByRole('button',{name:'Retry rename',exact:true}).waitFor();
+  assert.equal(await page.locator('.topbar h1').innerText(),'Saved name');
+  assert.equal(await page.locator('.session-row.selected .session-title').innerText(),'Saved name');
+  assert.equal(await page.title(),'Saved name · Moyai');
+  const third=await editTitle(page);await third.fill('New draft');
+  await third.press('Escape');
+  assert.equal(await page.locator('.topbar h1').innerText(),'Saved name');
+});
+
+test('a rename failure stays actionable after navigating away and editing another session',async t=>{
+  let release;reset({createdSession:true,holdRename:new Promise(resolve=>{release=resolve;}),renameErrors:['Rejected name']});
+  t.after(()=>release());const page=await pageFor(t);
+  const input=await editTitle(page);await input.fill('Rejected name');await input.press('Enter');
+  await waitFor(()=>renameRequests().length===1);
+  await page.locator(`.session-row a[href="#${'c'.repeat(32)}"]`).click();
+  await page.waitForURL('**/#'+'c'.repeat(32));
+  await page.getByRole('button',{name:'Session actions',exact:true}).click();
+  await page.getByRole('menuitem',{name:'Pin',exact:true}).click();
+  await page.getByRole('status').filter({hasText:'Session pinned.'}).waitFor();
+  release();
+  await page.getByRole('button',{name:'Retry rename',exact:true}).waitFor();
+  assert.match(await page.locator('.action-toast[role="alert"]').innerText(),/Rejected name/);
+  assert.equal(await page.locator('.topbar h1').innerText(),'Current native work');
+  state.renameErrors=[];
+  await page.getByRole('button',{name:'Retry rename',exact:true}).click();
+  await waitFor(()=>state.titles?.[sessionId]==='Rejected name');
   assert.equal(state.titles?.['c'.repeat(32)],undefined);
 });
 
@@ -713,23 +912,114 @@ test('swarm Space and Chat retain drafts and worker navigation opens the full co
   await space.waitFor();
 });
 
-for(const attention of ['question','effect'])test(`swarm reveals a pending ${attention} instead of hiding it behind Space`,async t=>{
+test('swarm reveals a pending question instead of hiding it behind Space',async t=>{
   reset({swarm:swarm()});const page=await pageFor(t);
   await page.getByRole('region',{name:'Live swarm space',exact:true}).waitFor();
-  if(attention==='question') {
-    state.status='waiting';
-    state.pending={calls:[{tool_call_id:'question',tool_name:'ask_user_question',args:{questions:[{
-      header:'Approach',question:'Which method should I use?',options:[{label:'Iterative addition'},{label:'Pairing'}],
-    }]}}],approvals:[]};
-  } else {
-    state.status='idle';
-    state.effects=[{id:'effect-one',turn_id:turnId,tool_name:'shell',arguments:{command:'example requiring review'}}];
-  }
-  await page.getByRole('heading',{name:attention==='question'?'Question':'An action needs review',exact:true}).waitFor();
+  state.status='waiting';
+  state.pending={calls:[{tool_call_id:'question',tool_name:'ask_user_question',args:{questions:[{
+    header:'Approach',question:'Which method should I use?',options:[{label:'Iterative addition'},{label:'Pairing'}],
+  }]}}],approvals:[]};
+  await page.getByRole('heading',{name:'Question',exact:true}).waitFor();
   assert.equal(await page.locator('.transcript').isVisible(),true);
   await page.getByRole('button',{name:'Space',exact:true}).click();
   assert.equal(await page.locator('.transcript').isVisible(),true);
   assert.equal(await page.getByRole('region',{name:'Live swarm space',exact:true}).count(),0);
+});
+
+for(const tool of ['browser_open','shell','github_create_pull_request','slack_post_message'])test(`failed ${tool} shows its error without an outcome-review form`,async t=>{
+  reset({status:'failed',turns:[{id:turnId,actor_id:'viewer',status:'failed',error:'The action failed.',connections:[],usage:{}}],
+    effects:[{id:'effect-one',turn_id:turnId,tool_name:tool,arguments:{}}]});
+  const page=await pageFor(t);
+  await page.getByText('The action failed.',{exact:true}).waitFor();
+  assert.equal(await page.getByRole('heading',{name:'An action needs review',exact:true}).count(),0);
+  assert.equal(await page.getByRole('button',{name:'Record verified outcome',exact:true}).count(),0);
+  await page.getByRole('textbox',{name:'Message Moyai',exact:true}).fill('Continue with the task.');
+  assert.equal(await page.getByRole('button',{name:'Send message',exact:true}).isEnabled(),true);
+});
+
+function failureFixture(overrides={}) {
+  return {status:'failed',turns:[{id:turnId,actor_id:'viewer',is_self:true,status:'failed',
+    error:'The agent could not complete this turn.',model:'test-model',connections:[],usage:{},
+    created_at:'2026-10-19T17:10:55Z',finished_at:'2026-10-19T17:15:02Z'}],
+  failureDetails:{session_id:sessionId,turn_id:turnId,workflow_id:'moyai-turn-'+turnId,status:'failed',
+    model:'test-model',summary:'The agent could not complete this turn.',
+    created_at:'2026-10-19T17:10:55Z',finished_at:'2026-10-19T17:15:02Z',
+    runtime:{exception_chain:[{type:'ActivityError',activity_type:'moyai_effects_reserve',activity_id:'16'},
+      {type:'ApplicationError',application_type:'PendingEffectError'}]},
+    last_action:{id:'read',tool:'browser_read',status:'completed',timestamp:'2026-10-19T17:14:45Z'},
+    recent_failures:[{id:'open',tool:'browser_open',timestamp:'2026-10-19T17:14:32Z',
+      error:'net::ERR_CONNECTION_REFUSED at http://localhost:8840/reference.png\n<script>not executable</script>',
+      restricted:false,truncated:false}],failures_limited:false,notes:[],usage:{input_tokens:521914,output_tokens:1693}},
+  ...overrides};
+}
+
+for(const width of [1440,768,320])test(`failure details open on demand, copy diagnostics and download the trace at ${width}px`,async t=>{
+  reset(failureFixture());
+  const page=await pageFor(t,'#'+sessionId,width,async page=>page.addInitScript(()=>{
+    window.failureCopy='';navigator.clipboard.writeText=async value=>{window.failureCopy=value;};
+  }));
+  const toggle=page.getByRole('button',{name:'Show failure details',exact:true});
+  await toggle.waitFor();
+  assert.equal(state.requests.some(row=>row.path.endsWith('/failure')),false);
+  await toggle.focus();
+  await toggle.press('Enter');
+  await page.getByText('PendingEffectError',{exact:true}).waitFor();
+  assert.match(await page.locator('.failure-tool pre').innerText(),/ERR_CONNECTION_REFUSED/);
+  assert.equal(await page.locator('.failure-tool script').count(),0);
+  assert.equal(await page.getByRole('heading',{name:'An action needs review',exact:true}).count(),0);
+  assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false);
+  await page.getByRole('button',{name:'Copy details',exact:true}).click();
+  await page.getByRole('button',{name:'Copied details',exact:true}).waitFor();
+  const copied=JSON.parse(await page.evaluate(()=>window.failureCopy));
+  assert.equal(copied.turn_id,turnId);assert.equal(copied.recent_failures[0].tool,'browser_open');
+  const download=page.waitForEvent('download');
+  await page.getByRole('button',{name:'Download debug trace',exact:true}).click();
+  assert.equal((await download).suggestedFilename(),`moyai-trace-${sessionId}.json`);
+  await page.getByRole('button',{name:'Hide failure details',exact:true}).click();
+  await page.locator('.failure-body').waitFor({state:'hidden'});
+  assert.equal(await page.locator('.failure-body').isVisible(),false);
+});
+
+test('failure details retry a read failure and preserve diagnostics after a copy failure',async t=>{
+  reset(failureFixture({failureError:503}));
+  const page=await pageFor(t,'#'+sessionId,1440,async page=>page.addInitScript(()=>{
+    navigator.clipboard.writeText=async()=>{throw new Error('Clipboard unavailable');};
+  }));
+  await page.getByRole('button',{name:'Show failure details',exact:true}).click();
+  await page.getByRole('button',{name:'Retry details',exact:true}).waitFor();
+  state.failureError=undefined;
+  await page.getByRole('button',{name:'Retry details',exact:true}).click();
+  await page.getByText('PendingEffectError',{exact:true}).waitFor();
+  await page.getByRole('button',{name:'Copy details',exact:true}).click();
+  await page.getByText('Could not copy details. Try downloading the debug trace.',{exact:true}).waitFor();
+  assert.equal(await page.getByText('PendingEffectError',{exact:true}).isVisible(),true);
+});
+
+test('failure details for another requester show only public context without a private read',async t=>{
+  const fixture=failureFixture();fixture.turns[0]={...fixture.turns[0],actor_id:'teammate',is_self:false};
+  reset(fixture);const page=await pageFor(t);
+  await page.getByRole('button',{name:'Show failure details',exact:true}).click();
+  await page.getByText('Detailed tool activity is visible only to the requester.',{exact:true}).waitFor();
+  assert.equal(state.requests.some(row=>row.path.endsWith('/failure')),false);
+  assert.equal(await page.getByRole('button',{name:'Copy details',exact:true}).count(),0);
+});
+
+test('failure details discard a late response after switching conversations',async t=>{
+  let release;const hold=new Promise(resolve=>{release=resolve;});t.after(()=>release());
+  const other='c'.repeat(32),fixture=failureFixture();
+  reset({...fixture,createdSession:true,failureHolds:{[sessionId]:hold},
+    failureDetailsBySession:{[other]:{...fixture.failureDetails,session_id:other,turn_id:'other-turn',
+      workflow_id:'moyai-other-turn',runtime:null,recent_failures:[],notes:['No exception details were recorded.']}},
+    turnsBySession:{[other]:[{...fixture.turns[0],id:'other-turn'}]}});
+  const page=await pageFor(t);
+  await page.getByRole('button',{name:'Show failure details',exact:true}).click();
+  await waitFor(()=>state.requests.some(row=>row.path.endsWith('/failure')),'held failure request');
+  await page.goto(base+'/#'+other);
+  await page.getByRole('button',{name:'Show failure details',exact:true}).click();
+  await page.getByText('moyai-other-turn',{exact:true}).waitFor();
+  release();
+  assert.equal(await page.getByText('PendingEffectError',{exact:true}).count(),0);
+  assert.equal(await page.getByText('moyai-other-turn',{exact:true}).isVisible(),true);
 });
 
 test('home and inventory render while account and folder reads are held',async t=>{
@@ -748,6 +1038,14 @@ for(const width of [1440,768,320])test(`home keeps the draft and controls reacha
   const heading=page.getByRole('heading',{name:'What are we building?',exact:true});
   await heading.waitFor();
   await page.evaluate(()=>document.fonts.ready);
+  if(process.env.MOYAI_UI_CAPTURE_DIR){
+    await fs.mkdir(process.env.MOYAI_UI_CAPTURE_DIR,{recursive:true});
+    await page.screenshot({path:path.join(process.env.MOYAI_UI_CAPTURE_DIR,`home-${width}-dark.png`)});
+    if(width<760)await page.getByRole('button',{name:'Toggle conversations',exact:true}).click();
+    await page.getByRole('button',{name:'Switch to light mode',exact:true}).click();
+    if(width<760)await page.getByRole('button',{name:'Toggle conversations',exact:true}).click();
+    await page.screenshot({path:path.join(process.env.MOYAI_UI_CAPTURE_DIR,`home-${width}-light.png`)});
+  }
   const geometry=await heading.boundingBox();
   const input=page.getByRole('textbox',{name:'Message Moyai'});
   await input.fill('A draft that must stay ready to edit.');
@@ -760,8 +1058,14 @@ for(const width of [1440,768,320])test(`home keeps the draft and controls reacha
   assert.equal(await page.getByText('Drop files or paste images · Enter to send',{exact:true}).isVisible(),true);
   assert.equal(await page.locator('.home-composer').getByRole('button',{name:'Private session',exact:true}).isVisible(),true);
   await page.getByRole('button',{name:'Review code',exact:true}).waitFor({state:'hidden'});
-  await input.fill('');
+  // Let Lexical handle selection and deletion through real keyboard commands.
+  // fill('') can race its selection listener and leave the old draft intact.
+  await input.press('ControlOrMeta+A');
+  await input.press('Backspace');
+  assert.equal(await input.textContent(),'');
   await page.getByRole('button',{name:'Review code',exact:true}).waitFor({state:'visible'});
+  assert.equal(await page.getByRole('button',{name:'Review code',exact:true}).isEnabled(),true);
+  assert.equal(await page.getByRole('button',{name:'Send message',exact:true}).isDisabled(),true);
 });
 
 for(const [label,prompt] of [
@@ -818,21 +1122,62 @@ for(const width of [1440,320])test(`selected chat keeps its highlight while acti
 test('sidebar PR icons retain multi-PR selection without numeric badges',async t=>{
   const pr=(number,state)=>({url:`https://github.com/example/project/pull/${number}`,repository:'example/project',
     number,title:`Review change ${number}`,state,draft:false,accessible:true});
-  reset({status:'waiting',prStatuses:{[sessionId]:[pr(12,'open'),pr(13,'open'),pr(14,'merged')]}});
+  reset({status:'idle',prStatuses:{[sessionId]:[pr(12,'open'),pr(13,'open'),pr(14,'merged')]}});
   const page=await pageFor(t,'');
   await page.locator(`[data-session-key="native:${sessionId}"]`).hover();
   await page.locator('.session-pr-ready').waitFor();
+  const metadata=page.locator(`[data-session-key="native:${sessionId}"] .session-row-meta`);
   assert.equal(await page.locator('.session-pr-ready').innerText(),'PRs ready');
   assert.equal(await page.locator('.session-pr-merged').innerText(),'PR merged');
+  assert.equal(await metadata.locator('.session-meta-separator').count(),1);
+  assert.equal(await page.locator('.session-pr-ready .session-meta-separator').count(),0);
   assert.equal(await page.locator('.session-pr-count').count(),0);
   assert.equal(await page.locator('.session-pr-ready svg').count(),1);
-  assert.equal(await page.locator('.session-meta-status.needs-input').innerText(),'Needs input');
   await page.locator('.session-pr-ready').click();
   await page.getByRole('button',{name:'Review change 12 example/project#12',exact:true}).waitFor();
   await page.getByRole('button',{name:'Review change 13 example/project#13',exact:true}).waitFor();
 });
 
-test('workspace overlay preserves chat geometry while the side panel resizes it',async t=>{
+async function assertWorkspaceSeparated(page) {
+  const area=await page.locator('.workspace > .chat').boundingBox();
+  const chat=await page.locator('.workspace > .chat .chat-content').boundingBox();
+  const menu=await page.getByRole('dialog',{name:'Workspace resources',exact:true}).boundingBox();
+  assert.equal(menu.width,280);
+  assert.ok(area.width < 640 ? chat.y - (menu.y + menu.height) >= 16 : menu.x - (chat.x + chat.width) >= 16,
+    JSON.stringify({area,chat,menu}));
+  const composer=await page.locator('.workspace > .chat .composer-wrap').boundingBox();
+  assert.ok(composer.y >= chat.y && composer.y + composer.height <= chat.y + chat.height + 1);
+  assert.ok(composer.x >= chat.x && composer.x + composer.width <= chat.x + chat.width + 1);
+  assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true);
+}
+
+for(const width of [1440,768,320])for(const theme of ['dark','light'])test(`workspace avoids messages and composer at ${width}px in ${theme}`,async t=>{
+  reset({status:'completed',messages:[
+    {id:1,turn_id:turnId,role:'user',content:'Keep the Workspace resources separate from this conversation.'},
+    {id:2,turn_id:turnId,role:'assistant',content:'The main chat remains readable while the resources are open. '.repeat(12)}],
+    workspaceData:{links:[],sources:[],subagents:[],subagents_limited:false,
+      files:Array.from({length:20},(_,i)=>({id:String(i),name:`responsive-layout-verification-report-${i}.md`,size:4096,url:`/files/${i}`,media_type:'text/plain'}))}});
+  const page=await pageFor(t,'#'+sessionId,width, page=>page.addInitScript(theme=>localStorage.setItem('moyai-appearance',theme),theme));
+  await page.setViewportSize({width,height:600});
+  const input=page.getByRole('textbox',{name:'Message Moyai'});
+  await input.fill('Preserve this draft while opening resources.');
+  const before=await page.locator('.chat-content').boundingBox();
+  await page.getByRole('button',{name:'Open workspace',exact:true}).click();
+  const menu=page.getByRole('dialog',{name:'Workspace resources',exact:true});
+  await menu.getByText('responsive-layout-verification-report-19.md',{exact:true}).waitFor();
+  await assertWorkspaceSeparated(page);
+  assert.ok(await menu.evaluate(el=>el.scrollHeight>el.clientHeight),'resources scroll within their own track');
+  assert.ok(await page.locator('.transcript').evaluate(el=>el.clientHeight>80),'chat keeps a usable scroll area');
+  if(process.env.MOYAI_UI_CAPTURE_DIR) {
+    await fs.mkdir(process.env.MOYAI_UI_CAPTURE_DIR,{recursive:true});
+    await page.screenshot({path:path.join(process.env.MOYAI_UI_CAPTURE_DIR,`workspace-separated-${width}-${theme}.png`)});
+  }
+  await page.keyboard.press('Escape');await menu.waitFor({state:'detached'});
+  assert.deepEqual(await page.locator('.chat-content').boundingBox(),before);
+  assert.equal(await input.innerText(),'Preserve this draft while opening resources.');
+});
+
+test('workspace reserves a narrower column with a gap and restores chat on dismissal',async t=>{
   reset({status:'completed',workspaceData:{links:[],files:[],sources:[],subagents_limited:false,
     subagents:[{id:'agent-one',parent_id:'',name:'Newton',avatar:0,status:'failed',can_inspect:true,started_at:'',depth:0}]}});
   const page=await pageFor(t);
@@ -843,7 +1188,11 @@ test('workspace overlay preserves chat geometry while the side panel resizes it'
   await key.click();
   const dialog=page.getByRole('dialog',{name:'Workspace resources',exact:true});
   await dialog.waitFor();
-  assert.deepEqual(await Promise.all([page.locator('.chat-content').boundingBox(),page.locator('.composer-wrap').boundingBox()]),before);
+  const chat = await page.locator('.chat-content').boundingBox(), menu = await dialog.boundingBox();
+  assert.equal(menu.width,280);
+  assert.ok(menu.x - (chat.x + chat.width) >= 16, 'Workspace must not cover chat');
+  const composer = await page.locator('.composer-wrap').boundingBox();
+  assert.ok(composer.x + composer.width <= menu.x - 16);
   assert.equal(await dialog.getByText('Failed',{exact:true}).count(),1);
   await page.keyboard.press('Escape');
   await dialog.waitFor({state:'detached'});
@@ -1209,6 +1558,39 @@ test('editing a queued message retains its inline token and restores the unsent 
   assert.equal(await input.innerText(),'Keep this unsent draft.');
 });
 
+test('Slack queued mentions display names while editing preserves original IDs',async t=>{
+  const original='make an IMG of <@U0B1TDTHL4Q>’s face and send it here';
+  reset({messages:[{id:1,turn_id:'queued',role:'user',author_id:'viewer',source:'slack',
+    content:original,slack_mentions:{U0B1TDTHL4Q:'Jordan Lee'}}],
+    turns:[{id:turnId,actor_id:'viewer',status:'running',connections:[]},{id:'queued',actor_id:'viewer',status:'queued',mode:'when_idle',connections:[]}]});
+  const page=await pageFor(t),input=page.getByRole('textbox',{name:'Message Moyai'});
+  await page.locator('.queued-message').getByText('make an IMG of @Jordan Lee’s face and send it here',{exact:true}).waitFor();
+  await page.locator('.queued-message').getByRole('button',{name:'Edit',exact:true}).click();
+  assert.equal(await input.innerText(),original);
+  await input.press('End');await input.pressSequentially(' Please.');
+  await page.getByRole('button',{name:'Save queued message'}).click();
+  await waitFor(()=>state.requests.some(row=>row.path==='/api/turns/queued'&&row.method==='PATCH'));
+  assert.equal(state.requests.find(row=>row.path==='/api/turns/queued'&&row.method==='PATCH').body.prompt,original+' Please.');
+});
+
+test('Slack mention names are literal text and preserve code, links, and non-Slack input',async t=>{
+  const content='Hi <@U0B1TDTHL4Q|old label> and <@W12345678>. Unknown <@UUNKNOWN1>. Code `<@U0B1TDTHL4Q>`\n```<@U0B1TDTHL4Q>```\n<https://example.test/?a=1&amp;b=2|repository> &lt;@U0B1TDTHL4Q&gt;';
+  reset({status:'completed',messages:[
+    {id:1,turn_id:turnId,role:'user',author_id:'viewer',source:'slack',content,
+      slack_mentions:{U0B1TDTHL4Q:'Jordan Lee',W12345678:'<img src=x onerror=alert(1)> & <https://evil.test|click>'}},
+    {id:2,turn_id:turnId,role:'user',author_id:'viewer',content:'Web text <@U0B1TDTHL4Q>',slack_mentions:{U0B1TDTHL4Q:'Jordan Lee'}},
+  ]});
+  const page=await pageFor(t),body=page.locator('.message-content').first();
+  await body.getByRole('link',{name:'repository'}).waitFor();
+  assert.match(await body.innerText(),/^Hi @Jordan Lee and @<img src=x onerror=alert\(1\)> & <https:\/\/evil.test\|click>/);
+  assert.match(await body.innerText(),/Unknown <@UUNKNOWN1>/);
+  assert.match(await body.innerText(),/Code `<@U0B1TDTHL4Q>`\n```<@U0B1TDTHL4Q>```/);
+  assert.equal(await body.locator('img').count(),0);
+  assert.equal(await body.locator('a').count(),1);
+  assert.equal(await body.getByRole('link',{name:'repository'}).getAttribute('href'),'https://example.test/?a=1&b=2');
+  await page.getByText('Web text <@U0B1TDTHL4Q>',{exact:true}).waitFor();
+});
+
 test('skill catalog retries and excludes personal skills in shared sessions',async t=>{
   reset({skillError:true,individual:false,skills:[{id:'p',name:'private-only',description:'Private',scope:'personal',reference:'personal:private-only'}]});
   const page=await pageFor(t,'#'),input=page.getByRole('textbox',{name:'Message Moyai'});
@@ -1221,31 +1603,31 @@ test('skill catalog retries and excludes personal skills in shared sessions',asy
 });
 
 const testGoal=()=>({objective:'Verify the original result.',status:'active',generation:1,owner_id:'viewer',
-  tokens_used:0,token_budget:null,turns:0,blocked_count:0,reason:'',created_at:''});
+  elapsed_seconds:0,tokens_used:0,token_budget:null,turns:0,blocked_count:0,reason:'',created_at:''});
 test('chat goal retries keep their request identity and preserve the edit after a failure',async t=>{
   reset({mode:'standalone',status:'idle',goal:testGoal(),goalError:true});
   const page=await pageFor(t);
-  await page.getByRole('button',{name:'Edit goal',exact:true}).click();
-  const dialog=page.getByRole('dialog',{name:'Edit goal',exact:true});
+  await page.getByRole('button',{name:'Expand goal',exact:true}).click();
+  const dialog=page.getByRole('form',{name:'Edit goal',exact:true});
   await dialog.getByLabel('Objective',{exact:true}).fill('Verify the new criterion.');
   await dialog.getByRole('button',{name:'Save goal',exact:true}).click();
   await dialog.getByRole('alert').filter({hasText:'Goal update temporarily unavailable'}).waitFor();
   assert.equal(await dialog.getByLabel('Objective',{exact:true}).inputValue(),'Verify the new criterion.');
   state.goalError=false;
   await dialog.getByRole('button',{name:'Save goal',exact:true}).click();
-  await dialog.waitFor({state:'hidden'});
-  const requests=state.requests.filter(row=>row.method==='POST'&&row.body?.prompt==='/goal edit Verify the new criterion.');
+  await page.waitForFunction(()=>document.querySelector('.goal-editor button[type=submit]').disabled);
+  const requests=state.requests.filter(row=>row.method==='POST'&&row.body?.prompt==='/goal edit --budget none Verify the new criterion.');
   assert.equal(requests.length,2);
   assert.deepEqual(requests[0].body,requests[1].body);
 });
 test('confirmed chat goal edits recover refresh errors without resubmitting',async t=>{
   reset({mode:'standalone',status:'idle',goal:testGoal(),goalRefreshError:true});
   const page=await pageFor(t);
-  await page.getByRole('button',{name:'Edit goal',exact:true}).click();
-  const dialog=page.getByRole('dialog',{name:'Edit goal',exact:true});
+  await page.getByRole('button',{name:'Expand goal',exact:true}).click();
+  const dialog=page.getByRole('form',{name:'Edit goal',exact:true});
   await dialog.getByLabel('Objective',{exact:true}).fill('The confirmed new objective.');
   await dialog.getByRole('button',{name:'Save goal',exact:true}).click();
-  await dialog.waitFor({state:'hidden'});
+  await page.getByRole('button',{name:'Close Edit goal tab'}).click();
   await page.getByRole('alert').filter({hasText:'goal was updated'}).waitFor();
   assert.equal(state.requests.filter(row=>row.method==='POST'&&row.body?.prompt?.startsWith('/goal ')).length,1);
   assert.equal(state.goal.objective,'The confirmed new objective.');
@@ -1264,7 +1646,7 @@ test('typed goal controls preserve staged files and work while connection select
   await page.locator('.image-preview[aria-busy="false"]').waitFor();
   const input=page.getByRole('textbox',{name:'Message Moyai',exact:true});
   await input.fill('/goal pause');await input.press('Enter');
-  await page.getByText('Goal paused',{exact:true}).waitFor();
+  await page.getByText('Paused goal',{exact:true}).waitFor();
   const request=state.requests.find(row=>row.method==='POST'&&row.body?.prompt==='/goal pause');
   assert.equal(request.body.attachments,undefined);
   assert.equal(request.body.connections,undefined);
@@ -1342,6 +1724,27 @@ test('a streaming answer stays above another requester’s already visible queue
   assert.equal(await page.locator('.turn-progress-toggle').getAttribute('aria-expanded'),'true');
 });
 
+for(const width of [1440,768,320])test(`unreadable API successes recover without losing the draft at ${width}px`,async t=>{
+  reset();const page=await pageFor(t,'#'+sessionId,width);
+  const input=page.getByRole('textbox',{name:'Message Moyai'});
+  await input.fill('Preserve this unsent draft.');
+  await waitFor(()=>clients.size>0,'SSE connected');
+  const route=`GET:/api/sessions/${sessionId}`,alert=page.locator('.composer-wrap [role="alert"]');
+  for(const [body,type] of [['<html>private proxy details</html>','text/html'],['{private broken JSON','application/json'],['','application/json']]){
+    state.httpErrors={[route]:{status:200,body,type}};
+    emit({},undefined,'refresh');
+    await alert.getByText(/Moyai returned an unreadable response/).waitFor();
+    assert.equal(await input.innerText(),'Preserve this unsent draft.');
+    assert.equal(await page.getByText(/private proxy details|private broken JSON|SyntaxError/).count(),0);
+    delete state.httpErrors[route];
+    emit({},undefined,'refresh');
+    await alert.waitFor({state:'hidden'});
+  }
+  assert.equal(await input.innerText(),'Preserve this unsent draft.');
+  assert.equal(state.requests.filter(req=>req.method==='POST'&&req.path.endsWith('/messages')).length,0);
+  assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true);
+});
+
 for(const width of [1440,768,320])test(`transient global and conversation errors recover independently at ${width}px`,async t=>{
   const conversation=`GET:/api/sessions/${sessionId}`,catalog='GET:/api/connections';
   reset({httpErrors:{[catalog]:{status:503}}});
@@ -1415,6 +1818,9 @@ test('a saved rename succeeds while its catalog refresh failure stays globally o
   await title.press('Enter');
   await title.waitFor({state:'hidden'});
   await page.getByRole('heading',{name:'Saved despite catalog outage',exact:true}).waitFor();
+  await waitFor(()=>state.titles?.[sessionId]==='Saved despite catalog outage');
+  await page.evaluate(()=>document.dispatchEvent(new Event('visibilitychange')));
+  await page.locator('.global-error').waitFor();
   assert.match(await page.locator('.global-error').innerText(),/Catalog unavailable/);
   assert.equal(await page.locator('.action-toast[role="alert"]').count(),0,'the successful rename is not a failed action');
   assert.equal(state.requests.filter(req=>req.method==='PATCH'&&req.body?.title==='Saved despite catalog outage').length,1);
@@ -1537,11 +1943,15 @@ test('root streaming survives saved-state polling, reconnect replay, per-round r
   await waitFor(()=>savedPolls()>polls,'saved poll');
   assert.equal(await page.locator('.turn-progress-history').getByText('I will inspect.',{exact:true}).count(),1);
   emit({type:'tool_call',id:'call1',name:'read_file',arguments:{path:'private-tool-detail'}},3);
-  await page.locator('.live-action').getByText('Using read file…',{exact:true}).waitFor();assert.equal(await page.getByText('private-tool-detail',{exact:true}).count(),0);
+  state.workProgress={messages:[{id:'saved-progress',phase:'commentary',text:'I will inspect.'}],
+    tools:[{id:'call1',name:'read_file',status:'running',created_at:new Date().toISOString()}],subagents:[]};
+  await page.locator('.live-action').getByText('Read file…',{exact:true}).waitFor();assert.equal(await page.getByText('private-tool-detail',{exact:true}).count(),0);
   for(const client of clients)client.end();await waitFor(()=>state.streams.length===2,'browser reconnect');assert.equal(state.streams[1].last,'3');
   emit({type:'text_delta',index:0,text:'duplicate'},2);emit({type:'response_start',run_id:turnId,step:2},4);emit({type:'text_start',index:0,text:'Wrong attempt'},5);
   emit({type:'response_start',run_id:turnId,step:2},6);emit({type:'text_start',index:0,text:'Final',phase:'final_answer'},7);emit({type:'text_delta',index:0,text:' answer'},8);
   await page.locator('.live-message').getByText('Final answer',{exact:true}).waitFor();assert.equal(await page.getByText(/Unlabelled child text|Wrong attempt|duplicate/).count(),0);
+  await page.locator('.live-action').getByText('Read file…',{exact:true}).waitFor();
+  state.workProgress.tools[0].status='completed';
   state.messages.push({id:2,turn_id:turnId,role:'assistant',author_id:null,content:'Final answer'});state.status='completed';emit({},undefined,'finished');
   await page.waitForFunction(()=>document.querySelectorAll('.message.assistant:not(.live-message)').length===1);
   assert.equal(await page.getByText('Final answer',{exact:true}).count(),1);
@@ -1574,7 +1984,9 @@ for(const width of [1440,768,320])test(`live work and subagents survive steering
   const progress=page.locator('.turn-progress');
   await progress.getByText('First inspection.',{exact:true}).waitFor();
   await progress.getByText('Checking recorded behavior.',{exact:true}).waitFor();
-  await progress.getByText('I found the renderer.',{exact:true}).waitFor();
+  await progress.locator('[data-agent-id="child"]').waitFor();
+  await page.getByRole('button',{name:'Close workspace',exact:true}).click();
+  assert.equal(await progress.getByText('I found the renderer.',{exact:true}).count(),0);
   assert.equal(await progress.locator('.turn-progress-toggle').getAttribute('aria-expanded'),'true');
   const input=page.getByRole('textbox',{name:'Message Moyai'});
   await input.fill('Also check keyboard use.');
@@ -1606,6 +2018,165 @@ for(const width of [1440,768,320])test(`live work and subagents survive steering
   assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=window.innerWidth),true);
 });
 
+for(const width of [1440,768,320])test(`shared conversation activity includes tools and subagents at ${width}px`,async t=>{
+  const start=Date.now()-60000,at=seconds=>new Date(start+seconds*1000).toISOString();
+  reset({ownerId:'teammate',sessionOverrides:{[sessionId]:{visibility:'shared',surface:'slack'}},
+    turns:[{id:turnId,actor_id:'teammate',is_self:false,status:'running',created_at:at(0),connections:[],usage:{}}],
+    messages:[{id:1,turn_id:turnId,role:'user',author_id:'teammate',author_name:'Test teammate',is_self:false,
+      content:'Check the shared task.',created_at:at(0)}],
+    workProgress:{messages:[{id:'shared-1',phase:'commentary',text:'Checking the shared task.',created_at:at(5)}],
+      tools:[{id:'shared-read',name:'read_file',status:'completed',created_at:at(6),finished_at:at(7)}],
+      subagents:[{id:'child',session_id:'private-child-chat',name:'Kepler',avatar:0,depth:0,status:'completed',
+        created_at:at(8),updated_at:at(10),messages:[{id:'child-result',phase:'final_answer',text:'Delegated check passed.',created_at:at(10)}],tools:[]}],
+      tools_limited:false,subagents_limited:false},
+    actionDetails:{'shared-read':{id:'shared-read',name:'read_file',status:'completed',created_at:at(6),finished_at:at(7),
+      input:'README.md',output:'Shared file contents.',restricted:false,input_truncated:false,output_truncated:false}}});
+  const page=await pageFor(t,'#'+sessionId,width);
+  const progress=page.getByRole('region',{name:'Work progress'});
+  await progress.getByText('Checking the shared task.',{exact:true}).waitFor({timeout:10000});
+  await progress.getByRole('button',{name:/Working for/}).waitFor();
+  await waitFor(()=>state.streams.length>0,'shared activity stream');
+  emit({type:'response_start',run_id:turnId,step:2},0);
+  emit({type:'text_start',index:0,text:'Live shared update.',phase:'commentary'},1);
+  await progress.getByText('Live shared update.',{exact:true}).waitFor();
+  await progress.getByRole('button',{name:'1 action',exact:true}).click();
+  await progress.getByRole('button',{name:'Open Read file action',exact:true}).click();
+  await page.getByText('Shared file contents.',{exact:true}).waitFor();
+  await page.getByRole('complementary',{name:'Session panel',exact:true}).getByRole('button',{name:'Hide side panel',exact:true}).click();
+  await progress.getByRole('button',{name:/Kepler Completed/}).click();
+  await progress.getByText('Delegated check passed.',{exact:true}).waitFor();
+  assert.equal(await progress.getByRole('button',{name:'Open Kepler details',exact:true}).count(),0,'Private follow-up chats stay private.');
+  state.workProgress.messages.push({id:'shared-2',phase:'commentary',text:'The shared check passed.',created_at:at(20)});
+  await progress.getByText('The shared check passed.',{exact:true}).waitFor();
+  if(process.env.MOYAI_UI_CAPTURE_DIR) {
+    await fs.mkdir(process.env.MOYAI_UI_CAPTURE_DIR,{recursive:true});
+    await page.screenshot({path:path.join(process.env.MOYAI_UI_CAPTURE_DIR,`shared-progress-${width}.png`)});
+  }
+  state.status='idle';state.turns[0].status='completed';state.turns[0].finished_at=at(30);
+  state.messages.push({id:2,turn_id:turnId,role:'assistant',author_id:null,content:'Shared final answer.',created_at:at(30)});
+  await page.getByText('Shared final answer.',{exact:true}).waitFor();
+  await progress.locator('.turn-progress-toggle[aria-expanded="false"]').waitFor();
+  await page.reload();
+  const toggle=progress.getByRole('button',{name:'Worked for 30s',exact:true});
+  await toggle.waitFor();
+  assert.equal(await toggle.getAttribute('aria-expanded'),'false');
+  await toggle.focus();await page.keyboard.press('Enter');
+  await progress.getByText('The shared check passed.',{exact:true}).waitFor();
+  assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=window.innerWidth),true);
+  state.denied=true;
+  await page.getByText('Checking the shared task.',{exact:true}).waitFor({state:'hidden'});
+  assert.equal(await page.getByText('The shared check passed.',{exact:true}).count(),0);
+  assert.equal(state.requests.some(row=>row.path.endsWith('/actions/shared-read')),true);
+});
+
+for(const width of [1440,768,320])test(`empty steering activity stays hidden during refresh at ${width}px`,async t=>{
+  const start=Date.now()-60000,at=seconds=>new Date(start+seconds*1000).toISOString();
+  const progressPath=`/api/sessions/${sessionId}/progress/${turnId}`;
+  reset({
+    turns:[{id:turnId,actor_id:'viewer',status:'running',created_at:at(0),connections:[],usage:{}},
+      ...[2,3].map(id=>({id:`steer-${id}`,actor_id:'viewer',status:'included',parent_turn:turnId,
+        created_at:at(id*10),guidance_at:at(id*10),connections:[],usage:{}}))],
+    messages:[{id:1,turn_id:turnId,role:'user',author_id:'viewer',content:'Inspect the renderer.',created_at:at(0)},
+      ...[2,3].map(id=>({id,turn_id:`steer-${id}`,role:'user',author_id:'viewer',content:`Follow-up ${id}.`,created_at:at(id*10)}))],
+    workProgress:{messages:[{id:'inspection',phase:'commentary',text:'Inspecting the renderer.',created_at:at(5)}],
+      tools:[{id:'delegate',name:'delegate_task',status:'running',created_at:at(8),finished_at:null}],
+      subagents:[{id:'child',parent_id:turnId,parent_name:null,name:'Kepler',avatar:0,depth:0,status:'running',
+        created_at:at(9),updated_at:at(12),messages:[{id:'child-update',phase:'commentary',text:'Checking the composer.',created_at:at(12)}],
+        tools:[],messages_limited:false,tools_limited:false}]},
+  });
+  const page=await pageFor(t,'#'+sessionId,width);
+  await page.locator('[data-agent-id="child"]').waitFor();
+  await page.getByRole('button',{name:'Close workspace',exact:true}).click();
+  const empty=page.locator(`[data-segment-id="${turnId}:2"]`),latest=page.locator(`[data-segment-id="${turnId}:3"]`);
+  assert.equal(await empty.count(),0);
+  // Hold a real background poll so the loading state is observable, rather than
+  // checking only the settled DOM after a fast synthetic response.
+  let release;
+  state.holds={[progressPath]:new Promise(resolve=>{release=resolve})};
+  t.after(()=>release());
+  const reads=()=>state.requests.filter(req=>req.path===progressPath).length;
+  const before=reads();
+  await waitFor(()=>reads()>before,'held progress refresh');
+  assert.equal(await empty.count(),0,'a refresh must not insert an empty historical activity section');
+  assert.equal(await page.getByText('Loading saved activity…',{exact:true}).count(),0);
+  await latest.getByText('Subagent Kepler is working…',{exact:true}).waitFor();
+  assert.equal(await latest.getByText('Waiting for the first update…',{exact:true}).count(),0);
+  assert.equal(await page.locator('[data-agent-id="child"]').count(),1,'keep the actual subagent card in its original position');
+  assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true);
+  if(process.env.MOYAI_UI_CAPTURE_DIR) {
+    await fs.mkdir(process.env.MOYAI_UI_CAPTURE_DIR,{recursive:true});
+    await page.screenshot({path:path.join(process.env.MOYAI_UI_CAPTURE_DIR,`steering-progress-${width}.png`)});
+  }
+  state.workProgress.subagents[0].status='completed';
+  state.workProgress.subagents[0].updated_at=at(40);
+  state.workProgress.tools[0].status='completed';
+  state.workProgress.tools[0].finished_at=at(40);
+  delete state.holds[progressPath];release();
+  await latest.getByText('Continuing the current task with your update…',{exact:true}).waitFor();
+  assert.equal(await latest.getByText('Subagent Kepler is working…',{exact:true}).count(),0);
+  state.httpErrors={[`GET:${progressPath}`]:{status:503,body:'Temporarily unavailable'}};
+  await latest.getByRole('alert').waitFor();
+  assert.equal(await empty.count(),0);
+  await page.getByText('Inspecting the renderer.',{exact:true}).waitFor();
+  state.httpErrors={};
+  state.workProgress.messages.push({id:'continued',phase:'commentary',text:'Applying your update.',created_at:at(45)});
+  await latest.getByRole('button',{name:'Retry',exact:true}).click();
+  await latest.getByText('Applying your update.',{exact:true}).waitFor();
+  assert.equal(await latest.getByRole('alert').count(),0);
+  assert.equal(await empty.count(),0);
+});
+
+for(const width of [1440,768,320])test(`delegation opens workspace once without stealing the draft at ${width}px`,async t=>{
+  const start=Date.now()-60000,at=seconds=>new Date(start+seconds*1000).toISOString();
+  const agent={id:'child',session_id:'d'.repeat(32),parent_id:turnId,parent_name:null,name:'Kepler',avatar:0,
+    depth:0,status:'running',created_at:at(5),updated_at:at(5),messages:[],tools:[],messages_limited:false,tools_limited:false};
+  reset({sessionOverrides:{[sessionId]:{surface:'slack'}},
+    turns:[{id:turnId,actor_id:'viewer',status:'running',created_at:at(0),connections:[],usage:{}}],
+    workProgress:{messages:[],tools:[],subagents:[]},
+    workspace:{links:[],files:[],sources:[],subagents:[],subagents_limited:false}});
+  const page=await pageFor(t,'#'+sessionId,width);
+  const input=page.getByRole('textbox',{name:'Message Moyai'}),menu=page.getByRole('dialog',{name:'Workspace resources',exact:true});
+  await input.fill('Keep this draft while the subagent starts.');
+  const chat=await page.locator('.chat-content').boundingBox();
+  state.workProgress.subagents.push(agent);
+  state.workspace.subagents.push({...agent,can_inspect:true,started_at:at(5)});
+  await menu.getByRole('region',{name:'Subagents',exact:true}).getByText('Kepler',{exact:true}).waitFor();
+  assert.equal(await input.evaluate(el=>el===document.activeElement),true,'automatic discovery must not steal typing focus');
+  assert.equal(await input.innerText(),'Keep this draft while the subagent starts.');
+  await assertWorkspaceSeparated(page);
+  const card=page.locator('[data-agent-id="child"]');
+  assert.equal(await card.locator('.work-agent-history').isVisible(),false,'collapsed cards show no report preview');
+  if(process.env.MOYAI_UI_CAPTURE_DIR) {
+    await fs.mkdir(process.env.MOYAI_UI_CAPTURE_DIR,{recursive:true});
+    await page.screenshot({path:path.join(process.env.MOYAI_UI_CAPTURE_DIR,`delegation-open-${width}.png`)});
+  }
+  await input.press('Escape');
+  await menu.waitFor({state:'hidden'});
+  assert.equal(await input.evaluate(el=>el===document.activeElement),true);
+  assert.deepEqual(await page.locator('.chat-content').boundingBox(),chat,'dismissal restores the chat area');
+  const reads=()=>state.requests.filter(req=>req.path.endsWith(`/progress/${turnId}`)).length;
+  const before=reads();
+  await waitFor(()=>reads()>before,'progress poll after dismissal');
+  assert.equal(await menu.count(),0,'polling must respect dismissal');
+  agent.status='completed';agent.updated_at=at(35);
+  agent.messages.push({id:'report',phase:'final_answer',text:'Inspected the repository.\n\n### Current composer\n\nThe full report is available here.',created_at:at(35)});
+  state.workspace.subagents[0].status='idle';
+  await card.getByRole('button',{name:/Kepler Completed/}).waitFor();
+  assert.equal(await card.getByRole('heading').count(),0);
+  assert.equal(await card.getByText('Inspected the repository.',{exact:true}).count(),0);
+  assert.equal(await menu.count(),0,'completion must not reopen the menu');
+  if(process.env.MOYAI_UI_CAPTURE_DIR)await page.screenshot({path:path.join(process.env.MOYAI_UI_CAPTURE_DIR,`delegation-complete-${width}.png`)});
+  await card.locator('.work-agent-heading .work-detail-toggle').click();
+  await card.getByRole('heading',{name:'Current composer',exact:true}).waitFor();
+  await card.getByText('The full report is available here.',{exact:true}).waitFor();
+  await card.locator('.work-agent-heading .work-detail-toggle').click();
+  assert.equal(await card.getByRole('heading').count(),0);
+  await page.getByRole('button',{name:'Open workspace',exact:true}).click();
+  await menu.getByRole('region',{name:'Subagents',exact:true}).getByText('Completed',{exact:true}).waitFor();
+  assert.equal(await menu.evaluate(el=>el.contains(document.activeElement)),true,'manual opening retains keyboard focus behavior');
+  assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true);
+});
+
 test('stopped work without a final answer keeps its updates expanded',async t=>{
   reset({workProgress:{messages:[{id:`commentary:${turnId}:1:0`,phase:'commentary',text:'Observed before interruption.'}]}});
   const page=await pageFor(t);
@@ -1618,6 +2189,57 @@ test('stopped work without a final answer keeps its updates expanded',async t=>{
   await page.reload();
   await page.getByText('Observed before interruption.',{exact:true}).waitFor();
   assert.equal(await page.locator('.message.assistant').count(),0);
+});
+
+for(const width of [1440,768,320])test(`resumed work without a new message stays visible after reload at ${width}px`,async t=>{
+  const at=seconds=>new Date(Date.now()-60000+seconds*1000).toISOString();
+  const resumed='after-login';
+  reset({sessionOverrides:{[sessionId]:{active_turn:resumed}},
+    turns:[{id:resumed,actor_id:'viewer',status:'running',created_at:at(30),connections:[],usage:{}},
+      {id:turnId,actor_id:'viewer',status:'resumed',created_at:at(0),finished_at:at(20),connections:[],usage:{}}],
+    messages:[{id:1,turn_id:turnId,role:'user',author_id:'viewer',content:'Inspect the protected page.',created_at:at(0)}],
+    workProgressByTurn:{[turnId]:{messages:[],tools:[],subagents:[]},[resumed]:{
+      messages:[{id:'after-login-update',phase:'commentary',text:'Inspection continued after sign-in.',created_at:at(35)}],
+      tools:[{id:'resumed-read',name:'read_file',status:'completed',created_at:at(36),finished_at:at(37)}],subagents:[]}},
+    actionDetails:{'resumed-read':{id:'resumed-read',name:'read_file',status:'completed',input:'{"path":"README.md"}',output:'Saved content',restricted:false,input_truncated:false,output_truncated:false}},
+  });
+  const page=await pageFor(t,'#'+sessionId,width);
+  await page.getByText('Inspection continued after sign-in.',{exact:true}).waitFor();
+  assert.equal(await page.locator('.message.user').count(),1);
+  const continuation=page.locator(`.turn-progress[data-turn-id="${resumed}"]`);
+  await continuation.getByRole('button',{name:'1 action',exact:true}).click();
+  await continuation.getByRole('button',{name:'Open Read file action',exact:true}).click();
+  await waitFor(()=>state.requests.some(row=>row.path.endsWith(`/progress/${resumed}/actions/resumed-read`)));
+  await page.reload();
+  await page.getByText('Inspection continued after sign-in.',{exact:true}).waitFor();
+  assert.equal(await page.locator('.message.user').count(),1);
+  assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true);
+});
+
+test('replayed historical actions cannot rapidly cycle the current status label',async t=>{
+  reset({workProgress:{messages:[],subagents:[],tools:[{id:'current',name:'shell',status:'running',created_at:new Date().toISOString()}]}});
+  const page=await pageFor(t);
+  await page.locator('.live-action').getByText('Run command…',{exact:true}).waitFor();
+  await waitFor(()=>clients.size>0);
+  for(let i=0;i<80;i++)emit({type:'tool_call',id:`old-${i}`,name:i%2?'browser_open':'edit_file',created_at:'2020-01-01T00:00:00Z'},i);
+  await page.getByRole('button',{name:'81 actions',exact:true}).waitFor();
+  assert.match(await page.locator('.live-action').innerText(),/^Run command…/);
+  state.workProgress.tools[0].status='completed';
+  await page.locator('.live-action').getByText('Working…',{exact:true}).waitFor();
+});
+
+for(const width of [1440,768,320])test(`Slack links and file upload failures are readable at ${width}px`,async t=>{
+  reset({status:'completed',sessionOverrides:{[sessionId]:{surface:'slack',visibility:'shared',can_manage:true}},
+    slackDelivery:{pending:0,sending:0,rejected:1,rejected_files:1,file_error_codes:['missing_scope']},
+    messages:[{id:1,turn_id:turnId,role:'user',author_id:'viewer',source:'slack',content:'Inspect <https://example.test/repo?a=1&amp;b=2|the repository>. Keep `<https://example.test/literal|code>` literal.'}],
+  });
+  const page=await pageFor(t,'#'+sessionId,width);
+  const link=page.locator('.message-content').getByRole('link',{name:'the repository',exact:true});
+  await link.waitFor();assert.equal(await link.getAttribute('href'),'https://example.test/repo?a=1&b=2');
+  assert.equal(await page.locator('.message-content').getByRole('link',{name:'code',exact:true}).count(),0);
+  await page.getByText(/Slack could not upload 1 file\(s\).*missing_scope/).waitFor();
+  await page.getByRole('button',{name:'Retry delivery',exact:true}).waitFor();
+  assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true);
 });
 
 test('access revocation removes transcript, draft and panel state before reauthorization',async t=>{
@@ -1718,19 +2340,33 @@ for(const width of [1440,768])test(`sidebar collapses to an accessible rail with
   assert.equal(await sidebar.isVisible(),false);
 });
 
-for(const width of [1440,768,320])test(`home and Settings share the same wordmark position and typography at ${width}px`,async t=>{
-  reset();const page=await pageFor(t,'',width);
+for(const theme of ['dark','light'])for(const width of [1440,768,320])test(`home and Settings share the same logo alignment and typography at ${width}px in ${theme}`,async t=>{
+  reset();const page=await pageFor(t,'',width,p=>p.addInitScript(theme=>localStorage.setItem('moyai-appearance',theme),theme));
   if(width<760)await page.getByRole('button',{name:'Toggle conversations',exact:true}).click();
   const brand=page.locator('.moyai-brand');await brand.waitFor();await page.evaluate(()=>document.fonts.ready);
   const metrics=()=>brand.evaluate(el=>{
     const bounds=el.querySelector('span').getBoundingClientRect(), style=getComputedStyle(el), subtitle=getComputedStyle(el.querySelector('small'));
     return {x:bounds.x,y:bounds.y,height:bounds.height,font:style.font,spacing:style.letterSpacing,transform:style.textTransform,subtitle:subtitle.font};
   });
-  const home=await metrics();
+  const logoMetrics=async()=>{
+    const logo=brand.locator('.moyai-brand-mark:visible');
+    assert.equal(await logo.count(),1);
+    assert.equal(await logo.getAttribute('alt'),'');
+    assert.ok((await logo.getAttribute('src')).includes(theme==='dark'?'moyai-mark-white':'moyai-mark-blue'));
+    await logo.evaluate(image=>image.decode());
+    const bounds=await logo.boundingBox(), text=await brand.locator('.moyai-brand-name').boundingBox();
+    assert.equal(bounds.width,20);assert.equal(bounds.height,20);
+    assert.ok(Math.abs(bounds.y+bounds.height/2-text.y-text.height/2)<1,'logo and wordmark are vertically centered');
+    assert.equal(text.x-bounds.x-bounds.width,8,'logo has a consistent 8px gap before the wordmark');
+    assert.equal(await brand.getAttribute('href'),'#');
+    return bounds;
+  };
+  const home=await metrics(), homeLogo=await logoMetrics();
   await page.getByRole('button',{name:'Settings',exact:true}).click();
   await page.getByRole('heading',{name:'Settings',exact:true}).waitFor();
-  assert.equal(await brand.count(),1);assert.equal(await brand.locator('img').count(),0);
+  assert.equal(await brand.count(),1);
   assert.deepEqual(await metrics(),home);
+  assert.deepEqual(await logoMetrics(),homeLogo);
   await brand.click();await page.locator('.home-composer').waitFor();
 });
 
@@ -1799,7 +2435,7 @@ test('source collisions and identically named legacy folders survive paged inven
     [{...session(collision),source:'legacy',key:'legacy:'+collision,title:'Legacy collision',read_only:true,folder:'Original folder',folder_id:'old-folder',pinned:false}],
     [{...session(collision),source:'native',key:'native:'+collision,title:'Native collision',folder:'',pinned:false}],
   ];
-  const page=await pageFor(t,'#run='+legacyId);await groupSidebarByFolder(page);const history=page.locator(`[data-session-key="legacy:${collision}"]`);
+  const page=await pageFor(t,'#run='+legacyId);const history=page.locator(`[data-session-key="legacy:${collision}"]`);
   await page.getByRole('button',{name:/^Original folder/}).click();
   await history.waitFor();assert.equal(await page.getByRole('button',{name:'Folder actions for Original folder'}).count(),0);
   assert.equal(await page.getByRole('button',{name:/Original folder/}).count(),1);
@@ -1807,8 +2443,8 @@ test('source collisions and identically named legacy folders survive paged inven
   await page.getByRole('button',{name:'Show more sessions',exact:true}).click();
   const native=page.locator(`[data-session-key="native:${collision}"]`);await native.waitFor();assert.equal(await history.count(),1);
   assert.equal(await history.locator('a').getAttribute('href'),'#run='+collision);assert.equal(await native.locator('a').getAttribute('href'),'#'+collision);
-  const pageReads=state.requests.filter(req=>req.path==='/api/history/sessions'&&req.query.includes('limit=100')).length;
-  await waitFor(()=>state.requests.filter(req=>req.path==='/api/history/sessions'&&req.query.includes('limit=100')).length>pageReads,'inventory refresh');
+  const pageReads=state.requests.filter(req=>req.path==='/api/history/sessions'&&req.query.includes('limit=20')).length;
+  await waitFor(()=>state.requests.filter(req=>req.path==='/api/history/sessions'&&req.query.includes('limit=20')).length>pageReads,'inventory refresh');
   assert.equal(await history.count(),1);assert.equal(await native.count(),1);
   await page.getByRole('button',{name:'Show archived conversations',exact:true}).click();
   await waitFor(()=>state.requests.some(req=>req.path==='/api/history/sessions'&&req.query.includes('archived=true')&&!req.query.includes('cursor=')));
@@ -2037,7 +2673,7 @@ for(const width of [1440,768,320])test(`ordinary subagent opens a full chat and 
   const page=await pageFor(t,'#'+sessionId);
   await page.setViewportSize({width,height:900});
   await page.getByRole('button',{name:'Open workspace',exact:true}).click();
-  await page.getByRole('region',{name:'Subagents',exact:true}).getByRole('button',{name:'Curie idle',exact:true}).click();
+  await page.getByRole('region',{name:'Subagents',exact:true}).getByRole('button',{name:'Curie Completed',exact:true}).click();
   await page.getByRole('heading',{name:'Curie',exact:true}).waitFor();
   assert.equal(new URL(page.url()).hash,'#'+childId);
   await page.getByText('Parent agent',{exact:true}).waitFor();
@@ -2208,12 +2844,102 @@ test('chat links remain accented and underlined while plain inline code stays ne
   reset({status:'completed',messages:[{id:1,turn_id:turnId,role:'assistant',content:'[BerriAI/moyai](https://github.com/BerriAI/moyai) contains the workspace.\n\n| Path | Description |\n| --- | --- |\n| `native/web/` | Frontend |\n\nStart with [`docs/architecture.md`](https://github.com/BerriAI/moyai/blob/main/docs/architecture.md).'}]});
   const page=await pageFor(t);
   const link=page.getByRole('link',{name:'BerriAI/moyai',exact:true});await link.waitFor();
-  const code=page.locator('.message-content td code');
-  const linkedCode=page.locator('.message-content a code');
-  const linkColor=await link.evaluate(el=>getComputedStyle(el).color);
-  assert.notEqual(await code.evaluate(el=>getComputedStyle(el).color),linkColor);
-  assert.equal(await linkedCode.evaluate(el=>getComputedStyle(el).color),linkColor);
-  assert.equal(await link.evaluate(el=>getComputedStyle(el).textDecorationLine),'underline');
+  // Read all styles in one browser turn. A session refresh can replace the
+  // Markdown between locator resolution and evaluate, detaching the old link.
+  const snapshot=await page.waitForFunction(()=>{
+    const message=document.querySelector('.message-content');
+    const link=message?.querySelector('a[href="https://github.com/BerriAI/moyai"]');
+    const code=message?.querySelector('td code');
+    const linkedCode=message?.querySelector('a code');
+    if(!link||!code||!linkedCode)return false;
+    return {linkColor:getComputedStyle(link).color,codeColor:getComputedStyle(code).color,
+      linkedCodeColor:getComputedStyle(linkedCode).color,decoration:getComputedStyle(link).textDecorationLine};
+  });
+  const styles=await snapshot.jsonValue();
+  assert.notEqual(styles.linkColor,'');
+  assert.notEqual(styles.codeColor,styles.linkColor);
+  assert.equal(styles.linkedCodeColor,styles.linkColor);
+  assert.equal(styles.decoration,'underline');
+});
+
+// Large synthetic screenshots reproduce the overflowing assistant image report.
+async function imageConversation(t,width=1440) {
+  reset({status:'completed',messages:[{id:1,turn_id:turnId,role:'assistant',content:
+    'Here is the updated workspace preview.\n\n![Workspace preview](/test-images/wide.svg)\n\nThe complete screenshot is available above.\n\n![Mobile preview](/test-images/tall.svg)\n\n[![Linked preview](/test-images/small.svg)](https://example.test/design)\n\n![Missing preview](/test-images/missing.svg)'}]});
+  return pageFor(t,'#'+sessionId,width,async page=>{
+    await page.route('**/test-images/*',route=>{
+      const name=new URL(route.request().url()).pathname.split('/').pop();
+      if(name==='missing.svg')return route.fulfill({status:404,body:'Missing image'});
+      const [w,h]=name==='wide.svg'?[2400,1400]:name==='tall.svg'?[600,1800]:[80,40];
+      return route.fulfill({contentType:'image/svg+xml',body:`<svg xmlns="http://www.w3.org/2000/svg" width="${w}" height="${h}" viewBox="0 0 1200 700" preserveAspectRatio="none">
+        <rect width="1200" height="700" fill="#161619"/><rect width="230" height="700" fill="#222226"/>
+        <g fill="#aaa8b0" font-family="sans-serif" font-size="20"><text x="28" y="50">Workspace</text><text x="28" y="120">New conversation</text><text x="28" y="175">Recent work</text></g>
+        <text x="280" y="90" fill="#ededf0" font-family="sans-serif" font-size="30">Your workspace, in focus</text>
+        <rect x="280" y="130" width="870" height="380" rx="12" fill="#25252a" stroke="#45454c"/>
+        <path d="M320 440L450 360L560 395L690 240L820 290L960 180L1110 210" fill="none" stroke="#b39aef" stroke-width="8"/>
+        <text x="280" y="575" fill="#aaa8b0" font-family="sans-serif" font-size="22">Synthetic preview for layout verification</text></svg>`});
+    });
+  });
+}
+
+for(const width of [1440,768,320])test(`chat image previews fit the conversation at ${width}px`,async t=>{
+  const page=await imageConversation(t,width);
+  const image=page.getByRole('img',{name:'Workspace preview',exact:true});await image.waitFor();
+  await image.evaluate(el=>el.decode());
+  await image.scrollIntoViewIfNeeded();
+  if(process.env.MOYAI_IMAGE_SCREENSHOTS)await page.screenshot({path:path.join(process.env.MOYAI_IMAGE_SCREENSHOTS,`chat-images-${width}-dark.png`)});
+  const geometry=await image.evaluate(el=>{
+    const box=el.getBoundingClientRect(),column=el.closest('.message-content').getBoundingClientRect();
+    return {left:box.left,right:box.right,width:box.width,height:box.height,columnLeft:column.left,columnRight:column.right,ratio:el.naturalWidth/el.naturalHeight};
+  });
+  assert(geometry.left>=geometry.columnLeft&&geometry.right<=geometry.columnRight+1,JSON.stringify(geometry));
+  assert(geometry.height<=280&&geometry.width<=480,JSON.stringify(geometry));
+  assert(Math.abs(geometry.width/geometry.height-geometry.ratio)<0.01,'Keep the entire screenshot in its original proportions');
+  const trigger=await page.getByRole('button',{name:'Enlarge image: Workspace preview',exact:true}).boundingBox();
+  const preview=await image.boundingBox();
+  assert(preview.y>=trigger.y&&preview.y+preview.height<=trigger.y+trigger.height,'The preview must fit its clickable card without overlapping following text');
+  const tall=page.getByRole('img',{name:'Mobile preview',exact:true});await tall.evaluate(el=>el.decode());
+  assert((await tall.boundingBox()).height<=280);
+  assert.equal(await page.locator('.transcript').evaluate(el=>el.scrollWidth<=el.clientWidth),true);
+  assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true);
+  if(width<760)await page.getByRole('button',{name:'Toggle conversations',exact:true}).click();
+  await page.getByRole('button',{name:'Switch to light mode',exact:true}).click();
+  if(width<760)await page.getByRole('button',{name:'Toggle conversations',exact:true}).click();
+  await image.scrollIntoViewIfNeeded();
+  if(process.env.MOYAI_IMAGE_SCREENSHOTS)await page.screenshot({path:path.join(process.env.MOYAI_IMAGE_SCREENSHOTS,`chat-images-${width}-light.png`)});
+});
+
+for(const width of [1440,320])test(`chat image viewer supports keyboard and fits at ${width}px`,async t=>{
+  const page=await imageConversation(t,width);
+  const trigger=page.getByRole('button',{name:'Enlarge image: Workspace preview',exact:true});await trigger.waitFor();
+  await trigger.focus();await page.keyboard.press('Enter');
+  const dialog=page.getByRole('dialog',{name:'Workspace preview',exact:true});await dialog.waitFor();
+  const image=dialog.getByRole('img',{name:'Workspace preview',exact:true});await image.evaluate(el=>el.decode());
+  const box=await dialog.boundingBox();assert(box.x>=0&&box.x+box.width<=width&&box.y>=0&&box.y+box.height<=1000);
+  assert(box.width>=Math.min(1120,width-32)-1,'The viewer should use the available screen width');
+  assert.equal(await dialog.evaluate(el=>el.scrollWidth<=el.clientWidth),true);
+  const original=dialog.getByRole('link',{name:'Open original',exact:true});
+  assert.equal(await original.getAttribute('href'),'/test-images/wide.svg');assert.equal(await original.getAttribute('target'),'_blank');
+  if(process.env.MOYAI_IMAGE_SCREENSHOTS)await page.screenshot({path:path.join(process.env.MOYAI_IMAGE_SCREENSHOTS,`chat-image-viewer-${width}.png`)});
+  await page.keyboard.press('Escape');await dialog.waitFor({state:'detached'});
+  await page.waitForFunction(()=>document.activeElement?.getAttribute('aria-label')==='Enlarge image: Workspace preview');
+  assert.equal(await trigger.evaluate(el=>el===document.activeElement),true);
+  await trigger.click();await dialog.waitFor();await dialog.getByRole('button',{name:'Close',exact:true}).click();
+  await dialog.waitFor({state:'detached'});
+});
+
+test('chat images preserve image links, small originals, and readable failures',async t=>{
+  const page=await imageConversation(t);
+  const link=page.getByRole('link',{name:'Linked preview',exact:true});await link.waitFor();
+  assert.equal(await link.getAttribute('href'),'https://example.test/design');
+  assert.equal(await link.locator('button, a').count(),0,'Linked images must not contain nested interactive elements');
+  const small=link.locator('img');await small.evaluate(el=>el.decode());
+  assert.equal((await small.boundingBox()).width,80,'Small originals should not be upscaled');
+  await page.getByText('Image unavailable',{exact:true}).waitFor();
+  const missing=page.getByRole('button',{name:'Enlarge image: Missing preview',exact:true});
+  await missing.click();
+  const dialog=page.getByRole('dialog',{name:'Missing preview',exact:true});await dialog.waitFor();
+  assert.equal(await dialog.getByRole('link',{name:'Open original',exact:true}).getAttribute('href'),'/test-images/missing.svg');
 });
 
 test('highlighted code preserves literal markup and copies the original text',async t=>{
@@ -2397,13 +3123,15 @@ for(const width of [1440,768,320])test(`Slack attribution, original files and de
     sessionOverrides:{[sessionId]:{surface:'slack',visibility:'shared',can_manage:true}},
     slackDelivery:{pending:0,sending:1,rejected:0},
     messages:[{id:1,turn_id:turnId,role:'user',author_id:'slack:TTEST:UME',author_name:'Avery Chen',is_self:true,
-      source:'slack',source_timestamp:'1792281607.232469',source_url:'/api/sessions/source-test',content:'Please review the launch notes.',
+      source:'slack',source_timestamp:'1792281607.232469',source_url:'/api/sessions/source-test',content:'Please review <@U0B1TDTHL4Q>’s launch notes.',
+      slack_mentions:{U0B1TDTHL4Q:'Jordan Lee'},
       attachments:[{id:'original-pdf',name:'Launch notes.pdf',media_type:'application/pdf',size:321}]},
       {id:2,turn_id:'other',role:'user',author_id:'slack:TTEST:UOTHER',author_name:'Jordan Lee',is_self:false,
        source:'slack',content:'The updated dates are ready.',edited:true,edited_after_start:true}]});
   const page=await pageFor(t,'#'+sessionId,width);
   await page.locator('.message-author').filter({hasText:'Avery Chen · You'}).waitFor();
   await page.getByText('Jordan Lee',{exact:true}).waitFor();
+  await page.getByText('Please review @Jordan Lee’s launch notes.',{exact:true}).waitFor();
   await page.getByText('Launch notes.pdf',{exact:true}).waitFor();
   assert.equal(await page.locator('.message-author img[alt="Slack"]').count(),2);
   assert.equal(await page.getByRole('link',{name:'Open message in Slack'}).count(),1);
@@ -2413,6 +3141,11 @@ for(const width of [1440,768,320])test(`Slack attribution, original files and de
   assert.equal(await page.getByRole('button',{name:'Retry delivery'}).count(),0);
   assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=window.innerWidth),true);
   await page.screenshot({path:`/tmp/moyai-slack-ui-${width}.png`});
+  if(width<760)await page.getByRole('button',{name:'Toggle conversations',exact:true}).click();
+  await page.getByRole('button',{name:'Switch to light mode',exact:true}).click();
+  if(width<760)await page.getByRole('button',{name:'Toggle conversations',exact:true}).click();
+  await page.getByText('Please review @Jordan Lee’s launch notes.',{exact:true}).waitFor();
+  await page.screenshot({path:`/tmp/moyai-slack-ui-${width}-light.png`});
   state.slackDelivery={pending:0,sending:0,rejected:1};
   await page.reload();
   await page.getByRole('button',{name:'Retry delivery'}).waitFor();
@@ -2435,4 +3168,115 @@ test('Slack history pages beyond 200 and navigation discards the old transcript 
   release();
   await page.getByText('The next conversation body.',{exact:true}).waitFor();
   assert.equal(await page.getByText('Authored message 205',{exact:true}).count(),0);
+});
+
+for(const width of [1440,768,320])test(`subagent failure before first output shows diagnostics and opens its chat at ${width}px`,async t=>{
+  const childId='d'.repeat(32),created_at=new Date(Date.now()-10000).toISOString(),updated_at=new Date().toISOString();
+  const failure='Subagent failed: PermissionError during agent__moyai__capability__memory__load_snapshot. Open its conversation for failure details.';
+  reset({sessionOverrides:{[childId]:{title:'Solon',status:'failed',parent_session_id:sessionId}},
+    messagesBySession:{[childId]:[{id:1,turn_id:'child-turn',role:'system',source:'delegation',content:'Inspect the repository.'}]},
+    workProgress:{messages:[],tools:[],subagents:[{id:'child-turn',session_id:childId,parent_id:turnId,parent_name:null,
+      name:'Solon',avatar:0,depth:0,status:'failed',created_at,updated_at,tools:[],messages_limited:false,tools_limited:false,
+      messages:[{id:'failure:child-turn',phase:'commentary',text:failure,created_at:updated_at}]}]}});
+  const page=await pageFor(t,'#'+sessionId,width);
+  const card=page.locator('[data-agent-id="child-turn"]');
+  await card.locator('.work-agent-heading .work-detail-toggle').click();
+  await card.getByText(failure,{exact:true}).waitFor();
+  assert.equal(await card.getByText('No public update was recorded.',{exact:true}).count(),0);
+  assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true);
+  await card.getByRole('button',{name:'Open Solon details',exact:true}).click();
+  const side=page.locator('.side-conversation');
+  await side.getByRole('heading',{name:'Solon',exact:true}).waitFor();
+  assert.equal(new URL(page.url()).hash,'#'+sessionId);
+  await side.getByText('Inspect the repository.',{exact:true}).waitFor();
+  assert.ok(state.requests.some(row=>row.path===`/api/sessions/${childId}`));
+});
+
+for(const theme of ['dark','light'])for(const width of [1440,768])test(`session sidebar resizes and resets at ${width}px in ${theme}`,async t=>{
+  reset({status:'idle'});
+  const page=await pageFor(t,'',width,p=>p.addInitScript(theme=>localStorage.setItem('moyai-appearance',theme),theme));
+  const handle=page.getByRole('separator',{name:'Resize session sidebar'});
+  await handle.waitFor();
+  const sidebar=page.locator('#session-sidebar');
+  const size=async()=>Math.round((await sidebar.boundingBox()).width);
+  const initial=width>1250?240:230;
+  assert.equal(await size(),initial);
+  await page.getByRole('textbox',{name:'Message Moyai'}).fill('Keep this draft while resizing.');
+  await handle.focus();await page.keyboard.press('ArrowRight');
+  assert.equal(await size(),initial+10);
+  await page.keyboard.press('Shift+ArrowRight');assert.equal(await size(),initial+50);
+  await page.keyboard.press('End');assert.equal(await size(),Math.min(440,width-360));
+  await page.keyboard.press('Home');assert.equal(await size(),200);
+  const wordmark=await page.locator('.moyai-brand-name').boundingBox();
+  const search=await page.getByRole('button',{name:'Search sessions & commands',exact:true}).boundingBox();
+  assert.ok(wordmark.x+wordmark.width<=search.x,'brand does not overlap controls at minimum sidebar width');
+  assert.equal(await page.locator('.moyai-brand small').isVisible(),false);
+  assert.equal((await page.locator('.moyai-brand-mark:visible').boundingBox()).width,20);
+  await page.keyboard.press('Enter');assert.equal(await size(),initial);
+  const drag=async delta=>{
+    const box=await handle.boundingBox();
+    await page.mouse.move(box.x+box.width/2,box.y+100);await page.mouse.down();
+    await page.mouse.move(box.x+box.width/2+delta,box.y+100,{steps:6});
+  };
+  await drag(80);await page.mouse.up();assert.equal(await size(),initial+80);
+  await drag(50);await page.keyboard.press('Escape');await page.mouse.up();assert.equal(await size(),initial+80);
+  assert.equal(await page.locator('.sidebar-resize-shield').count(),0);
+  await handle.dblclick();assert.equal(await size(),initial);
+  await drag(-1000);await page.mouse.up();assert.equal(await size(),200);
+  await drag(22);await page.mouse.up();assert.equal(await size(),222);
+  const narrowWordmark=await page.locator('.moyai-brand-name').boundingBox();
+  const narrowSearch=await page.getByRole('button',{name:'Search sessions & commands',exact:true}).boundingBox();
+  assert.ok(narrowWordmark.x+narrowWordmark.width<=narrowSearch.x,'brand stays clear of controls near the byline breakpoint');
+  await drag(1500);await page.mouse.up();assert.equal(await size(),Math.min(440,width-360));
+  assert.equal(await page.getByRole('textbox',{name:'Message Moyai'}).innerText(),'Keep this draft while resizing.');
+  assert.equal(await page.locator('.app').evaluate(el=>el.scrollWidth<=el.clientWidth),true);
+  await page.getByRole('button',{name:'Close sidebar',exact:true}).click();
+  await handle.waitFor({state:'hidden'});assert.equal(await size(),52);
+  await page.getByRole('button',{name:'Open sidebar',exact:true}).click();
+  assert.equal(await size(),Math.min(440,width-360));
+  await page.locator('.new-chat').click();assert.equal(await size(),initial);
+  await handle.focus();await page.keyboard.press('Shift+ArrowRight');
+  await page.locator(`[data-session-key="native:${sessionId}"] > a`).click();
+  await page.getByRole('heading',{name:'Current native work',exact:true}).waitFor();assert.equal(await size(),initial);
+  await handle.focus();await page.keyboard.press('Shift+ArrowRight');
+  await page.locator('.new-chat').click();
+  await page.getByRole('heading',{name:'What are we building?'}).waitFor();assert.equal(await size(),initial);
+  await handle.focus();await page.keyboard.press('End');
+  await page.setViewportSize({width:650,height:1000});
+  await page.waitForFunction(()=>document.querySelector('[aria-label="Resize session sidebar"]').getAttribute('aria-valuenow')==='290');
+  assert.equal(await size(),290);
+  await page.setViewportSize({width:320,height:700});
+  await page.getByRole('button',{name:'Toggle conversations',exact:true}).click();
+  await handle.waitFor({state:'hidden'});
+  assert.equal(await page.locator('.app').evaluate(el=>el.scrollWidth<=el.clientWidth),true);
+});
+
+for(const theme of ['dark','light'])test(`README composer demo in ${theme}`,async t=>{
+  resetReadmeDemo();
+  const page=await browser.newPage({viewport:{width:1280,height:800},deviceScaleFactor:2,reducedMotion:'reduce'});
+  t.after(()=>page.close());
+  const errors=[];page.on('pageerror',error=>errors.push(error.message));
+  await page.addInitScript(theme=>localStorage.setItem('moyai-appearance',theme),theme);
+  await page.goto(base+'/');
+  await page.getByRole('heading',{name:'What are we building?',exact:true}).waitFor();
+  const editor=page.getByRole('textbox',{name:'Message Moyai'});
+  await editor.fill('Add keyboard shortcuts to the command palette.\nMatch the existing components, test the interactions, and open a PR with a preview.');
+  await page.getByText('Alex Morgan',{exact:true}).waitFor();
+  await page.locator('#session-sidebar').getByText('Fix streaming reconnects',{exact:true}).waitFor();
+  const resize=page.getByRole('separator',{name:'Resize session sidebar'});
+  await resize.focus();await page.keyboard.press('Shift+ArrowRight');await page.keyboard.press('Shift+ArrowRight');
+  assert.equal(await resize.getAttribute('aria-valuenow'),'320');
+  await page.evaluate(()=>document.fonts.ready);
+  assert.equal(await page.getByRole('button',{name:'Send message',exact:true}).isEnabled(),true);
+  assert.equal(await page.locator('.app').evaluate(el=>el.scrollWidth<=el.clientWidth),true);
+  assert.equal(await page.locator('.session-row').count(),6);
+  assert.deepEqual(errors,[]);
+  if(process.env.MOYAI_README_CAPTURE_DIR){
+    // Fail capture rather than silently publishing a fallback-font screenshot.
+    assert.equal(await page.evaluate(()=>[...document.fonts].some(font=>font.family.includes('General Sans')&&font.status==='loaded')),true);
+    await fs.mkdir(process.env.MOYAI_README_CAPTURE_DIR,{recursive:true});
+    await page.getByRole('heading',{name:'What are we building?',exact:true}).click();
+    await page.mouse.move(1260,780);
+    await page.screenshot({path:path.join(process.env.MOYAI_README_CAPTURE_DIR,theme==='dark'?'home.png':'home-light.png'),animations:'disabled'});
+  }
 });

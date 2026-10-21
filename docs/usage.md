@@ -2,26 +2,44 @@
 
 [Install Moyai](../README.md#run-locally) · [Documentation](README.md)
 
+## Resize the session sidebar
+
+On desktop, drag the right edge of the left session sidebar to change its width.
+Focus the divider and use Left/Right arrows for 10px steps, or Shift+Left/Right
+for 40px steps. Home/End select the limits; Enter or double-click restores the
+default. Escape cancels a drag. Closing and reopening the sidebar keeps its
+width in the current view; switching conversations or choosing **New session**
+resets it. Mobile navigation remains an overlay. Right-hand panels are unchanged.
+
 ## Goals
 
 `/goal` is a native Moyai command available out of the box in ordinary web chats.
-No personal skill, connector, or installation is required. Select **Goal** from
-the `/` picker, or send `/goal <objective>`. Moyai saves the objective with the
-conversation and continues across turns until it verifies completion.
+No personal skill, connector, or installation is required. Type `/goal` and
+select **Goal** from the picker. A **Goal** chip appears below the input; type
+your objective and send it. Hover or focus the chip to remove goal mode without
+losing your draft. You can also send `/goal <objective>` directly.
+Moyai saves the objective with the conversation and continues across turns until
+it reports verified completion. Sending another goal stops the previous goal's
+work and starts the replacement, retaining your conversation history.
 Files attached when starting a goal are retained with its first message, using
 the same upload permissions as ordinary chat. Goal controls leave unsent files
 in the composer.
 
 | Command | Action |
 | --- | --- |
-| `/goal <objective>` | Start a goal, or replace a completed goal. |
-| `/goal` | View the goal; open the setup dialog if none exists. |
+| `/goal <objective>` | Start a goal, replacing any existing goal. |
+| `/goal` | Select goal mode in the composer. |
 | `/goal edit <objective>` | Revise the objective; active goals continue with the revision. |
 | `/goal pause` | Pause work and automatic continuation. |
 | `/goal resume` | Resume the saved goal with its original model and accounts. |
 | `/goal clear` | Stop goal work and remove the goal; retain the conversation. |
 
-The goal panel shows its status, completed turns, token usage, and controls.
+The compact bar above the input shows the objective, status, elapsed turn time,
+completed turns, and token usage. Use **Pause goal** or **Resume goal** to control
+work, **Clear goal** to stop and remove it, or **Expand goal** to edit it in the
+side panel. The original message keeps its **Sent as goal** label after editing
+or clearing. No token budget is set by default; the editor's **Goal details**
+contains the optional budget.
 Objectives accept up to 4,000 characters. Follow-up messages steer the work
 without replacing the objective. Questions and approval requests still require
 their normal answers; goal mode never grants additional permissions.
@@ -75,8 +93,8 @@ an existing conversation beside the Computer, Activity, Plan and Files panel.
 Drop files anywhere in the chat column, choose **Attach**, or paste an image
 with Command/Ctrl+V. New-session, main-chat and side-chat composers show
 removable attachment cards and support file-only messages. A message can contain
-eight files, each up to 20 MB; PNG, JPEG, GIF and WebP images are limited to 8 MB
-and 20 megapixels each. Zip a folder before attaching it.
+eight files, each up to 20 MB, including PNG, JPEG, GIF and WebP images.
+Images must also be no larger than 20 megapixels. Zip a folder before attaching it.
 Uploads are stored in encrypted objects; admission binds each upload to its
 owner's chosen conversation. Images use native Pydantic `BinaryContent`,
 including when steering a run. Other originals are available through the shared
@@ -125,7 +143,10 @@ after opening its sign-in page. The requester sees **Browser sign-in needed**,
 the website and reason, and Computer opens once for that request. Closing the
 panel keeps it closed until **Open Computer** is selected; reloading a waiting
 conversation restores the request. Take control, sign in inside Chromium, then
-release control and select **I've signed in**. Moyai resumes and must inspect
+select **I've signed in**. This returns your computer control, including control
+held by another of your browser tabs, and resumes Moyai in one step. Another
+person's active control and an unsettled computer action still block the handoff.
+Moyai must inspect
 the page to verify access. Confirmation is not an authentication-success check.
 **Cancel sign-in** resumes with a cancellation so Moyai can explain or continue
 independent work. These requests do not time out and only the original requester
@@ -134,8 +155,10 @@ can answer. A changed computer requires cancelling and making a fresh request.
 Opening the computer starts a real X desktop in the same sandbox, with Chromium open and a taskbar.
 The panel shows the desktop itself. Click **Take control** on the screen to
 click, type, paste text and scroll, using Chromium's own tabs and address bar.
-Expand the panel for more space. The small **Release control** overlay appears
-on hover or keyboard focus; Ctrl+Shift+Escape also returns control. Leaving or
+Expand the panel for more space. A **Release control** button stays visible above
+the desktop while you control it, including when the stream disconnects or
+another of your tabs holds control;
+Ctrl+Shift+Escape also returns control. Leaving or
 reloading the page releases this browser's control.
 
 Desktop access follows session visibility and rechecks the workspace's current
@@ -188,7 +211,8 @@ history and has its own computer. In the left sidebar, children nest beneath the
 parent in a collapsible group. Select a child to open its full conversation, or
 choose **Open in side chat** from its row, menu, or Workspace entry to chat with
 the same child in the right panel. The parent stays open and keeps its draft.
-Older SDK subagents retain their requester-only answer and recorded-steps panels.
+Older SDK subagents expose their answers and recorded steps to everyone who can
+read the parent conversation.
 See [Subagent chats](subagent-chats.md) for lifecycle and migration details. Saving a
 file with `save_artifact` adds an output, and `attach_link` adds a PR, external
 output or source. PR links in the public transcript also appear as mentioned PRs.

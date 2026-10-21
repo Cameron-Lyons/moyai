@@ -5,10 +5,13 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any, cast
 from urllib.parse import quote
 
+from app.connector_errors import ConnectorError
 from app.db import database as source_database
 from app.github import Publish as LegacyPublish
 from app.github import Update, workflow_changes
@@ -81,24 +84,83 @@ class Publications:
             authorize=lambda: self.service.check(self.scope, self.grant), recheck=method == "GET",
         )
 
+    async def governed(self, *, write: bool) -> None:
+        # Each credential release rechecks the live role and session policy.
+        governance = getattr(self.database, "governance", None)
+        if governance is not None:
+            await governance.connection(self.scope, self.grant, write=write)
+
     async def token(self, *, workflows: bool = False) -> str:
         await self.service.check(self.scope, self.grant)
         if self.grant.read_only:
             raise ToolFailed("This selected GitHub connection is read only.")
+        await self.governed(write=True)
         token = await self.service.execution.call(lambda bound: bound.github.installation_token(
             credentials=bound.github.saved_credentials(), repository=self.target, write=True, workflows=workflows,
         ))
         await self.service.check(self.scope, self.grant)
         return token
 
+    async def protection_token(self) -> str:
+        """Use installed read access without widening the repository write token."""
+        await self.service.check(self.scope, self.grant)
+        await self.governed(write=False)
+        try:
+            token = await self.service.execution.call(lambda bound: bound.github.installation_token(
+                credentials=bound.github.saved_credentials(), repository=self.target, protection=True,
+            ))
+        except ConnectorError as error:
+            raise ToolFailed(str(error)) from None
+        await self.service.check(self.scope, self.grant)
+        return token
+
     def document(self, row: Operation) -> dict:
         return json.loads(self.database.security.unseal(row.document))
+
+    def require_attempt(self, current: Operation, row: Operation) -> None:
+        if current.original_effect_id != row.original_effect_id or self.document(current).get("preflight_error"):
+            raise ToolFailed("This publication attempt was refused or replaced. It will not dispatch a write.")
+
+    @asynccontextmanager
+    async def attempt(self, ctx: RunContext[RunScope], kind: str, request) -> AsyncIterator[Operation]:
+        row = await self.operation(ctx, kind, request)
+        try:
+            yield row
+        except (ToolFailed, ConnectorError) as error:
+            if await self.refuse_preflight(row, str(error)):
+                raise ToolFailed(
+                    f"{error} No repository write was attempted. After correcting the reported condition, "
+                    "retry with the same request_key and unchanged inputs in a new tool call."
+                ) from None
+            raise ToolFailed(
+                f"{error} This operation may already have attempted writes. Inspect publication_status "
+                "with the original operation and request_key; do not start a replacement publication."
+            ) from None
+
+    async def refuse_preflight(self, row: Operation, reason: str) -> bool:
+        # Share step's lock: either this refusal wins, or the durable dispatch
+        # marker wins. Never turn a partially dispatched operation into a retry.
+        async with self.database.sessions.begin() as db:
+            current = await db.get(Operation, row.id, with_for_update=True)
+            if current is None or current.original_effect_id != row.original_effect_id:
+                return False
+            document = self.document(current)
+            if document["attempts"] or document["steps"] or document.get("result"):
+                return False
+            effect = await db.get(Effect, current.original_effect_id, with_for_update=True)
+            if effect is None or effect.state not in {"pending", "not_dispatched"}:
+                return False
+            document["preflight_error"] = reason
+            current.document, current.updated_at = self.database.security.seal(document), now()
+            effect.state, effect.settled_at = "not_dispatched", now()
+            return True
 
     async def operation(self, ctx: RunContext[RunScope], kind: str, request) -> Operation:
         if not ctx.tool_call_id:
             raise ToolFailed("Publication needs a native tool identity.")
         await self.check_target(request)
-        name = f"github_{self.grant.id[:8]}_{kind}"
+        shared_name = f"github_{kind}"
+        name = shared_name if ctx.tool_name == shared_name else f"github_{self.grant.id[:8]}_{kind}"
         stored_kind = {
             "request_pull_request_write_access": "pr_write_access",
             "request_pr_lifecycle_access": "pr_lifecycle_access",
@@ -127,6 +189,21 @@ class Publications:
                     or row.repository_id != self.target
                 ):
                     raise ToolFailed("This request key belongs to different intent or GitHub authority.")
+                document = self.document(row)
+                previous = await db.get(Effect, row.original_effect_id, with_for_update=True)
+                if (
+                    receipt.state == "pending" and previous is not None
+                    and previous.state in {"not_dispatched", "failed"}
+                    and not document["attempts"] and not document["steps"] and not document.get("result")
+                    and effect != row.original_effect_id
+                ):
+                    # A fresh reservation may retry a proven no-write refusal,
+                    # including an old failed turn. Keep its Effect as evidence.
+                    # Changing the owner under the dispatch lock fences delayed
+                    # executions that still hold the previous Operation object.
+                    row.original_effect_id, row.turn_id = effect, self.scope.turn_id
+                    document.pop("preflight_error", None)
+                    row.document, row.updated_at = self.database.security.seal(document), now()
                 return row
             row = Operation(
                 id=identity, session_id=self.scope.session_id, turn_id=self.scope.turn_id,
@@ -145,6 +222,7 @@ class Publications:
         async with self.database.sessions.begin() as db:
             current = await db.get(Operation, row.id, with_for_update=True)
             assert current is not None
+            self.require_attempt(current, row)
             document = self.document(current)
             document.update(values)
             current.document, current.updated_at = self.database.security.seal(document), now()
@@ -161,6 +239,7 @@ class Publications:
             current = await db.get(Operation, row.id, with_for_update=True)
             if current is None:
                 raise ToolFailed("The publication reservation disappeared.")
+            self.require_attempt(current, row)
             document = self.document(current)
             scopes = document.setdefault("required_authorities", {})
             previous = scopes.get(str(number))
@@ -178,14 +257,18 @@ class Publications:
             original_turn = await db.get(Turn, row.turn_id)
             if current is None or effect is None or original_turn is None:
                 raise ToolFailed("The original publication evidence is unavailable.")
+            self.require_attempt(current, row)
             confirmed = effect.settled_at or now()
             if row.kind in {"create_pull_request", "open_pull_request"}:
                 original = replace(self.scope, turn_id=row.turn_id, model=original_turn.model)
-                name = f"github_{self.grant.id[:8]}_{row.kind}"
+                name = effect.tool_name
                 base = result.get("base")
                 repository = (base.get("repo") or {}).get("full_name", "") if isinstance(base, dict) else ""
                 owner, _, repo = repository.partition("/") if isinstance(repository, str) else ("", "", "")
-                receipt = creation_receipt(original, name, {"owner": owner, "repo": repo}, result, confirmed)
+                receipt = creation_receipt(
+                    original, name, {"owner": owner, "repo": repo}, result, confirmed,
+                    connection_id=row.connection_id,
+                )
                 if receipt is None or receipt.repository_id != self.target:
                     raise ToolFailed("GitHub returned no verifiable creation receipt.")
             document = self.document(current)
@@ -205,6 +288,7 @@ class Publications:
             await self.authorize(db)
             current = await db.get(Operation, row.id, with_for_update=True)
             assert current is not None
+            self.require_attempt(current, row)
             document = self.document(current)
             if key in document["steps"]:
                 return document["steps"][key]
@@ -459,7 +543,9 @@ class Publications:
         document = self.document(row)
         if document.get("result"):
             await self.finish(row, document["result"])
-        return {"status": "confirmed" if document.get("result") else "incomplete",
+        return {"status": "confirmed" if document.get("result") else
+                          "not_dispatched" if document.get("preflight_error") else "incomplete",
+                **({"error": document["preflight_error"]} if document.get("preflight_error") else {}),
                 "result": document.get("result"), "attempted_steps": document["attempts"],
                 "confirmed_steps": list(document["steps"]), "branch": document.get("branch")}
 

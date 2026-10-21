@@ -54,6 +54,23 @@ Without the test database environment, PostgreSQL cases skip. A passing local
 SQLite-only run is not full qualification. Native tests may download Temporal
 binaries and take around 15 minutes; avoid editing runtime code during a full run.
 
+## README composer screenshots
+
+The browser fixture renders the real frontend with synthetic accounts, sessions,
+and model labels. It fills an unsent draft and widens the sidebar using its
+keyboard control. Regenerate both theme variants from the repository root:
+
+```sh
+MOYAI_README_CAPTURE_DIR=docs/assets/native node --test \
+  --test-name-pattern='README composer demo' tests/browser/native_product_shell.cjs
+```
+
+Captures are 2560 × 1600 PNGs (1280 × 800 CSS pixels at 2×). The capture waits for
+fonts and fails if General Sans did not load, rather than silently saving a
+fallback-font image. Fontshare must be reachable. Inspect both images at README
+size before committing. These images demonstrate presentation, not live model
+or connected-service execution.
+
 ## Frontend and image
 
 ```sh
@@ -86,3 +103,33 @@ application health, user sign-in, historical files, a real model/Modal
 task and continuation/approval recovery. Preserve uncertain
 external effects for explicit reconciliation. No deployment is performed by the
 consolidation test suite.
+
+## Coding computer Node runtime
+
+`native/src/moyai/coding_image.py` owns the exact Node version and the official
+AMD64/ARM64 archive checksums. Fresh and restored Modal project images use its
+installer, and `scripts/lambda_image.py` includes that same installer in the
+Lambda image package. Install Node before any image-bundled npm dependencies.
+Do not add a separate Node pin to a preview launcher.
+
+The bundled npm configuration enables `engine-strict`, so an incompatible
+dependency reports an install error instead of leaving a partially usable
+preview. A repository that requires another Node version must select that
+runtime before both installation and execution. Changing the image pin rebuilds
+the Node layer and bundled dependencies. Existing live computers and filesystem
+checkpoints retain their environments; reinstall project dependencies from the
+lockfile when changing their runtime.
+
+With Docker available, run:
+
+```sh
+uv run --frozen python -m scripts.node_runtime_smoke --platform linux/amd64
+uv run --frozen python -m scripts.node_runtime_smoke --platform linux/arm64
+```
+
+The native runtime CI runs both architectures. It builds the complete packaged
+Lambda image, installs the repository's locked dependencies, loads Tailwind's
+native binding, and starts Vite through npm. The install hook, npm and preview
+must all report the pinned Node executable/version. It also checks that an
+unsupported Node engine fails installation. These container checks supplement
+actual-app model/Modal verification.

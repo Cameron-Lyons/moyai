@@ -7,7 +7,7 @@ import hmac
 from typing import TYPE_CHECKING, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from .models import User
 
@@ -21,6 +21,87 @@ class RoleEdit(BaseModel):
     revision: int = Field(ge=0)
     replace_custom_role: bool = False
     access_revision: int | None = Field(default=None, ge=0)
+
+
+_OUTPUT = ConfigDict(json_schema_serialization_defaults_required=True)
+
+
+class ProductUserRoleResult(BaseModel):
+    model_config = _OUTPUT
+    email: str
+    role: Literal["admin", "member"]
+    revision: int
+
+
+class ProductAccessRole(BaseModel):
+    model_config = _OUTPUT
+    id: str
+    name: str
+    revision: int
+
+
+class ProductDirectoryUser(BaseModel):
+    model_config = _OUTPUT
+    id: str
+    username: str
+    display_name: str
+    enabled: bool
+    email: str
+    name: str | None
+    has_signed_in: bool
+    last_seen: str | None
+    role: str
+    revision: int
+    # Custom role (None for built-in access) and SCIM state.
+    access_role: ProductAccessRole | None
+    active: bool
+    permissions: list[str]
+
+
+class ProductRoleActivity(BaseModel):
+    model_config = _OUTPUT
+    email: str
+    previous_role: str
+    role: str
+    actor: str
+    created_at: str
+
+
+class ProductDirectoryCapabilities(BaseModel):
+    model_config = _OUTPUT
+    read: bool
+    create: bool
+    update: bool
+    delete: bool
+    roles: bool
+
+
+class ProductUserDirectory(BaseModel):
+    model_config = _OUTPUT
+    users: list[ProductDirectoryUser]
+    activity: list[ProductRoleActivity]
+    domains: list[str]
+    source: Literal["product"]
+    capabilities: ProductDirectoryCapabilities
+    note: str
+
+
+async def user_directory(runtime: Runtime) -> ProductUserDirectory:
+    """GET /api/settings/users in product mode; settings_api owns the route."""
+    product = runtime.product
+    assert product is not None
+    directory = await asyncio.to_thread(product.roles.directory)
+    return ProductUserDirectory.model_validate({
+        **directory,
+        "users": [{
+            **row, "id": row["email"], "username": row["email"],
+            "display_name": row["name"] or row["email"], "enabled": True,
+        } for row in directory["users"]],
+        "source": "product", "capabilities": {
+            "read": True, "create": False, "update": False, "delete": False, "roles": True,
+        },
+        "note": "Organization sign-in manages accounts. Roles are shared with existing Moyai.",
+    })
 
 
 async def password_login(runtime: Runtime, password: str, request: Request, response: Response):
@@ -50,26 +131,8 @@ def routes(runtime: Runtime, actor) -> APIRouter:
     router = APIRouter()
     router.include_router(product.google.routes())
 
-    @router.get("/api/settings/users")
-    async def users(user: User = Depends(actor)):
-        from .product_governance import permission_for_user
-        if not permission_for_user(user, 'users.read'):
-            raise HTTPException(403, "An organization administrator must perform this action.")
-        directory = await asyncio.to_thread(product.roles.directory)
-        return {
-            **directory,
-            "users": [{
-                **row, "id": row["email"], "username": row["email"],
-                "display_name": row["name"] or row["email"], "enabled": True,
-            } for row in directory["users"]],
-            "source": "product", "capabilities": {
-                "read": True, "create": False, "update": False, "delete": False, "roles": True,
-            },
-            "note": "Organization sign-in manages accounts. Roles are shared with existing Moyai.",
-        }
-
-    @router.put("/api/settings/users/role")
-    async def role(body: RoleEdit, request: Request, user: User = Depends(actor)):
+    @router.put("/api/settings/users/role", operation_id="updateProductUserRole")
+    async def role(body: RoleEdit, request: Request, user: User = Depends(actor)) -> ProductUserRoleResult:
         from .product_governance import permission_for_user
         if not permission_for_user(user, 'users.manage'):
             raise HTTPException(403, "An organization administrator must perform this action.")
@@ -80,12 +143,6 @@ def routes(runtime: Runtime, actor) -> APIRouter:
         result = await asyncio.to_thread(
             product.roles.change, RoleChange(**body.model_dump()), info,
         )
-        return result
-
-    @router.post("/api/settings/users")
-    @router.patch("/api/settings/users/{identity}")
-    @router.delete("/api/settings/users/{identity}")
-    async def native_account_mutation(user: User = Depends(actor)):
-        raise HTTPException(409, "Manage this account through organization sign-in and product roles.")
+        return ProductUserRoleResult.model_validate(result)
 
     return router

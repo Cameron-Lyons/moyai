@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, cast
 
 from agentchat.models import UploadFile
 
@@ -21,14 +21,17 @@ class FailureReport:
     @classmethod
     async def for_turn(cls, runtime: Runtime, turn: Turn) -> FailureReport:
         text = (
-            f"This task stopped before it completed: {turn.error}\nDebug log attached."
-            if turn.error else "This task stopped before it completed.\nDebug log attached."
+            f"This task stopped before it completed: {turn.error}"
+            if turn.error else "This task stopped before it completed."
         )
         try:
             async with runtime.database.sessions() as db:
                 actor = await db.get(User, turn.actor_id)
-            if actor is None:
-                raise ValueError("The task requester no longer exists.")
+                if actor is None:
+                    raise ValueError("The task requester no longer exists.")
+                grant = await runtime.database._saved_product_grant(db, turn)
+                if grant is not None:
+                    cast(Any, actor).product_grant = grant
             trace = await debug_trace(runtime, actor, turn.session_id)
             content = json.dumps(trace).encode()
         except Exception as exc:  # noqa: BLE001  # [BLE001] Export failures need fallback JSON.

@@ -14,9 +14,10 @@ from sqlalchemy import select
 
 from .models import Event, Session, Turn, User
 from .product_requester import answer_actor
+from .slack_questions import SlackQuestions
 
 
-def question_results(pending, value: str) -> dict[str, Any]:
+def question_results(pending, value: str | dict[str, Any]) -> dict[str, Any]:
     calls = [call for call in pending.calls if call.tool_name == "ask_user_question"]
     requests = [AskUserRequest.from_tool_call(call) for call in calls]
     headers = [question.header for request in requests for question in request.questions]
@@ -24,7 +25,9 @@ def question_results(pending, value: str) -> dict[str, Any]:
         raise HTTPException(409, "There is no ordinary question to answer. Use the secure form for credential requests.")
     if len(headers) != len(set(headers)):
         raise HTTPException(422, "These questions repeat a heading; answer them in the Moyai session.")
-    if len(headers) == 1 and not value.lstrip().startswith("{"):
+    if isinstance(value, dict):
+        answers = value
+    elif len(headers) == 1 and not value.lstrip().startswith("{"):
         answers = {headers[0]: value.strip()}
     else:
         try:
@@ -99,6 +102,7 @@ async def record_replies(runtime, actor: User, turn: Turn, *, calls=None, approv
 
 async def resume_replies(runtime, actor: User, turn: Turn) -> bool:
     pending = deferred(runtime, turn)
+    await runtime.database.prefetch_session_audiences(actor, [turn.session_id])
     async with runtime.database.sessions.begin() as db:
         calls, approvals = await stored_replies(runtime, db, turn)
         vault = getattr(runtime, "product_secrets", None)
@@ -118,6 +122,7 @@ async def resume_replies(runtime, actor: User, turn: Turn) -> bool:
 
 
 async def answer(slack, sender: User, thread, value: str, *, continuing: bool = False) -> bool:
+    await slack.runtime.database.prefetch_session_audiences(sender, [thread.session_id])
     async with slack.runtime.database.sessions() as db:
         session = await slack.runtime.database.allowed_session(db, thread.session_id, sender)
         turn = await db.get(Turn, session.active_turn) if session.active_turn else None
@@ -127,3 +132,22 @@ async def answer(slack, sender: User, thread, value: str, *, continuing: bool = 
     if not continuing:
         await record_replies(slack.runtime, actor, turn, calls=question_results(deferred(slack.runtime, turn), value))
     return await resume_replies(slack.runtime, actor, turn)
+
+
+async def submit_choices(runtime, actor: User, turn: Turn, pending, state: dict[str, Any]) -> str | None:
+    try:
+        requests = SlackQuestions.requests(pending)
+        if not requests:
+            raise HTTPException(409, "There is no question to answer.")
+        answers = SlackQuestions.answers(requests, state)
+        calls = question_results(pending, answers)
+        actor = await answer_actor(runtime, actor, turn)
+        await record_replies(runtime, actor, turn, calls=calls)
+        resumed = await resume_replies(runtime, actor, turn)
+    except HTTPException as error:
+        if error.status_code >= 500:
+            raise
+        return str(error.detail)
+    if resumed:
+        return None
+    return "Your answer was saved. Complete the remaining approval or secure request to continue."

@@ -25,7 +25,7 @@ from moyai.models import Session
 from moyai.product_governance import ProductGovernance
 from moyai.product_governance_models import ProductSessionPolicy
 from moyai.product_schema import (
-    GOAL_SCHEMA_VERSION,
+    AUTOMATION_CHAT_SCHEMA_VERSION,
     GOVERNANCE_SCHEMA_VERSION,
     migrate_product_schema,
     verify_product_schema,
@@ -150,7 +150,9 @@ async def test_tools_filtered_and_rechecked_for_policy_and_live_role(governed):
                                               ('github_aaaaaaaa_create_pull_request', False)])
     assert allowed == ['read_file', 'shell']
     await governance.check_tool(scope, 'read_file', read_only=True)
-    for name in ('write_file', 'github_aaaaaaaa_create_pull_request', 'open_pull_request'):
+    # Grant-prefixed and shared repository (`github_<operation>`) names are both GitHub writes.
+    for name in ('write_file', 'github_aaaaaaaa_create_pull_request', 'open_pull_request',
+                 'github_create_pull_request', 'github_publish_branch', 'github_submit_review'):
         with pytest.raises(HTTPException):
             await governance.check_tool(scope, name, read_only=False)
     await member_role(product, ['sessions.read'])
@@ -158,6 +160,20 @@ async def test_tools_filtered_and_rechecked_for_policy_and_live_role(governed):
         await governance.check_tool(scope, 'read_file', read_only=True)
     with pytest.raises(HTTPException):
         await product.database.create_session(product.actor, NewSession())
+
+
+async def test_policy_editor_operation_names_allowlist_shared_repository_tools(governed):
+    product = governed
+    selected = await profile(product, {'tools': ['create_pull_request', 'checkout'], 'connected_apps': ['github']})
+    await defaults(product, selected)
+    _, _, prepared = await authority.active_turn(product)
+    governance, scope = product.database.governance, prepared.scope
+    tools = [('github_create_pull_request', False), ('github_checkout', True), ('github_publish_branch', False)]
+    assert await governance.tools(scope, tools) == ['github_create_pull_request', 'github_checkout']
+    await member_role(product, ['sessions.create', 'sessions.read', 'connections.read'])
+    _, _, prepared = await authority.active_turn(product)
+    # Without connections.write, the shared repository writes are refused too.
+    assert await governance.tools(prepared.scope, tools) == ['github_checkout']
 
 
 async def test_scim_reactivation_never_revives_an_earlier_native_grant(governed):
@@ -257,9 +273,10 @@ async def test_zero_budget_and_unpriced_cost_block_before_provider_call(inferenc
     assert len(ctx.calls) == 3
 
 
-async def test_governance_schema_adds_receipt_without_changing_v22(product_database):
+async def test_governance_schema_adds_receipt_without_changing_v23(product_database):
     product = product_database
-    await migrate_product_schema(product.source, schema=product.schema, source_schema='moyai', version=GOAL_SCHEMA_VERSION)
+    await migrate_product_schema(product.source, schema=product.schema, source_schema='moyai',
+                                 version=AUTOMATION_CHAT_SCHEMA_VERSION)
     async with product.source.connect() as db:
         before = (await db.execute(text(f'SELECT * FROM "{product.schema}".moyai_app_schema_versions'))).all()
     await migrate_product_schema(product.source, schema=product.schema, source_schema='moyai')
@@ -334,8 +351,9 @@ def test_empty_profile_keeps_existing_automation_authority_digest():
     from test_product_automations import definition
 
     from moyai.product_automations import _digest, definition_digest
-    value = definition().model_dump(mode='json')
-    value.pop('security_profile_id')
+    # Absent optional fields (no profile selection, no chat destination) are
+    # omitted, so enabled definitions written before either keep their digest.
+    value = definition().model_dump(mode='json', exclude={'security_profile_id', 'session_id'})
     assert definition_digest(definition()) == _digest(value)
     assert definition_digest(definition(security_profile_id='a' * 32)) != _digest(value)
 
@@ -354,61 +372,117 @@ async def test_custom_publisher_uses_native_skill_writer_without_builtin_admin(s
         assert await db.scalar(text('SELECT scope FROM moyai.skills WHERE id=:id'), {'id': created['id']}) == 'organization'
 
 
-async def test_spend_management_without_read_permission_does_not_return_usage(governed):
+def governance_client(product, **services):
     import httpx
     from fastapi import APIRouter, FastAPI
 
     from moyai.product_governance_routes import routes
+    database = services.pop('database', product.database)
+    resources = product.database.governance.product
+    resources.scim = SimpleNamespace(router=lambda: APIRouter())
+    for name, service in services.items():
+        setattr(resources, name, service)
+    app = FastAPI()
+    app.include_router(routes(SimpleNamespace(product=resources, database=database)))
+    cookie, csrf = google_cookie(product.adapter, sub=product.subject)
+    client = httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://127.0.0.1:8787',
+                               headers={'origin': 'http://127.0.0.1:8787', 'x-csrf-token': csrf})
+    client.cookies.set('workspace_session', cookie)
+    return client
+
+
+SPEND_ROW = {'id': 'organization', 'kind': 'organization', 'subject': '', 'limit_usd': 10.0, 'revision': 1,
+             'updated_at': '2026-10-21T00:00:00Z', 'updated_by': 'admin@example.test'}
+
+
+async def test_spend_management_without_read_permission_does_not_return_usage(governed):
     product = governed
     await member_role(product, ['spend.manage'])
     class ConfigurationOnly:
         def save(self, body, actor):
-            return {'limits': [{'id': 'organization', 'limit_usd': 10}]}
+            return {'limits': [SPEND_ROW]}
         def delete(self, identity, revision, actor):
-            return {'limits': []}
+            return {'id': identity, 'deleted': True}
         def listing(self):
-            pytest.fail('A limit writer without spend.read reached the usage response.')
-    resources = product.database.governance.product
-    resources.scim = SimpleNamespace(router=lambda: APIRouter())
-    resources.spend_limits = ConfigurationOnly()
-    app = FastAPI()
-    app.include_router(routes(SimpleNamespace(product=resources, database=product.database)))
-    cookie, csrf = google_cookie(product.adapter, sub=product.subject)
-    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://127.0.0.1:8787',
-                                headers={'origin': 'http://127.0.0.1:8787', 'x-csrf-token': csrf}) as client:
-        client.cookies.set('workspace_session', cookie)
+            return {'limits': [SPEND_ROW]}
+    def no_usage():
+        pytest.fail('A limit writer without spend.read reached the usage query.')
+    async with governance_client(product, spend_limits=ConfigurationOnly(),
+                                 database=SimpleNamespace(sessions=no_usage)) as client:
+        configuration = {'limits': [{**SPEND_ROW, 'used_usd': None}], 'usage': None, 'can_manage': True}
         response = await client.put('/api/admin/spend-limits', json={'changes': [{'id': 'organization', 'limit_usd': 10.0, 'revision': 0}]})
-        assert response.status_code == 200 and response.json() == {'limits': [{'id': 'organization', 'limit_usd': 10}]}
+        assert response.status_code == 200 and response.json() == configuration
         response = await client.delete('/api/admin/spend-limits/user:person@example.test?revision=1')
-        assert response.status_code == 200 and response.json() == {'limits': []}
+        assert response.status_code == 200 and response.json() == configuration
         assert (await client.get('/api/admin/spend-limits')).status_code == 403
 
 
-async def test_audit_feed_and_export_apply_the_requested_window(governed):
-    import httpx
-    from fastapi import APIRouter, FastAPI
+async def test_scim_token_creation_returns_the_one_time_token_in_its_record(governed):
+    product = governed
+    record = {'id': 'a' * 32, 'label': 'Okta', 'prefix': 'moyai_scim_aaaaaaaa', 'created_at': '2026-10-21T00:00:00Z',
+              'created_by': 'admin@example.test', 'last_used_at': None, 'revoked_at': None}
+    class Provisioning:
+        def router(self):
+            from fastapi import APIRouter
+            return APIRouter()
+        def create_token(self, label, actor):
+            return {**record, 'label': label}, 'moyai_scim_secret'
+        def revoke_token(self, identity, actor):
+            return {**record, 'revoked_at': '2026-10-21T01:00:00Z'}
+    async with governance_client(product, scim=Provisioning()) as client:
+        created = await client.post('/api/admin/scim/tokens', json={'label': 'Entra'})
+        assert created.status_code == 201 and created.headers['cache-control'] == 'no-store'
+        assert created.json() == {**record, 'label': 'Entra', 'token': 'moyai_scim_secret'}
+        revoked = await client.delete(f"/api/admin/scim/tokens/{record['id']}")
+        assert revoked.status_code == 200 and revoked.json()['revoked_at'] == '2026-10-21T01:00:00Z'
 
-    from moyai.product_governance_routes import routes
+
+async def test_scheduled_chat_destination_cannot_widen_the_workflow_policy(governed):
+    product, governance = governed, governed.database.governance
+    unrestricted = await product.database.create_session(product.actor, NewSession())
+    restricted = await profile(product, {'tools': ['read_file'], 'git_access': 'read'})
+    await defaults(product, restricted)
+    bound = await product.database.create_session(product.actor, NewSession())
+    async with product.database.sessions.begin() as db:
+        await governance.continuation(db, bound.id, restricted)
+        await governance.continuation(db, bound.id)  # The default is the same profile.
+    with pytest.raises(HTTPException, match='allows more than'):
+        async with product.database.sessions.begin() as db:
+            await governance.continuation(db, unrestricted.id, restricted)
+    await defaults(product)  # A narrower chat may serve an unrestricted workflow.
+    async with product.database.sessions.begin() as db:
+        await governance.continuation(db, bound.id)
+
+
+async def test_delegated_child_binds_the_parent_snapshot_not_a_newer_default(governed):
+    from moyai.delegation import DelegationService
+    product = governed
+    selected = await profile(product, {'tools': ['read_file', 'shell'], 'git_access': 'read'})
+    await defaults(product, selected)
+    _, _, prepared = await authority.active_turn(product)
+    await defaults(product)  # A newer unrestricted default must not reach the child.
+    child = await DelegationService(product.database).start(prepared.scope, 'child', 'Work')
+    async with product.database.sessions() as db:
+        bound = await db.get(ProductSessionPolicy, child['session_id'])
+        assert (bound.profile_id, bound.inherited_from) == (selected, prepared.scope.session_id)
+        policy = await product.database.governance.policy(db, child['session_id'])
+        assert policy.tools == ('read_file', 'shell') and policy.git_access == 'read'
+
+
+async def test_audit_feed_and_export_apply_the_requested_window(governed):
     product = governed
     seen = []
     class Recording:
         def listing(self, filters, cursor, limit):
             seen.append(filters)
-            return {'events': [], 'next_cursor': None}
+            return {'entries': [], 'next_cursor': None, 'facets': {'actions': [], 'resource_types': []}}
         def export(self, filters, format):
             seen.append(filters)
             return iter(())
-    resources = product.database.governance.product
-    resources.scim = SimpleNamespace(router=lambda: APIRouter())
-    resources.audit = Recording()
-    app = FastAPI()
-    app.include_router(routes(SimpleNamespace(product=resources, database=product.database)))
-    cookie, csrf = google_cookie(product.adapter, sub=product.subject)
     window = {'after': '2026-10-01T00:00:00Z', 'before': '2026-10-16T00:00:00Z'}
-    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://127.0.0.1:8787',
-                                headers={'origin': 'http://127.0.0.1:8787', 'x-csrf-token': csrf}) as client:
-        client.cookies.set('workspace_session', cookie)
+    async with governance_client(product, audit=Recording()) as client:
         assert (await client.get('/api/admin/governance/audit', params=window)).status_code == 200
         assert (await client.get('/api/admin/governance/audit/export', params=window)).status_code == 200
+        assert (await client.get('/api/admin/governance/audit/export', params={'format': 'xml'})).status_code == 422
     assert [(f.after.isoformat(), f.before.isoformat()) for f in seen] == [
         ('2026-10-01T00:00:00+00:00', '2026-10-16T00:00:00+00:00')] * 2

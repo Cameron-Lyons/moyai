@@ -628,7 +628,7 @@ async def unified(product, tmp_path):
     await add_session(updated_at="2026-10-04")
     await add_message()
     runtime = SimpleNamespace(
-        database=SimpleNamespace(sessions=sessions, user=current_user), security=security,
+        database=SimpleNamespace(sessions=sessions, user=current_user, slack_mentions=None), security=security,
         product_identity=product.identity, product_history=product.history, product_files=product.files,
     )
     from types import MethodType
@@ -637,7 +637,9 @@ async def unified(product, tmp_path):
     runtime.database.security = security
     runtime.database.product_identity = None
     runtime.database.product_authority_enabled = False
-    for method in ("allowed_session", "execution_session", "check_source_audience", "same_person"):
+    for method in (
+        "allowed_session", "execution_session", "check_source_audience", "same_person", "prefetch_session_audiences",
+    ):
         setattr(runtime.database, method, MethodType(getattr(Database, method), runtime.database))
 
     async def actor():
@@ -703,6 +705,36 @@ async def test_unified_source_dispatch_does_not_guess_from_identical_id(unified)
         assert result.json()["messages"][0]["content"] == ("Native public answer" if source == "native" else "Public question")
     assert (await unified.client.get(f"/api/history/sessions/{ROOT}")).status_code == 422
     assert (await unified.client.get(f"/api/history/sessions/{ROOT}?source=all")).status_code == 422
+
+
+async def test_typed_history_responses_keep_every_service_key(unified):
+    """Response models must neither drop a key the service returns nor add absent ones as null."""
+    service, reader = unified.service, unified.reader
+    native = json.loads(json.dumps(await service.listing(reader)))
+    assert (await unified.client.get("/api/history/sessions")).json() == native
+    assert {row["source"] for row in native["sessions"]} == {"native", "legacy"}
+    assert all("owner" in row for row in native["sessions"] if row["source"] == "legacy")
+    assert all("owner" not in row for row in native["sessions"] if row["source"] == "native")
+    found = json.loads(json.dumps(await service.listing(reader, query="Native")))
+    assert (await unified.client.get("/api/history/search", params={"q": "Native"})).json() == found
+    for source in ("native", "legacy"):
+        detail = json.loads(json.dumps(await service.detail(reader, ROOT, source)))
+        response = await unified.client.get(f"/api/history/sessions/{ROOT}", params={"source": source})
+        assert response.json() == detail
+        messages = json.loads(json.dumps(await service.messages(reader, ROOT, source)))
+        response = await unified.client.get(f"/api/history/sessions/{ROOT}/messages", params={"source": source})
+        assert response.json() == messages and messages["messages"]
+    history = unified.product.history
+    for path, expected in (
+        ("/api/product/sessions", await history.sessions(reader.principal)),
+        ("/api/product/search?q=Public", await history.search(reader.principal, "Public")),
+        ("/api/product/folders", await history.folders(reader.principal)),
+        (f"/api/product/sessions/{ROOT}", await history.detail(reader.principal, ROOT)),
+        (f"/api/product/sessions/{ROOT}/messages", await history.messages(reader.principal, ROOT)),
+        (f"/api/product/sessions/{ROOT}/children", await history.children(reader.principal, ROOT)),
+        (f"/api/product/sessions/{ROOT}/files", await unified.product.files.listing(reader.principal, ROOT)),
+    ):
+        assert (await unified.client.get(path)).json() == json.loads(json.dumps(expected)), path
 
 
 async def test_merged_pagination_consumes_only_selected_rows_from_each_source(unified):
@@ -838,6 +870,39 @@ async def test_partial_source_outage_never_downgrades_auth_error(unified, monkey
     async def expired(*args, **kwargs):
         raise HTTPException(401, "Expired authority.")
     monkeypatch.setattr(unified.product.history, "sessions", expired)
+    assert (await unified.client.get("/api/history/sessions")).status_code == 401
+
+
+async def test_all_sources_unavailable_is_not_a_successful_empty_history(unified, monkeypatch):
+    async def unavailable(*args, **kwargs):
+        raise HTTPException(503, "Private storage details.")
+
+    monkeypatch.setattr(ProductReadService, "native_list", unavailable)
+    monkeypatch.setattr(unified.product.history, "sessions", unavailable)
+    response = await unified.client.get("/api/history/sessions")
+    assert response.status_code == 503
+    assert "sessions" not in response.json() and "Private storage" not in response.text
+
+
+async def test_unavailable_source_with_empty_healthy_source_is_not_empty_success(unified, monkeypatch):
+    async def empty(*args, **kwargs):
+        return {"sessions": [], "has_more": False, "next_offset": None}
+
+    async def unavailable(*args, **kwargs):
+        raise HTTPException(503, "Private storage details.")
+
+    monkeypatch.setattr(ProductReadService, "native_list", empty)
+    monkeypatch.setattr(unified.product.history, "sessions", unavailable)
+    assert (await unified.client.get("/api/history/sessions")).status_code == 503
+
+
+async def test_history_rechecks_revocation_before_reporting_all_sources_busy(unified, monkeypatch):
+    async def revoked_and_unavailable(*args, **kwargs):
+        unified.product.identity.revoked = True
+        raise HTTPException(503, "Private storage details.")
+
+    monkeypatch.setattr(ProductReadService, "native_list", revoked_and_unavailable)
+    monkeypatch.setattr(unified.product.history, "sessions", revoked_and_unavailable)
     assert (await unified.client.get("/api/history/sessions")).status_code == 401
 
 

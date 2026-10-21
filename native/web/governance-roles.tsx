@@ -5,11 +5,13 @@ import { Input } from "@/components/ui/input"
 import { Textarea } from "@/components/ui/textarea"
 import { Checkbox } from "@/components/ui/checkbox"
 import { TableCell, TableRow } from "@/components/ui/table"
-import { api } from "./api"
 import { Choice, Empty, RecordTable, Toolbar, contains, dateTime } from "./settings"
 import { assignmentBody, groupRoleBody, permissionGroups, permissionLabel, roleBody, roleIdFromName, roleUsage, type RoleDraft } from "./governance-data"
-import { DialogActions, GovConfirm, GovDialog, LoadGate, MutationError, PageActions, Section, StatusBadge, accessChanged, useGovMutation, useGovResource } from "./governance-shared"
-import type { DirectoryGroup, GroupRole, PermissionCatalog, PermissionInfo, Role, RoleAssignment, RolesAdmin } from "./governance-types"
+import { DialogActions, GovConfirm, GovDialog, LoadGate, MutationError, PageActions, Section, StatusBadge, accessChanged, dataOf, useGovMutation, useGovResource } from "./governance-shared"
+import {
+  archiveGovernanceRole, assignGovernanceRole, createGovernanceRole, getPermissions, listGovernanceRoles, updateGovernanceGroupRole, updateGovernanceRole,
+  type DirectoryGroup, type GovernanceGroupRole as GroupRole, type GovernanceRole as Role, type GovernanceRoleAssignment as RoleAssignment, type PermissionInfo, type RolesAdmin,
+} from "./generated/api"
 
 const NO_ROLE = "__none__"
 const exceeds = (role: Role, grantable: readonly string[] | null) => grantable !== null && role.permissions.some(permission => !grantable.includes(permission))
@@ -64,8 +66,8 @@ export function GroupGrantRows({ groups, grants, roles, onChange }: { groups: Di
 }
 
 export function RolesPage() {
-  const catalog = useGovResource<PermissionCatalog>("/permissions")
-  const resource = useGovResource<RolesAdmin>("/admin/roles")
+  const catalog = useGovResource("permissions", signal => getPermissions({ signal }).then(dataOf))
+  const resource = useGovResource("roles", signal => listGovernanceRoles({ signal }).then(dataOf))
   const refresh = () => { catalog.refresh(); resource.refresh() }
   // Any of these changes can alter the signed-in person's own permissions.
   const saved = () => { resource.refresh(); accessChanged() }
@@ -109,11 +111,11 @@ export function RolesPage() {
       {editor && <RoleEditor role={editor === "new" ? undefined : editor} catalog={permissions.catalog} grantable={admin.grantable} onClose={() => setEditor(null)} onSaved={saved} onReload={refresh} />}
       {archive && <GovConfirm title={`Archive ${archive.name}?`} label="Archive role" onReload={refresh} onClose={() => setArchive(null)}
         description={<ArchiveEffect role={archive} admin={admin} />}
-        onConfirm={async () => { await api(`/admin/roles/${encodeURIComponent(archive.id)}?revision=${archive.revision}`, "DELETE"); saved() }} />}
+        onConfirm={async () => { await archiveGovernanceRole({ path: { identity: archive.id }, query: { revision: archive.revision } }); saved() }} />}
       {assign && <AssignmentEditor existing={assign === "new" ? undefined : assign} roles={active} onClose={() => setAssign(null)} onSaved={saved} onReload={refresh} />}
       {remove && <GovConfirm title={`Remove the custom role from ${remove.email}?`} label="Remove custom role" onReload={refresh} onClose={() => setRemove(null)}
         description="They return to the built-in Member permissions on their next request, plus any directory group grants. Administrator access is unchanged."
-        onConfirm={async () => { await api("/admin/role-assignments", "PUT", assignmentBody(remove.email, "member", remove)); saved() }} />}
+        onConfirm={async () => { await assignGovernanceRole({ body: assignmentBody(remove.email, "member", remove) }); saved() }} />}
       {grant && <GroupGrantEditor group={grant} existing={admin.group_roles.find(row => row.group_id === grant.id)} roles={active} onClose={() => setGrant(null)} onSaved={saved} onReload={refresh} />}
     </>
   }}</LoadGate>
@@ -135,8 +137,8 @@ export function RoleEditor({ role, catalog, grantable, onClose, onSaved, onReloa
   return <GovDialog wide title={role ? `Edit ${role.name}` : "New role"} busy={mutation.busy} onClose={onClose}
     description="Choose exactly what people with this role can do. It replaces the Member permission set for each person assigned to it.">
     <form className="ns-fields" onSubmit={event => { event.preventDefault(); void mutation.run(async () => {
-      const body = roleBody(draft, role, catalog)
-      await api(role ? `/admin/roles/${encodeURIComponent(role.id)}` : "/admin/roles", role ? "PUT" : "POST", body)
+      if (role) await updateGovernanceRole({ path: { identity: role.id }, body: roleBody(draft, role, catalog) })
+      else await createGovernanceRole({ body: roleBody(draft, undefined, catalog) })
     }, () => { onSaved(); onClose() }) }}>
       <div className="ns-gov-field-pair">
         <div className="ns-field"><label htmlFor={`${id}-name`}>Role name</label><Input id={`${id}-name`} autoFocus required minLength={2} maxLength={100} disabled={mutation.busy} value={draft.name}
@@ -171,7 +173,7 @@ export function AssignmentEditor({ existing, roles, onClose, onSaved, onReload }
   const [roleId, setRoleId] = useState(existing && roles.some(role => role.id === existing.role_id) ? existing.role_id : roles[0]?.id ?? "")
   return <GovDialog title={existing ? `Change role for ${existing.email}` : "Assign a custom role"} busy={mutation.busy} onClose={onClose}
     description="The role replaces this person’s Member permissions on their next request. Directory group grants still add permissions.">
-    <form className="ns-fields" onSubmit={event => { event.preventDefault(); void mutation.run(() => api("/admin/role-assignments", "PUT", assignmentBody(email, roleId, existing)), () => { onSaved(); onClose() }) }}>
+    <form className="ns-fields" onSubmit={event => { event.preventDefault(); void mutation.run(async () => { await assignGovernanceRole({ body: assignmentBody(email, roleId, existing) }) }, () => { onSaved(); onClose() }) }}>
       <div className="ns-field"><label htmlFor={`${id}-email`}>Work email</label><Input id={`${id}-email`} type="email" autoFocus={!existing} required maxLength={254} autoComplete="off" disabled={mutation.busy || Boolean(existing)} value={email} onChange={event => setEmail(event.target.value)} /></div>
       <div className="ns-field"><label htmlFor={`${id}-role`}>Role</label><Choice id={`${id}-role`} label="Role" value={roleId} disabled={mutation.busy} onChange={setRoleId} options={roles.map(role => ({ value: role.id, label: role.name }))} /></div>
       <MutationError mutation={mutation} onReload={() => { onReload(); onClose() }} />
@@ -185,7 +187,7 @@ export function GroupGrantEditor({ group, existing, roles, onClose, onSaved, onR
   const [roleId, setRoleId] = useState(existing?.role_id && roles.some(role => role.id === existing.role_id) ? existing.role_id : NO_ROLE)
   return <GovDialog title={`Grant for ${group.display_name}`} busy={mutation.busy} onClose={onClose}
     description={`Each of the ${group.member_count.toLocaleString()} active members gains this role’s permissions in addition to their own role.`}>
-    <form className="ns-fields" onSubmit={event => { event.preventDefault(); void mutation.run(() => api(`/admin/group-roles/${encodeURIComponent(group.id)}`, "PUT", groupRoleBody(roleId === NO_ROLE ? "" : roleId, existing)), () => { onSaved(); onClose() }) }}>
+    <form className="ns-fields" onSubmit={event => { event.preventDefault(); void mutation.run(async () => { await updateGovernanceGroupRole({ path: { identity: group.id }, body: groupRoleBody(roleId === NO_ROLE ? "" : roleId, existing) }) }, () => { onSaved(); onClose() }) }}>
       <div className="ns-field"><label htmlFor={`${id}-role`}>Additional role</label><Choice id={`${id}-role`} label="Additional role" value={roleId} disabled={mutation.busy} onChange={setRoleId}
         options={[{ value: NO_ROLE, label: "No additional role" }, ...roles.map(role => ({ value: role.id, label: role.name }))]} />
         <p className="ns-field-hint">Removing a grant takes effect on each member’s next request.</p></div>

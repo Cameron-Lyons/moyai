@@ -46,10 +46,13 @@ def test_json_schema_matches_original_public_contract(name):
     if event is not None:
         assert event["properties"]["session_id"]["maxLength"] == 36
         event["properties"]["session_id"]["maxLength"] = 32
-    # Governance adds an optional, separately authorized selection. Preserve
-    # the original schema receipt for every other field.
+    # Chat continuation adds one optional destination and governance adds an
+    # optional, separately authorized selection. Retain the original contract otherwise.
     definition = schema if name == "Definition" else schema.get("$defs", {}).get("Definition")
     if definition is not None:
+        destination = definition["properties"].pop("session_id")
+        assert destination["default"] is None
+        assert "session_id" not in definition.get("required", [])
         selection = definition["properties"].pop("security_profile_id")
         assert selection == {"default": "", "pattern": "^([0-9a-f]{32})?$", "title": "Security Profile Id", "type": "string"}
     assert hashlib.sha256(json.dumps(schema, sort_keys=True).encode()).hexdigest() == SCHEMAS[name]

@@ -44,6 +44,7 @@ class Settings(BaseSettings):
     moyai_native_object_format: str = ""
     moyai_worker_deployment: str = Field(default="", pattern=r"^(?:[A-Za-z0-9][A-Za-z0-9_-]{0,127})?$")
     moyai_worker_build_id: str = Field(default="", pattern=r"^(?:[A-Za-z0-9][A-Za-z0-9_-]{0,127})?$")
+    moyai_worker_adoption_bridge: bool = False
     moyai_database_url: str = Field(default='', repr=False)
     moyai_database_initialize: bool = False
     moyai_schema_mode: Literal['auto', 'verify'] = 'auto'
@@ -65,6 +66,11 @@ class Settings(BaseSettings):
     def worker_deployment_identity(self) -> "Settings":
         if bool(self.moyai_worker_deployment) != bool(self.moyai_worker_build_id):
             raise ValueError('Worker deployment name and build ID must be configured together.')
+        if self.moyai_worker_adoption_bridge and (
+            self.moyai_core != 'pydantic' or not self.moyai_worker_deployment
+            or self.moyai_runtime_role == 'standalone'
+        ):
+            raise ValueError('Worker adoption bridging requires a distributed native role and a worker version.')
         return self
 
     @model_validator(mode='after')
@@ -171,7 +177,7 @@ class Settings(BaseSettings):
     password_login_enabled: bool = True
     google_client_id: str = ""
     google_client_secret: str = ""
-    google_allowed_domains: str = "berri.ai"
+    google_allowed_domains: str = ""
     google_admin_emails: str = ""
     organization_name: str = Field(default="Internal team", min_length=1, max_length=80)
     session_secret: str = ""

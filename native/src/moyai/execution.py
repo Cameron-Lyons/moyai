@@ -53,7 +53,10 @@ class AuthorizedActivity(ActivityInboundInterceptor):
                 # live authorization for NEW work. Prechecking a retry here
                 # would discard a child committed before steering or Stop.
                 async with self.database.sessions() as db:
-                    if name != "agent__moyai__capability__moyai_interactive_delegation__start":
+                    if name not in {
+                        "agent__moyai__capability__moyai_interactive_delegation__start",
+                        "agent__moyai__capability__moyai_interactive_delegation__send_message",
+                    }:
                         await self.database.authorize_scope(scope, input_id=input_id, db=db)
                     governance = self.database.governance
                     if governance is not None and name.endswith('__call_tool'):

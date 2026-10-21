@@ -4,14 +4,17 @@ import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Textarea } from "@/components/ui/textarea"
 import { Checkbox } from "@/components/ui/checkbox"
-import { api } from "./api"
 import { Choice, Empty, Toolbar, contains, dateTime } from "./settings"
 import { defaultsBody, policyBody, policyDraft, policySummary, type PolicyDraft, type ScopeMode } from "./governance-data"
-import { DialogActions, GovConfirm, GovDialog, LoadGate, MutationError, PageActions, Section, StatusBadge, useGovMutation, useGovResource } from "./governance-shared"
-import type { GitAccess, ProfileDefaults, SecurityProfile, SecurityProfilesAdmin } from "./governance-types"
+import { DialogActions, GovConfirm, GovDialog, LoadGate, MutationError, PageActions, Section, StatusBadge, dataOf, useGovMutation, useGovResource } from "./governance-shared"
+import {
+  createSecurityProfile, disableSecurityProfile, listSecurityProfiles, updateSecurityProfile, updateSecurityProfileDefaults,
+  type PolicyCatalog as Catalog, type SecurityProfileDefaults as ProfileDefaults, type SecurityProfileView as SecurityProfile, type SecurityProfilesAdmin,
+} from "./generated/api"
+import type { ConnectedApp, GitAccess } from "./governance-types"
 
 const NONE = "__none__"
-type Catalog = SecurityProfilesAdmin["catalog"]
+const toggled = <T,>(list: readonly T[], value: T, checked: boolean): T[] => checked ? [...new Set([...list, value])] : list.filter(item => item !== value)
 
 export function ProfileRows({ profiles, defaults, catalog, onEdit, onDisable, onEnable }: {
   profiles: SecurityProfile[]; defaults: ProfileDefaults; catalog: Catalog
@@ -40,7 +43,7 @@ export function ProfileRows({ profiles, defaults, catalog, onEdit, onDisable, on
 }
 
 export function SecurityPoliciesPage() {
-  const resource = useGovResource<SecurityProfilesAdmin>("/admin/security-profiles")
+  const resource = useGovResource("security-profiles", signal => listSecurityProfiles({ signal }).then(dataOf))
   const [search, setSearch] = useState(""), [status, setStatus] = useState("all")
   const [editor, setEditor] = useState<SecurityProfile | "new" | null>(null), [disable, setDisable] = useState<SecurityProfile | null>(null)
   const toggle = useGovMutation()
@@ -58,14 +61,14 @@ export function SecurityPoliciesPage() {
           filter={<Choice label="Policy status" value={status} onChange={setStatus} options={[{ value: "all", label: "All policies" }, { value: "enabled", label: "Enabled" }, { value: "disabled", label: "Disabled" }]} />} />
         <MutationError mutation={toggle} onReload={resource.refresh} />
         {rows.length ? <ProfileRows profiles={rows} defaults={data.defaults} catalog={data.catalog} onEdit={setEditor} onDisable={setDisable}
-          onEnable={profile => void toggle.run(() => api(`/admin/security-profiles/${encodeURIComponent(profile.id)}`, "PUT", { name: profile.name, enabled: true, policy: profile.policy, revision: profile.revision }), resource.refresh)} />
+          onEnable={profile => void toggle.run(() => updateSecurityProfile({ path: { identity: profile.id }, body: { name: profile.name, enabled: true, policy: profile.policy, revision: profile.revision } }), resource.refresh)} />
           : data.profiles.length ? <Empty filtered noun="policies" onClear={() => { setSearch(""); setStatus("all") }} />
             : <div className="ns-empty"><h3>No security policies yet</h3><p>Sessions are unrestricted until you create a policy and choose it as the default or mandatory policy.</p></div>}
       </Section>
       {editor && <PolicyEditor profile={editor === "new" ? undefined : editor} catalog={data.catalog} defaults={data.defaults} onClose={() => setEditor(null)} onSaved={resource.refresh} />}
       {disable && <GovConfirm title={`Disable ${disable.name}?`} label="Disable policy" onReload={resource.refresh} onClose={() => setDisable(null)}
         description="People can no longer choose it for new sessions. Sessions that already started with it keep their recorded policy. You can enable it again later."
-        onConfirm={async () => { await api(`/admin/security-profiles/${encodeURIComponent(disable.id)}?revision=${disable.revision}`, "DELETE"); resource.refresh() }} />}
+        onConfirm={async () => { await disableSecurityProfile({ path: { identity: disable.id }, query: { revision: disable.revision } }); resource.refresh() }} />}
     </>
   }}</LoadGate>
 }
@@ -86,7 +89,7 @@ function DefaultsForm({ admin, onSaved }: { admin: SecurityProfilesAdmin; onSave
   const dirty = value(defaultId) !== admin.defaults.default_profile_id || value(mandatoryId) !== admin.defaults.mandatory_profile_id
   if (!admin.profiles.length) return <p className="ns-muted">Create a policy below to choose organization defaults.</p>
   return <form className="ns-gov-defaults" onSubmit={event => { event.preventDefault(); setSaved(false)
-    void mutation.run(() => api("/admin/security-profiles/defaults", "PUT", defaultsBody(value(defaultId), value(mandatoryId), admin.defaults.revision, admin.profiles)), () => { setSaved(true); onSaved() }) }}>
+    void mutation.run(async () => { await updateSecurityProfileDefaults({ body: defaultsBody(value(defaultId), value(mandatoryId), admin.defaults.revision, admin.profiles) }) }, () => { setSaved(true); onSaved() }) }}>
     <div className="ns-gov-field-pair">
       <div className="ns-field"><label htmlFor={`${id}-default`}>Default for new sessions</label><Choice id={`${id}-default`} label="Default for new sessions" value={defaultId} disabled={mutation.busy} onChange={next => { setDefaultId(next); setSaved(false) }} options={options(admin.defaults.default_profile_id, "No default (unrestricted)")} />
         <p className="ns-field-hint">People can pick another enabled policy when they start a session.</p></div>
@@ -112,7 +115,8 @@ export function PolicyEditor({ profile, catalog, defaults, onClose, onSaved }: {
   const [draft, setDraft] = useState<PolicyDraft>(() => policyDraft(profile))
   const [toolFilter, setToolFilter] = useState("")
   const change = (patch: Partial<PolicyDraft>) => setDraft(previous => ({ ...previous, ...patch }))
-  const pick = (key: "app_ids" | "tool_ids", value: string, checked: boolean) => setDraft(previous => ({ ...previous, [key]: checked ? [...new Set([...previous[key], value])] : previous[key].filter(item => item !== value) }))
+  const pickApp = (app: ConnectedApp, checked: boolean) => setDraft(previous => ({ ...previous, app_ids: toggled(previous.app_ids, app, checked) }))
+  const pickTool = (tool: string, checked: boolean) => setDraft(previous => ({ ...previous, tool_ids: toggled(previous.tool_ids, tool, checked) }))
   const inUse = Boolean(profile && (defaults.default_profile_id === profile.id || defaults.mandatory_profile_id === profile.id))
   const known = new Set(catalog.tools.map(tool => tool.id))
   const tools = [...catalog.tools, ...draft.tool_ids.filter(tool => !known.has(tool)).map(tool => ({ id: tool, label: tool, group: "Saved, not in the current catalog" }))]
@@ -121,7 +125,9 @@ export function PolicyEditor({ profile, catalog, defaults, onClose, onSaved }: {
   return <GovDialog wide title={profile ? `Edit ${profile.name}` : "New security policy"} busy={mutation.busy} onClose={onClose}
     description="Saving creates a new revision. Sessions that already started keep the revision they started with.">
     <form className="ns-fields" onSubmit={event => { event.preventDefault(); void mutation.run(async () => {
-      await api(profile ? `/admin/security-profiles/${encodeURIComponent(profile.id)}` : "/admin/security-profiles", profile ? "PUT" : "POST", policyBody(draft, profile))
+      const body = policyBody(draft, profile)
+      if (profile) await updateSecurityProfile({ path: { identity: profile.id }, body })
+      else await createSecurityProfile({ body })
     }, () => { onSaved(); onClose() }) }}>
       <div className="ns-field"><label htmlFor={`${id}-name`}>Policy name</label><Input id={`${id}-name`} autoFocus required maxLength={80} disabled={mutation.busy} value={draft.name} onChange={event => change({ name: event.target.value })} /></div>
       <div className="ns-gov-check"><Checkbox id={`${id}-enabled`} checked={draft.enabled} disabled={mutation.busy || inUse} onCheckedChange={value => change({ enabled: value === true })} aria-describedby={`${id}-enabled-hint`} />
@@ -132,7 +138,7 @@ export function PolicyEditor({ profile, catalog, defaults, onClose, onSaved }: {
           <ScopeChoice id={`${id}-apps`} label="Connected apps" value={draft.apps} disabled={mutation.busy} onChange={apps => change({ apps })} all="All connected apps" selected="Only selected apps" none="No connected apps" />
           <p className="ns-field-hint">{draft.apps === "all" ? "Sessions can use any app connection the person can already use." : draft.apps === "none" ? "Sessions cannot use GitHub, Linear, Slack or Notion connections." : "Sessions can use only the apps checked below."}</p></div>
         {draft.apps === "selected" && <div className="ns-gov-options" role="group" aria-label="Allowed connected apps">{catalog.connected_apps.map(app => <div className="ns-gov-check" key={app.id}>
-          <Checkbox id={`${id}-app-${app.id}`} checked={draft.app_ids.includes(app.id)} disabled={mutation.busy} onCheckedChange={checked => pick("app_ids", app.id, checked === true)} /><div><label htmlFor={`${id}-app-${app.id}`}>{app.label}</label></div></div>)}</div>}
+          <Checkbox id={`${id}-app-${app.id}`} checked={draft.app_ids.includes(app.id)} disabled={mutation.busy} onCheckedChange={checked => pickApp(app.id, checked === true)} /><div><label htmlFor={`${id}-app-${app.id}`}>{app.label}</label></div></div>)}</div>}
       </fieldset>
 
       <fieldset className="ns-gov-policy-block"><legend>Agent tools</legend>
@@ -143,7 +149,7 @@ export function PolicyEditor({ profile, catalog, defaults, onClose, onSaved }: {
           <div className="ns-field"><label htmlFor={`${id}-tool-filter`}>Filter tools</label><Input id={`${id}-tool-filter`} type="search" value={toolFilter} onChange={event => setToolFilter(event.target.value)} /></div>
           <div className="ns-gov-tool-list" role="group" aria-label={`Allowed tools, ${draft.tool_ids.length} selected`} tabIndex={0}>
             {toolGroups.map(group => <fieldset key={group}><legend>{group}</legend>{visibleTools.filter(tool => (tool.group || "Other") === group).map(tool => <div className="ns-gov-check" key={tool.id}>
-              <Checkbox id={`${id}-tool-${tool.id}`} checked={draft.tool_ids.includes(tool.id)} disabled={mutation.busy} aria-describedby={`${id}-tool-${tool.id}-name`} onCheckedChange={checked => pick("tool_ids", tool.id, checked === true)} />
+              <Checkbox id={`${id}-tool-${tool.id}`} checked={draft.tool_ids.includes(tool.id)} disabled={mutation.busy} aria-describedby={`${id}-tool-${tool.id}-name`} onCheckedChange={checked => pickTool(tool.id, checked === true)} />
               <div><label htmlFor={`${id}-tool-${tool.id}`}>{tool.label}</label><small id={`${id}-tool-${tool.id}-name`}><code>{tool.id}</code></small></div></div>)}</fieldset>)}
             {!visibleTools.length && <p className="ns-muted">No tools match this filter.</p>}
           </div>

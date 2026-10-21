@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import csv
 import hashlib
 import io
@@ -15,8 +16,11 @@ from types import SimpleNamespace
 import httpx
 import pytest
 import pytest_asyncio
+from asyncpg import InsufficientPrivilegeError, QueryCanceledError
 from fastapi import FastAPI
 from sqlalchemy import event, insert, text
+from sqlalchemy.exc import OperationalError, SQLAlchemyError
+from sqlalchemy.exc import TimeoutError as DatabaseTimeoutError
 from sqlalchemy.ext.asyncio import create_async_engine
 from test_product_identity import google_cookie, settings_for
 from test_product_identity import product as product_fixture
@@ -366,6 +370,50 @@ async def test_counterpart_lookup_precedes_date_filter_across_midnight(store, ru
     assert len(unresolved.charges) == 1 and unresolved.charges[0].occurred_at is None
 
 
+async def test_reconciliation_reads_period_once_and_follows_new_cross_date_aliases(store, rules, monkeypatch):
+    await seed(store, old=[
+        old_row(id="inside", gateway_id="first-call", created_at="2026-10-02T00:00:00+00:00"),
+        old_row(id="outside-broker", gateway_id="second-call", created_at="2026-09-30T23:59:59+00:00"),
+    ], new=[new_row(provider_request_id="first-call", created_at="2026-09-30T23:59:59+00:00")])
+    original = BillingReader.records
+    inside_reads = 0
+
+    async def counted(reader, *args, **kwargs):
+        nonlocal inside_reads
+        async for row in original(reader, *args, **kwargs):
+            inside_reads += row.get("id") == "inside"
+            yield row
+
+    monkeypatch.setattr(BillingReader, "records", counted)
+    result = await project(store, rules, bindings={
+        SourceRef("native", "native-observation"): NativeBinding(
+            SCOPE, RequestIdentity("broker_request", "outside-broker"), "verified", "1",
+        ),
+    })
+    # The out-of-period broker anchors its native counterpart outside October.
+    # The in-period request must not be fetched again for every closure round.
+    assert len(result.charges) == 1
+    assert result.charges[0].observations[0].source == SourceRef("legacy", "inside")
+    assert result.actual_subtotal == Decimal("0.123400")
+    assert inside_reads == 1
+
+
+async def test_explicit_read_bound_covers_accumulated_counterparts(store, rules):
+    await seed(store, old=[
+        old_row(id="inside", gateway_id="shared-call"),
+        old_row(id="outside-1", gateway_id="shared-call", created_at="2026-09-30T00:00:00+00:00"),
+        old_row(id="outside-2", gateway_id="shared-call", created_at="2026-09-30T00:00:01+00:00"),
+    ])
+    with pytest.raises(BillingReadError, match="too_many_accounting_records"):
+        await project(store, rules, max_records=2)
+
+
+async def test_counterpart_with_missing_date_is_not_silently_discarded(store, rules):
+    await seed(store, old=[old_row(), old_row(id="undated", created_at=None)])
+    with pytest.raises(BillingReadError, match="invalid_accounting_timestamp"):
+        await project(store, rules)
+
+
 async def test_read_bound_and_missing_schema_raise_without_creating_bridge_rows(store, rules):
     await seed(store, old=[old_row(id=f"request-{i}", gateway_id=f"call-{i}") for i in range(3)])
     with pytest.raises(BillingReadError, match="too_many_accounting_records"):
@@ -376,6 +424,177 @@ async def test_read_bound_and_missing_schema_raise_without_creating_bridge_rows(
             await BillingReader(conn).table("missing_source", ["id"], ["id"])
         assert (await conn.exec_driver_sql("SELECT count(*) FROM runs")).scalar_one() == 2
         assert (await conn.exec_driver_sql("SELECT count(*) FROM sqlite_master WHERE name='missing_source'")).scalar_one() == 0
+
+
+async def test_report_exceeds_old_record_ceiling_without_losing_totals_or_detail_pages(
+    billing_product,
+):
+    context = billing_product
+    count = 50_001
+    base = old_row(user_id="google:admin-sub", cost="0.000000000000000001")
+    await seed(context.writer, old=[base], new=[new_row(cost_usd=base["cost"])])
+    async with context.writer.begin() as connection:
+        await connection.execute(text("""
+            WITH RECURSIVE numbers(n) AS (
+                SELECT 1 UNION ALL SELECT n+1 FROM numbers WHERE n<:count
+            )
+            INSERT INTO model_requests(
+                id,run_id,user_id,model,created_at,status,cost,key_hash,gateway_scope,gateway_id,
+                prompt_tokens,completion_tokens,total_tokens
+            )
+            SELECT 'bulk-' || n,'historical-child','google:admin-sub','route',
+                   '2026-10-03T00:00:00+00:00','complete','0.000000000000000001',
+                   :key,:scope,'bulk-call-' || n,12,4,16
+            FROM numbers
+        """), {"count": count - 1, "key": KEY, "scope": GATEWAY})
+    result = await context.service.report(
+        start="2026-10-01", end="2026-10-31", viewer_id="google:admin-sub", offset=50_000,
+    )
+    assert result["total"]["requests"] == count
+    assert Decimal(result["total"]["spend"]) == Decimal("0.000000000000050001")
+    assert result["total"]["total_tokens"] == count * 16
+    assert result["coverage"]["deduplicated_observations"] == 1
+    assert result["request_total"] == count and len(result["request_details"]) == 1
+    assert sum(Decimal(row["spend"] or "0") for row in result["daily"]) == Decimal(result["total"]["spend"])
+    assert result["daily"][-1]["cumulative_spend"] == result["total"]["spend"]
+    assert result["users"][0]["spend"] == result["models"][0]["spend"] == result["total"]["spend"]
+
+
+async def test_report_has_no_internal_deadline_and_caller_cancellation_releases_readers(billing_product, monkeypatch):
+    import moyai.product_billing_routes as billing_routes
+
+    context = billing_product
+    started, cancelled = asyncio.Event(), asyncio.Event()
+    real_read = billing_routes.read_product_billing
+
+    def unexpected_timeout(delay):
+        raise AssertionError(f"The accounting report must not create a fixed deadline ({delay}).")
+
+    async def blocked_read(*args, **kwargs):
+        started.set()
+        try:
+            await asyncio.Future()
+        finally:
+            cancelled.set()
+
+    monkeypatch.setattr(billing_routes.asyncio, "timeout", unexpected_timeout)
+    monkeypatch.setattr(billing_routes, "read_product_billing", blocked_read)
+    task = asyncio.create_task(context.service.report(start="2026-10-01", end="2026-10-31"))
+    try:
+        await asyncio.wait_for(started.wait(), timeout=5)
+        task.cancel()
+        done, _ = await asyncio.wait({task}, timeout=5)
+        assert task in done, "Caller cancellation must stop the report."
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert cancelled.is_set()
+        assert context.source.pool.checkedout() == context.writer.pool.checkedout() == 0
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+    monkeypatch.setattr(billing_routes, "read_product_billing", real_read)
+    result = await context.service.report(start="2026-10-01", end="2026-10-31")
+    assert result["total"]["requests"] == 0
+
+
+async def test_accounting_failure_logs_phase_without_database_details(billing_product, monkeypatch, caplog):
+    import moyai.product_billing_routes as billing_routes
+
+    async def failed_read(*args, **kwargs):
+        raise SQLAlchemyError("PRIVATE_CONNECTION_DETAIL")
+
+    monkeypatch.setattr(billing_routes, "read_product_billing", failed_read)
+    with pytest.raises(SQLAlchemyError):
+        await billing_product.service.report(start="2026-10-01", end="2026-10-31")
+    assert "'phase': 'accounting'" in caplog.text
+    assert "'error_type': 'SQLAlchemyError'" in caplog.text
+    assert "PRIVATE_CONNECTION_DETAIL" not in caplog.text
+
+
+class _PgcodeQueryCancelled(Exception):
+    pgcode = "57014"
+
+
+@pytest.mark.parametrize(("failure", "message"), [
+    (TimeoutError("PRIVATE_TIMEOUT"), "The accounting database did not respond. Please try again."),
+    (DatabaseTimeoutError("PRIVATE_POOL"), "The accounting database did not respond. Please try again."),
+    (
+        OperationalError("PRIVATE_SQL", {"secret": "PRIVATE_PARAMETER"}, QueryCanceledError("PRIVATE_DRIVER")),
+        "The accounting database query was cancelled. Please try again.",
+    ),
+    (
+        OperationalError("PRIVATE_SQL", None, _PgcodeQueryCancelled("PRIVATE_DRIVER")),
+        "The accounting database query was cancelled. Please try again.",
+    ),
+    (
+        OperationalError("PRIVATE_SQL", None, InsufficientPrivilegeError("PRIVATE_DRIVER")),
+        "Product accounting is temporarily unavailable.",
+    ),
+    (SQLAlchemyError("PRIVATE_DATABASE"), "Product accounting is temporarily unavailable."),
+])
+async def test_billing_route_classifies_driver_failures_without_leaking_details(
+    billing_product, monkeypatch, failure, message,
+):
+    async def unavailable(**kwargs):
+        raise failure
+
+    monkeypatch.setattr(billing_product.service, "report", unavailable)
+    cookie, _ = google_cookie(billing_product.identity)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=billing_product.app), base_url="http://testserver",
+    ) as client:
+        client.cookies.set("workspace_session", cookie)
+        response = await client.get("/api/settings/billing", params={"start": "2026-10-01", "end": "2026-10-31"})
+    assert response.status_code == 503
+    assert response.json() == {"detail": message}
+
+
+def test_reconciliation_population_is_not_limited_by_fetch_bounds(rules, monkeypatch):
+    import moyai.product_billing as billing
+
+    monkeypatch.setattr(billing, "MAX_RECORDS", 2)
+    observations = [
+        legacy_observation(
+            old_row(id=f"request-{index}", gateway_id=f"call-{index}"),
+            rules, MAPPINGS, {}, policy=RecoveryPolicy(), clock=CLOCK,
+        ) for index in range(5)
+    ]
+    assert len(reconcile(observations, period=PERIOD)) == 5
+
+
+async def test_daily_cumulative_totals_preserve_missing_costs_and_exact_precision(billing_product):
+    context = billing_product
+    await seed(context.writer, old=[
+        old_row(id="missing", gateway_id="missing-call", cost=None, cost_next_attempt_at="",
+                user_id="google:admin-sub", created_at="2026-10-02T00:00:00+00:00"),
+        old_row(id="priced", gateway_id="priced-call", cost="0.000000000000000001",
+                user_id="google:admin-sub", created_at="2026-10-03T00:00:00+00:00"),
+        old_row(id="zero", gateway_id="zero-call", cost="0.00",
+                user_id="google:admin-sub", created_at="2026-10-04T00:00:00+00:00"),
+    ])
+    value = await context.service.report(start="2026-10-01", end="2026-10-05")
+    assert [row["cumulative_pricing_status"] for row in value["daily"]] == [
+        "empty", "unpriced", "partial", "partial", "partial",
+    ]
+    assert [row["cumulative_spend"] for row in value["daily"]] == [None, None, "1E-18", "1E-18", "1E-18"]
+    assert value["daily"][-1]["cumulative_spend"] == value["total"]["spend"]
+
+
+async def test_service_reader_keeps_one_sqlite_snapshot_during_cost_recovery(billing_product):
+    context = billing_product
+    await seed(context.writer, old=[old_row()])
+    async with context.writer.connect() as connection:
+        await connection.exec_driver_sql("PRAGMA journal_mode=WAL")
+    async with context.service._reader(context.source, None) as reader:
+        first = await reader.rows("legacy", PERIOD)
+        async with context.writer.begin() as writer:
+            await writer.execute(text("UPDATE model_requests SET cost='9.99'"))
+        again = await reader.rows("legacy", PERIOD)
+        assert first[0]["cost"] == again[0]["cost"] == "0.123400"
+    async with context.service._reader(context.source, None) as reader:
+        fresh = await reader.rows("legacy", PERIOD)
+        assert fresh[0]["cost"] == "9.99"
 
 
 async def test_infrastructure_sources_preserve_credits_estimates_overrides_scope_and_exclusive_end(store, rules):

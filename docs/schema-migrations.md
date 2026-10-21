@@ -5,7 +5,7 @@ This branch's canonical schema requires revision **23**, with compatibility floo
 revision 22. Upstream and the earlier governance branch used revision 22 for
 different changes; neither layout is admitted as the combined schema. Use the
 offline migration for either source. Native application migrations have their
-own version receipts. Pair canonical revision 23 with native governance v23; both must verify before native execution starts.
+own version receipts. Pair canonical revision 23 with native governance v24; both must verify before native execution starts.
 The Pydantic application and Harness have separate receipts; see the
 [deployment contract](pydantic-deployment.md). Coordinate a maintenance window
 for current native upgrades. The retained online migration engine and its ledger

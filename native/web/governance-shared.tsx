@@ -3,28 +3,35 @@ import { Check, Copy, RefreshCw } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog"
-import { api, ApiError, csrfToken } from "./api"
+import { ApiError, csrfToken } from "./api"
 import { dateTime, errorText } from "./settings"
 import { actionLabel, detailText } from "./governance-data"
-import type { AuditEntry } from "./governance-types"
+import type { AuditEntry } from "./generated/api"
 
 export const STALE_MESSAGE = "This changed elsewhere. Reload and try again."
 export type GovResource<T> = { data: T | undefined; loading: boolean; error: string; status: number; refresh: () => void }
 
 export const accessChanged = () => window.dispatchEvent(new Event("moyai:access-changed"))
+/** Unwrap a generated SDK result: `.then(dataOf)`. */
+export const dataOf = <T,>(result: { data: T }): T => result.data
 
-/** Path-keyed GET that drops responses from an earlier path, actor, refresh or replacement. */
-export function useGovResource<T>(path: string | null): GovResource<T> & { replace: (data: T) => void } {
+/**
+ * Keyed read through a generated SDK loader. `name` identifies what `load`
+ * reads (include its parameters); responses from an earlier name, actor,
+ * refresh or replacement are dropped.
+ */
+export function useGovResource<T>(name: string | null, load: (signal: AbortSignal) => Promise<T>): GovResource<T> & { replace: (data: T) => void } {
   const [revision, setRevision] = useState(0)
-  const [state, setState] = useState<{ key: string; data?: T; loading: boolean; error: string; status: number }>({ key: "", loading: Boolean(path), error: "", status: 0 })
+  const [state, setState] = useState<{ key: string; data?: T; loading: boolean; error: string; status: number }>({ key: "", loading: Boolean(name), error: "", status: 0 })
   const replaced = useRef(0)
-  const key = path ? `${path}#${csrfToken()}` : ""
+  const key = name ? `${name}#${csrfToken()}` : ""
   useEffect(() => {
-    if (!path) { setState({ key, loading: false, error: "", status: 0 }); return }
+    if (!name) { setState({ key, loading: false, error: "", status: 0 }); return }
     const controller = new AbortController(), generation = replaced.current
     const stale = () => controller.signal.aborted || replaced.current !== generation
     setState(previous => ({ key, data: previous.key === key ? previous.data : undefined, loading: true, error: "", status: 0 }))
-    void api<T>(path, "GET", undefined, controller.signal).then(
+    // `load` belongs to the render that produced this key, so it reads what `name` names.
+    void load(controller.signal).then(
       data => { if (!stale()) setState({ key, data, loading: false, error: "", status: 200 }) },
       reason => {
         if (stale()) return
@@ -35,7 +42,7 @@ export function useGovResource<T>(path: string | null): GovResource<T> & { repla
       },
     )
     return () => controller.abort()
-  }, [key, path, revision])
+  }, [key, name, revision])
   const refresh = useCallback(() => setRevision(value => value + 1), [])
   // A mutation that returns the full listing supersedes any read still in flight.
   const replace = useCallback((data: T) => { replaced.current++; setState({ key, data, loading: false, error: "", status: 200 }) }, [key])

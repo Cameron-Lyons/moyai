@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import json
 import os
@@ -18,7 +19,7 @@ import test_product_authority as authority
 from app.model_slots import PostgresModelSlots
 from fastapi import FastAPI
 from openai import AsyncOpenAI
-from pydantic_ai.messages import ModelRequest, UserPromptPart
+from pydantic_ai.messages import BinaryContent, ModelRequest, UserPromptPart
 from pydantic_ai.models import ModelRequestParameters
 from pydantic_ai.models.openai import OpenAIResponsesModel
 from pydantic_ai.providers.litellm import LiteLLMProvider
@@ -48,6 +49,7 @@ from moyai.product_billing import (
 )
 from moyai.product_inference import InferenceAdmissionError, ProductInferenceRequest, ProductInferenceService
 from moyai.product_inference_routes import product_inference_routes
+from moyai.product_inference_transport import BrokerUpstream
 
 pytestmark = pytest.mark.skipif(not os.getenv("MOYAI_TEST_POSTGRES"), reason="Disposable local PostgreSQL required.")
 product_database = authority.product_database
@@ -121,6 +123,13 @@ async def requests(ctx):
         return list((await db.scalars(select(ProductInferenceRequest).order_by(
             ProductInferenceRequest.created_at,
         ))).all())
+
+
+async def install_broker_upstream(ctx, handler):
+    await ctx.service.upstream.aclose()
+    ctx.service.upstream = BrokerUpstream(
+        ctx.service.slots.capacity, transport=httpx2.MockTransport(handler),
+    )
 
 
 async def test_admission_captures_exact_scope_and_physical_identity_without_legacy_run(inference):
@@ -621,27 +630,30 @@ async def test_key_rotation_during_recovery_does_not_assign_receipt(inference):
 
 
 @pytest.mark.parametrize("protected", [False, True])
-async def test_broker_relay_has_one_scoped_ledger_and_blocks_paid_replay(inference, monkeypatch, protected):
-    from moyai import product_inference_routes as routes
-
+@pytest.mark.parametrize("image_size", [0, 7 * 1024 * 1024])
+async def test_broker_relay_has_one_scoped_ledger_and_blocks_paid_replay(inference, protected, image_size):
     ctx = inference
     ctx.service.settings = ctx.service.settings.model_copy(update={
         "public_url": "https://workspace.invalid",
         "cloudflare_access_client_id": ACCESS_HEADERS["CF-Access-Client-Id"] if protected else "",
         "cloudflare_access_client_secret": ACCESS_HEADERS["CF-Access-Client-Secret"] if protected else "",
     })
+    image = b"x" * image_size
     calls = []
     async def upstream(request):
         assert request.headers["authorization"] == "Bearer synthetic-inference-key"
         assert all(name not in request.headers for name in ACCESS_HEADERS)
+        if image:
+            assert len(request.content) > 8 * 1024 * 1024
+            body = json.loads(request.content)
+            image_url = body["input"][0]["content"][1]["image_url"]
+            assert base64.b64decode(image_url.split(",", 1)[1]) == image
         calls.append(request)
         return httpx2.Response(
             200, stream=WireStream(json.dumps(payload(cost="0.43")).encode()),
             headers={"content-type": "application/json", "x-litellm-call-id": "exact-call-id"},
         )
-    monkeypatch.setattr(routes, "InferenceUsageTransport", lambda **kwargs: InferenceUsageTransport(
-        httpx2.MockTransport(upstream), **kwargs,
-    ))
+    await install_broker_upstream(ctx, upstream)
     app = FastAPI()
     app.include_router(product_inference_routes(ctx.service))
     broker_calls = []
@@ -683,7 +695,10 @@ async def test_broker_relay_has_one_scoped_ledger_and_blocks_paid_replay(inferen
                         )
                         model = OpenAIResponsesModel("test", provider=LiteLLMProvider(openai_client=sdk))
                         result = await model.request(
-                            [ModelRequest(parts=[UserPromptPart("private input")])],
+                            [ModelRequest(parts=[UserPromptPart(
+                                ["private input", BinaryContent(data=image, media_type="image/png")]
+                                if image else "private input",
+                            )])],
                             None, ModelRequestParameters(),
                         )
                         assert result.usage.input_tokens == 11

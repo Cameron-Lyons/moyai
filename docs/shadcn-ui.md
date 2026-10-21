@@ -29,9 +29,10 @@ workspace and Settings share the collapsed state. Mobile navigation stays an ove
 
 The folder workspace key uses the shared Button and Radix Dialog behavior, including
 Escape, outside dismissal and the Command/Control-period shortcut. Its resource
-menu floats within the chat area and must not resize the transcript, move the
-composer or change their scroll positions. The independent Computer/resource
-side panel still resizes the chat through its existing split.
+menu reserves a 280px column with a 16px gap from the transcript and composer.
+Below 640px of available chat width, it uses a bounded scrolling row above chat
+instead of covering content. Closing the menu restores the full chat area.
+The independent Computer/resource side panel retains its existing split.
 
 Images/fonts belong to `native/web/assets`; public files and the sculpture model
 belong to `native/web/public`. Analytics rendering and automation normalization
@@ -47,11 +48,9 @@ starts drafting, the starters cannot replace their text. Home no longer loads th
 Three.js sculpture or runs the headline decode animation. The full-width shell keeps navigation and independent panels
 compact across viewport sizes.
 
-The sidebar defaults to Needs you, In progress, In review and Backlog, derived
-from current session/child states and accessible, non-draft open pull requests.
-Each conversation family appears once. The grouping control retains the folder
-view with its pins, participation, archive and drag/drop behavior; moving a task
-between status groups is not an action. The chat composer uses a compact rounded
+The sidebar lists Recent and Participated sessions alongside pins and folders,
+newest first, with each session’s status or PR state on a second line under the
+title. The chat composer uses a compact rounded
 entry above its attachment/model toolbar. Fenced Markdown code has a language
 header, local syntax coloring and plain-text copy; unknown languages remain
 readable plain text, and long lines scroll within a focusable region. PR diffs appear above

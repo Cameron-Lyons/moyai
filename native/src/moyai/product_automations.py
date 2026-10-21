@@ -54,8 +54,10 @@ with workflow.unsafe.imports_passed_through():
     from .product_automation_models import (
         ProductAutomationOperation as Operation,
     )
+    from .product_automation_models import ProductAutomationTurn
     from .product_config import CORE_IDENTITY
-    from .product_continuation_models import ProductContinuation
+    from .product_continuation_models import ProductContinuation, ProductExecutionContext
+    from .product_continuation_workspace import fingerprint as workspace_fingerprint
     from .product_identity import ProductGrant
 
 MAX_TRIGGERS = 16
@@ -102,17 +104,144 @@ class Migration(Mutation):
     activate: bool = False
 
 
+# Response models. The generated frontend client is built from these; every
+# key a handler returns must be declared here or FastAPI drops it.
+_OUTPUT = ConfigDict(json_schema_serialization_defaults_required=True)
+
+
+class ProductAutomationTrigger(Trigger):
+    model_config = _OUTPUT
+
+
+class ProductAutomationDefinition(Definition):
+    """A saved canonical definition as returned to the editor."""
+
+    model_config = _OUTPUT
+
+
+class ProductAutomationNativeState(BaseModel):
+    model_config = _OUTPUT
+    core: str
+    generation: int
+    state: Literal["paused", "active", "deleted"]
+    sync_state: str
+    synced_generation: int
+    source_revision: int
+    last_error: str
+
+
+class ProductAutomationSummary(BaseModel):
+    model_config = _OUTPUT
+    id: str
+    revision: int
+    name: str
+    owner_id: str
+    owned: bool
+    legacy_paused: bool
+    triggers: list[ProductAutomationTrigger]
+    native: ProductAutomationNativeState | None
+
+
+class ProductAutomationInventoryCapabilities(BaseModel):
+    model_config = _OUTPUT
+    create: bool
+    read: bool
+
+
+class ProductAutomationInventory(BaseModel):
+    model_config = _OUTPUT
+    automations: list[ProductAutomationSummary]
+    next_offset: int | None
+    source: Literal["canonical_product"]
+    migration: Literal["opt_in"]
+    event_choices: dict[str, list[tuple[str, str]]]
+    capabilities: ProductAutomationInventoryCapabilities
+
+
+class ProductAutomationCapabilities(BaseModel):
+    model_config = _OUTPUT
+    update: bool
+    migrate: bool
+    enable: bool
+    pause: bool
+    retire: bool
+    run: bool
+    webhook: bool
+    test_event: bool
+
+
+class ProductAutomationPreview(BaseModel):
+    model_config = _OUTPUT
+    id: str
+    owner_id: str
+    revision: int
+    definition: ProductAutomationDefinition
+    legacy_paused: bool
+    native: ProductAutomationNativeState | None
+    blockers: list[str]
+    supported: bool
+    activation: str
+    target_core: str
+    overlap: str
+    catchup_seconds: int
+    execution_visibility: str
+    sharing_notice: str
+    legacy_fence: str
+    migration_changes: list[str]
+    capabilities: ProductAutomationCapabilities
+
+
+class ProductAutomationHistoryEntry(BaseModel):
+    model_config = _OUTPUT
+    occurrence: str
+    revision: int
+    outcome: str
+    created_at: str
+    engine: str
+    status: str
+    session_id: str | None
+    turn_id: str | None
+    detail: str
+
+
+class ProductAutomationHistoryPage(BaseModel):
+    model_config = _OUTPUT
+    history: list[ProductAutomationHistoryEntry]
+    next_cursor: str | None
+    untrusted_reference: bool
+
+
+class ProductAutomationMutationResult(BaseModel):
+    model_config = _OUTPUT
+    id: str
+    revision: int
+    outcome: str
+    legacy_paused: bool
+    native_state: str
+    sync_state: str
+    previous_harness: str | None = None
+
+
+class ProductAutomationRunResult(BaseModel):
+    model_config = _OUTPUT
+    status: str
+    session_id: str | None = None
+    turn_id: str | None = None
+
+
 def _digest(value: Any) -> str:
     return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
 
 
 def definition_digest(definition: Definition) -> str:
-    value = definition.model_dump(mode="json")
-    # Preserve already-authorized native workflow receipts when no profile was
-    # selected before governance existed. Explicit selections remain bound.
-    if not value['security_profile_id']:
-        value.pop('security_profile_id')
-    return _digest(value)
+    # Preserve digests of enabled definitions written before chat destinations
+    # and governance: an absent destination or profile selection is omitted.
+    # Explicit selections remain bound.
+    excluded = {name for name, absent in (
+        ("session_id", definition.session_id is None),
+        ("security_profile_id", not definition.security_profile_id),
+    ) if absent}
+    return _digest(definition.model_dump(mode="json", exclude=excluded or None))
 
 
 def _definition(row: dict[str, Any]) -> Definition:
@@ -214,6 +343,18 @@ class ProductAutomationService:
     ) -> list[str]:
         result = []
         project_grants = []
+        if definition.session_id:
+            governance = getattr(self.database, "governance", None)
+            try:
+                await self.database.automation_session(db, row["owner_id"], definition.session_id)
+            except HTTPException:
+                result.append("scheduled_chat_unavailable")
+            else:
+                if governance is not None:
+                    try:
+                        await governance.continuation(db, definition.session_id, definition.security_profile_id)
+                    except HTTPException:
+                        result.append("scheduled_chat_exceeds_security_policy")
         if definition.mode != "modal":
             result.append("execution_mode_not_supported")
         if len(definition.triggers) > MAX_TRIGGERS:
@@ -223,7 +364,7 @@ class ProductAutomationService:
                 result.append("event_trigger_adapter_required")
             else:
                 result.extend(await self.events.blockers(db, row, definition))
-        if definition.plugins:
+        if definition.plugins and not definition.session_id:
             if self.connections is None:
                 result.append("connection_mapping_required")
             else:
@@ -233,7 +374,9 @@ class ProductAutomationService:
                     )
                 except (HTTPException, ValueError):
                     result.append("selected_connections_require_onboarding_or_authorization")
-        if self.workspace is None:
+        if definition.session_id:
+            pass  # The existing chat supplies its computer and connected accounts.
+        elif self.workspace is None:
             if definition.repo_url or definition.github_repository_id:
                 result.append("repository_bootstrap_adapter_required")
             if definition.environment_id != "none":
@@ -307,6 +450,26 @@ class ProductAutomationService:
         identity = workspace.get("repository_id")
         return not workspace.get("repo_url") or (type(identity) is int and identity > 0)
 
+    async def _chat_context(self, db: AsyncSession, owner: str, session_id: str) -> tuple[list[str], dict]:
+        session = await self.database.automation_session(db, owner, session_id)
+        latest = await db.scalar(select(Turn).where(Turn.session_id == session.id).order_by(
+            Turn.created_at.desc(), Turn.id.desc(),
+        ).limit(1))
+        connections = json.loads(latest.connections) if latest else []
+        selected = await db.scalar(select(ProductExecutionContext).join(
+            Turn, Turn.id == ProductExecutionContext.turn_id,
+        ).where(Turn.session_id == session.id).order_by(Turn.created_at.desc(), Turn.id.desc()).limit(1))
+        if selected:
+            workspace = json.loads(self.database.security.unseal(selected.descriptor))
+        else:
+            origin = await db.scalar(select(ProductContinuation).where(
+                ProductContinuation.native_session_id == session.id,
+            ))
+            workspace = json.loads(self.database.security.unseal(origin.workspace))["context"] if origin else {}
+        if selected and workspace_fingerprint(workspace) != selected.fingerprint:
+            raise HTTPException(409, "The chat's saved project context changed.")
+        return sorted(connections), workspace
+
     async def _capture_context(
         self, db: AsyncSession, binding: Binding, definition: Definition, principal: Any,
         *, capture: bool, previous_generation: int,
@@ -314,15 +477,21 @@ class ProductAutomationService:
         if capture:
             connections = []
             grants = []
-            if definition.plugins:
-                grants = await self.connections.resolve_grants(
-                    binding.owner_id, definition.plugins, shared_session=True, surface="automation", db=db,
+            if definition.session_id:
+                connections, workspace = await self._chat_context(db, binding.owner_id, definition.session_id)
+                grants = await self.database.resolve_grants(
+                    db, binding.owner_id, connections, shared_session=True, surface="automation",
                 )
-                connections = sorted({grant.id for grant in grants})
-            workspace = await self.workspace.capture_workspace_context(db, principal, {
-                "repo_url": definition.repo_url, "github_repository_id": definition.github_repository_id,
-                "environment_id": definition.environment_id,
-            }) if self.workspace else {}
+            else:
+                if definition.plugins:
+                    grants = await self.connections.resolve_grants(
+                        binding.owner_id, definition.plugins, shared_session=True, surface="automation", db=db,
+                    )
+                    connections = sorted({grant.id for grant in grants})
+                workspace = await self.workspace.capture_workspace_context(db, principal, {
+                    "repo_url": definition.repo_url, "github_repository_id": definition.github_repository_id,
+                    "environment_id": definition.environment_id,
+                }) if self.workspace else {}
             if not self._repository_identity_known(workspace):
                 raise HTTPException(409, "Verify the repository's permanent identity before enabling this automation.")
             if self.workspace is not None:
@@ -369,6 +538,14 @@ class ProductAutomationService:
             if self.events is None:
                 raise HTTPException(409, "The canonical event adapter is unavailable.")
             await self.events.validate_authority(db, binding, definition, event_authority)
+        if definition.session_id:
+            selected, current_workspace = await self._chat_context(db, binding.owner_id, definition.session_id)
+            if selected != connections or current_workspace != workspace:
+                raise HTTPException(409, "The chat's accounts or project changed. Review and enable the schedule again.")
+            await self.database.resolve_grants(
+                db, binding.owner_id, connections, shared_session=True, surface="automation",
+            )
+            return connections, workspace
         current = []
         if connections:
             if self.connections is None:
@@ -610,11 +787,12 @@ class ProductAutomationService:
             or turn.parent_turn is not None
         ):
             raise HTTPException(403, "Private, delegated and automated work cannot export into shared automations.")
-        if await self.automated_session(db, session.id) or await self.human_origin(db, scope) is None:
+        if scope.authority.surface == "automation" or await self.automated_session(db, session.id) or await self.human_origin(db, scope) is None:
             raise HTTPException(403, "Private, delegated and automated work cannot export into shared automations.")
 
     async def automated_session(self, db: AsyncSession, session_id: str) -> bool:
-        if await db.scalar(select(Occurrence.occurrence).where(Occurrence.session_id == session_id).limit(1)):
+        session = await db.get(Session, session_id)
+        if session and session.surface == "automation":
             return True
         original = await db.scalar(select(ProductContinuation.source_session_id).where(
             ProductContinuation.native_session_id == session_id, ProductContinuation.source_schema == self.schema,
@@ -635,6 +813,8 @@ class ProductAutomationService:
             ):
                 return None
             seen.add(current.id)
+            if await db.get(ProductAutomationTurn, current.id) is not None:
+                return None
             if await self.database._saved_product_grant(db, current) != scope.product_grant:
                 return None
             authored = await db.scalar(select(Message.id).where(
@@ -721,7 +901,7 @@ class ProductAutomationService:
                 required.add(connection_id)
             return value
 
-        if definition.repo_url or definition.github_repository_id:
+        if not definition.session_id and (definition.repo_url or definition.github_repository_id):
             repository = definition.repo_url.removeprefix("https://github.com/").removesuffix(".git")
             value = await resolve(repository, definition.github_repository_id, selected="github" in definition.plugins)
             definition.repo_url, definition.github_repository_id = value["repo_url"], value["repository_id"]
@@ -742,7 +922,13 @@ class ProductAutomationService:
     ) -> dict[str, Any]:
         if not re.fullmatch(r"[A-Za-z0-9_:-]{1,80}", operation_scope):
             raise HTTPException(422, "Invalid operation scope.")
-        fingerprint = _digest({"action": action, "id": identity, "body": body.model_dump(mode="json")})
+        payload = body.model_dump(mode="json")
+        # Request keys recorded before chat destinations or governance keep their fingerprint.
+        if isinstance(body, Save) and body.definition.session_id is None:
+            payload["definition"].pop("session_id", None)
+        if isinstance(body, Save) and not body.definition.security_profile_id:
+            payload["definition"].pop("security_profile_id", None)
+        fingerprint = _digest({"action": action, "id": identity, "body": payload})
         identified, repository_grants = await self.repository_preflight(
             grant, action, identity, body, operation_scope, fingerprint, scope,
         )
@@ -830,6 +1016,10 @@ class ProductAutomationService:
                         )
                         db.add(binding)
                     binding.authority_version = grant.authority_version
+                if action in {"create", "update"} and definition.session_id:
+                    await self.database.automation_session(db, principal.id, definition.session_id)
+                    if governance is not None:
+                        await governance.continuation(db, definition.session_id, definition.security_profile_id)
                 revision = row["revision"] + (action != "create")
                 if action != "create":
                     await db.execute(text(
@@ -1146,7 +1336,7 @@ class ProductAutomationService:
                 db, grant=original, title=f"Automation · {definition.name}",
                 prompt=definition.prompt, model=self.settings.resolve_model(definition.model or None),
                 request_key="automation-" + hashlib.sha256(key.encode()).hexdigest(),
-                connections=connections,
+                connections=connections, session_id=definition.session_id,
                 security_profile_id=definition.security_profile_id,
             )
             if self.workspace is not None:
@@ -1191,6 +1381,7 @@ class ProductAutomationService:
                 db, grant=original, title=f"Automation · {definition.name}", prompt=definition.prompt,
                 model=self.settings.resolve_model(definition.model or None),
                 request_key="automation-" + hashlib.sha256(key.encode()).hexdigest(), connections=connections,
+                session_id=definition.session_id, security_profile_id=definition.security_profile_id,
             )
             if self.workspace is not None:
                 await self.workspace.bind_automation_turn(db, session, turn, workspace)
@@ -1234,6 +1425,12 @@ class ProductAutomationService:
             for row in rows[:limit]:
                 link = await db.get(Occurrence, row["occurrence"])
                 turn = await db.get(Turn, link.turn_id) if link and link.turn_id else None
+                if turn and turn.status == "resumed":
+                    turn = await db.scalar(select(Turn).join(
+                        ProductAutomationTurn, ProductAutomationTurn.turn_id == Turn.id,
+                    ).where(ProductAutomationTurn.origin_turn_id == link.turn_id).order_by(
+                        Turn.created_at.desc(), Turn.id.desc(),
+                    ).limit(1)) or turn
                 session = await db.get(Session, link.session_id) if link and link.session_id else None
                 if session and (session.visibility == "private" or session.deleted):
                     continue
@@ -1349,40 +1546,64 @@ def routes(service: ProductAutomationService | None) -> APIRouter:
     async def principal(request: Request, *, mutation: bool = False):
         return await service.identity.authenticate(request, mutation=mutation)
 
-    @router.get("")
-    async def listing(request: Request, limit: int = Query(50, ge=1, le=50), offset: int = Query(0, ge=0)):
+    @router.get("", operation_id="listProductAutomations")
+    async def listing(
+        request: Request, limit: int = Query(50, ge=1, le=50), offset: int = Query(0, ge=0),
+    ) -> ProductAutomationInventory:
         actor = await principal(request)
-        return await service.listing(actor.grant, limit=limit, offset=offset, shared_library=True)
+        return ProductAutomationInventory.model_validate(
+            await service.listing(actor.grant, limit=limit, offset=offset, shared_library=True),
+        )
 
-    @router.get("/{identity}/preview")
-    async def preview(identity: str, request: Request):
-        return await service.preview((await principal(request)).grant, identity, shared_library=True)
+    @router.get("/{identity}/preview", operation_id="getProductAutomationPreview")
+    async def preview(identity: str, request: Request) -> ProductAutomationPreview:
+        return ProductAutomationPreview.model_validate(
+            await service.preview((await principal(request)).grant, identity, shared_library=True),
+        )
 
-    @router.get("/{identity}/history")
-    async def history(identity: str, request: Request, limit: int = Query(20, ge=1, le=100), cursor: str = ""):
-        return await service.history((await principal(request)).grant, identity, limit=limit, cursor=cursor, shared_library=True)
+    @router.get("/{identity}/history", operation_id="listProductAutomationHistory")
+    async def history(
+        identity: str, request: Request, limit: int = Query(20, ge=1, le=100), cursor: str = "",
+    ) -> ProductAutomationHistoryPage:
+        return ProductAutomationHistoryPage.model_validate(await service.history(
+            (await principal(request)).grant, identity, limit=limit, cursor=cursor, shared_library=True,
+        ))
 
-    @router.post("")
-    async def create(body: Save, request: Request):
-        return await service.mutate((await principal(request, mutation=True)).grant, "create", None, body)
+    @router.post("", operation_id="createProductAutomation")
+    async def create(body: Save, request: Request) -> ProductAutomationMutationResult:
+        return ProductAutomationMutationResult.model_validate(
+            await service.mutate((await principal(request, mutation=True)).grant, "create", None, body),
+        )
 
-    @router.put("/{identity}")
-    async def edit(identity: str, body: Save, request: Request):
-        return await service.mutate((await principal(request, mutation=True)).grant, "update", identity, body)
+    @router.put("/{identity}", operation_id="updateProductAutomation")
+    async def edit(identity: str, body: Save, request: Request) -> ProductAutomationMutationResult:
+        return ProductAutomationMutationResult.model_validate(
+            await service.mutate((await principal(request, mutation=True)).grant, "update", identity, body),
+        )
 
-    @router.post("/{identity}/migrate")
-    async def migrate(identity: str, body: Migration, request: Request):
-        return await service.mutate((await principal(request, mutation=True)).grant, "migrate", identity, body)
+    @router.post("/{identity}/migrate", operation_id="migrateProductAutomation")
+    async def migrate(identity: str, body: Migration, request: Request) -> ProductAutomationMutationResult:
+        return ProductAutomationMutationResult.model_validate(
+            await service.mutate((await principal(request, mutation=True)).grant, "migrate", identity, body),
+        )
 
-    @router.post("/{identity}/run", status_code=202)
-    async def run_now(identity: str, body: Mutation, request: Request):
-        return await service.run_now((await principal(request, mutation=True)).grant, identity, body)
+    @router.post("/{identity}/run", status_code=202, operation_id="runProductAutomation")
+    async def run_now(identity: str, body: Mutation, request: Request) -> ProductAutomationRunResult:
+        return ProductAutomationRunResult.model_validate(
+            await service.run_now((await principal(request, mutation=True)).grant, identity, body),
+        )
 
-    @router.post("/{identity}/{action}")
-    async def state(identity: str, action: Literal["enable", "pause", "retire"], body: Mutation, request: Request):
-        return await service.mutate((await principal(request, mutation=True)).grant, action, identity, body)
+    @router.post("/{identity}/{action}", operation_id="setProductAutomationState")
+    async def state(
+        identity: str, action: Literal["enable", "pause", "retire"], body: Mutation, request: Request,
+    ) -> ProductAutomationMutationResult:
+        return ProductAutomationMutationResult.model_validate(
+            await service.mutate((await principal(request, mutation=True)).grant, action, identity, body),
+        )
 
     if service.events is not None:
+        # Event routes must precede /{identity}/{action} so POST .../webhook and
+        # .../test-event never reach the action route.
         from .product_automation_events import routes as event_routes
         root = APIRouter()
         root.include_router(event_routes(service.events))

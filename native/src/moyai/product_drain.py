@@ -4,18 +4,19 @@ from __future__ import annotations
 
 import hashlib
 import json
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC
 from typing import TYPE_CHECKING
 
-from sqlalchemy import func, select, text
+from sqlalchemy import func, or_, select, text
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from temporalio import activity
 
 from .inference_usage import InferenceUsage
-from .models import Effect, Turn, now
+from .models import ComputerOperation, Effect, Turn, now
 from .product_drain_models import ProductDrainReceipt, ProductDrainState, ProductDrainWorker
 from .product_inference import ProductInferenceRequest
 from .product_role_authority import ProductRoleAuthority
@@ -155,11 +156,46 @@ class ProductDrainService:
             if not paused:
                 if expected[0].requested_drain or any(w.requested_drain for w in workers):
                     raise ProductDrainError("A live maintenance worker has not retired.")
+                await self._require_adoption_retired(db)
                 counts = await self._counts(db, state)
                 if counts["unsafe_turns"] or counts["effects"] or counts["requests"]:
                     raise ProductDrainError("Execution or unknown outcomes still prevent resume.")
             self._write_intent(state, owner, paused=paused, request_key=request_key, fingerprint=fingerprint)
             return self._receipt(state)
+
+    async def _require_adoption_retired(self, db: AsyncSession) -> None:
+        # Seal holds this same native pause row FOR SHARE until its role/member
+        # capture commits. Resume already holds it FOR UPDATE, so it cannot miss
+        # a concurrent seal. No pool or connection is retained through shutdown.
+        from .fleet_registry import SCHEMA
+
+        installed = await db.scalar(text("SELECT to_regclass(:table)"), {"table": SCHEMA + ".schema_version"})
+        if installed is None:
+            return
+        live = await db.scalar(text(f"""
+            SELECT EXISTS(
+                SELECT 1 FROM {SCHEMA}.fleets f
+                JOIN {SCHEMA}.roles r ON r.fleet=f.fleet
+                JOIN {SCHEMA}.members m
+                    ON (m.fleet,m.generation,m.role)=(r.fleet,r.generation,r.role)
+                JOIN pg_stat_activity a ON a.pid=m.owner_pid AND a.backend_start=m.owner_started
+                WHERE f.native_schema=:schema AND f.task_queue=:queue AND f.enabled
+                    AND r.role='worker' AND r.worker_deployment='' AND r.worker_build=''
+                    AND r.state IN ('draining','retired') AND m.drain_request=r.drain_request
+            )
+        """), {"schema": self.native_schema, "queue": self.task_queue})
+        if live:
+            raise ProductDrainError("The sealed adoption worker has not retired.")
+
+    async def require_checkpoint_retirement(self, request_id: str) -> None:
+        """Recheck durable safety immediately before an unversioned poller stops."""
+        async with self.sessions().begin() as db:
+            state = await db.get(ProductDrainState, 1, with_for_update={"read": True})
+            if state is None or not state.paused or state.request_key != request_id:
+                raise ProductDrainError("The adoption checkpoint pause changed.")
+            counts = await self._counts(db, state)
+            if any(counts[key] for key in ("unsafe_turns", "effects", "requests")):
+                raise ProductDrainError("The adoption worker still has unsafe work.")
 
     def _receipt(self, state: ProductDrainState) -> dict:
         return {
@@ -172,8 +208,19 @@ class ProductDrainService:
 
     @staticmethod
     async def _unsettled(db: AsyncSession, turn_id: str | None = None) -> tuple[int, int]:
+        from .failed_action_attempts import failed_action_attempt
+
         effects = select(func.count()).select_from(Effect).where(
             Effect.state.not_in(["confirmed", "not_dispatched"]),
+            or_(
+                ~failed_action_attempt(),
+                # A failed attempt no longer requires human evidence,
+                # but its bounded guest operation must finish before maintenance.
+                select(ComputerOperation.session_id).where(
+                    ComputerOperation.session_id == Effect.session_id,
+                    ComputerOperation.expires_at > time.time(),
+                ).exists(),
+            ),
         )
         if turn_id is not None:
             effects = effects.where(Effect.turn_id == turn_id)
@@ -254,17 +301,60 @@ class ProductDrainService:
         )))
         parked = {r.turn_id: r for r in receipts}
         queued = sum(t.status == "queued" for t in turns)
-        safe = sum(
-            t.id in parked and parked[t.id].workflow_id == t.workflow_id
+        safe = {
+            t.id for t in turns
+            if t.id in parked and parked[t.id].workflow_id == t.workflow_id
             and (
                 t.status in {"starting", "running", "saving"}
                 or (t.status == "waiting" and bool(t.result_accepted) and bool(t.conversation)
                     and parked[t.id].boundary == "deferred_waiting")
-            ) for t in turns
-        )
+            )
+        }
+        accepted = [t for t in turns if t.status == "accepted"]
+        parents = {
+            t.id: t for t in await db.scalars(select(Turn).where(
+                Turn.id.in_(select(Turn.parent_turn).where(Turn.status == "accepted")),
+            ))
+        } if accepted else {}
+        # Accepted steering is durably enqueued in its parent's workflow, not
+        # dispatched as a separate workflow. Its parent must still prove safety;
+        # never invent a checkpoint or make all accepted rows terminal.
+        def safe_input(t: Turn) -> bool:
+            parent = parents.get(t.parent_turn or "")
+            if not (
+                t.mode == "asap" and t.enqueue_id and t.accepted_at
+                and t.preparation is None and t.result is None and t.conversation is None
+                and t.deferred_results is None and t.result_accepted is None and t.finished_at is None
+                and t.result_fingerprint is None and t.error is None
+                and parent is not None and parent.parent_turn is None and parent.workflow_id
+                and parent.session_id == t.session_id
+                and parent.actor_id == t.actor_id and parent.model == t.model
+            ):
+                return False
+            try:
+                usage = json.loads(t.usage)
+                connections = (json.loads(t.connections), json.loads(parent.connections))
+            except (TypeError, ValueError):
+                return False
+            if (
+                not isinstance(usage, dict) or usage
+                or any(not isinstance(ids, list) or not all(isinstance(key, str) for key in ids)
+                       for ids in connections)
+                or set(connections[0]) != set(connections[1])
+            ):
+                return False
+            # SDK enqueue cannot precede preparation of a live agent run.
+            # A deferred-waiting receipt instead proves its exact completed
+            # Temporal run and saved result; it does not require preparation.
+            return parent.status in {"completed", "failed", "stopped", "resumed"} or (
+                parent.id in safe and (parent.status == "waiting" or bool(parent.preparation))
+            )
+
+        safe_inputs = sum(safe_input(t) for t in accepted)
         effects, requests = await self._unsettled(db)
         return {
-            "queued": queued, "parked": safe, "unsafe_turns": len(turns) - queued - safe,
+            "queued": queued, "parked": len(safe),
+            "unsafe_turns": len(turns) - queued - len(safe) - safe_inputs,
             "effects": effects, "requests": requests,
         }
 

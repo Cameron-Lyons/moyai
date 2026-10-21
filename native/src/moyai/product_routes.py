@@ -18,10 +18,12 @@ from urllib.parse import quote
 
 from cryptography.fernet import InvalidToken
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
+from pydantic import MISSING
 from sqlalchemy import and_, case, column, false, func, or_, select, table
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import aliased
 
+from .database import SESSION_METADATA
 from .delegation_models import DelegatedSession
 from .models import Message, Session, SessionPreference, SessionRead, Turn, User
 from .product_files import routes as file_routes
@@ -29,11 +31,16 @@ from .product_history import (
     MAX_MESSAGE_CHARS,
     MAX_OFFSET,
     MAX_PAGE,
+    HistoryMessage,
+    HistorySession,
     Principal,
+    ResponseModel,
+    absent,
     bounded,
     prepare_history_query,
 )
 from .product_history import routes as legacy_routes
+from .product_identity import ProductAuthorityBusy
 from .swarm_models import SwarmMember
 
 if TYPE_CHECKING:
@@ -45,6 +52,68 @@ NavigationScope = Literal["all", "mine"]
 SEARCH_ROWS = 1000
 SEARCH_BYTES = 4 * 1024 * 1024
 CIPHER_CHARS = 180_000
+SourceState = Literal["available", "unavailable", "disabled"]
+
+
+class HistorySourceStates(ResponseModel):
+    native: SourceState | MISSING = absent()
+    legacy: SourceState | MISSING = absent()
+
+
+class HistorySearchLimits(ResponseModel):
+    native_messages: int
+    native_ciphertext_bytes: int
+    legacy_message_prefix_chars: int | None
+
+
+class SourcedHistorySession(HistorySession):
+    """A /api/history row: stored IDs are kept; ``key`` is the source-qualified UI identity."""
+    source: Source
+    key: str
+    can_manage: bool | MISSING = absent()
+
+
+class HistorySessionList(ResponseModel):
+    sessions: list[SourcedHistorySession]
+    ancestors: list[SourcedHistorySession]
+    has_more: bool
+    next_cursor: str | None
+    sources: HistorySourceStates
+    partial: bool
+    notice: str | None
+    search_limits: HistorySearchLimits | None
+
+
+class ProductContinuationResult(ResponseModel):
+    """The native conversation that continues an earlier-product session."""
+    source: Literal["native"]
+    id: str
+    source_session_id: str
+    url: str
+    turn_id: str | None
+    history_count: int
+    imported_count: int
+    recent_history: bool
+
+
+class HistorySessionDetail(ResponseModel):
+    session: SourcedHistorySession
+    # Earlier-product sessions only.
+    turns: list[Any] | MISSING = absent()
+    effects: list[Any] | MISSING = absent()
+    has_unsettled_effects: bool | MISSING = absent()
+    continuation_supported: bool | MISSING = absent()
+    continuation: ProductContinuationResult | None | MISSING = absent()
+
+
+class HistoryMessagePage(ResponseModel):
+    messages: list[HistoryMessage]
+    has_more: bool
+    next_offset: int | None
+    # Earlier-product sessions only.
+    content_limit: int | MISSING = absent()
+    attachments_truncated: bool | MISSING = absent()
+    source_format: str | MISSING = absent()
 
 
 def sourced(row: dict[str, Any], source: Source) -> dict[str, Any]:
@@ -104,17 +173,29 @@ class ProductReadService:
         if current.auth_version != reader.user.auth_version:
             raise HTTPException(401, "Your session expired.")
 
-    @staticmethod
-    def visible(reader: Reader, *, deleted: bool = False):
+    def private_candidate(self, reader: Reader, session=Session):
+        """SQL candidates only; native_recheck validates the live identity link/audience."""
         private = reader.principal is None or reader.principal.individual
-        ownership = Session.owner_id == reader.user.id
-        access = or_(ownership if private else false(), Session.visibility == "shared")
+        ownership = session.owner_id == reader.user.id
+        schema = getattr(self.identity, "schema", None)
+        linked = false()
+        if schema and reader.principal is not None and reader.principal.individual:
+            users = table("users", column("id"), column("kind"), column("linked_user_id"), schema=schema)
+            linked = session.owner_id.in_(select(users.c.id).where(
+                users.c.kind == "slack", users.c.linked_user_id == reader.user.id,
+            ))
+        delegation = aliased(DelegatedSession)
+        child = select(delegation.session_id).where(delegation.session_id == session.id).exists()
+        return or_(ownership if private else false(), and_(child, or_(ownership, linked)))
+
+    def visible(self, reader: Reader, *, deleted: bool = False):
+        access = or_(self.private_candidate(reader), Session.visibility == "shared")
         clauses = [Session.deleted.is_(deleted), access]
         if not deleted:
             root = aliased(Session)
             membership = select(SwarmMember.session_id).where(SwarmMember.session_id == Session.id)
             parent_access = or_(
-                root.owner_id == reader.user.id if private else false(), root.visibility == "shared",
+                self.private_candidate(reader, root), root.visibility == "shared",
             )
             visible_parent = select(SwarmMember.session_id).join(
                 root, root.id == SwarmMember.mission_id,
@@ -134,14 +215,14 @@ class ProductReadService:
         parent = aliased(Session)
         parent_access = or_(
             parent.visibility == "shared",
-            parent.owner_id == reader.user.id if reader.principal is None or reader.principal.individual else false(),
+            self.private_candidate(reader, parent),
         )
         query = select(
             Session.id, Session.title, Session.owner_id, Session.visibility, Session.surface, Session.model,
             Session.status, Session.active_turn, Session.archived, Session.deleted, Session.created_at,
             Session.updated_at, SessionPreference.pinned, SessionPreference.folder,
             SessionRead.unread.label("marked_unread"), unread.label("new_messages"),
-            (Session.owner_id == reader.user.id).label("created_by_me"),
+            or_(Session.owner_id == reader.user.id, self.private_candidate(reader)).label("created_by_me"),
             (and_(Session.owner_id != reader.user.id, participated)).label("participated"),
             parent.id.label("parent_session_id"),
         ).outerjoin(SessionPreference, preference).outerjoin(SessionRead, read).outerjoin(
@@ -217,20 +298,36 @@ class ProductReadService:
 
     async def native_recheck(self, reader: Reader, ids: list[str], *, deleted: bool = False) -> set[str]:
         await self.current(reader)
+        await self.runtime.database.prefetch_session_audiences(reader.user, ids, deleted=deleted)
         mapped: dict[str, str] = {}
         async with self.runtime.database.sessions() as db:
             await prepare_history_query(db)
-            valid = set(await db.scalars(select(Session.id).where(self.visible(reader, deleted=deleted),
-                                                                Session.id.in_(ids))))
-            for session_id in list(valid):
+            member = aliased(SwarmMember)
+            rows = (await db.execute(select(
+                Session.id, Session.surface, DelegatedSession.session_id.label("delegated"),
+                member.session_id.label("swarm"),
+            ).outerjoin(
+                DelegatedSession, DelegatedSession.session_id == Session.id,
+            ).outerjoin(
+                member, member.session_id == Session.id,
+            ).where(self.visible(reader, deleted=deleted), Session.id.in_(ids)))).mappings().all()
+            valid = {row["id"] for row in rows}
+            for row in rows:
+                # Ordinary web sessions have no inherited/provider audience.
+                # The fresh query already checks their owner, visibility and
+                # deletion state. Keep both revalidation fences, without four
+                # additional lookups per row at each fence.
+                if not deleted and row["surface"] == "web" and row["delegated"] is None and row["swarm"] is None:
+                    continue
+                session_id = row["id"]
                 try:
                     if deleted:
-                        session = await db.get(Session, session_id)
+                        session = await db.get(Session, session_id, options=SESSION_METADATA)
                         if session is None or not await self.runtime.database.same_person(db, reader.user, session.owner_id):
                             raise HTTPException(404, "Conversation not found.")
-                        await self.runtime.database.check_source_audience(db, session, reader.user)
+                        await self.runtime.database.check_source_audience(db, session, reader.user, metadata_only=True)
                     else:
-                        await self.runtime.database.allowed_session(db, session_id, reader.user)
+                        await self.runtime.database.allowed_session(db, session_id, reader.user, metadata_only=True)
                 except HTTPException as error:
                     if error.status_code != 404:
                         raise
@@ -283,6 +380,16 @@ class ProductReadService:
         scanned, consumed, limited = 0, 0, False
         async with self.runtime.database.sessions() as db:
             await prepare_history_query(db)
+            planned = (await db.execute(select(Message.id, Message.session_id).join(
+                Session, Session.id == Message.session_id,
+            ).where(
+                self.visible(reader), Message.role.in_(("user", "assistant")),
+            ).order_by(Message.id.desc()).limit(SEARCH_ROWS + 1))).all()
+        await self.runtime.database.prefetch_session_audiences(
+            reader.user, list({row.session_id for row in planned}),
+        )
+        async with self.runtime.database.sessions() as db:
+            await prepare_history_query(db)
             title_rows = (await db.execute(self.native_query(reader).where(
                 self.visible(reader), func.lower(Session.title).contains(query.lower(), autoescape=True),
             ).order_by(Session.updated_at.desc(), Session.id.desc()).limit(offset + limit + 1))).mappings()
@@ -293,6 +400,7 @@ class ProductReadService:
                 func.substr(Message.content, 1, CIPHER_CHARS + 1).label("content"),
             ).join(Session, Session.id == Message.session_id).where(
                 self.visible(reader), Message.role.in_(("user", "assistant")),
+                Message.id.in_([row.id for row in planned]),
             ).order_by(Message.id.desc()).limit(SEARCH_ROWS + 1).execution_options(yield_per=16))
             try:
                 async for row in stream.mappings():
@@ -462,6 +570,8 @@ class ProductReadService:
                 pages[selected], states[selected] = page, "available"
                 if page.get("notice"):
                     notices.append(page["notice"])
+            except ProductAuthorityBusy:
+                raise
             except (HTTPException, SQLAlchemyError, TimeoutError) as exc:
                 if isinstance(exc, HTTPException) and exc.status_code < 500:
                     raise
@@ -495,12 +605,9 @@ class ProductReadService:
             page["sessions"] = [row for row in page["sessions"] if row["id"] in valid]
         merged = merge_session_lists(pages.get("native", {}).get("sessions", []),
                                      pages.get("legacy", {}).get("sessions", []))
+        if not merged and "unavailable" in states.values():
+            raise HTTPException(503, "Session history is temporarily unavailable. Refresh to retry.")
         chosen = merged[:limit]
-        async with self.runtime.database.sessions() as db:
-            for item in chosen:
-                if item["source"] == "native":
-                    item["can_manage"] = await self.runtime.database.same_person(db, reader.user, item["owner_id"])
-                    item["capabilities"]["rename"] = item["can_manage"] and not item["deleted"]
         has_more = len(merged) > limit or any(page["has_more"] for page in pages.values())
         for selected, page in pages.items():
             consumed = sum(row["source"] == selected for row in chosen)
@@ -520,6 +627,8 @@ class ProductReadService:
             try:
                 async with asyncio.timeout(3):
                     ancestors = await self.native_ancestors(reader, chosen, archived=archived, scope=scope)
+            except ProductAuthorityBusy:
+                raise
             except (SQLAlchemyError, TimeoutError):
                 notices.append("Some parent conversations are temporarily unavailable. Refresh to retry.")
             valid = await self.native_recheck(reader, [row["id"] for row in chosen if row["source"] == "native"])
@@ -531,6 +640,7 @@ class ProductReadService:
                           for owner in {row["owner_id"] for row in native_rows}}
                 for row in native_rows:
                     row["can_manage"] = owners[row["owner_id"]]
+                    row["capabilities"]["rename"] = row["can_manage"] and not row["deleted"]
         return {"sessions": chosen, "ancestors": ancestors, "has_more": has_more, "next_cursor": next_cursor, "sources": states,
                 "partial": "unavailable" in states.values(), "notice": " ".join(notices) or None,
                 "search_limits": {
@@ -540,6 +650,8 @@ class ProductReadService:
 
     async def detail(self, reader: Reader, run_id: str, source: Source) -> dict[str, Any]:
         await self.current(reader)
+        if source == "native":
+            await self.runtime.database.prefetch_session_audiences(reader.user, [run_id])
         if source == "legacy":
             if self.history is None or reader.principal is None:
                 raise HTTPException(503, "Existing product history is not configured.")
@@ -581,12 +693,14 @@ class ProductReadService:
                 ).order_by(Message.id).offset(offset).limit(limit + 1)))
                 from .message_sources import public_message, source_view
                 messages = []
+                origins = {}
                 for row in rows[:limit]:
                     item = {key: getattr(row, key) for key in ("id", "turn_id", "role", "author_id", "created_at")}
                     try:
                         if len(row.content) > CIPHER_CHARS:
                             raise ValueError("Message exceeds display budget")
                         decoded, origin = await public_message(self.runtime.database, db, row)
+                        origins[row.id] = origin
                         author = await db.get(User, row.author_id) if row.author_id else None
                         item.update(content=decoded[:MAX_MESSAGE_CHARS], content_truncated=len(decoded) > MAX_MESSAGE_CHARS,
                                     author_name=author.display_name if author else None,
@@ -597,6 +711,8 @@ class ProductReadService:
                     messages.append(item)
                 result = {"messages": messages, "has_more": len(rows) > limit,
                           "next_offset": offset + limit if len(rows) > limit else None}
+            if self.runtime.database.slack_mentions is not None:
+                await self.runtime.database.slack_mentions(messages, origins)
         await self.detail(reader, run_id, source)
         return result
 
@@ -609,7 +725,7 @@ def routes(runtime: Runtime, actor) -> APIRouter:
         response.headers["Cache-Control"] = "no-store"
         return await service.authenticate(request, user)
 
-    @router.get("/api/history/sessions")
+    @router.get("/api/history/sessions", operation_id="listHistorySessions", response_model=HistorySessionList)
     async def sessions(
         source: Sources = "all", limit: int = Query(50, ge=1, le=MAX_PAGE),
         cursor: str | None = Query(None, max_length=512), archived: bool = False, deleted: bool = False,
@@ -619,18 +735,21 @@ def routes(runtime: Runtime, actor) -> APIRouter:
         return await service.listing(current, source=source, limit=limit, cursor=cursor,
                                      archived=archived, deleted=deleted, scope=scope)
 
-    @router.get("/api/history/search")
+    @router.get("/api/history/search", operation_id="searchHistory", response_model=HistorySessionList)
     async def search(
         q: str = Query("", max_length=200), source: Sources = "all", limit: int = Query(20, ge=1, le=MAX_PAGE),
         cursor: str | None = Query(None, max_length=512), current: Reader = Depends(reader),
     ):
         return await service.listing(current, source=source, query=q, limit=limit, cursor=cursor)
 
-    @router.get("/api/history/sessions/{run_id}")
+    @router.get("/api/history/sessions/{run_id}", operation_id="getHistorySession", response_model=HistorySessionDetail)
     async def detail(run_id: str, source: Source, current: Reader = Depends(reader)):
         return await service.detail(current, run_id, source)
 
-    @router.get("/api/history/sessions/{run_id}/messages")
+    @router.get(
+        "/api/history/sessions/{run_id}/messages", operation_id="listHistoryMessages",
+        response_model=HistoryMessagePage,
+    )
     async def messages(
         run_id: str, source: Source, limit: int = Query(50, ge=1, le=MAX_PAGE),
         offset: int = Query(0, ge=0, le=MAX_OFFSET), current: Reader = Depends(reader),

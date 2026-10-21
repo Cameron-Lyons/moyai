@@ -12,12 +12,15 @@ import asyncio
 import re
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
 from fastapi import APIRouter, HTTPException, Query, Request, Response
+from pydantic import MISSING, BaseModel, ConfigDict, Field
 from sqlalchemy import bindparam, text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, AsyncSession
+
+from .product_identity import ProductAuthorityBusy
 
 SOURCE_FORMAT = "moyai-product-v1"
 MAX_PAGE = 100
@@ -29,6 +32,199 @@ CAPABILITIES = {
     "pin": False, "archive": False, "delete": False, "restore": False,
     "stop": False, "computer": False,
 }
+
+
+def _missing(value: object) -> bool:
+    return value is MISSING
+
+
+def absent() -> Any:
+    """A response key that some rows omit: optional in OpenAPI, omitted (not null) on the wire."""
+    return Field(default=MISSING, exclude_if=_missing)
+
+
+class ResponseModel(BaseModel):
+    model_config = ConfigDict(json_schema_serialization_defaults_required=True)
+
+
+# Response models are the source of the generated frontend types. They mirror
+# the dictionaries built below; FastAPI validates and filters each response once.
+
+class HistoryOwner(ResponseModel):
+    id: str
+    name: str | None
+
+
+class HistoryCapabilities(ResponseModel):
+    model_config = ConfigDict(json_schema_serialization_defaults_required=True, validate_by_name=True,
+                              serialize_by_alias=True)
+    read: bool
+    continue_: bool = Field(alias="continue")
+    rename: bool
+    move: bool
+    pin: bool
+    archive: bool | MISSING = absent()
+    delete: bool | MISSING = absent()
+    restore: bool | MISSING = absent()
+    stop: bool | MISSING = absent()
+    computer: bool | MISSING = absent()
+
+
+class HistoryMatch(ResponseModel):
+    message_id: int | None
+    snippet: str
+
+
+class HistorySession(ResponseModel):
+    """A native or earlier-product session row, as listed by history and product routes."""
+    id: str
+    title: str
+    owner_id: str
+    visibility: Literal["private", "shared"]
+    surface: str
+    model: str
+    status: str
+    active_turn: str | None
+    workspace: None
+    save_warning: None
+    created_at: str
+    updated_at: str
+    archived: bool
+    deleted: bool
+    pinned: bool
+    folder: str
+    participated: bool
+    created_by_me: bool
+    parent_session_id: str | None
+    url: str
+    source_format: str
+    execution_engine: str
+    read_only: bool
+    capabilities: HistoryCapabilities
+    unread: bool | None
+    # Earlier-product rows only.
+    owner: HistoryOwner | MISSING = absent()
+    source_status: str | MISSING = absent()
+    deleting: bool | MISSING = absent()
+    deleted_at: str | None | MISSING = absent()
+    folder_id: str | None | MISSING = absent()
+    root_session_id: str | MISSING = absent()
+    side_chat_of: str | None | MISSING = absent()
+    unread_source: str | MISSING = absent()
+    read_marker_key: str | MISSING = absent()
+    completion_marker: str | MISSING = absent()
+    # Native rows continued from an earlier-product session.
+    source_session_id: str | None | MISSING = absent()
+    # Search hits.
+    match: HistoryMatch | None | MISSING = absent()
+
+
+class ProductSessionPage(ResponseModel):
+    sessions: list[HistorySession]
+    has_more: bool
+    next_offset: int | None
+    source_format: str
+
+
+class ProductSearchPage(ProductSessionPage):
+    searched_message_prefix_chars: int
+
+
+class ProductChildrenPage(ResponseModel):
+    sessions: list[HistorySession]
+    has_more: bool
+    next_offset: int | None
+
+
+class ProductFolder(ResponseModel):
+    id: str
+    name: str
+    revision: int
+
+
+class ProductFolderPage(ResponseModel):
+    folders: list[ProductFolder]
+    has_more: bool
+    next_offset: int | None
+    read_only: bool
+
+
+class ProductSessionDetail(ResponseModel):
+    session: HistorySession
+    turns: list[Any]
+    effects: list[Any]
+    has_unsettled_effects: bool
+    continuation_supported: bool
+
+
+class HistoryAttachment(ResponseModel):
+    id: str
+    kind: Literal["upload"]
+    name: str
+    size: int
+    media_type: str
+    created_at: str
+    url: str
+    download_url: str
+    preview_url: str
+    original_url: str
+    source_format: str
+    message_id: int
+
+
+class HistoryAttachmentStatus(ResponseModel):
+    file_id: str | MISSING = absent()
+    upload_id: str | MISSING = absent()
+    name: str | MISSING = absent()
+    bytes: int | MISSING = absent()
+    media_type: str | MISSING = absent()
+    error: Literal["unavailable"] | MISSING = absent()
+    preview_error: Literal["preview_unavailable"] | MISSING = absent()
+
+
+class HistoryMessage(ResponseModel):
+    """A native or earlier-product public message. Slack-sourced rows add the source fields."""
+    id: int
+    role: str
+    content: str
+    slack_mentions: dict[str, str] | MISSING = absent()
+    created_at: str
+    author_id: str | None
+    content_truncated: bool | MISSING = absent()
+    content_unavailable: bool | MISSING = absent()
+    turn_id: str
+    author_name: str | None | MISSING = absent()
+    is_self: bool | MISSING = absent()
+    # Earlier-product rows only.
+    session_id: str | MISSING = absent()
+    status: str | MISSING = absent()
+    started_at: str | MISSING = absent()
+    response_to_id: int | None | MISSING = absent()
+    model: str | None | MISSING = absent()
+    revision: int | None | MISSING = absent()
+    source_format: str | MISSING = absent()
+    attachments: list[HistoryAttachment] | MISSING = absent()
+    # message_sources.source_view
+    source: Literal["slack"] | MISSING = absent()
+    source_url: str | None | MISSING = absent()
+    source_timestamp: str | MISSING = absent()
+    attachment_status: list[HistoryAttachmentStatus] | MISSING = absent()
+    context_status: str | None | MISSING = absent()
+    edited: bool | MISSING = absent()
+    edited_in: Literal["web", "slack"] | MISSING = absent()
+    deleted: bool | MISSING = absent()
+    edited_after_start: bool | MISSING = absent()
+    attachments_changed: bool | MISSING = absent()
+    legacy_review_required: bool | MISSING = absent()
+
+
+class ProductMessagePage(ResponseModel):
+    messages: list[HistoryMessage]
+    has_more: bool
+    next_offset: int | None
+    content_limit: int
+    attachments_truncated: bool
+    source_format: str
 
 
 class Principal(Protocol):
@@ -77,6 +273,7 @@ async def prepare_history_query(db: AsyncConnection | AsyncSession) -> None:
 class ProductHistoryAdapter:
     continuation_access: Any = None
     slack_access: Any = None
+    slack_prefetch: Any = None
     decorate_messages: Any = None
     continuation_schema: str | None = None
 
@@ -115,23 +312,33 @@ class ProductHistoryAdapter:
                 await prepare_history_query(conn)
                 # No commit, DDL, bootstrap or migration, including on SQLite.
                 yield conn
+        except ProductAuthorityBusy:
+            raise
         except (SQLAlchemyError, TimeoutError):
             raise HTTPException(503, "Existing product history is unavailable; check its database/schema.") from None
+
+    def graph_cte(self) -> str:
+        """Share a fresh graph within this statement; never mutate source views."""
+        from .history_graph import ancestry_query
+
+        t = self.table
+        if self.engine.dialect.name == "postgresql":
+            # These are the canonical views' exact direct-parent semantics.
+            # Following the unique parent avoids the downward view's inflated
+            # fan-out estimates; roots reuse this one expansion.
+            return f"""WITH ancestry AS MATERIALIZED ({ancestry_query(t('runs'))}),
+                history_roots AS MATERIALIZED (
+                    SELECT a.run_id,r.id AS root_id FROM ancestry a
+                    JOIN {t('runs')} r ON r.id=a.ancestor_id WHERE r.parent_run_id=''
+                )"""
+        return f"""WITH ancestry AS (SELECT run_id,ancestor_id FROM {t('run_ancestry')}),
+            history_roots AS (SELECT run_id,root_id FROM {t('run_roots')})"""
 
     def access_cte(self, *, deleted: bool = False) -> str:
         t = self.table
         live = "" if deleted else "AND r.deleted_at='' AND r.deletion_requested_at=''"
         ancestor_live = "" if deleted else "OR a.deleted_at!='' OR a.deletion_requested_at!=''"
-        # The canonical ancestry relation is a recursive view. Referencing it
-        # separately for each ACL predicate expands the complete graph repeatedly.
-        # Share one statement-local snapshot without caching authorization across
-        # requests or removing the final live ACL checks.
-        materialized = "MATERIALIZED " if self.engine.dialect.name == "postgresql" else ""
-        return f"""WITH ancestry AS {materialized}(
-            SELECT run_id,ancestor_id FROM {t('run_ancestry')}
-        ), history_roots AS {materialized}(
-            SELECT run_id,root_id FROM {t('run_roots')}
-        ), identities AS (
+        return self.graph_cte() + f""", identities AS (
             SELECT :actor AS id UNION SELECT id FROM {t('users')}
               WHERE kind='slack' AND linked_user_id=:actor
         ), visible AS (
@@ -188,8 +395,10 @@ class ProductHistoryAdapter:
     def view(self, row: dict[str, Any], principal: Principal) -> dict[str, Any]:
         # Explicit allowlist: no pending_result, side_chat_context, sandbox/token,
         # checkpoints, working events, credential configuration or tool payloads.
+        from .slack_messages import plain_slack_title
+        title = row["title"] or "Earlier conversation"
         return {
-            "id": row["id"], "title": row["title"] or "Earlier conversation",
+            "id": row["id"], "title": plain_slack_title(title) if row["slack_connected"] else title,
             "owner_id": row["owner_id"], "owner": {"id": row["owner_id"], "name": row["owner_name"]},
             "visibility": "private" if self.privacy.is_private(row) else "shared",
             "surface": "slack" if row["slack_connected"] else "web",
@@ -212,6 +421,7 @@ class ProductHistoryAdapter:
 
     async def allowed(
         self, conn: AsyncConnection | AsyncSession, principal: Principal, run_id: str,
+        *, source_actor: Any = None,
     ) -> dict[str, Any]:
         session_id(run_id)
         result = await conn.execute(text(
@@ -223,14 +433,17 @@ class ProductHistoryAdapter:
         guard = getattr(self, "continuation_access", None)
         if guard is not None and run_id not in await guard(conn, principal, [run_id]):
             raise HTTPException(404, "Session not found.")
-        if self.slack_access is not None and run_id not in await self.slack_access(conn, principal, [run_id]):
-            raise HTTPException(404, "Session not found.")
+        if self.slack_access is not None:
+            options = {"source_actor": source_actor} if source_actor is not None else {}
+            if run_id not in await self.slack_access(conn, principal, [run_id], **options):
+                raise HTTPException(404, "Session not found.")
         return dict(row)
 
     async def recheck(self, principal: Principal, ids: list[str], *, deleted: bool = False) -> set[str]:
         current = await self.identity.require_current(principal.grant)
         if not ids:
             return set()
+        await self.prefetch(current, ids, deleted=deleted)
         async with self.read() as conn:
             query = text(self.access_cte(deleted=deleted) + "SELECT id FROM visible WHERE id IN :ids")
             result = await conn.execute(query.bindparams(bindparam("ids", expanding=True)),
@@ -245,9 +458,24 @@ class ProductHistoryAdapter:
 
     async def require(self, principal: Principal, run_id: str) -> Principal:
         current = await self.identity.require_current(principal.grant)
+        await self.prefetch(current, [run_id])
         async with self.read() as conn:
             await self.allowed(conn, current, run_id)
         return current
+
+    async def prefetch(self, principal: Principal, ids: list[str], *, deleted: bool = False) -> None:
+        if self.slack_prefetch is not None and ids:
+            # Resolve only currently visible candidates before asking a
+            # provider about their audience. Recheck again when publishing.
+            async with self.read() as conn:
+                query = text(self.access_cte(deleted=deleted) + "SELECT id FROM visible WHERE id IN :ids")
+                visible = set((await conn.execute(
+                    query.bindparams(bindparam("ids", expanding=True)), self.params(principal) | {"ids": ids},
+                )).scalars())
+                guard = getattr(self, "continuation_access", None)
+                if guard is not None:
+                    visible &= await guard(conn, principal, list(visible))
+            await self.slack_prefetch(principal, list(visible))
 
     def navigation_scope(
         self, principal: Principal, *, archived: bool | None = None, personal: bool = False,
@@ -282,10 +510,21 @@ class ProductHistoryAdapter:
         if exclude_continued and self.continuation_schema:
             where += f""" AND NOT EXISTS(SELECT 1 FROM "{self.continuation_schema}".moyai_product_continuations c
                 WHERE c.source_schema=:continuation_source AND c.source_session_id=r.id)"""
+        # Filter navigation once before the ordered LIMIT. With sparse personal
+        # history, PostgreSQL otherwise walks the ordered roots index and scans
+        # all visible rows again for each root, expecting to fill the page early.
+        # Materialize only IDs/timestamps; project sidebar fields after paging.
+        materialized = "MATERIALIZED " if self.engine.dialect.name == "postgresql" else ""
         async with self.read() as conn:
             result = await conn.execute(text(
-                self.access_cte(deleted=deleted) + f"SELECT {self.columns()} {self.from_runs()} WHERE {where} "
-                "ORDER BY r.updated_at DESC,r.created_at DESC,r.id DESC LIMIT :limit OFFSET :offset"
+                self.access_cte(deleted=deleted) + f""", navigation_candidates AS {materialized}(
+                    SELECT r.id,r.updated_at,r.created_at FROM {t('runs')} r
+                    JOIN visible v ON v.id=r.id WHERE {where}
+                ), navigation_page AS (
+                    SELECT id FROM navigation_candidates
+                    ORDER BY updated_at DESC,created_at DESC,id DESC LIMIT :limit OFFSET :offset
+                ) SELECT {self.columns()} {self.from_runs()} WHERE r.id IN (SELECT id FROM navigation_page)
+                ORDER BY r.updated_at DESC,r.created_at DESC,r.id DESC"""
             ), self.params(current) | {"limit": limit + 1, "offset": offset, "is_admin": int(current.role == "admin"),
                                       "continuation_source": self.schema})
             rows = [dict(r) for r in result.mappings()]
@@ -296,6 +535,7 @@ class ProductHistoryAdapter:
 
     async def detail(self, principal: Principal, run_id: str) -> dict[str, Any]:
         current = await self.identity.require_current(principal.grant)
+        await self.prefetch(current, [run_id])
         async with self.read() as conn:
             row = await self.allowed(conn, current, run_id)
         if run_id not in await self.recheck(current, [run_id]):
@@ -308,6 +548,7 @@ class ProductHistoryAdapter:
     ) -> dict[str, Any]:
         bounded(limit, offset)
         current = await self.identity.require_current(principal.grant)
+        await self.prefetch(current, [run_id])
         async with self.read() as conn:
             await self.allowed(conn, current, run_id)
             rows = [dict(r) for r in (await conn.execute(text(
@@ -337,6 +578,7 @@ class ProductHistoryAdapter:
     ) -> dict[str, Any]:
         bounded(limit, offset)
         current = await self.identity.require_current(principal.grant)
+        await self.prefetch(current, [run_id])
         t = self.table
         async with self.read() as conn:
             await self.allowed(conn, current, run_id)
@@ -430,7 +672,7 @@ def routes(adapter: ProductHistoryAdapter) -> APIRouter:
         response.headers["Cache-Control"] = "no-store"
         return await adapter.identity.authenticate(request)
 
-    @router.get("/sessions")
+    @router.get("/sessions", operation_id="listProductSessions", response_model=ProductSessionPage)
     async def sessions(
         request: Request, response: Response, limit: int = Query(50, ge=1, le=MAX_PAGE),
         offset: int = Query(0, ge=0, le=MAX_OFFSET), archived: bool = False, deleted: bool = False,
@@ -438,32 +680,32 @@ def routes(adapter: ProductHistoryAdapter) -> APIRouter:
         return await adapter.sessions(await actor(request, response), limit=limit, offset=offset,
                                       archived=archived, deleted=deleted)
 
-    @router.get("/search")
+    @router.get("/search", operation_id="searchProductSessions", response_model=ProductSearchPage)
     async def search(
         request: Request, response: Response, q: str = Query(min_length=1, max_length=200),
         limit: int = Query(20, ge=1, le=MAX_PAGE), offset: int = Query(0, ge=0, le=MAX_OFFSET),
     ):
         return await adapter.search(await actor(request, response), q, limit=limit, offset=offset)
 
-    @router.get("/folders")
+    @router.get("/folders", operation_id="listProductFolders", response_model=ProductFolderPage)
     async def folders(
         request: Request, response: Response, limit: int = Query(100, ge=1, le=MAX_PAGE),
         offset: int = Query(0, ge=0, le=MAX_OFFSET),
     ):
         return await adapter.folders(await actor(request, response), limit=limit, offset=offset)
 
-    @router.get("/sessions/{run_id}")
+    @router.get("/sessions/{run_id}", operation_id="getProductSession", response_model=ProductSessionDetail)
     async def detail(run_id: str, request: Request, response: Response):
         return await adapter.detail(await actor(request, response), run_id)
 
-    @router.get("/sessions/{run_id}/messages")
+    @router.get("/sessions/{run_id}/messages", operation_id="listProductSessionMessages", response_model=ProductMessagePage)
     async def messages(
         run_id: str, request: Request, response: Response, limit: int = Query(50, ge=1, le=MAX_PAGE),
         offset: int = Query(0, ge=0, le=MAX_OFFSET),
     ):
         return await adapter.messages(await actor(request, response), run_id, limit=limit, offset=offset)
 
-    @router.get("/sessions/{run_id}/children")
+    @router.get("/sessions/{run_id}/children", operation_id="listProductSessionChildren", response_model=ProductChildrenPage)
     async def children(
         run_id: str, request: Request, response: Response, limit: int = Query(50, ge=1, le=MAX_PAGE),
         offset: int = Query(0, ge=0, le=MAX_OFFSET),

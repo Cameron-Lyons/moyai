@@ -3,10 +3,15 @@ import { KeyRound, Plus, TriangleAlert } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { TableCell, TableRow } from "@/components/ui/table"
-import { api, csrfToken } from "./api"
+import { csrfToken } from "./api"
 import { Choice, Empty, RecordTable, Toolbar, contains, dateTime, errorText } from "./settings"
-import { ActivityList, CopyField, DialogActions, GovConfirm, GovDialog, LoadGate, MutationError, PageActions, Section, StatusBadge, useGovMutation, useGovResource } from "./governance-shared"
-import type { CreatedScimToken, ScimAdmin, ScimGroup, ScimToken, ScimUser } from "./governance-types"
+import { ActivityList, CopyField, DialogActions, GovConfirm, GovDialog, LoadGate, MutationError, PageActions, Section, StatusBadge, dataOf, useGovMutation, useGovResource } from "./governance-shared"
+import {
+  createScimToken, getScimAdmin, revokeScimToken,
+  type CreatedScimToken, type ScimAdmin, type ScimGroupSummary as ScimGroup, type ScimToken, type ScimUserSummary as ScimUser,
+} from "./generated/api"
+
+const PAGE_SIZE = 50
 
 export function TokenRows({ tokens, onRevoke }: { tokens: ScimToken[]; onRevoke?: (token: ScimToken) => void }) {
   return <RecordTable label="Provisioning tokens" headings={["Token", "Created", "Last used", "Status", "Actions"]}>{tokens.map(token => <TableRow key={token.id}>
@@ -36,7 +41,7 @@ export function DirectoryGroupRows({ groups }: { groups: ScimGroup[] }) {
 }
 
 export function ProvisioningPage({ canManageRoles }: { canManageRoles: boolean }) {
-  const resource = useGovResource<ScimAdmin>("/admin/scim?limit=50")
+  const resource = useGovResource("scim", signal => getScimAdmin({ query: { limit: PAGE_SIZE }, signal }).then(dataOf))
   const [pages, setPages] = useState<{ base?: ScimAdmin; items: ScimUser[]; next: string | null; loaded: boolean; loading: boolean; error: string }>({ items: [], next: null, loaded: false, loading: false, error: "" })
   const loadMore = useRef<AbortController | null>(null)
   const [search, setSearch] = useState(""), [status, setStatus] = useState("all")
@@ -53,7 +58,7 @@ export function ProvisioningPage({ canManageRoles }: { canManageRoles: boolean }
       const controller = new AbortController(), auth = csrfToken()
       loadMore.current?.abort(); loadMore.current = controller
       setPages(previous => ({ ...previous, loading: true, error: "" }))
-      void api<ScimAdmin>(`/admin/scim?limit=50&cursor=${encodeURIComponent(next)}`, "GET", undefined, controller.signal).then(page => {
+      void getScimAdmin({ query: { limit: PAGE_SIZE, cursor: next }, signal: controller.signal }).then(({ data: page }) => {
         if (controller.signal.aborted || auth !== csrfToken()) return
         setPages(previous => previous.base === data ? { base: data, items: [...previous.items, ...page.users.items], next: page.users.next_cursor, loaded: true, loading: false, error: "" } : previous)
       }, reason => { if (!controller.signal.aborted) setPages(previous => ({ ...previous, loading: false, error: errorText(reason) })) })
@@ -87,7 +92,7 @@ export function ProvisioningPage({ canManageRoles }: { canManageRoles: boolean }
       </Section>
       {revoke && <GovConfirm title={`Revoke ${revoke.label}?`} label="Revoke token" onReload={resource.refresh} onClose={() => setRevoke(null)}
         description="Your identity provider can no longer sync with this token. People and groups already provisioned are kept. This cannot be undone; create a new token to reconnect."
-        onConfirm={async () => { await api(`/admin/scim/tokens/${encodeURIComponent(revoke.id)}`, "DELETE"); resource.refresh() }} />}
+        onConfirm={async () => { await revokeScimToken({ path: { identity: revoke.id } }); resource.refresh() }} />}
     </>
   }}</LoadGate>
     {/* Outside the load gate: a failed list refresh must not discard the one-time token. */}
@@ -112,8 +117,10 @@ export function TokenDialog({ onClose, onCreated }: { onClose: () => void; onCre
     <form className="ns-fields" onSubmit={event => { event.preventDefault(); let result: CreatedScimToken; void mutation.run(async () => {
       const value = label.trim()
       if (!value || value.length > 80) throw new Error("Use a label between 1 and 80 characters.")
-      result = await api<CreatedScimToken>("/admin/scim/tokens", "POST", { label: value })
-      if (typeof result?.token !== "string" || !result.token) throw new Error("The server did not return the new token. Revoke it and try again.")
+      const { data } = await createScimToken({ body: { label: value } })
+      // The secret is returned only here; never open the one-time view without it.
+      if (!data.token) throw new Error("The server did not return the new token. Revoke it and try again.")
+      result = data
     }, () => { setCreated(result); onCreated() }) }}>
       <div className="ns-field"><label htmlFor={`${id}-label`}><KeyRound size={14} aria-hidden="true" /> Token label</label><Input id={`${id}-label`} autoFocus required maxLength={80} autoComplete="off" placeholder="Okta production" disabled={mutation.busy} value={label} onChange={event => setLabel(event.target.value)} />
         <p className="ns-field-hint">Shown in the token list and audit log.</p></div>

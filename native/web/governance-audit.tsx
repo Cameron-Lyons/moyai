@@ -3,12 +3,13 @@ import { Download } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { TableCell, TableRow } from "@/components/ui/table"
-import { api, apiDownload, csrfToken } from "./api"
+import { apiDownload, csrfToken } from "./api"
 import { saveBlob } from "./debug-trace"
 import { Choice, RecordTable, dateTime, errorText } from "./settings"
-import { actionLabel, auditExportPath, auditParams, auditPath, emptyAuditFilters } from "./governance-data"
-import { AuditDetails, LoadGate, MutationError, PageActions, useGovMutation, useGovResource } from "./governance-shared"
-import type { AuditEntry, AuditFilters, AuditPage as AuditResponse } from "./governance-types"
+import { actionLabel, auditExportPath, auditPageQuery, auditQuery, emptyAuditFilters } from "./governance-data"
+import { AuditDetails, LoadGate, MutationError, PageActions, dataOf, useGovMutation, useGovResource } from "./governance-shared"
+import { listGovernanceAudit, type AuditEntry, type AuditFacets, type AuditPage as AuditResponse } from "./generated/api"
+import type { AuditExportFormat, AuditFilters } from "./governance-types"
 
 const ALL = "__all__"
 const sourceLabels: Record<string, string> = { governance: "Governance", user_roles: "Built-in roles", connections: "Connections", credentials: "Credentials" }
@@ -30,21 +31,22 @@ export function AuditLogPage() {
   const [draft, setDraft] = useState<AuditFilters>(emptyAuditFilters)
   const [applied, setApplied] = useState<AuditFilters>(emptyAuditFilters)
   const [formError, setFormError] = useState("")
-  const resource = useGovResource<AuditResponse>(auditPath(applied))
-  const [facets, setFacets] = useState<AuditResponse["facets"]>({ actions: [], resource_types: [] })
+  const query = auditPageQuery(applied)
+  const resource = useGovResource(`audit:${JSON.stringify(query)}`, signal => listGovernanceAudit({ query, signal }).then(dataOf))
+  const [facets, setFacets] = useState<AuditFacets>({ actions: [], resource_types: [] })
   const [pages, setPages] = useState<{ base?: AuditResponse; entries: AuditEntry[]; next: string | null; loaded: boolean; loading: boolean; error: string }>({ entries: [], next: null, loaded: false, loading: false, error: "" })
   const loadMore = useRef<AbortController | null>(null)
-  const exporter = useGovMutation(), [format, setFormat] = useState<"csv" | "ndjson">("csv")
+  const exporter = useGovMutation(), [format, setFormat] = useState<AuditExportFormat>("csv")
   useEffect(() => { if (resource.data?.facets) setFacets(resource.data.facets) }, [resource.data])
   // New filters or a refresh discard pages loaded for the previous result.
   useEffect(() => { loadMore.current?.abort(); setPages({ base: resource.data, entries: [], next: null, loaded: false, loading: false, error: "" }) }, [resource.data])
   useEffect(() => () => loadMore.current?.abort(), [])
   const change = (patch: Partial<AuditFilters>) => { setFormError(""); setDraft(previous => ({ ...previous, ...patch })) }
   const apply = (next: AuditFilters) => {
-    try { auditParams(next) } catch (reason) { setFormError(reason instanceof Error ? reason.message : "Check the filters."); return }
+    try { auditQuery(next) } catch (reason) { setFormError(reason instanceof Error ? reason.message : "Check the filters."); return }
     setFormError(""); exporter.reset(); setApplied(next)
   }
-  const download = (value: "csv" | "ndjson") => {
+  const download = (value: AuditExportFormat) => {
     let file: { blob: Blob; filename: string }
     setFormat(value)
     void exporter.run(async () => { file = await apiDownload(auditExportPath(applied, value)) }, () => saveBlob(file.blob, file.filename || `governance.${value}`))
@@ -78,7 +80,7 @@ export function AuditLogPage() {
         const controller = new AbortController(), auth = csrfToken()
         loadMore.current?.abort(); loadMore.current = controller
         setPages(previous => ({ ...previous, loading: true, error: "" }))
-        void api<AuditResponse>(auditPath(applied, next), "GET", undefined, controller.signal).then(page => {
+        void listGovernanceAudit({ query: auditPageQuery(applied, next), signal: controller.signal }).then(({ data: page }) => {
           if (controller.signal.aborted || auth !== csrfToken()) return
           setPages(previous => previous.base === data ? { base: data, entries: [...previous.entries, ...page.entries], next: page.next_cursor, loaded: true, loading: false, error: "" } : previous)
         }, reason => { if (!controller.signal.aborted) setPages(previous => ({ ...previous, loading: false, error: errorText(reason) })) })

@@ -13,6 +13,7 @@ from pydantic_ai.messages import (
     ModelResponse,
     RetryPromptPart,
     SystemPromptPart,
+    TextContent,
     TextPart,
     ThinkingPart,
     ToolCallPart,
@@ -21,8 +22,9 @@ from pydantic_ai.messages import (
 )
 from sqlalchemy import select
 
+from .failure_diagnostics import FAILURE_KIND, safe_failure_metadata
 from .history_handoff import is_turn_run, latest_turn_snapshot
-from .models import Message, Turn, User
+from .models import Event, Message, Turn, User
 from .presentation import private_tool
 from .runtime import Runtime
 
@@ -34,7 +36,8 @@ def _timestamp(value: datetime | str | None) -> str | None:
 def _user_prompt_text(part: UserPromptPart) -> str:
     if isinstance(part.content, str):
         return part.content
-    return "\n".join(item for item in part.content if isinstance(item, str))
+    return "\n".join(item.content if isinstance(item, TextContent) else item
+                     for item in part.content if isinstance(item, (str, TextContent)))
 
 
 def _turn_cost(turn: Turn) -> float | None:
@@ -79,6 +82,15 @@ async def debug_trace(runtime: Runtime, user: User, session_id: str) -> dict[str
         from .message_sources import public_message
         public = {row.id: (await public_message(runtime.database, db, row))[0] for row in messages}
         own = {turn.actor_id: await runtime.database.same_person(db, user, turn.actor_id) for turn in turns}
+        failure_records = list(await db.scalars(select(Event).where(
+            Event.session_id == session_id, Event.kind == FAILURE_KIND,
+        ).order_by(Event.id)))
+        own_turns = {turn.id for turn in turns if own[turn.actor_id]}
+        failure_metadata = {
+            row.turn_id: safe_failure_metadata(json.loads(runtime.security.unseal(row.content)))
+            for row in failure_records
+            if row.turn_id in own_turns
+        }
 
     messages_by_turn: dict[str, list[Message]] = {}
     for message in messages:
@@ -130,7 +142,7 @@ async def debug_trace(runtime: Runtime, user: User, session_id: str) -> dict[str
             steps.append(user_step)
 
         if own[turn.actor_id]:
-            snapshot = await latest_turn_snapshot(runtime, turn.id)
+            snapshot = await latest_turn_snapshot(runtime, turn.id, include_interrupted=True)
             if snapshot is not None:
                 tool_steps: dict[str, tuple[dict[str, Any], bool]] = {}
                 first_request = True
@@ -147,15 +159,20 @@ async def debug_trace(runtime: Runtime, user: User, session_id: str) -> dict[str
                                 add_instructions(part.content, message.timestamp)
                             elif isinstance(part, UserPromptPart):
                                 text = _user_prompt_text(part)
-                                if first_request:
+                                metadata = next((item.metadata for item in part.content
+                                                 if isinstance(item, TextContent) and isinstance(item.metadata, dict)
+                                                 and item.metadata.get("moyai_parent_turn_id") == turn.id), None) if not isinstance(part.content, str) else None
+                                metadata = metadata or message.metadata or {}
+                                input_id = metadata.get("moyai_input_id") if metadata.get("moyai_parent_turn_id") == turn.id else None
+                                if first_request and not input_id:
                                     user_parts.append(text)
                                 else:
                                     steps.append({
                                         "step_id": len(steps) + 1,
-                                        "timestamp": _timestamp(message.timestamp),
+                                        "timestamp": _timestamp(part.timestamp),
                                         "source": "user",
                                         "message": text,
-                                        "extra": {"kind": "steering"},
+                                        "extra": {"kind": "steering", **({"input_turn_id": input_id} if input_id else {})},
                                     })
                             elif isinstance(part, (ToolReturnPart, RetryPromptPart)):
                                 call_id = part.tool_call_id
@@ -289,11 +306,36 @@ async def debug_trace(runtime: Runtime, user: User, session_id: str) -> dict[str
                 "timestamp": turn.finished_at or turn.created_at,
                 "source": "system",
                 "message": turn.error,
-                "extra": {"kind": "error", "turn_id": turn.id},
+                "extra": {
+                    "kind": "error", "turn_id": turn.id,
+                    **({"diagnostics": failure_metadata[turn.id]} if failure_metadata.get(turn.id) else {}),
+                },
             })
         if (cost := _turn_cost(turn)) is not None:
             total_cost_usd += cost
             has_cost = True
+
+    # Parent runs and admitted steering overlap in time. Storage turn order is
+    # not chronology. Prefer the original authored input to its model copy.
+    authored = {step["extra"]["turn_id"]: step for step in steps
+                if step["source"] == "user" and step.get("extra", {}).get("turn_id")}
+    unique_steps = []
+    for step in steps:
+        extra = step.get("extra", {})
+        if extra.get("kind") == "steering":
+            original = authored.get(extra.get("input_turn_id"))
+            if original is None:
+                original = next((row for row in authored.values()
+                                 if row["message"] == step["message"] and row["timestamp"] == step["timestamp"]), None)
+            if original is not None:
+                original["extra"]["prompt_received"] = step["message"]
+                original["extra"]["delivered_at"] = step["timestamp"]
+                continue
+        unique_steps.append(step)
+    steps = unique_steps
+    steps.sort(key=lambda step: step.get("timestamp") or "")
+    for index, step in enumerate(steps, 1):
+        step["step_id"] = index
 
     final_metrics: dict[str, int | float] = {
         "total_prompt_tokens": sum(
@@ -310,6 +352,11 @@ async def debug_trace(runtime: Runtime, user: User, session_id: str) -> dict[str
     if has_cost:
         final_metrics["total_cost_usd"] = total_cost_usd
 
+    hidden_turns = sum(not own[turn.actor_id] for turn in turns)
+    visibility_note = (
+        f" {hidden_turns} turn(s) belong to another requester; their private activity is omitted. "
+        "Token totals cover only visible activity, not the whole session."
+    ) if hidden_turns else ""
     return {
         "schema_version": "ATIF-v1.8",
         "session_id": session.id,
@@ -323,11 +370,14 @@ async def debug_trace(runtime: Runtime, user: User, session_id: str) -> dict[str
             f"Moyai debug trace for session {session.title}: user messages, the agent's reasoning, "
             "tool calls and tool results in order. Hand it to Moyai with what you expected to debug "
             "where it went wrong. Arguments and results marked redacted were hidden for privacy, not empty."
+            + visibility_note
         ),
         "final_metrics": final_metrics,
         "extra": {
             "exported_at": datetime.now(UTC).isoformat(),
             "session_title": session.title,
             "turn_count": len(turns),
+            "private_activity_omitted_turns": hidden_turns,
+            "token_metrics_scope": "visible_activity",
         },
     }
