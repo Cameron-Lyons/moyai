@@ -3,13 +3,55 @@ from __future__ import annotations
 
 import re
 from contextlib import asynccontextmanager
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from fastapi import HTTPException
-from sqlalchemy import Numeric, cast, func, select, text
+from sqlalchemy import Numeric, and_, cast, exists, false, func, literal, not_, or_, select, text
 
 from .product_governance_models import ProductSessionPolicy
+
+# A request without a reported cost stops blocking budgets after this long.
+RECEIPT_WINDOW = timedelta(days=1)
+# A model activity ends at its timeout; this allows for its final ledger write.
+IN_FLIGHT_MARGIN = timedelta(minutes=1)
+# LiteLLM records a gateway error at zero spend, and a duplicate receipt's
+# charge is already counted on the request that holds it.
+UNBILLED = ('gateway_error', 'duplicate_provider_receipt')
+
+
+class SpendLedger:
+    """Spend predicates over the native inference ledger for admission and the spend page.
+
+    spent sums reported costs. A pending request is in flight until the model
+    timeout passes; it neither counts nor blocks. awaiting counts finished
+    unpriced requests that receipt recovery can still settle, and any of them
+    makes a limited scope fail closed. unresolved counts those recovery can no
+    longer settle; they are reported for review instead of blocking.
+    """
+
+    def __init__(self, database):
+        from .inference_usage import InferenceUsage as usage
+        from .product_inference import ProductInferenceRequest as request
+        now = datetime.now(UTC)
+        self.period_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0).isoformat()
+        started = now - timedelta(seconds=database.settings.model_timeout_seconds) - IN_FLIGHT_MARGIN
+        in_flight = and_(usage.status == 'pending', usage.created_at >= started.isoformat())
+        unpriced = and_(usage.cost_usd.is_(None), usage.status != 'not_dispatched', not_(in_flight),
+                        func.coalesce(usage.coverage_error, '').not_in(UNBILLED))
+        recoverable = false()
+        service = getattr(database, 'product_inference', None)
+        if service is not None and service.settings.litellm_spend_recovery_enabled:
+            gateway, key_hash = service.scope()
+            # The requests ProductInferenceRecovery.poll still retries.
+            recoverable = and_(usage.created_at >= (now - RECEIPT_WINDOW).isoformat(), exists().where(
+                request.request_key == usage.request_key, request.gateway_scope == gateway,
+                request.key_hash == key_hash,
+                or_(request.next_attempt_at.is_not(None), request.recovery_error == 'receipt_access_denied')))
+        self.spent = func.coalesce(func.sum(cast(usage.cost_usd, Numeric)), 0)
+        self.awaiting = func.count().filter(unpriced, recoverable)
+        self.unresolved = func.count().filter(unpriced, not_(recoverable))
+        self.in_flight = func.count().filter(in_flight)
 
 
 class CanonicalRead:
@@ -47,9 +89,9 @@ class ProductGovernance:
         existing = await db.get(ProductSessionPolicy, session.id)
         if existing is not None:
             return existing
+        parent = await db.get(ProductSessionPolicy, inherited_from) if inherited_from else None
         if inherited_from and not requested:
             principal.require('sessions.read')
-            parent = await db.get(ProductSessionPolicy, inherited_from)
             from app.security_profiles import SessionBinding
             binding = SessionBinding(parent.profile_id if parent else '', parent.profile_revision if parent else 0,
                                      await self.policy(db, inherited_from))
@@ -65,7 +107,9 @@ class ProductGovernance:
         await db.flush()
         row = ProductSessionPolicy(session_id=session.id, profile_id=binding.profile_id,
                                    profile_revision=binding.revision, policy=dump_policy(policy),
-                                   inherited_from=inherited_from)
+                                   inherited_from=inherited_from,
+                                   # An unbound parent (a pre-governance session) heads the family.
+                                   family_root=parent.family_root if parent else inherited_from or session.id)
         db.add(row)
         await db.flush()
         return row
@@ -179,38 +223,29 @@ class ProductGovernance:
             limits = limits_from_rows(rows, principal.email)
             if limits.unlimited:
                 return
-            # In-flight requests were admitted below every limit and may cross it
-            # once priced, so they neither count nor block concurrent admission.
-            # A finished request without a reported cost fails closed until
-            # receipt recovery settles it.
-            settled = select(func.coalesce(func.sum(cast(InferenceUsage.cost_usd, Numeric)), 0),
-                             func.count().filter(InferenceUsage.cost_usd.is_(None))).where(
-                InferenceUsage.status.not_in(('not_dispatched', 'pending')))
-            since = datetime.now(UTC).replace(day=1, hour=0, minute=0, second=0, microsecond=0).isoformat()
+            ledger = SpendLedger(self.database)
+            # policy() above has already loaded this binding.
+            bound = await transaction.get(ProductSessionPolicy, scope.session_id)
+            root = bound.family_root if bound else scope.session_id
             scopes = {
-                'organization': [InferenceUsage.created_at >= since],
-                'user': [InferenceUsage.created_at >= since, InferenceUsage.actor_id.in_(
+                'organization': [InferenceUsage.created_at >= ledger.period_start],
+                'user': [InferenceUsage.created_at >= ledger.period_start, InferenceUsage.actor_id.in_(
                     select(text('id')).select_from(text(self.identity._table('users')))
                     .where(text('email=:email')).params(email=principal.email))
                     if principal.email else InferenceUsage.actor_id == principal.id],
                 # A delegated child shares every ancestor's lifetime session
-                # budget. The root's family includes each ancestor's family, so
-                # its total is the largest one that any ancestor's limit sees.
-                'session': [InferenceUsage.session_id.in_(text('''WITH RECURSIVE ancestors(id) AS (
-                        SELECT CAST(:session AS text) UNION
-                        SELECT p.inherited_from FROM moyai_product_session_policies p
-                        JOIN ancestors a ON p.session_id=a.id WHERE p.inherited_from IS NOT NULL
-                    ), family(id) AS (
-                        SELECT id FROM ancestors UNION
-                        SELECT p.session_id FROM moyai_product_session_policies p
-                        JOIN family f ON p.inherited_from=f.id
-                    ) SELECT id FROM family''').bindparams(session=scope.session_id))],
+                # budget. The whole family's total is the largest one that any
+                # ancestor's limit sees, so every member is checked against it.
+                # IN over a union keeps both lookups indexed; an OR would scan the ledger.
+                'session': [InferenceUsage.session_id.in_(select(ProductSessionPolicy.session_id).where(
+                    ProductSessionPolicy.family_root == root).union_all(select(literal(root))))],
             }
             usage = {}
             for kind, clauses in scopes.items():
                 if getattr(limits, kind) is not None:
-                    total, unpriced = (await transaction.execute(settled.where(*clauses))).one()
-                    usage[kind] = None if unpriced else total
+                    total, awaiting = (await transaction.execute(
+                        select(ledger.spent, ledger.awaiting).where(*clauses))).one()
+                    usage[kind] = None if awaiting else total
             if evaluate(limits, usage):
                 raise HTTPException(403, 'The configured spend limit has been reached. Ask a spend manager to review it.')
 

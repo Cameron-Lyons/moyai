@@ -14,6 +14,7 @@ const singletons = [
   { id: "session-default", label: "Limit per session", hint: "Lifetime model spend for a session and all its delegated agents." },
 ] as const
 const monthStart = (value: string) => Number.isFinite(Date.parse(value)) ? new Date(value).toLocaleDateString(undefined, { month: "long", day: "numeric", year: "numeric", timeZone: "UTC" }) : "the start of this month"
+const requests = (count: number) => count === 1 ? "1 model request" : `${count} model requests`
 
 /** Usage is null for a viewer without spend.read; the summary is then omitted. */
 export function SpendSummary({ data }: { data: SpendLimitsAdmin }) {
@@ -22,11 +23,15 @@ export function SpendSummary({ data }: { data: SpendLimitsAdmin }) {
   const organization = data.limits.find(limit => limit.id === "organization")
   const used = usage.organization_month_usd, limit = organization?.limit_usd ?? null
   const remaining = limit === null ? null : Math.max(0, limit - used)
-  return <dl className="ns-gov-stats" aria-label="Organization spend this month">
-    <div><dt>Spent since {monthStart(usage.period_start)}</dt><dd>{usd(used)}</dd></div>
-    <div><dt>Organization limit</dt><dd>{limitText(limit)}</dd></div>
-    <div><dt>Remaining this month</dt><dd>{limit !== null && usage.unknown_requests > 0 ? "Pending cost reconciliation" : remaining === null ? "No limit" : usd(remaining)}{limit !== null && used >= limit && <small>Limit reached. New model requests are refused.</small>}</dd></div>
-  </dl>
+  return <>
+    {usage.unknown_requests > 0 && <p className="ns-notice" role="status">{requests(usage.unknown_requests)} finished without a reported cost. Reported spend is incomplete; configured limits block further requests until their costs are recovered.</p>}
+    {usage.unresolved_requests > 0 && <p className="ns-notice" role="status">The cost of {requests(usage.unresolved_requests)} could not be recovered and is excluded from reported spend and limits. Review it against the gateway's spend logs.</p>}
+    <dl className="ns-gov-stats" aria-label="Organization spend this month">
+      <div><dt>Spent since {monthStart(usage.period_start)}</dt><dd>{usd(used)}{usage.in_flight_requests > 0 && <small>Excludes {requests(usage.in_flight_requests)} still running.</small>}</dd></div>
+      <div><dt>Organization limit</dt><dd>{limitText(limit)}</dd></div>
+      <div><dt>Remaining this month</dt><dd>{limit !== null && usage.unknown_requests > 0 ? "Pending cost reconciliation" : remaining === null ? "No limit" : usd(remaining)}{limit !== null && used >= limit && <small>Limit reached. New model requests are refused.</small>}</dd></div>
+    </dl>
+  </>
 }
 
 export function OverrideRows({ rows, canManage, onEdit, onRemove }: { rows: SpendLimit[]; canManage: boolean; onEdit: (row: SpendLimit) => void; onRemove: (row: SpendLimit) => void }) {
@@ -51,9 +56,8 @@ export function SpendLimitsPage({ canManage }: { canManage: boolean }) {
     const rows = overrides.filter(row => contains(search, row.subject))
     const revisionKey = singletons.map(item => data.limits.find(limit => limit.id === item.id)?.revision ?? 0).join(":")
     return <>
-      <div className="ns-gov-intro"><p className="ns-notice">Limits cover month-to-date model spend in US dollars, reset on the first day of each UTC month. When a limit is reached, new model requests are refused with an explanation. Pending or missing costs block new requests whenever an applicable limit is configured. A request admitted below the threshold can exceed it.</p>
+      <div className="ns-gov-intro"><p className="ns-notice">Limits cover month-to-date model spend in US dollars, reset on the first day of each UTC month. When a limit is reached, new model requests are refused with an explanation. A finished request whose cost is still being recovered blocks new requests under an applicable limit, for up to a day. Requests still running are not counted yet, so one admitted below the threshold can exceed it.</p>
         <PageActions resource={resource} /></div>
-      {data.usage && data.usage.unknown_requests > 0 && <p className="ns-notice" role="status">{data.usage.unknown_requests} model requests have pending or missing costs. Reported spend is incomplete; configured limits block further requests until costs are known.</p>}
       <SpendSummary data={data} />
       <Section id="gov-spend-limits" title="Organization and defaults" description={manage ? "Leave an amount blank for no limit. Enter 0 to block model use." : "You can view limits. Changing them requires the spend.manage permission."}>
         <LimitsForm revisionKey={revisionKey} data={data} manage={manage} onSaved={saved} onReload={resource.refresh} />

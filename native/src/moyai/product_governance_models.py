@@ -28,4 +28,6 @@ class ProductSessionPolicy(Base):
     profile_revision: Mapped[int] = mapped_column(Integer)
     policy: Mapped[str] = mapped_column(Text)  # Canonical JSON of the bound profile policy.
     inherited_from: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    # The delegation family's top session, so a family budget is one indexed lookup.
+    family_root: Mapped[str] = mapped_column(String(100), index=True)
     created_at: Mapped[str] = mapped_column(String(40), default=now)

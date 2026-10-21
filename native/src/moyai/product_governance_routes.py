@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import UTC, datetime
 from typing import Literal
 
 from app.enterprise_roles import GovernanceActor, GroupRoleChange, RoleAssignment, RoleCreate, RoleUpdate
@@ -141,36 +140,39 @@ def routes(runtime):
         """The limit listing; usage totals only for a caller holding spend.read."""
         data = await asyncio.to_thread(product.spend_limits.listing)
         permitted = 'spend.read' in user.effective_permissions
-        usage, total, amounts = None, 0.0, {}
+        usage, organization, amounts = None, None, {}
         if permitted:
-            from sqlalchemy import Numeric, cast, func, select, text
+            from sqlalchemy import column, select, table
 
             from .inference_usage import InferenceUsage
-            since = datetime.now(UTC).replace(day=1, hour=0, minute=0, second=0, microsecond=0).isoformat()
+            from .product_governance import SpendLedger
+            ledger = SpendLedger(runtime.database)
+            month = InferenceUsage.created_at >= ledger.period_start
+            people = table('users', column('id'), column('email'), schema=product.identity.schema or None)
             async with runtime.database.sessions() as db:
-                month = (InferenceUsage.created_at >= since, InferenceUsage.status != 'not_dispatched')
-                total, unknown = (await db.execute(select(
-                    func.coalesce(func.sum(cast(InferenceUsage.cost_usd, Numeric)), 0),
-                    func.count().filter(InferenceUsage.cost_usd.is_(None))).where(*month))).one()
-                users = (await db.execute(text(f'''SELECT person.email,
-                    COALESCE(SUM(CAST(usage.cost_usd AS numeric)),0) AS amount,
-                    COUNT(*) FILTER (WHERE usage.cost_usd IS NULL) AS unknown
-                    FROM moyai_inference_usage usage JOIN {product.identity._table('users')} person ON person.id=usage.actor_id
-                    WHERE usage.created_at>=:since AND usage.status<>'not_dispatched' GROUP BY person.email'''),
-                    {'since': since})).mappings()
-                amounts = {row['email']: None if row['unknown'] else float(row['amount']) for row in users}
-            total = float(total)
-            usage = {'organization_month_usd': total, 'period_start': since, 'unknown_requests': unknown}
+                total, awaiting, in_flight, unresolved = (await db.execute(select(
+                    ledger.spent, ledger.awaiting, ledger.in_flight, ledger.unresolved).where(month))).one()
+                users = await db.execute(select(people.c.email, ledger.spent, ledger.awaiting)
+                                         .join_from(InferenceUsage, people, people.c.id == InferenceUsage.actor_id)
+                                         .where(month).group_by(people.c.email))
+                # A scope awaiting a cost has no usage (None), exactly as admission sees it.
+                amounts = {email: None if blocked else float(spent) for email, spent, blocked in users}
+            usage = {'organization_month_usd': float(total), 'period_start': ledger.period_start,
+                     'unknown_requests': awaiting, 'in_flight_requests': in_flight,
+                     'unresolved_requests': unresolved}
+            organization = None if awaiting else usage['organization_month_usd']
         for row in data['limits']:
             row['used_usd'] = None if not permitted else (
-                total if row['kind'] == 'organization'
+                organization if row['kind'] == 'organization'
                 else amounts.get(row['subject'], 0) if row['kind'] == 'user' else None)
         return SpendLimitsAdmin.model_validate({**data, 'usage': usage,
                                                 'can_manage': 'spend.manage' in user.effective_permissions})
 
     @router.get('/api/admin/spend-limits', operation_id='getSpendLimits')
     async def spend(user=Depends(principal)) -> SpendLimitsAdmin:
-        user.require('spend.read')
+        # A limit manager needs the current revisions; spend_view withholds usage.
+        if 'spend.manage' not in user.effective_permissions:
+            user.require('spend.read')
         return await spend_view(user)
 
     @router.put('/api/admin/spend-limits', operation_id='updateSpendLimits')

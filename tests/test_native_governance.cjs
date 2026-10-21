@@ -150,9 +150,15 @@ test('policy rows mark defaults, keep defaults enabled and summarize empty lists
 test('spend and audit rows: read-only viewers get no actions and details are escaped text',()=>{
   const overrides=render(gov.OverrideRows,{rows:[limit({id:'user:carol@example.test',kind:'user',subject:'carol@example.test',limit_usd:50,used_usd:60})],canManage:false,onEdit(){},onRemove(){}});
   assert.doesNotMatch(overrides,/>Edit<|>Remove</);assert.match(overrides,/Limit reached/);assert.doesNotMatch(overrides,/Actions/);
-  const summary=render(gov.SpendSummary,{data:{limits:limits(),usage:{organization_month_usd:6000,period_start:'2026-10-01T00:00:00Z',unknown_requests:0},can_manage:true}});
-  assert.match(summary,/Limit reached/);assert.match(summary,/\$0\.00/);
-  assert.match(render(gov.SpendSummary,{data:{limits:limits(),usage:{organization_month_usd:10,period_start:'2026-10-01T00:00:00Z',unknown_requests:2},can_manage:true}}),/Pending cost reconciliation/);
+  const usage=(patch={})=>({organization_month_usd:10,period_start:'2026-10-01T00:00:00Z',unknown_requests:0,in_flight_requests:0,unresolved_requests:0,...patch});
+  const summary=render(gov.SpendSummary,{data:{limits:limits(),usage:usage({organization_month_usd:6000}),can_manage:true}});
+  assert.match(summary,/Limit reached/);assert.match(summary,/\$0\.00/);assert.doesNotMatch(summary,/still running|without a reported cost|could not be recovered/);
+  const awaiting=render(gov.SpendSummary,{data:{limits:limits(),usage:usage({unknown_requests:2}),can_manage:true}});
+  assert.match(awaiting,/Pending cost reconciliation/);assert.match(awaiting,/2 model requests finished without a reported cost/);
+  // Running and unrecoverable requests do not block admission, so the remaining amount stays known.
+  const reported=render(gov.SpendSummary,{data:{limits:limits(),usage:usage({in_flight_requests:3,unresolved_requests:1}),can_manage:true}});
+  assert.match(reported,/Excludes 3 model requests still running/);assert.match(reported,/The cost of 1 model request could not be recovered/);
+  assert.doesNotMatch(reported,/Pending cost reconciliation/);assert.match(reported,/\$4,990\.00/);
   assert.equal(render(gov.SpendSummary,{data:{limits:limits().map(row=>({...row,used_usd:null})),usage:null,can_manage:true}}),'','no summary without spend.read usage');
   const audit=render(gov.AuditRows,{entries:[{id:'a',source:'governance',action:'role.created',actor:'',resource_type:'role',resource_id:'<script>',details:{note:'<img src=x onerror=bad()>'},created_at:stamp}]});
   assert.doesNotMatch(audit,/<script>|<img/);assert.match(audit,/&lt;script&gt;/);assert.match(audit,/System/);assert.match(audit,/Role created/);

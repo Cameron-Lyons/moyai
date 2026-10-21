@@ -4,9 +4,12 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from uuid import uuid4
 
+import httpx2
 import pytest
 import pytest_asyncio
 import test_product_authority as authority
@@ -15,15 +18,18 @@ import test_product_inference as inference_fixtures
 import test_product_skill_tools as skill_fixtures
 from app.security_profiles import ProfilePolicy, SecurityProfiles, dump_policy
 from fastapi import HTTPException
-from sqlalchemy import select, text
+from sqlalchemy import select, text, update
 from sqlalchemy.exc import DBAPIError
+from test_inference_usage import WireStream, payload
 from test_product_identity import google_cookie, request
 from test_product_inference import perform, requests
 
 from moyai.contracts import NewSession
+from moyai.inference_usage import InferenceUsage
 from moyai.models import Session
 from moyai.product_governance import ProductGovernance
 from moyai.product_governance_models import ProductSessionPolicy
+from moyai.product_inference import ProductInferenceRequest
 from moyai.product_schema import (
     AUTOMATION_CHAT_SCHEMA_VERSION,
     GOVERNANCE_SCHEMA_VERSION,
@@ -99,6 +105,7 @@ async def test_binding_pins_revision_inherits_parent_and_intersects_live_mandato
     async with product.database.sessions() as db:
         bound = await db.get(ProductSessionPolicy, child.id)
         assert (bound.profile_id, bound.profile_revision, bound.inherited_from) == (selected, 1, parent.id)
+        assert bound.family_root == (await db.get(ProductSessionPolicy, parent.id)).family_root == parent.id
         assert (await product.database.governance.policy(db, child.id)).tools == ('read_file', 'shell')
     mandatory = await profile(product, {'tools': ['read_file'], 'git_access': 'none'})
     await defaults(product, mandatory=mandatory)
@@ -318,10 +325,119 @@ async def test_child_spend_is_charged_to_the_parent_session_limit(inference):
     child = await ctx.product.database.create_session(ctx.product.actor, NewSession(), inherited_from=ctx.session.id)
     await source_write(ctx.product, "INSERT INTO moyai.spend_limits VALUES('session-default','session-default','',0.2,1,'owner','now')")
     await perform(ctx, cost='0.25')
-    from dataclasses import replace
-    child_scope = replace(ctx.scope, session_id=child.id)
+    grandchild = await ctx.product.database.create_session(ctx.product.actor, NewSession(), inherited_from=child.id)
+    async with ctx.product.database.sessions() as db:
+        # The parent predates its family's bindings, so it heads the family.
+        assert (await db.get(ProductSessionPolicy, grandchild.id)).family_root == ctx.session.id
+    for member in (child, grandchild):
+        with pytest.raises(HTTPException, match='spend limit'):
+            await ctx.product.database.governance.check_model(replace(ctx.scope, session_id=member.id))
+
+
+async def session_limit(product):
+    await source_write(product, "INSERT INTO moyai.spend_limits VALUES('session-default','session-default','',10,1,'owner','now')")
+
+
+@pytest.mark.parametrize('outcome', ['parked', 'expired', 'disabled', 'rotated'])
+async def test_unpriced_request_blocks_only_while_recovery_can_settle_it(inference, outcome):
+    ctx = inference
+    attach(ctx.product)
+    await session_limit(ctx.product)
+    await perform(ctx, logical='unpriced', cost=None)
     with pytest.raises(HTTPException, match='spend limit'):
-        await ctx.product.database.governance.check_model(child_scope)
+        await perform(ctx, logical='blocked')
+    headers = None
+    async with ctx.product.database.sessions.begin() as db:
+        if outcome == 'parked':
+            await db.execute(update(ProductInferenceRequest).values(next_attempt_at=None, recovery_error='unverified_zero'))
+        elif outcome == 'expired':
+            old = (datetime.now(UTC) - timedelta(days=2)).isoformat()
+            await db.execute(update(InferenceUsage).values(created_at=old))
+    if outcome == 'disabled':
+        ctx.service.settings.litellm_spend_recovery_enabled = False
+    elif outcome == 'rotated':
+        ctx.service.settings.litellm_api_key = 'rotated-inference-key'
+        headers = {'authorization': 'Bearer rotated-inference-key'}
+    await perform(ctx, logical='admitted', headers=headers)
+    assert len(ctx.calls) == 2
+
+
+async def test_gateway_errors_and_duplicate_receipts_never_block_a_limit(inference):
+    ctx = inference
+    attach(ctx.product)
+    await session_limit(ctx.product)
+
+    async def rejected(_):
+        return httpx2.Response(429, stream=WireStream(b'<html>Busy</html>'), headers={'content-type': 'text/html'})
+
+    async def same_receipt(_):
+        return httpx2.Response(200, stream=WireStream(json.dumps(payload(cost='0.125')).encode()),
+                               headers={'content-type': 'application/json', 'x-litellm-call-id': 'same-receipt'})
+    assert (await perform(ctx, logical='rejected', handler=rejected)).status_code == 429
+    await perform(ctx, logical='first', handler=same_receipt)
+    await perform(ctx, logical='second', handler=same_receipt)
+    async with ctx.product.database.sessions() as db:
+        errors = list(await db.scalars(select(InferenceUsage.coverage_error).where(InferenceUsage.cost_usd.is_(None))))
+    assert sorted(errors) == ['duplicate_provider_receipt', 'gateway_error']
+    await perform(ctx, logical='admitted')
+    assert len(ctx.calls) == 4
+
+
+async def test_pending_request_counts_once_it_outlives_the_model_timeout(inference, monkeypatch):
+    ctx = inference
+    attach(ctx.product)
+    await session_limit(ctx.product)
+
+    async def unavailable(_):
+        raise RuntimeError('synthetic final accounting outage')
+    monkeypatch.setattr(ctx.service, 'observe', unavailable)
+    await perform(ctx, logical='lost')  # Its final status and cost are never written.
+    monkeypatch.undo()
+    await perform(ctx, logical='in-flight')  # Still within the model timeout.
+    started = datetime.now(UTC) - timedelta(seconds=ctx.product.database.settings.model_timeout_seconds + 120)
+    async with ctx.product.database.sessions.begin() as db:
+        await db.execute(update(InferenceUsage).where(InferenceUsage.status == 'pending')
+                         .values(created_at=started.isoformat()))
+    with pytest.raises(HTTPException, match='spend limit'):
+        await perform(ctx, logical='after')
+    assert len(ctx.calls) == 2
+
+
+async def test_spend_page_reports_usage_as_admission_counts_it(inference):
+    ctx = inference
+    attach(ctx.product)
+    await perform(ctx, logical='priced', cost='0.25')
+    await perform(ctx, logical='parked', cost=None)
+    async with ctx.product.database.sessions.begin() as db:
+        await db.execute(update(ProductInferenceRequest).where(ProductInferenceRequest.cost_usd.is_(None))
+                         .values(next_attempt_at=None, recovery_error='unverified_zero'))
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def running(_):
+        entered.set()
+        await release.wait()
+        return httpx2.Response(200, stream=WireStream(json.dumps(payload()).encode()),
+                               headers={'content-type': 'application/json'})
+    person = {**SPEND_ROW, 'id': 'user:admin@example.test', 'kind': 'user', 'subject': 'admin@example.test'}
+
+    class Listing:
+        def listing(self):
+            return {'limits': [dict(SPEND_ROW), dict(person)]}
+    task = asyncio.create_task(perform(ctx, logical='running', handler=running))
+    async with governance_client(ctx.product, spend_limits=Listing()) as client:
+        try:
+            await asyncio.wait_for(entered.wait(), 5)
+            running_body = (await client.get('/api/admin/spend-limits')).json()
+        finally:
+            release.set()
+            await task
+        finished_body = (await client.get('/api/admin/spend-limits')).json()
+    counts = ('organization_month_usd', 'unknown_requests', 'in_flight_requests', 'unresolved_requests')
+    assert tuple(running_body['usage'][key] for key in counts) == (0.25, 0, 1, 1)
+    assert [row['used_usd'] for row in running_body['limits']] == [0.25, 0.25]
+    # Finished without a cost, it now awaits recovery and blocks both scopes.
+    assert tuple(finished_body['usage'][key] for key in counts) == (0.25, 1, 0, 1)
+    assert [row['used_usd'] for row in finished_body['limits']] == [None, None]
 
 
 async def test_workflow_update_checks_the_submitted_definition_inside_the_writer(automations):
@@ -395,7 +511,7 @@ SPEND_ROW = {'id': 'organization', 'kind': 'organization', 'subject': '', 'limit
              'updated_at': '2026-10-21T00:00:00Z', 'updated_by': 'admin@example.test'}
 
 
-async def test_spend_management_without_read_permission_does_not_return_usage(governed):
+async def test_spend_management_without_read_permission_does_not_return_usage(governed, monkeypatch):
     product = governed
     await member_role(product, ['spend.manage'])
     class ConfigurationOnly:
@@ -414,6 +530,11 @@ async def test_spend_management_without_read_permission_does_not_return_usage(go
         assert response.status_code == 200 and response.json() == configuration
         response = await client.delete('/api/admin/spend-limits/user:person@example.test?revision=1')
         assert response.status_code == 200 and response.json() == configuration
+        # Exercise the handler's own check; route_permission is tested on its own.
+        monkeypatch.setattr('app.permissions.route_permission', lambda request: None)
+        response = await client.get('/api/admin/spend-limits')
+        assert response.status_code == 200 and response.json() == configuration
+        await source_write(product, "UPDATE moyai.enterprise_roles SET permissions='[\"workspace.read\"]' WHERE id='restricted'")
         assert (await client.get('/api/admin/spend-limits')).status_code == 403
 
 

@@ -18983,6 +18983,10 @@
       },
       "SpendUsage": {
         "properties": {
+          "in_flight_requests": {
+            "title": "In Flight Requests",
+            "type": "integer"
+          },
           "organization_month_usd": {
             "title": "Organization Month Usd",
             "type": "number"
@@ -18994,12 +18998,18 @@
           "unknown_requests": {
             "title": "Unknown Requests",
             "type": "integer"
+          },
+          "unresolved_requests": {
+            "title": "Unresolved Requests",
+            "type": "integer"
           }
         },
         "required": [
           "organization_month_usd",
           "period_start",
-          "unknown_requests"
+          "unknown_requests",
+          "in_flight_requests",
+          "unresolved_requests"
         ],
         "title": "SpendUsage",
         "type": "object"

@@ -124,13 +124,29 @@ child must also remain below every ancestor's session budget.
 
 The inference admission transaction that records the durable request receipt
 checks the budget. Requests still in flight neither count nor block concurrent
-admission, so concurrent work can cross a limit by its in-flight cost. A finished
+admission, so concurrent work can cross a limit by its in-flight cost. A request
+stops counting as in flight one minute after the model timeout
+(`MOYAI_MODEL_TIMEOUT`), even if its final status was never recorded. A finished
 request without a reported cost fails closed for every limited scope it counts
-toward until receipt recovery settles it. Requests known not to have dispatched
-do not consume budget. Reported final USD costs come from the native inference
-ledger; no prices are invented for missing receipts. These are admission limits,
-not provider-side prepaid reservations. Already dispatched work is not cancelled
-by a limit change. Without a configured limit, admission reads no usage.
+toward while receipt recovery can still settle it, for at most 24 hours.
+Requests known not to have dispatched, requests the gateway answered with an
+error status (LiteLLM records those at zero spend), and duplicate receipts whose
+charge another request carries do not consume budget. A cost that recovery
+cannot settle (recovery disabled, a rotated gateway key, rejected receipt
+evidence, or a request older than 24 hours) stops blocking; Spend limits reports
+it as unresolved for a spend manager to review. Reported final USD costs come
+from the native inference ledger; no prices are invented for missing receipts.
+These are admission limits, not provider-side prepaid reservations. Already
+dispatched work is not cancelled by a limit change. Without a configured limit,
+admission reads no usage.
+
+A session budget reads only its delegation family, through the family root
+bound with each session. Organization and per-person budgets sum the month's
+ledger rows on every model request, inside the admission transaction, so that
+check grows with the month's request volume. The ledger keeps its existing time,
+actor and session indexes. A covering index or running totals would change the
+ledger that the billing-storage consolidation copies and re-indexes, so they need
+a reviewed billing-storage migration.
 
 Native Slack intake does not transcribe audio, since gateway transcription is
 neither admitted against these limits nor recorded in the ledger. The original

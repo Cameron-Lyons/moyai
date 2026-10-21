@@ -220,6 +220,11 @@ class UsageCapture:
         elif encoding != "identity":
             self.disabled = True
             self.values["coverage_error"] = "unsupported_content_encoding"
+        if not response.is_success:
+            # An error body has no usage, and LiteLLM records the failure at
+            # zero spend. Spend limits therefore never wait for its receipt.
+            self.disabled = True
+            self.values["coverage_error"] = "gateway_error"
 
     def consume(self, value: object, *, final: bool) -> None:
         if not isinstance(value, dict):

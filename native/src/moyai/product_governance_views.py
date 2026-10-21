@@ -238,14 +238,19 @@ class SpendLimitView(GovernanceView):
     updated_at: str | None
     updated_by: str
     # Month-to-date spend for "organization" and "user" rows; None for defaults,
-    # unpriced usage, or a caller without spend.read.
+    # usage awaiting cost recovery (which blocks it), or a caller without spend.read.
     used_usd: float | None
 
 
 class SpendUsage(GovernanceView):
     organization_month_usd: float
     period_start: str
+    # Finished requests awaiting cost recovery; each blocks every limited scope it counts toward.
     unknown_requests: int
+    # Requests still running; they count once finished.
+    in_flight_requests: int
+    # Requests whose cost recovery cannot settle; excluded from limits, for review.
+    unresolved_requests: int
 
 
 class SpendLimitsAdmin(GovernanceView):

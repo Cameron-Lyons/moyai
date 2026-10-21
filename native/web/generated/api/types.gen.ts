@@ -10778,6 +10778,10 @@ export type SpendLimitsAdmin = {
  */
 export type SpendUsage = {
     /**
+     * In Flight Requests
+     */
+    in_flight_requests: number;
+    /**
      * Organization Month Usd
      */
     organization_month_usd: number;
@@ -10789,6 +10793,10 @@ export type SpendUsage = {
      * Unknown Requests
      */
     unknown_requests: number;
+    /**
+     * Unresolved Requests
+     */
+    unresolved_requests: number;
 };
 
 /**
