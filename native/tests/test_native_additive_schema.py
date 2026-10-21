@@ -243,7 +243,8 @@ async def test_sequential_batches_preserve_original_native_and_online_receipts(e
         assert online.apply(connection, batch, guard=lambda _: None)["status"] == "already_applied"
     assert set(original) <= set(rows(connection, database.schema, product.RECEIPTS))
     assert rows(connection, database.schema, online.LEDGER)[0] == legacy_ledger[0]
-    assert len(rows(connection, database.schema, online.LEDGER)) == 4
+    # One ledger row per registered step applied.
+    assert len(rows(connection, database.schema, online.LEDGER)) == len(online._steps(online.FROM_VERSION, V25))
     current = online.plan_from_receipts("moyai", database.schema, "native-online-test", value["target"]["app"])
     assert current["from_version"] == current["to_version"] == V25
     assert online.inspect(connection, current)["status"] == "current"

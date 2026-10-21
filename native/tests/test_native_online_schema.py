@@ -17,6 +17,7 @@ from moyai.native_online_schema import (
     ADDED,
     FROM_VERSION,
     LEDGER,
+    SESSION_POLICY_IMMUTABLE,
     TO_VERSION,
     OnlineSchemaError,
     _indexes,
@@ -28,6 +29,10 @@ from moyai.native_online_schema import (
 )
 from moyai.product_schema import (
     AUTOMATION_CHAT_SCHEMA_VERSION,
+    GOVERNANCE_SCHEMA_VERSION,
+    SESSION_POLICY_FUNCTION_BODY,
+    SESSION_POLICY_TABLE,
+    SESSION_POLICY_TRIGGER,
     _manifest,
     application_metadata,
     migrate_product_schema,
@@ -76,8 +81,8 @@ def test_frozen_expansion_matches_the_real_v22_tables_and_indexes():
 async def test_automation_chat_expansion_preserves_history_and_matches_offline_schema(product_database, before):
     product = product_database
     await migrate_product_schema(product.source, schema=product.schema, source_schema="moyai", version=before)
-    value = plan("moyai", product.schema, "native-online-test", from_version=before)
-    assert value["to_version"] == AUTOMATION_CHAT_SCHEMA_VERSION
+    value = plan("moyai", product.schema, "native-online-test", from_version=before,
+                 to_version=AUTOMATION_CHAT_SCHEMA_VERSION)
     frozen = _metadata(product.schema, version=AUTOMATION_CHAT_SCHEMA_VERSION)
     actual = application_metadata(product.schema, version=AUTOMATION_CHAT_SCHEMA_VERSION)
     assert _manifest(frozen) == _manifest(actual)
@@ -106,6 +111,42 @@ async def test_automation_chat_expansion_preserves_history_and_matches_offline_s
         )).fetchone() == (0,)
     await verify_product_schema(product.source, schema=product.schema, version=before)
     await verify_product_schema(product.source, schema=product.schema, version=AUTOMATION_CHAT_SCHEMA_VERSION)
+
+
+def test_frozen_governance_step_matches_the_installed_v24_binding():
+    assert SESSION_POLICY_IMMUTABLE == (SESSION_POLICY_TABLE, SESSION_POLICY_TRIGGER, SESSION_POLICY_FUNCTION_BODY)
+    frozen = _metadata("native_online", version=GOVERNANCE_SCHEMA_VERSION)
+    actual = application_metadata("native_online", version=GOVERNANCE_SCHEMA_VERSION)
+    assert _manifest(frozen) == _manifest(actual)
+    assert _indexes(frozen) == _indexes(actual)
+
+
+async def test_governance_expansion_installs_the_immutable_binding_online(product_database):
+    product = product_database
+    await migrate_product_schema(
+        product.source, schema=product.schema, source_schema="moyai", version=AUTOMATION_CHAT_SCHEMA_VERSION,
+    )
+    value = plan("moyai", product.schema, "native-online-test", from_version=AUTOMATION_CHAT_SCHEMA_VERSION)
+    assert value["to_version"] == GOVERNANCE_SCHEMA_VERSION
+    assert product.settings.postgres_url
+    with psycopg.connect(product.settings.postgres_url, autocommit=True) as connection:
+        assert apply(connection, value, guard=lambda _: None)["status"] == "applied"
+    # Normal startup verification checks the exact immutability trigger.
+    await verify_product_schema(product.source, schema=product.schema, version=GOVERNANCE_SCHEMA_VERSION)
+    with psycopg.connect(product.settings.postgres_url, autocommit=True) as connection:
+        connection.execute(sql.SQL("DROP TRIGGER {} ON {}").format(
+            sql.Identifier(SESSION_POLICY_TRIGGER), sql.Identifier(product.schema, SESSION_POLICY_TABLE)))
+        with pytest.raises(OnlineSchemaError, match="target_structure_changed"):
+            inspect(connection, value)
+
+
+async def test_offline_governance_migration_is_a_current_online_noop(product_database):
+    product = product_database
+    await migrate_product_schema(product.source, schema=product.schema, source_schema="moyai")
+    value = plan("moyai", product.schema, "native-online-test", from_version=GOVERNANCE_SCHEMA_VERSION)
+    assert product.settings.postgres_url
+    with psycopg.connect(product.settings.postgres_url, autocommit=True) as connection:
+        assert inspect(connection, value)["status"] == "current"
 
 
 @pytest.mark.parametrize("change", ["sql", "digest", "prefix", "schema", "queue", "extra"])

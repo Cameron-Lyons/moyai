@@ -13,9 +13,10 @@ in [the deployment contract](pydantic-deployment.md). Canonical revision 23 comb
 upstream revision 22 with the governance branch's older revision 22; neither older
 layout is admitted as the combined release. The native migration follows upstream
 v23 (automation chats), adds an immutable session-policy table and preserves the
-previous 23 migration receipts. It installs a trigger, so it is not an
-[online expansion](native-online-schema.md). Normal startup verifies both schemas;
-it does not run migrations.
+previous 23 migration receipts. It is also a registered
+[online expansion](native-online-schema.md), so the native table can be prepared
+while v23 services run; the canonical revision still needs the maintenance
+window. Normal startup verifies both schemas; it does not run migrations.
 
 The canonical upgrade retains existing governance configuration and audit events,
 copies the older `floor_profile_id` into the mandatory policy, and adds SCIM

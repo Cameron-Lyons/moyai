@@ -40,6 +40,14 @@ PROTOCOL = "moyai-native-online-v1"
 FROM_VERSION = "2026-10-18-message-sources-v21"
 TO_VERSION = "2026-10-17-goals-v22"
 AUTOMATION_CHAT_VERSION = "2026-10-19-automation-chats-v23"
+GOVERNANCE_VERSION = "2026-10-21-product-governance-v24"
+SESSION_POLICIES = "moyai_product_session_policies"
+# Frozen with the step: a transported engine never imports the definition from
+# an older installed application.
+SESSION_POLICY_IMMUTABLE = (
+    SESSION_POLICIES, "moyai_product_session_policy_immutable",
+    "BEGIN RAISE EXCEPTION 'A bound session security policy is immutable' USING ERRCODE='55000'; END",
+)
 LEDGER = "moyai_native_online_migrations"
 ADDED = frozenset({"moyai_goals", "moyai_goal_turns", "moyai_goal_receipts"})
 PARENTS = ("moyai_sessions", "moyai_turns", "moyai_users")
@@ -123,6 +131,9 @@ class Expansion(NamedTuple):
     tables: frozenset[str]
     columns: tuple[tuple[str, str], ...]
     define: Callable[[MetaData, str], None]
+    # Reviewed (table, trigger, PL/pgSQL body) row triggers that reject every
+    # UPDATE and DELETE on a table this step creates.
+    immutable: tuple[tuple[str, str, str], ...] = ()
 
 
 def _automation_chat_tables(metadata: MetaData, schema: str) -> None:
@@ -135,10 +146,26 @@ def _automation_chat_tables(metadata: MetaData, schema: str) -> None:
     )
 
 
+def _governance_tables(metadata: MetaData, schema: str) -> None:
+    # Freeze the v24 session policy binding independently of later ORM changes.
+    Table(
+        SESSION_POLICIES, metadata,
+        Column("session_id", String(36), ForeignKey(f"{schema}.moyai_sessions.id"), primary_key=True),
+        Column("profile_id", String(64), nullable=False),
+        Column("profile_revision", Integer, nullable=False),
+        Column("policy", Text, nullable=False),
+        Column("inherited_from", String(100), nullable=True),
+        Column("family_root", String(100), nullable=False, index=True),
+        Column("created_at", String(40), nullable=False), schema=schema,
+    )
+
+
 EXPANSIONS = (
     Expansion(FROM_VERSION, TO_VERSION, ADDED, (), _goal_tables),
     Expansion(TO_VERSION, AUTOMATION_CHAT_VERSION, frozenset({"moyai_product_automation_turns"}), (),
               _automation_chat_tables),
+    Expansion(AUTOMATION_CHAT_VERSION, GOVERNANCE_VERSION, frozenset({SESSION_POLICIES}), (), _governance_tables,
+              (SESSION_POLICY_IMMUTABLE,)),
 )
 
 
@@ -235,6 +262,9 @@ def _define(metadata: MetaData, schema: str, step: Expansion) -> None:
     require(not step.tables.intersection({LEDGER, "moyai_app_schema_versions"}), "step_invalid")
     step.define(metadata, schema)
     require({table.name for table in metadata.tables.values()} == set(old) | step.tables, "step_not_additive")
+    for table_name, trigger, body in step.immutable:
+        _identifier(trigger)
+        require(table_name in step.tables and isinstance(body, str) and "$$" not in body, "step_invalid")
     require(all(table.schema == schema for table in metadata.tables.values()), "scope_invalid")
     for name, column_name in step.columns:
         require(name in old and column_name not in original_columns[name], "step_not_additive")
@@ -318,6 +348,15 @@ def _ddl(metadata: MetaData, steps: tuple[Expansion, ...] | None = None) -> list
             require(name not in names, "index_collision")
             names.add(name)
             statements.append(str(CreateIndex(index).compile(dialect=dialect)))
+    preparer = dialect.identifier_preparer
+    for step in steps:
+        for name, trigger, body in step.immutable:
+            # The same statements as the offline migration, for a table created above.
+            table = next(table for table in metadata.tables.values() if table.name == name)
+            function = f"{preparer.quote_schema(table.schema)}.{preparer.quote(trigger)}"
+            statements.append(f"CREATE FUNCTION {function}() RETURNS trigger LANGUAGE plpgsql AS $$ {body} $$")
+            statements.append(f"CREATE TRIGGER {preparer.quote(trigger)} BEFORE UPDATE OR DELETE "
+                              f"ON {preparer.format_table(table)} FOR EACH ROW EXECUTE FUNCTION {function}()")
     for step in steps:
         for name, column in step.columns:
             # A multi-step upgrade may add a column to a table created earlier
@@ -351,13 +390,7 @@ def plan(
         "scope_invalid",
     )
     # The transported engine can know more versions than its old interpreter.
-    # Later native versions (governance v24 installs a trigger) need the offline
-    # migration, so the default target is the last reviewed online step.
-    if to_version is None:
-        versions = _versions()
-        to_version = EXPANSIONS[-1].after
-        if from_version in versions and versions.index(from_version) > versions.index(to_version):
-            to_version = from_version  # Already past every online step: nothing to plan.
+    to_version = to_version or _versions()[-1]
     return _plan(source_schema, native_schema, task_queue, from_version, to_version, _inventory(native_schema))
 
 
@@ -537,6 +570,7 @@ def _ledger(connection, value: dict, plans: dict[tuple[str, str], dict]) -> dict
 
 def _verify_added(
     connection, schema: str, metadata: MetaData, tables: frozenset[str], columns: tuple[tuple[str, str], ...],
+    immutable: tuple[tuple[str, str, str], ...] = (),
 ) -> None:
     dialect = postgresql.dialect()
     names = tables | {name for name, _ in columns}
@@ -553,7 +587,21 @@ def _verify_added(
                 EXISTS(SELECT 1 FROM pg_inherits WHERE inhrelid=pg_class.oid OR inhparent=pg_class.oid)
             FROM pg_class WHERE oid=to_regclass(%s)
         """, (relation,)).fetchone()
-        require(kind == ("r", False, False, False, "p", False, False), "target_structure_changed")
+        triggers = {(trigger, f" {body} ") for target, trigger, body in immutable if target == name}
+        require(kind == ("r", False, False, False, "p", bool(triggers), False), "target_structure_changed")
+        if triggers:
+            # Exactly the reviewed BEFORE UPDATE OR DELETE row triggers (tgtype 27).
+            actual_triggers = connection.execute("""
+                SELECT t.tgname,p.prosrc FROM pg_trigger t JOIN pg_proc p ON p.oid=t.tgfoid
+                JOIN pg_namespace pn ON pn.oid=p.pronamespace JOIN pg_language l ON l.oid=p.prolang
+                WHERE t.tgrelid=%s::regclass AND NOT t.tgisinternal AND t.tgtype=27 AND t.tgenabled='O'
+                    AND t.tgqual IS NULL AND t.tgnargs=0 AND p.proname=t.tgname AND pn.nspname=%s
+                    AND l.lanname='plpgsql' AND p.prorettype='trigger'::regtype AND p.pronargs=0
+            """, (relation, schema)).fetchall()
+            count = connection.execute(
+                "SELECT count(*) FROM pg_trigger WHERE tgrelid=%s::regclass AND NOT tgisinternal", (relation,),
+            ).fetchone()
+            require(set(actual_triggers) == triggers and count == (len(triggers),), "target_structure_changed")
         actual_columns = connection.execute("""
             SELECT a.attname,format_type(a.atttypid,a.atttypmod),NOT a.attnotnull,
                 pg_get_expr(d.adbin,d.adrelid),a.attidentity,a.attgenerated,a.attcollation=t.typcollation
@@ -699,6 +747,7 @@ def _status(
         connection, schema, inventories[observed],
         frozenset().union(*(step.tables for step in historical)),
         tuple(column for step in historical for column in step.columns),
+        tuple(trigger for step in historical for trigger in step.immutable),
     )
     return status
 

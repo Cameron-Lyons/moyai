@@ -15,6 +15,9 @@ apply to the subsequent application upgrade.
 
 The module carries an append-only `EXPANSIONS` registry of frozen metadata
 callbacks, declared new tables and declared nullable columns on earlier tables.
+A step may also declare reviewed immutability triggers (BEFORE UPDATE OR DELETE
+row triggers with a frozen PL/pgSQL body) on tables it creates, as the governance
+v24 session-policy step does; verification requires exactly those triggers.
 It reconstructs consecutive registered versions from the installed application's
 historical metadata, including when transported to an older interpreter. A plan binds
 the canonical/native schemas, queue, every existing migration manifest, the
