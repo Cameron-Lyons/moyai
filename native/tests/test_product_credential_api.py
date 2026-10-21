@@ -10,6 +10,7 @@ from types import SimpleNamespace
 import httpx
 import pytest
 import test_product_credential_execution as credential_tests
+from app.permissions import MEMBER_PERMISSIONS
 from fastapi import APIRouter
 from pydantic_ai import Conversation, ConversationTypeAdapter, DeferredToolRequests
 from pydantic_ai.messages import (
@@ -142,13 +143,25 @@ async def test_full_api_mixed_request_csrf_server_handles_and_one_slot_resume(cr
         await engine.dispose()
 
 
-async def test_admin_assistance_cannot_answer_another_task_or_open_private_session(credentials, runtime, monkeypatch):
+@pytest.mark.parametrize("delegated", [False, True])
+async def test_admin_assistance_cannot_answer_another_task_or_open_private_session(
+    credentials, runtime, monkeypatch, delegated,
+):
     f = credentials
     pending, _ = await mixed_request(f)
     async with f.product.source.begin() as db:
         await db.execute(text(
             "INSERT INTO moyai.users VALUES ('google:other','google','other@example.test','Other admin',NULL,'c','u')",
         ))
+        if delegated:
+            # A member whose custom role holds credentials.publish assists like an administrator.
+            await db.execute(text("INSERT INTO moyai.user_roles VALUES ('other@example.test','member',1,'owner','now')"))
+            await db.execute(text(
+                "INSERT INTO moyai.enterprise_roles VALUES ('steward','Steward','',:permissions,1,0,'owner','now','now')",
+            ), {"permissions": json.dumps(sorted(MEMBER_PERMISSIONS | {"credentials.publish"}))})
+            await db.execute(text(
+                "INSERT INTO moyai.enterprise_role_assignments VALUES ('other@example.test','steward',1,'owner','now')",
+            ))
     async with assembled_client(f, runtime, monkeypatch, sub="other", email="other@example.test") as client:
         assert (await client.get(f"/api/sessions/{f.session.id}")).status_code == 404
         async with f.product.database.sessions.begin() as db:

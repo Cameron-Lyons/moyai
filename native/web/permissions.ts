@@ -28,13 +28,20 @@ export function permissionKey(subject: PermissionSubject): string {
   return [...permissionsOf(subject)].sort().join(",")
 }
 
-/** Settings pages that require a permission; other pages are available to every signed-in person. */
-export const PAGE_PERMISSIONS: Readonly<Record<string, string>> = {
-  users: "users.read", performance: "runtime.manage", usage: "spend.read",
-  roles: "roles.manage", provisioning: "scim.manage", "security-policies": "security.manage",
-  "spend-limits": "spend.read", "audit-log": "audit.read",
+/**
+ * Settings pages that require permissions; other pages are available to every signed-in person.
+ * A page needs one permission from each list. Performance reports include cost, and limit
+ * managers without spend.read still read limits (the server withholds usage).
+ */
+export const PAGE_PERMISSIONS: Readonly<Record<string, readonly (readonly string[])[]>> = {
+  users: [["users.read"]], performance: [["runtime.manage"], ["spend.read"]], usage: [["spend.read"]],
+  roles: [["roles.manage"]], provisioning: [["scim.manage"]], "security-policies": [["security.manage"]],
+  "spend-limits": [["spend.read", "spend.manage"]], "audit-log": [["audit.read"]],
 }
 export function canOpenPage(subject: PermissionSubject, page: string): boolean {
-  const permission = PAGE_PERMISSIONS[page]
-  return !permission || can(subject, permission)
+  return (PAGE_PERMISSIONS[page] ?? []).every(choices => choices.some(permission => can(subject, permission)))
+}
+/** What a page requires, for example "runtime.manage and spend.read". */
+export function pagePermissionText(page: string): string {
+  return (PAGE_PERMISSIONS[page] ?? []).map(choices => choices.join(" or ")).join(" and ")
 }

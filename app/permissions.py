@@ -36,7 +36,7 @@ PERMISSIONS = {
     'spend.personal': 'View personal model spend',
     'spend.read': 'View organization spend, adoption and spend limits',
     'spend.manage': 'Manage spend limits, infrastructure billing and spend identity links',
-    'runtime.manage': 'View performance, capacity, pull-request and deployment details; configure session titles',
+    'runtime.manage': 'View performance (also requires spend.read), capacity, pull-request and deployment details; configure session titles',
     'audit.read': 'Read enterprise governance audit history',
     'security.manage': 'Manage security profiles and policies',
     'scim.manage': 'View directory provisioning and revoke provisioning credentials',
@@ -65,6 +65,10 @@ def route_permission(request):
         return 'security.manage'
     if path.startswith('/api/admin/governance'):
         return 'audit.read'
+    if path.startswith('/api/admin/spend-limits'):
+        # Limit managers without spend.read need the revisions they write; the
+        # listing's handler accepts either permission and withholds usage.
+        return None if read else 'spend.manage'
     if path.startswith('/api/admin/spend'):
         return 'spend.read' if read else 'spend.manage'
     if path == '/api/spend':
@@ -83,7 +87,8 @@ def route_permission(request):
         return 'credentials.read' if read else 'credentials.manage'
     if path.startswith('/api/product/sessions'):
         return 'sessions.read' if read else 'sessions.create'
-    if path.startswith(('/api/history', '/api/files/', '/api/pull-requests')):
+    if path.startswith(('/api/history', '/api/files/', '/api/pull-requests', '/api/product/search',
+                        '/api/product/folders', '/api/runs/')):
         return 'sessions.read'
     if path.startswith('/api/effects/'):
         return 'sessions.manage'
@@ -97,6 +102,9 @@ def route_permission(request):
         return 'sessions.read' if read else 'sessions.create'
     if path.startswith(('/api/sessions/', '/api/turns/', '/api/folders', '/api/artifacts', '/api/computer', '/api/goals', '/api/swarms')):
         return 'sessions.read' if read else 'sessions.manage'
+    if path.startswith('/api/connections/slack/personal'):
+        # A member's own Slack link is a personal credential, not organization setup.
+        return 'credentials.read' if read else 'credentials.manage'
     if path.startswith('/api/connections'):
         return 'connections.read' if read else 'connections.manage'
     if path.startswith(('/api/automations', '/api/settings/automations')):
@@ -114,7 +122,7 @@ def route_permission(request):
     if path.startswith(('/api/settings/usage', '/api/settings/billing')):
         return 'spend.read' if read else 'spend.manage'
     if path.startswith(('/api/settings/performance', '/api/admin/performance')):
-        return 'runtime.manage'
+        return 'runtime.manage'  # The report includes cost, so its handler also requires spend.read.
     return 'workspace.read' if path.startswith('/api/settings') else None
 
 # Display label and group per permission. The UI groups by `group` in order of first appearance.

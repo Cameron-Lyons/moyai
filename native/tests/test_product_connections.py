@@ -4,6 +4,7 @@ import asyncio
 import json
 import threading
 import time
+from contextlib import asynccontextmanager
 from dataclasses import asdict, replace
 from types import SimpleNamespace
 
@@ -557,6 +558,87 @@ async def test_onboarding_reuses_canonical_auth_csrf_and_provider_routes(bridge,
         assert not bridge.store.rows("SELECT 1 FROM oauth_states WHERE provider='linear'")
         with pytest.raises(HTTPException):
             await bridge.require_scope(scope)
+
+
+@asynccontextmanager
+async def owner_client(bridge, runtime, permissions=None):
+    """owner@example.test, a Google member, through the real product route gate and optional custom role."""
+    import httpx
+    from app.enterprise_roles import GovernanceActor, RoleAssignment, RoleCreate
+    from app.user_roles import UserRoles
+    from fastapi import FastAPI, Response
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    from moyai.product_connections import routes
+    from moyai.product_identity import ProductIdentityAdapter
+
+    roles = bridge.security.user_roles = UserRoles(bridge.store, bridge.settings)
+    if permissions is not None:
+        admin = GovernanceActor(id="google:admin", email="admin@example.test", builtin_role="admin",
+                                permissions=None, kind="individual")
+        roles.enterprise.create(RoleCreate(id="delegate", name="Delegate", permissions=permissions), admin)
+        roles.enterprise.assign(RoleAssignment(email="owner@example.test", role_id="delegate", revision=0), admin)
+    source = create_async_engine(f"sqlite+aiosqlite:///file:{bridge.store.path}?mode=ro&uri=true")
+    bridge.product.identity = ProductIdentityAdapter(
+        bridge.settings, source, native_engine=runtime.database.engine, allow_shared_identities=True,
+    )
+    app = FastAPI()
+    app.include_router(routes(bridge))
+    response = Response()
+    sid = bridge.security.new_session(response, identity={
+        "sub": "owner", "email": "owner@example.test", "domain": "example.test", "name": "Owner",
+    })
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url=bridge.settings.public_url,
+            headers={"Origin": bridge.settings.public_url, "X-CSRF-Token": bridge.security.csrf(sid)},
+        ) as client:
+            client.cookies.set("workspace_session", response.headers["set-cookie"].split(";", 1)[0].split("=", 1)[1])
+            yield client
+    finally:
+        await source.dispose()
+
+
+async def test_members_manage_personal_slack_but_not_organization_slack(bridge, runtime):
+    bridge.settings.slack_client_id = "synthetic-client"
+    bridge.settings.slack_client_secret = "synthetic-client-secret"
+    async with owner_client(bridge, runtime) as client:
+        started = await client.post("/api/connections/slack/personal/oauth")
+        assert started.status_code == 200, started.text
+        assert started.json()["url"].startswith("https://slack.com/oauth/v2/authorize?")
+        assert (await client.delete("/api/connections/slack/personal")).status_code == 200
+        assert (await client.post("/api/connections/slack/oauth")).status_code == 403
+
+
+async def test_connection_managers_can_finish_the_setup_they_start(bridge, runtime, monkeypatch):
+    from urllib.parse import parse_qs, urlsplit
+
+    from app.permissions import MEMBER_PERMISSIONS
+
+    bridge.settings.linear_client_id = "synthetic-client"
+    bridge.settings.linear_client_secret = "synthetic-client-secret"
+
+    async def exchange(provider, code):
+        return {"access_token": "synthetic-" + code, "kind": "personal"}
+
+    async def verify(provider, credentials):
+        return "Local " + provider
+
+    monkeypatch.setattr(bridge.connectors, "exchange", exchange)
+    monkeypatch.setattr(bridge.connectors, "verify", verify)
+    async with owner_client(bridge, runtime, sorted(MEMBER_PERMISSIONS | {"connections.manage"})) as client:
+        started = await client.post("/api/connections/linear/oauth")
+        assert started.status_code == 200, started.text
+        state = parse_qs(urlsplit(started.json()["url"]).query)["state"][0]
+        finished = await client.get("/oauth/linear/callback", params={"state": state, "code": "code"})
+        assert finished.status_code == 303 and finished.headers["location"] == "/?connection=success#connections"
+        assert bridge.store.rows("SELECT label FROM connections WHERE provider='linear'")[0]["label"] == "Local linear"
+        # GitHub App setup reaches its own state and connection checks, not an administrator gate.
+        for path in ("/auth/github/register", "/oauth/github/app-callback", "/oauth/github/callback"):
+            response = await client.get(path, params={"state": "unknown"})
+            assert response.status_code == 400 and "Start again from Connections" in response.json()["detail"], path
+        repositories = await client.get("/api/connections/github/repositories")
+        assert repositories.json() == {"detail": "Connect Github in Connections first."}
 
 
 async def test_slack_reconnect_rechecks_blocked_profiles_without_granting_identity(bridge, monkeypatch):

@@ -20,7 +20,7 @@ import {
 import { MoyaiBrand, SidebarToggle } from "./brand"
 import { AppearanceToggle } from "./appearance-toggle"
 import type { GeneralPreferences } from "./general-preferences"
-import { can, canOpenPage, PAGE_PERMISSIONS, permissionKey } from "./permissions"
+import { can, canOpenPage, pagePermissionText, permissionKey } from "./permissions"
 import {
   checkOrganizationConnection, connectOrganizationConnection, createCredential, createProductMemory, deleteProductMemory,
   disconnectOrganizationConnection, getProductSkill, listCredentials, listOrganizationConnections, listProductMemories,
@@ -1104,7 +1104,7 @@ export function SettingsPage({ user, page, productMode = "standalone", onNavigat
         {/* Keyed by access so a permission change discards every protected draft and response. */}
         <div key={`${user.id}:${current}:${permissionKey(user)}`}>
           {destination?.productOnly && productMode !== "existing" ? <div className="ns-empty"><h2>Existing product accounts required</h2><p>This page is available when Moyai uses the existing product account service.</p></div>
-            : destination && !canOpenPage(user, destination.id) ? <div className="ns-empty" role="alert"><Shield size={24} /><h2>Permission required</h2><p>This page requires the <code>{PAGE_PERMISSIONS[destination.id]}</code> permission. Ask a workspace administrator to update your role.</p><Button variant="outline" onClick={() => navigate("overview")}>Back to overview</Button></div>
+            : destination && !canOpenPage(user, destination.id) ? <div className="ns-empty" role="alert"><Shield size={24} /><h2>Permission required</h2><p>This page requires <code>{pagePermissionText(destination.id)}</code>. Ask a workspace administrator to update your role.</p><Button variant="outline" onClick={() => navigate("overview")}>Back to overview</Button></div>
             : current === "overview" ? <OverviewPage user={user} navigate={navigate} productMode={productMode} />
               : current === "general" ? <GeneralPage onPreferences={onPreferences} />
               : current === "skills" ? productMode === "existing" ? <ProductSkillsPage /> : <SkillsPage user={user} />

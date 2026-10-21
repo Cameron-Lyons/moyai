@@ -88,6 +88,27 @@ async def test_canonical_secret_crud_encryption_revision_replay_and_revocation(s
     assert (await client.get("/api/credentials")).json()["secrets"] == []
 
 
+async def test_delegated_credentials_publish_manages_organization_credentials(secrets_api):
+    from app.enterprise_roles import GovernanceActor, RoleAssignment, RoleCreate
+    from app.permissions import MEMBER_PERMISSIONS
+
+    admin = GovernanceActor(id="google:admin", email="admin@example.test", builtin_role="admin",
+                            permissions=None, kind="individual")
+    roles = secrets_api.bridge.security.user_roles.enterprise
+    roles.create(RoleCreate(id="steward", name="Secrets steward",
+                            permissions=sorted(MEMBER_PERMISSIONS | {"credentials.publish"})), admin)
+    roles.assign(RoleAssignment(email="owner@example.test", role_id="steward", revision=0), admin)
+    client = secrets_api.client
+    capabilities = (await client.get("/api/credentials")).json()["capabilities"]
+    assert capabilities["scopes"] == ["personal", "organization"] and capabilities["organization"]
+    assert (await client.post("/api/credentials/secrets", json=secret(scope="organization"))).status_code == 201
+    row = (await client.get("/api/credentials")).json()["secrets"][0]
+    assert row["scope"] == "organization" and row["can_manage"]
+    updated = await client.patch("/api/credentials/secrets/" + row["id"], json={"revision": row["revision"], "label": "Shared"})
+    assert updated.status_code == 200 and updated.json()["label"] == "Shared", updated.text
+    assert (await client.delete("/api/credentials/secrets/" + row["id"])).json() == {"revoked": True}
+
+
 async def test_secret_mutations_require_csrf_and_org_admin_and_hide_invalid_value(secrets_api):
     client = secrets_api.client
     denied = await client.post("/api/credentials/secrets", json=secret(scope="organization"))

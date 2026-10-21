@@ -334,7 +334,7 @@ class ProductCredentialExecution:
             return {"requests": [self.public(row) for row in rows if (
                 await self.equivalent(db, principal.id, row.actor_id)
                 or await self.equivalent(db, row.actor_id, principal.id)
-                or principal.role == "admin"
+                or "credentials.publish" in principal.effective_permissions
             )]}
 
     async def describe(self, principal: ProductPrincipal, request_id: str) -> dict:
@@ -347,7 +347,8 @@ class ProductCredentialExecution:
                 raise HTTPException(404, "Native credential request not found.")
             session = await self.database.allowed_session(db, row.session_id, actor)
             own = await self.equivalent(db, principal.id, row.actor_id) or await self.equivalent(db, row.actor_id, principal.id)
-            if not own and principal.role != "admin":
+            publish = "credentials.publish" in principal.effective_permissions
+            if not own and not publish:
                 raise HTTPException(404, "Native credential request not found.")
             capability = json.loads(row.capability)
             choices = []
@@ -357,11 +358,11 @@ class ProductCredentialExecution:
                 if self.vault.credentials.matching(secret, capability) and await self.permitted(
                     db, dict(secret), principal.id, row.session_id,
                 ):
-                    choices.append(self.vault.credentials.metadata(secret, principal.id, principal.role == "admin"))
+                    choices.append(self.vault.credentials.metadata(secret, principal.id, publish))
             context = await self.database.execution_context(db, session)
             private = context.visibility == "private" and context.surface == "web"
             scopes = (["personal"] if private and own and (principal.individual or self.vault.security.local_preview()) else [])
-            if principal.role == "admin":
+            if publish:
                 scopes.append("organization")
             return {**self.public(row), "credentials": choices, "scopes": scopes,
                     "lifetimes": ["session", "persistent"], "can_resolve": row.status == "pending",
@@ -385,7 +386,7 @@ class ProductCredentialExecution:
             actor = await self.current_actor(db, principal)
             await self.database.allowed_session(db, row.session_id, actor)
             own = await self.equivalent(db, principal.id, row.actor_id) or await self.equivalent(db, row.actor_id, principal.id)
-            if not own and principal.role != "admin":
+            if not own and "credentials.publish" not in principal.effective_permissions:
                 raise HTTPException(403, "Only the requester or an organization administrator may resolve this request.")
             if body.generation != row.generation:
                 raise HTTPException(409, "This request changed. Reload its secure form.")

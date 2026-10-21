@@ -466,6 +466,42 @@ async def test_cloudflare_requires_real_signed_assertion_and_existing_pinned_acc
         await adapter.authenticate(request(cookie, headers={"cf-access-jwt-assertion": token}))
 
 
+async def test_native_access_login_leaves_scim_provisioning_to_its_bearer_controller(product, runtime, monkeypatch):
+    import httpx
+    from fastapi import APIRouter
+
+    from moyai.api import create_app
+
+    adapter, *_ = await cloudflare_setup(product)
+    scim = APIRouter()
+
+    @scim.patch("/scim/v2/Users/{identity}")
+    async def deactivate(identity: str, request: Request):
+        return {"id": identity, "authorization": request.headers["authorization"]}
+
+    identity, bearer = "0" * 32, {"authorization": "Bearer moyai_scim_synthetic"}
+    # Restore the runtime's product before the runtime fixture closes it.
+    with monkeypatch.context() as patch:
+        patch.setattr(runtime, "product", SimpleNamespace(
+            settings=adapter.settings, identity=adapter, scim=SimpleNamespace(router=lambda: scim),
+            google=SimpleNamespace(routes=APIRouter),
+        ))
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=create_app(runtime, run_dispatcher=False)),
+            base_url=adapter.settings.public_url,
+        ) as client:
+            response = await client.patch(f"/scim/v2/Users/{identity}", json={"active": False}, headers=bearer)
+            assert response.status_code == 200, response.text
+            assert response.json() == {"id": identity, "authorization": bearer["authorization"]}
+            # Only provisioning operations skip Access; token administration and other paths keep it.
+            for method, path in (
+                ("PATCH", "/scim/v2/Users/not-an-id"), ("GET", "/api/admin/scim/tokens"), ("GET", "/api/me"),
+            ):
+                denied = await client.request(method, path, headers=bearer)
+                assert denied.status_code == 401, path
+                assert denied.json() == {"detail": "A valid organization sign-in is required."}
+
+
 async def test_each_activity_attempt_checks_source_even_when_mirror_is_unchanged(product):
     principal = await product.adapter.current("google:admin-sub")
     mirror = {"id": principal.id, "role": "admin", "enabled": True}

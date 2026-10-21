@@ -56,7 +56,9 @@ Provisioning uses `/scim/v2` with bearer credentials created in Settings →
 Provisioning. Tokens are shown once and stored as hashes. The directory supports
 Users, Groups, filtering, pagination, PATCH, deactivation, and retained tombstones.
 SCIM does not create an interactive login session. Revoking a token stops that
-provisioning credential without deleting the provisioned directory.
+provisioning credential without deleting the provisioned directory. With
+Cloudflare Access sign-in, provisioning operations need only that bearer
+credential, not an Access assertion; token administration still requires Access.
 
 | Permission | Governance access |
 | --- | --- |
@@ -66,6 +68,7 @@ provisioning credential without deleting the provisioned directory.
 | `security.manage` | Policy configuration and explicit profile selection |
 | `spend.read` / `spend.manage` | Organization spend / limit configuration |
 | `audit.read` | Audit feed and exports |
+| `runtime.manage` | Performance reports, which include cost and so also require `spend.read` |
 
 `GET /api/permissions` returns the full catalog and effective permissions.
 Organization accounting and usage exports honor delegated `spend.read` access;

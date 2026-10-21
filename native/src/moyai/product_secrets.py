@@ -202,9 +202,8 @@ class ProductSecrets:
     async def inventory(self, principal: ProductPrincipal, root: str = "") -> dict[str, Any]:
         if root:
             await self.require_root(principal, root)
-        rows = await source_database(
-            self.credentials.list_secrets, principal.id, principal.role == "admin", root,
-        )
+        publish = "credentials.publish" in principal.effective_permissions
+        rows = await source_database(self.credentials.list_secrets, principal.id, publish, root)
         visible = []
         for row in rows:
             if row["lifetime"] == "session":
@@ -219,7 +218,7 @@ class ProductSecrets:
         scopes = []
         if principal.individual or self.security.local_preview():
             scopes.append("personal")
-        if principal.role == "admin":
+        if publish:
             scopes.append("organization")
         return {
             "providers": [{"id": key, "name": value["name"], "setup_url": value["setup"]}
@@ -228,7 +227,7 @@ class ProductSecrets:
             "capabilities": {
                 "create": bool(scopes), "update": True, "delete": True,
                 "scopes": scopes, "lifetimes": ["persistent", "session"],
-                "organization": principal.role == "admin", "native_execution": self.execution.enabled,
+                "organization": publish, "native_execution": self.execution.enabled,
                 "native_formats": ["env", "file"] if self.execution.enabled else [],
                 "native_provider_http": False, "native_aws_login": False,
             },
@@ -301,7 +300,8 @@ class ProductSecrets:
             ).fetchone()
             if not binding or binding["subject"] != identity.get("sub"):
                 raise HTTPException(401, "The Access identity mapping changed before saving.")
-        return admin
+        # Organization credentials follow live credentials.publish, which custom roles can delegate.
+        return security.has_actor_permission(principal.id, "credentials.publish", connection=connection)
 
     async def create(self, request: Request, principal: ProductPrincipal, body: ProductSaveSecret):
         native = None
@@ -321,6 +321,8 @@ class ProductSecrets:
         return {"id": identity, "saved": True}
 
     async def update(self, request: Request, principal: ProductPrincipal, identity: str, body: ProductUpdateSecret):
+        publish = "credentials.publish" in principal.effective_permissions
+
         def current():
             rows = self.store.rows(
                 """SELECT id,scope,owner_id,root_id,lifetime FROM provider_secrets
@@ -328,7 +330,7 @@ class ProductSecrets:
             )
             if not rows or not (
                 rows[0]["owner_id"] == principal.id or
-                (rows[0]["scope"] == "organization" and principal.role == "admin")
+                (rows[0]["scope"] == "organization" and publish)
             ):
                 raise HTTPException(404, "Credentials not found.")
             return rows[0]
@@ -342,7 +344,7 @@ class ProductSecrets:
 
         def save():
             return self.credentials.update_secret(
-                identity, body, principal.id, principal.role == "admin", authorized_native_root=native,
+                identity, body, principal.id, publish, authorized_native_root=native,
                 authorize=lambda conn: self.require_mutation(
                     request, principal, conn, native, personal=scope == "personal",
                 ),

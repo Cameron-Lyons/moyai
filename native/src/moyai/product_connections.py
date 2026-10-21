@@ -727,8 +727,10 @@ def routes(service: ProductConnections) -> APIRouter:
         @wraps(original)
         async def endpoint(**kwargs: Any):
             request = kwargs["request"]
+            # Every canonical GitHub route, callbacks included, is organization setup.
             await source_database(
-                security.require, request, mutation=request.method not in {"GET", "HEAD", "OPTIONS"}, admin=True,
+                security.require, request, mutation=request.method not in {"GET", "HEAD", "OPTIONS"},
+                permission="connections.manage",
             )
             # These source routes use body()/JSON only, never streaming. Read
             # the ASGI body on its owning loop before entering source helpers.
@@ -834,7 +836,8 @@ def routes(service: ProductConnections) -> APIRouter:
     async def callback(provider: Provider, request: Request, state: str = "", code: str = "", error: str = ""):
         if provider == "slack" and connectors.personal_slack.is_oauth_state(state):
             return await personal_callback(request, state=state, code=code, error=error)
-        sid = await source_database(security.require, request, admin=True)
+        # The state is bound to the session that started this organization setup.
+        sid = await source_database(security.require, request, permission="connections.manage")
 
         def consume():
             with store.connect() as conn:

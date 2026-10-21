@@ -1,4 +1,4 @@
-"""Admin-only GitHub App manifest/installation flow; no per-user GitHub OAuth."""
+"""Organization GitHub App manifest/installation flow (connections.manage); no per-user GitHub OAuth."""
 import html
 import json
 import re
@@ -163,7 +163,8 @@ def routes(connectors, security, store, settings):
 
     @router.get('/api/connections/github/repositories', operation_id='listGitHubRepositories')
     async def repositories(request: Request) -> GitHubRepositoryChoices:
-        security.require(request, admin=True)
+        # Repository choices are organization setup, not a member connections.read.
+        security.require(request, permission='connections.manage')
         current = await github.ensure_connection()
         discovered = await github.discover_repositories(current['installation_id'])
         options = {r['id']: r for r in github.repository_options(discovered)}
@@ -203,7 +204,7 @@ def routes(connectors, security, store, settings):
 
     @router.get('/auth/github/register')
     async def registration(request: Request, state: str = ''):
-        sid = security.require(request, admin=True)
+        sid = security.require(request, permission='connections.manage')
         check_state(sid, 'github_app', state, consume=False)
         owner = registration_owner(state)['owner_login']
         origin = settings.public_url.rstrip('/')
@@ -234,7 +235,7 @@ def routes(connectors, security, store, settings):
 
     @router.get('/oauth/github/app-callback')
     async def app_callback(request: Request, state: str = '', code: str = ''):
-        sid = security.require(request, admin=True)
+        sid = security.require(request, permission='connections.manage')
         check_state(sid, 'github_app', state)
         if not re.fullmatch(r'[A-Za-z0-9_-]{10,200}', code):
             raise HTTPException(400, 'GitHub did not provide a valid registration code.')
@@ -257,7 +258,7 @@ def routes(connectors, security, store, settings):
 
     @router.get('/oauth/github/callback')
     async def install_callback(request: Request, state: str = '', installation_id: str = '', setup_action: str = ''):
-        sid = security.require(request, admin=True)
+        sid = security.require(request, permission='connections.manage')
         check_state(sid, 'github', state)
         if not installation_id.isdecimal() or len(installation_id) > 20 or setup_action not in {'install', 'update'}:
             raise HTTPException(400, 'GitHub did not confirm an installation. Start again from Connections.')

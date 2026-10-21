@@ -85,6 +85,7 @@ from .models import (
     now,
 )
 from .presentation import public_event, redact
+from .product_governance import permission_for_user
 from .product_identity import ProductAuthorityBusy
 from .product_requester import answer_actor, can_answer
 from .pull_requests import routes as pull_request_routes
@@ -333,9 +334,15 @@ def create_app(runtime: Runtime | None = None, *, run_dispatcher: bool = True) -
             request.url.path not in {"/health", "/healthz"}
             and not request.url.path.startswith(("/hooks/", "/broker/native/"))
         ):
+            from app.cloudflare_access import scim_provisioning_route
+
             from .product_access import access_session
             try:
-                access_cookie = await access_session(runtime.product, request)
+                # Identity providers have no Access sign-in; each provisioning
+                # operation requires its own SCIM bearer credential instead.
+                access_cookie = None if scim_provisioning_route(request.url.path, request.method) else (
+                    await access_session(runtime.product, request)
+                )
             except HTTPException as error:
                 return JSONResponse(
                     {"detail": error.detail}, status_code=error.status_code,
@@ -625,7 +632,7 @@ def create_app(runtime: Runtime | None = None, *, run_dispatcher: bool = True) -
                     ))
                 if deadline is not None:
                     result["question_deadline"] = json.loads(runtime.security.unseal(deadline.content))["deadline"]
-            elif runtime.product_secrets is not None and user.role == "admin":
+            elif runtime.product_secrets is not None and permission_for_user(user, "credentials.publish"):
                 # Organization access assistance does not confer permission to
                 # answer another requester's questions or approve their tools.
                 requests = await runtime.product_secrets.execution.pending(request.state.product_principal, session_id)

@@ -173,6 +173,11 @@ test('permission checks use /api/me permissions and fall back to built-in sets f
   assert.equal(permissions.can({role:'admin',permissions:['audit.read']},'roles.manage'),false,'an explicit list is authoritative');
   assert.equal(permissions.can({role:'admin'},'roles.manage'),true);assert.equal(permissions.can({role:'member'},'users.read'),false);
   assert.equal(permissions.canOpenPage({role:'member',permissions:['spend.read']},'spend-limits'),true);
+  assert.equal(permissions.canOpenPage({role:'member',permissions:['spend.manage']},'spend-limits'),true,'limit managers read the revisions they write');
+  assert.equal(permissions.canOpenPage({role:'member',permissions:['runtime.manage']},'performance'),false,'performance reports include cost');
+  assert.equal(permissions.canOpenPage({role:'member',permissions:['runtime.manage','spend.read']},'performance'),true);
+  assert.equal(permissions.pagePermissionText('performance'),'runtime.manage and spend.read');
+  assert.equal(permissions.pagePermissionText('spend-limits'),'spend.read or spend.manage');
   assert.equal(permissions.canOpenPage({role:'member',permissions:['spend.read']},'usage'),true);
   assert.equal(permissions.canOpenPage({role:'member',permissions:[]},'skills'),true);
   assert.equal(permissions.canOpenPage({role:'member',permissions:[]},'audit-log'),false);

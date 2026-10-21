@@ -46,6 +46,7 @@ from app.permissions import (
     TOOL_PERMISSIONS,
     catalog,
     connector_tool,
+    route_permission,
     tool_permission,
 )
 from app.scim import CORE, Scim
@@ -234,6 +235,28 @@ def test_connector_tools_follow_the_canonical_read_write_catalog():
     # Unknown names are session work, never "no check".
     for name in ('future_unknown_capability', 'github_', '', None, 7):
         assert tool_permission(name) == DEFAULT_TOOL_PERMISSION
+
+
+@pytest.mark.parametrize(('method', 'path', 'permission'), [
+    # A member's own Slack link is a personal credential; organization Slack is setup.
+    ('GET', '/api/connections/slack/personal', 'credentials.read'),
+    ('POST', '/api/connections/slack/personal/oauth', 'credentials.manage'),
+    ('POST', '/api/connections/slack/personal/check', 'credentials.manage'),
+    ('DELETE', '/api/connections/slack/personal', 'credentials.manage'),
+    ('POST', '/api/connections/slack/oauth', 'connections.manage'),
+    ('GET', '/oauth/slack/callback', None),  # Shared with organization Slack; each handler checks its own.
+    # Historical search, folders and archives expose session content.
+    ('GET', '/api/product/search', 'sessions.read'),
+    ('GET', '/api/product/folders', 'sessions.read'),
+    ('GET', '/api/runs/' + '0' * 32 + '/artifact', 'sessions.read'),
+    # The limit listing's handler accepts spend.read or spend.manage.
+    ('GET', '/api/admin/spend-limits', None),
+    ('PUT', '/api/admin/spend-limits', 'spend.manage'),
+    ('DELETE', '/api/admin/spend-limits/user:person@example.com', 'spend.manage'),
+    ('GET', '/api/admin/spend', 'spend.read'),
+])
+def test_route_permissions_follow_the_resource(method, path, permission):
+    assert route_permission(SimpleNamespace(scope={'path': path}, method=method)) == permission
 
 
 def test_resolution_is_pure_and_matches_named_queries(governance):
