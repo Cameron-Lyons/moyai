@@ -7,11 +7,12 @@ not required.
 
 ## Deployment and migration
 
-Apply canonical schema revision **23** and native application migration
+Apply canonical schema revision **24** and native application migration
 **2026-10-21-product-governance-v24** during the coordinated maintenance window
-in [the deployment contract](pydantic-deployment.md). Canonical revision 23 combines
-upstream revision 22 with the governance branch's older revision 22; neither older
-layout is admitted as the combined release. The native migration follows upstream
+in [the deployment contract](pydantic-deployment.md). Canonical revision 24 combines
+upstream revision 22 with the governance branch's older revision 22, plus the
+role permissions revision added after the first combined revision 23; none of the
+older layouts is admitted as the combined release. The native migration follows upstream
 v23 (automation chats), adds an immutable session-policy table and preserves the
 previous 23 migration receipts. It is also a registered
 [online expansion](native-online-schema.md), so the native table can be prepared
