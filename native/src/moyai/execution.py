@@ -52,19 +52,24 @@ class AuthorizedActivity(ActivityInboundInterceptor):
                 # Admission owns both original-identity receipt recovery and
                 # live authorization for NEW work. Prechecking a retry here
                 # would discard a child committed before steering or Stop.
-                async with self.database.sessions() as db:
-                    if name not in {
-                        "agent__moyai__capability__moyai_interactive_delegation__start",
-                        "agent__moyai__capability__moyai_interactive_delegation__send_message",
-                    }:
-                        await self.database.authorize_scope(scope, input_id=input_id, db=db)
-                    governance = self.database.governance
-                    if governance is not None and name.endswith('__call_tool'):
+                exempt = name in {
+                    "agent__moyai__capability__moyai_interactive_delegation__start",
+                    "agent__moyai__capability__moyai_interactive_delegation__send_message",
+                }
+                governance = getattr(self.database, "governance", None)
+                if governance is None or not name.endswith("__call_tool"):
+                    if not exempt:
+                        await self.database.authorize_scope(scope, input_id=input_id)
+                else:
+                    # A governed tool attempt checks scope and policy in one transaction.
+                    async with self.database.sessions() as db:
+                        if not exempt:
+                            await self.database.authorize_scope(scope, input_id=input_id, db=db)
                         wire = input.args[0]
-                        definition = getattr(wire, 'tool_def', None)
-                        metadata = getattr(definition, 'metadata', None) or {}
+                        definition = getattr(wire, "tool_def", None)
+                        metadata = getattr(definition, "metadata", None) or {}
                         await governance.check_tool(scope, wire.name, db=db,
-                                                    read_only=metadata.get('annotations', {}).get('readOnlyHint'))
+                                                    read_only=metadata.get("annotations", {}).get("readOnlyHint"))
             except (PermissionError, HTTPException) as error:
                 raise ApplicationError(
                     "Execution authority changed before this activity attempt.",
