@@ -105,49 +105,13 @@ def test_candidate_plans_require_contiguous_reviewed_source_digests(monkeypatch)
         online.plan(BASE)
 
 
-def test_performance_expansion_preserves_old_writer_and_matches_initializer(database, tmp_path, monkeypatch):
-    """Exercise the real 20 -> 21 declaration, not only a synthetic future plan."""
-    from app import performance
-    # Later releases may require maintenance. Keep this historical reader/writer
-    # compatibility proof scoped to the reviewed performance-only expansion.
-    monkeypatch.setattr(schema_migrations, 'SCHEMA_REVISION', 21)
-    url, schema = database
-    columns = {'message_id': 'BIGINT PRIMARY KEY', 'run_id': 'TEXT NOT NULL',
-               'kind': 'TEXT NOT NULL', 'received_at': 'TEXT', 'persisted_at': 'TEXT NOT NULL',
-               'send_now_at': 'TEXT', 'send_now_kind': 'TEXT', 'picked_up_at': 'TEXT',
-               'pickup_kind': 'TEXT', 'first_model_at': 'TEXT'}
-    with psycopg.connect(url, autocommit=True) as conn:
-        conn.execute(f'SET search_path TO "{schema}",pg_catalog')
-        conn.execute('UPDATE schema_state SET revision=20')
-        conn.execute('CREATE TABLE performance_samples (' +
-                     ','.join(name + ' ' + kind for name, kind in columns.items()) + ')')
-        conn.execute("INSERT INTO performance_samples(message_id,run_id,kind,persisted_at,first_model_at) "
-                     "VALUES(1,'saved','new_chat','2026-10-15T00:00:00+00:00','2026-10-15T00:00:01+00:00')")
-        # Same connection remains a live old writer across the additive DDL.
-        plan = online.plan(20)
-        assert online.apply_plan(conn, schema, plan)['status'] == 'applied'
-        assert online.schema_is_compatible(conn, schema, 20, 20)
-        assert online.schema_is_compatible(conn, schema, 21, 20)
-        conn.execute("UPDATE performance_samples SET first_model_at='2026-10-15T00:00:02+00:00' WHERE message_id=1")
-        assert conn.execute('SELECT timing_version,dispatch_at FROM performance_samples').fetchone() == (None, None)
-        actual = {row[0] for row in conn.execute(
-            "SELECT column_name FROM information_schema.columns WHERE table_schema=%s AND table_name='performance_samples'",
-            (schema,))}
-    sqlite = Store(tmp_path / 'initializer')
-    try:
-        with sqlite.connect() as conn:
-            assert actual == set(conn.column_names('performance_samples'))
-    finally:
-        sqlite.close()
-    new = Store(tmp_path / 'new-reader', database_url=url, database_schema=schema, schema_mode='verify')
-    try:
-        performance.model_dispatched(new, {'id': 'saved', 'active_message_id': 1},
-                                     '2026-10-15T00:00:01+00:00', '2026-10-15T00:00:03+00:00', 'request')
-        assert new.rows('SELECT first_model_at,dispatch_at,timing_version FROM performance_samples') == [
-            {'first_model_at': '2026-10-15T00:00:02+00:00', 'dispatch_at': '2026-10-15T00:00:03+00:00',
-             'timing_version': 2}]
-    finally:
-        new.close()
+def test_shipped_registry_has_no_online_path_below_the_compatibility_floor():
+    """Compatibility 23 retired the historical 20 -> 21 step; earlier schemas need maintenance."""
+    assert online._manifest() == {'protocol': 1, 'steps': []}
+    for revision in (20, 22):
+        with pytest.raises(DatabaseError, match='No compatible online migration path'):
+            online.plan(revision)
+    assert online.plan(23) == seal({'from_revision': 23, 'to_revision': 23, 'compatibility': 23, 'steps': []})
 
 
 @pytest.mark.parametrize('mutation', ['drop','default','not_null','index_existing','sql_type',

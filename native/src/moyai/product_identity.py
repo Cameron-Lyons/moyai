@@ -588,11 +588,11 @@ class ProductIdentityAdapter:
             raise HTTPException(409, "Product identity conflicts with an existing native account.")
         elif not user.enabled:
             raise HTTPException(401, "This native account is disabled.")
+        elif user.auth_version != fresh.native_auth_version:
+            # A local revocation could win while the projection waited for this
+            # user row. Compare under the lock: admission caches its earlier read.
+            raise HTTPException(401, "Your access changed. Sign in again.")
         else:
-            if backend == "postgresql":
-                # A local revocation could win while the projection waited for
-                # this user row; recheck the epoch under the acquired row lock.
-                fresh = await self.authorize_admission(db, principal.grant)
             user.display_name, user.role = fresh.name[:200], fresh.role
         # No preference, Slack identity, local disable or local epoch is reset.
         # This server-authored request context is intentionally not an ORM field.

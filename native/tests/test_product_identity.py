@@ -101,7 +101,7 @@ SCHEMA = (
     "CREATE TABLE user_roles (email TEXT PRIMARY KEY, role TEXT NOT NULL CHECK(role IN ('admin','member')), revision INTEGER NOT NULL, updated_by TEXT NOT NULL, updated_at TEXT NOT NULL)",
     'CREATE TABLE user_role_audit (id INTEGER PRIMARY KEY, email TEXT NOT NULL, previous_role TEXT NOT NULL, role TEXT NOT NULL, actor TEXT NOT NULL, created_at TEXT NOT NULL)',
     'CREATE TABLE access_identities (issuer TEXT NOT NULL, subject TEXT NOT NULL, email TEXT NOT NULL, user_id TEXT NOT NULL REFERENCES users(id), created_at TEXT NOT NULL, PRIMARY KEY(issuer,subject), UNIQUE(issuer,user_id), UNIQUE(issuer,email))',
-    'CREATE TABLE enterprise_roles (id TEXT PRIMARY KEY, name TEXT NOT NULL, description TEXT NOT NULL, permissions TEXT NOT NULL, revision INTEGER NOT NULL, archived INTEGER NOT NULL DEFAULT 0 CHECK(archived IN (0,1)), updated_by TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)',
+    'CREATE TABLE enterprise_roles (id TEXT PRIMARY KEY, name TEXT NOT NULL, description TEXT NOT NULL, permissions TEXT NOT NULL, revision INTEGER NOT NULL, archived INTEGER NOT NULL DEFAULT 0 CHECK(archived IN (0,1)), updated_by TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, permissions_revision INTEGER NOT NULL DEFAULT 0)',
     'CREATE TABLE enterprise_role_assignments (email TEXT PRIMARY KEY, role_id TEXT NOT NULL, revision INTEGER NOT NULL, updated_by TEXT NOT NULL, updated_at TEXT NOT NULL)',
     'CREATE TABLE enterprise_group_roles (group_id TEXT PRIMARY KEY, role_id TEXT, revision INTEGER NOT NULL, updated_by TEXT NOT NULL, updated_at TEXT NOT NULL)',
     "CREATE TABLE scim_tokens (id TEXT PRIMARY KEY, label TEXT NOT NULL, token_hash TEXT NOT NULL UNIQUE, prefix TEXT NOT NULL, created_by TEXT NOT NULL, created_at TEXT NOT NULL, last_used_at TEXT NOT NULL DEFAULT '', revoked_at TEXT NOT NULL DEFAULT '')",
@@ -613,7 +613,7 @@ async def test_postgres_admission_serializes_with_canonical_role_writes_and_reje
 async def test_live_custom_permissions_authorize_delegates_before_builtin_role_gate(product, path, permission):
     import json
     async with product.writer.begin() as db:
-        await db.execute(text("INSERT INTO enterprise_roles VALUES('delegate','Delegate','',:permissions,1,0,'owner','now','now')"),
+        await db.execute(text("INSERT INTO enterprise_roles VALUES('delegate','Delegate','',:permissions,1,0,'owner','now','now',1)"),
                          {'permissions': json.dumps([permission])})
         await db.execute(text("INSERT INTO enterprise_role_assignments VALUES('member@example.test','delegate',1,'owner','now')"))
     cookie, _ = google_cookie(product.adapter, sub='member-sub', email='member@example.test')
@@ -631,7 +631,7 @@ async def test_live_custom_permissions_authorize_delegates_before_builtin_role_g
 
 async def test_delegated_mutation_still_requires_cookie_csrf_and_origin(product):
     async with product.writer.begin() as db:
-        await db.execute(text('''INSERT INTO enterprise_roles VALUES('delegate','Delegate','','["roles.manage"]',1,0,'owner','now','now')'''))
+        await db.execute(text('''INSERT INTO enterprise_roles VALUES('delegate','Delegate','','["roles.manage"]',1,0,'owner','now','now',1)'''))
         await db.execute(text("INSERT INTO enterprise_role_assignments VALUES('member@example.test','delegate',1,'owner','now')"))
     cookie, csrf = google_cookie(product.adapter, sub='member-sub', email='member@example.test')
     for headers, allowed in (({}, False), ({'origin': 'https://foreign.test', 'x-csrf-token': csrf}, False),
@@ -644,3 +644,26 @@ async def test_delegated_mutation_still_requires_cookie_csrf_and_origin(product)
             with pytest.raises(HTTPException) as denied:
                 await product.adapter.authenticate(incoming, mutation=True)
             assert denied.value.status_code == 403
+
+
+@pytest.mark.skipif(not os.getenv("MOYAI_TEST_POSTGRES"), reason="Set a disposable local PostgreSQL URL.")
+async def test_projection_rechecks_a_local_revocation_under_the_user_row_lock(tmp_path):
+    """Regression: the recheck reused this transaction's cached admission, so a bump that won the race passed."""
+    from product_database_fixtures import product_database_state
+
+    from moyai.product_schema import migrate_product_schema
+
+    async with product_database_state(tmp_path) as product:
+        await migrate_product_schema(product.source, schema=product.schema, source_schema="moyai")
+        await product.database.start()
+        principal = await product.adapter.current(product.user_id)
+        async with product.database.sessions.begin() as db:
+            await product.adapter.project_native_user(db, principal)
+        async with product.database.sessions.begin() as db:
+            # The request's first admission is cached for its whole transaction.
+            await product.adapter.authorize_admission(db, principal.grant)
+            async with product.database.sessions.begin() as other:
+                (await other.get(User, principal.id)).auth_version += 1
+            with pytest.raises(HTTPException) as denied:
+                await product.adapter.project_native_user(db, principal)
+            assert denied.value.status_code == 401

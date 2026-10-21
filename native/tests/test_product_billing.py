@@ -971,7 +971,7 @@ def test_from_runtime_keeps_schemas_distinct_and_does_no_io_before_lifespan(tmp_
 async def assign_billing_role(context, permissions):
     import json
     async with context.writer.begin() as db:
-        await db.execute(text("INSERT INTO enterprise_roles VALUES('billing-reader','Billing reader','',:permissions,1,0,'owner','now','now')"),
+        await db.execute(text("INSERT INTO enterprise_roles VALUES('billing-reader','Billing reader','',:permissions,1,0,'owner','now','now',1)"),
                          {'permissions': json.dumps(permissions)})
         await db.execute(text("INSERT INTO enterprise_role_assignments VALUES('member@example.test','billing-reader',1,'owner','now')"))
 

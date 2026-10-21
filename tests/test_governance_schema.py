@@ -1,4 +1,4 @@
-"""Revision-22 governance storage and audit-event contract on SQLite or --postgres-backend."""
+"""Revision-23 governance storage and audit-event contract on SQLite or --postgres-backend."""
 import json
 import re
 
@@ -45,6 +45,25 @@ def test_governance_module_initializers_need_only_the_core_store(tmp_path):
         for module in (governance_audit, spend_limits, security_profiles, scim, enterprise_roles):
             module.initialize_schema(store)
         assert 'governance_audit_events' in store.table_names()
+    finally:
+        store.close()
+
+
+def test_upgraded_roles_start_their_permissions_revision_at_the_revision(tmp_path):
+    """Authority entries use permissions_revision, so an upgrade must not change any saved version."""
+    from app.schema_initializers import initialize_enterprise_roles
+    store = Store(tmp_path / 'upgrade')
+    try:
+        store.execute('''CREATE TABLE enterprise_roles (id TEXT PRIMARY KEY, name TEXT NOT NULL,
+            description TEXT NOT NULL, permissions TEXT NOT NULL, revision INTEGER NOT NULL,
+            archived INTEGER NOT NULL DEFAULT 0, updated_by TEXT NOT NULL, created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL)''')
+        store.execute("INSERT INTO enterprise_roles VALUES('reader','Reader','','[]',4,0,'owner','now','now')")
+        initialize_enterprise_roles(store)
+        store.execute('UPDATE enterprise_roles SET revision=5')  # A later rename; rerunning must not reset it.
+        initialize_enterprise_roles(store)
+        assert store.rows('SELECT revision,permissions_revision FROM enterprise_roles') == [
+            {'revision': 5, 'permissions_revision': 4}]
     finally:
         store.close()
 

@@ -45,6 +45,8 @@ from .product_history import session_id
 from .product_identity import ProductPrincipal
 
 if TYPE_CHECKING:
+    from app.security_profiles import ProfilePolicy
+
     from .runtime import Runtime
 
 MAX_FAMILY = 1000
@@ -156,6 +158,27 @@ class ProductContinuationService:
         return set((await db.execute(text(
             "SELECT table_name FROM information_schema.tables WHERE table_schema=:schema"
         ), {"schema": self.source_schema})).scalars())
+
+    async def _saved_policy(self, db: AsyncSession, source_id: str) -> ProfilePolicy | None:
+        """The root's policy saved by the earlier governance branch, which added runs.security_policy.
+
+        That branch stored '{}' for an ungoverned session, and its children
+        intersected their parent's policy, so the root bounds the whole family.
+        """
+        from app.security_profiles import InvalidPolicy, load_policy
+        if not await db.scalar(text(
+            "SELECT 1 FROM information_schema.columns WHERE table_schema=:schema "
+            "AND table_name='runs' AND column_name='security_policy'"
+        ), {"schema": self.source_schema}):
+            return None
+        saved = await db.scalar(text(f"SELECT security_policy FROM {self.table('runs')} WHERE id=:id"),
+                                {"id": source_id})
+        if saved in (None, "", "{}"):
+            return None
+        try:
+            return load_policy(saved)
+        except InvalidPolicy:
+            raise HTTPException(409, "Review the saved session security policy before continuing.") from None
 
     async def _root(self, db: AsyncSession, source_id: str, principal: ProductPrincipal) -> dict[str, Any]:
         session_id(source_id)
@@ -539,9 +562,7 @@ class ProductContinuationService:
         db.add(target)
         governance = getattr(self.runtime.database, 'governance', None)
         if governance is not None:
-            from app.security_profiles import load_policy
-            saved_policy = root.get('security_policy')
-            await governance.bind(db, target, current, ceiling=load_policy(saved_policy) if saved_policy else None)
+            await governance.bind(db, target, current, ceiling=await self._saved_policy(db, source_id))
         await db.flush()
         if target_surface == "slack":
             slack = self.runtime.product_slack

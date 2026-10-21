@@ -703,3 +703,36 @@ async def test_scheduled_governance_refusal_blocks_the_workflow_instead_of_retry
     async with product.source.connect() as db:
         details = (await db.execute(text('SELECT detail FROM moyai.automation_runs'))).scalars().all()
     assert details == [GOVERNANCE_BLOCKED] * 2
+
+
+@pytest_asyncio.fixture
+async def governed_continuation(tmp_path):
+    import test_product_continuation as continuation_fixtures
+    async for product in continuation_fixtures.continuation.__wrapped__(tmp_path):
+        attach(product)
+        product.admit = lambda product=product: continuation_fixtures.admit(product)
+        yield product
+
+
+@pytest.mark.parametrize(('saved', 'git_access'), [
+    ('{}', 'write'), (dump_policy(ProfilePolicy(git_access='none', tools=['read_file'])), 'none'), ('[]', None),
+], ids=['ungoverned', 'governed', 'invalid'])
+async def test_continuation_keeps_the_saved_policy_of_a_historical_governed_session(
+        governed_continuation, saved, git_access):
+    """Regression: the root read never selected runs.security_policy, so continuing dropped its ceiling."""
+    product = governed_continuation
+    # The earlier governance branch's column; '{}' marked an ungoverned session.
+    await product.sql("ALTER TABLE moyai.runs ADD COLUMN security_policy text NOT NULL DEFAULT '{}'")
+    await product.sql('UPDATE moyai.runs SET security_policy=:policy', policy=saved)
+    if git_access is None:
+        with pytest.raises(HTTPException) as refused:
+            await product.admit()
+        assert refused.value.status_code == 409
+        async with product.database.sessions() as db:
+            assert not list(await db.scalars(select(ProductSessionPolicy.session_id)))
+        return
+    result = await product.admit()
+    async with product.database.sessions() as db:
+        policy = await product.database.governance.policy(db, result['id'])
+    assert policy.git_access == git_access
+    assert policy.tools == (('read_file',) if git_access == 'none' else None)

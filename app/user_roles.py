@@ -69,10 +69,10 @@ class _Snapshot:
         self.assignments = {row['email']: dict(row) for row in conn.execute(
             'SELECT email,role_id,revision FROM enterprise_role_assignments')}
         self.roles = {row['id']: dict(row) for row in conn.execute(
-            'SELECT id,name,permissions,revision,archived FROM enterprise_roles')}
+            'SELECT id,name,permissions,permissions_revision,archived FROM enterprise_roles')}
         self.grants = {}
         for row in conn.execute('''SELECT u.user_name,r.group_id,r.revision,r.role_id,e.permissions,e.archived,
-                    e.revision AS role_revision
+                    e.permissions_revision AS role_revision
                 FROM enterprise_group_roles r
                 JOIN scim_groups g ON g.id=r.group_id AND g.deleted_at=''
                 JOIN scim_group_members m ON m.group_id=g.id

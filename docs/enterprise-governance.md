@@ -23,7 +23,8 @@ copies the older `floor_profile_id` into the mandatory policy, and adds SCIM
 revocation epochs. Previously inactive directory users remain revoked. Existing
 native sessions without policy bindings have no selected profile, and are still
 subject to the current mandatory policy. A continuation of a historical governed
-session intersects its saved policy with the new native binding.
+session intersects its saved policy with the new native binding; an unreadable
+saved policy blocks the continuation for review.
 
 Use `MOYAI_ORGANIZATION_ID` for one organization per deployment and database.
 The immutable database pin rejects a different organization at startup. An existing
@@ -45,8 +46,10 @@ make shared conversations private. Built-in roles cannot be edited or archived.
 The server checks permissions independently of navigation visibility. Native
 session and turn admission, tool catalogs, actual tool attempts and retries,
 connection credentials, model dispatch, memory recall, and workspace preparation
-resolve current authority. Role changes and SCIM revocations invalidate saved
-execution grants. Reactivation does not restore an earlier revoked grant.
+resolve current authority. Role permission changes, archives, assignments, group
+grants and SCIM revocations invalidate saved execution grants; renaming a role or
+editing its description does not. Reactivation does not restore an earlier
+revoked grant.
 
 Only a built-in administrator can grant or remove administrator access. Delegated
 role managers may grant only permissions they directly hold. Custom-role

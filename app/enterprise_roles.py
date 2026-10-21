@@ -19,10 +19,12 @@ access. Writers take the canonical exclusive writer, re-resolve the actor inside
 that transaction, and record exactly one governance audit event per change.
 
 Authority entries are monotonic: once governance has touched a person (any
-assignment row, including 'member', or a SCIM deactivation, deletion or loss of a
-granted group), returning to default access never restores an earlier entry,
-so saved authority versions stay revoked. People governance never touched keep
-no entry, so upgrading leaves their authority versions unchanged.
+assignment row, including 'member', a group grant, or a SCIM deactivation,
+deletion or loss of a granted group), returning to default access never restores
+an earlier entry, so saved authority versions stay revoked. People governance
+never touched keep no entry, so upgrading leaves their authority versions
+unchanged. Role entries carry the permissions revision, so renaming a role keeps
+its holders' saved authority.
 
 Schema lives in the canonical initializers; keep the import alias below instead
 of defining initialize_schema here.
@@ -165,9 +167,9 @@ ACCESS_QUERIES = {
     'scim_user': ("SELECT id, active, deleted_at, access_epoch FROM {scim_users} WHERE user_name=:email "
                   "ORDER BY (deleted_at='') DESC, updated_at DESC LIMIT 1"),
     'assignment': 'SELECT role_id, revision FROM {enterprise_role_assignments} WHERE email=:email',
-    'role': 'SELECT id, name, permissions, revision, archived FROM {enterprise_roles} WHERE id=:role_id',
+    'role': 'SELECT id, name, permissions, permissions_revision, archived FROM {enterprise_roles} WHERE id=:role_id',
     'group_grants': '''SELECT r.group_id, r.revision, r.role_id, e.permissions, e.archived,
-            e.revision AS role_revision
+            e.permissions_revision AS role_revision
         FROM {enterprise_group_roles} r
         JOIN {scim_groups} g ON g.id=r.group_id AND g.deleted_at=''
         JOIN {scim_group_members} m ON m.group_id=g.id
@@ -226,14 +228,15 @@ class AccessState:
 
     role_id/role_name: the direct custom role (None without one, or with a
     built-in 'member' row). assignment_revision: the enterprise_role_assignments
-    revision (0 without a row). role_revision: the direct custom role
-    definition's revision (0 without one); unlike the roles API's
-    role_revision, it is not the user_roles revision. groups: (group_id, grant
-    revision, role_id) for every grant applying through live SCIM membership.
+    revision (0 without a row). role_revision: the direct custom role's
+    permissions revision (0 without one), which renames do not advance; unlike
+    the roles API's role_revision, it is not the user_roles revision. groups:
+    (group_id, grant revision, role_id) for every grant applying through live
+    SCIM membership; none for a built-in administrator.
     scim_active: None when the email is not SCIM-managed, False when deactivated
     or deleted. default: no custom role and permissions equal the built-in set;
     Slack treats such an email as ungoverned. grant_roles: sorted (role_id, role
-    definition revision) of the granted roles, so narrowing and re-widening a
+    permissions revision) of the granted roles, so narrowing and re-widening a
     granted role is never the same state. directory: (SCIM user id, access epoch)
     once the directory has narrowed this email's access (deactivation, deletion,
     reprovisioning a deleted userName, or leaving a granted group); None before.
@@ -258,11 +261,11 @@ class AccessState:
 
         None only for default state that governance never touched, which must
         not change upgraded authority versions. An assignment row (even a reset
-        to 'member') keeps its revision and directory history keeps the SCIM id
-        and access epoch, so returning to default never revalidates an earlier
-        version.
+        to 'member') keeps its revision, directory history keeps the SCIM id
+        and access epoch, and a group grant keeps its role's permissions
+        revision, so returning to default never revalidates an earlier version.
         """
-        if self.default and not self.assignment_revision and self.directory is None:
+        if self.default and not self.assignment_revision and self.directory is None and not self.groups:
             return None
         entry: dict[str, Any] = {
             'role_id': self.role_id, 'role_revision': self.role_revision,
@@ -297,9 +300,11 @@ def resolve_access(fetch: Fetch, email: str, builtin_role: str) -> AccessState:
         # never the member default.
         direct = role_permissions(role['permissions']) if role and not role['archived'] else frozenset()
         if role:
-            role_name, role_revision = role['name'], int(role['revision'])
+            role_name, role_revision = role['name'], int(role['permissions_revision'])
     groups, granted, grant_roles = [], set(), set()
-    if scim_active:  # Group grants apply only through a live, active SCIM user.
+    # Group grants apply only through a live, active SCIM user, and never change
+    # a built-in administrator's access, so they stay out of admins' authority.
+    if scim_active and builtin_role != 'admin':
         for row in fetch('group_grants', {'email': email}):
             groups.append((row['group_id'], int(row['revision']), row['role_id']))
             if row['role_revision'] is not None:
@@ -603,8 +608,8 @@ class EnterpriseRoles:
         if conn.execute('SELECT 1 FROM enterprise_roles WHERE id=?', (body.id,)).fetchone():
             raise GovernanceConflict('A role with this ID already exists.')
         stamp = timestamp()
-        conn.execute('''INSERT INTO enterprise_roles(id,name,description,permissions,revision,archived,
-            updated_by,created_at,updated_at) VALUES(?,?,?,?,1,0,?,?,?)''',
+        conn.execute('''INSERT INTO enterprise_roles(id,name,description,permissions,revision,permissions_revision,
+            archived,updated_by,created_at,updated_at) VALUES(?,?,?,?,1,1,0,?,?,?)''',
             (body.id, body.name, body.description, json.dumps(body.permissions), authority.label, stamp, stamp))
         record_event_in(conn, 'role.created', authority.label, 'role', body.id,
                         {'permissions': body.permissions, 'revision': 1})
@@ -630,22 +635,15 @@ class EnterpriseRoles:
         authority.bound(previous, HELD_ROLE)
         authority.bound(body.permissions)
         revision = int(old['revision']) + 1
+        # Only a permission change revokes holders' saved authority; renames keep it.
+        permissions_revision = revision if set(body.permissions) != previous else int(old['permissions_revision'])
         conn.execute('''UPDATE enterprise_roles SET name=?,description=?,permissions=?,revision=?,
-            updated_by=?,updated_at=? WHERE id=?''',
-            (body.name, body.description, json.dumps(body.permissions), revision, authority.label, timestamp(), role_id))
+            permissions_revision=?,updated_by=?,updated_at=? WHERE id=?''',
+            (body.name, body.description, json.dumps(body.permissions), revision, permissions_revision,
+             authority.label, timestamp(), role_id))
         record_event_in(conn, 'role.updated', authority.label, 'role', role_id,
                         {'previous': sorted(previous), 'permissions': body.permissions, 'revision': revision})
         return _view(conn.execute('SELECT * FROM enterprise_roles WHERE id=?', (role_id,)).fetchone())
-
-    def save(self, body: RoleCreate | RoleUpdate, actor, role_id: str | None = None) -> dict[str, Any]:
-        """Create (role_id None, RoleCreate) or update an existing role (RoleUpdate)."""
-        if role_id is None:
-            if not isinstance(body, RoleCreate):
-                raise TypeError('Creating a role requires RoleCreate.')
-            return self.create(body, actor)
-        if not isinstance(body, RoleUpdate):
-            raise TypeError('Updating a role requires RoleUpdate.')
-        return self.update(role_id, body, actor)
 
     def archive(self, role_id: str, revision: int, actor) -> dict[str, Any]:
         return self._write(self.archive_in, role_id, revision, actor)
@@ -665,8 +663,8 @@ class EnterpriseRoles:
         previous = role_permissions(old['permissions'])
         # Directly assigned people lose every permission of an archived role.
         authority.bound(previous, HELD_ROLE)
-        conn.execute('UPDATE enterprise_roles SET archived=1,revision=?,updated_by=?,updated_at=? WHERE id=?',
-                     (revision + 1, authority.label, timestamp(), role_id))
+        conn.execute('''UPDATE enterprise_roles SET archived=1,revision=?,permissions_revision=?,updated_by=?,
+            updated_at=? WHERE id=?''', (revision + 1, revision + 1, authority.label, timestamp(), role_id))
         record_event_in(conn, 'role.archived', authority.label, 'role', role_id,
                         {'permissions': sorted(previous), 'revision': revision + 1})
         return _view(conn.execute('SELECT * FROM enterprise_roles WHERE id=?', (role_id,)).fetchone())

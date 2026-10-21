@@ -817,6 +817,9 @@ def initialize_enterprise_roles(store):
 
     A role id of 'admin' or 'member' names a built-in role, so assignments and
     group grants carry no foreign key. Permissions are a sorted JSON list.
+    permissions_revision is the revision that last changed the permissions or
+    archived the role; authority versions use it, so renames revoke nothing.
+    Existing roles start at their revision, keeping saved authority versions.
     """
     with store.connect() as conn:
         conn.executescript('''
@@ -824,7 +827,8 @@ def initialize_enterprise_roles(store):
                 id TEXT PRIMARY KEY, name TEXT NOT NULL, description TEXT NOT NULL,
                 permissions TEXT NOT NULL, revision INTEGER NOT NULL,
                 archived INTEGER NOT NULL DEFAULT 0 CHECK(archived IN (0,1)),
-                updated_by TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+                updated_by TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                permissions_revision INTEGER NOT NULL DEFAULT 0);
             CREATE TABLE IF NOT EXISTS enterprise_role_assignments (
                 email TEXT PRIMARY KEY, role_id TEXT NOT NULL, revision INTEGER NOT NULL,
                 updated_by TEXT NOT NULL, updated_at TEXT NOT NULL);
@@ -832,6 +836,10 @@ def initialize_enterprise_roles(store):
                 group_id TEXT PRIMARY KEY, role_id TEXT, revision INTEGER NOT NULL,
                 updated_by TEXT NOT NULL, updated_at TEXT NOT NULL);
         ''')
+        if 'permissions_revision' not in conn.column_names('enterprise_roles'):
+            conn.execute('ALTER TABLE enterprise_roles ADD COLUMN permissions_revision INTEGER NOT NULL DEFAULT 0')
+        # Writers always store at least 1, so 0 marks only a row the column was just added to.
+        conn.execute('UPDATE enterprise_roles SET permissions_revision=revision WHERE permissions_revision=0')
 
 
 def initialize_scim(store):

@@ -611,6 +611,62 @@ def test_returning_to_default_never_restores_an_earlier_authority_entry(governan
     assert access(service, 'kim@example.com').authority_entry() is None
 
 
+def test_archiving_or_narrowing_a_granted_role_never_restores_the_pre_grant_entry(governance):
+    """Regression: a group grant whose role was archived, or swapped for a member subset, left a default
+    state with no entry, which revived authority versions issued before the grant."""
+    service = governance
+    role(service, 'auditor', ['audit.read'])
+    role(service, 'subset', ['workspace.read'])
+    for end in ('subset', 'archive'):
+        email = f'pat-{end}@example.com'
+        team = directory_group(service, f'Audit {end}', [provision(service, email)])
+        seen = [access(service, email).authority_entry()]
+        service.enterprise.set_group_role(team, GroupRoleChange(role_id='auditor'), OWNER)
+        seen.append(access(service, email).authority_entry())
+        if end == 'archive':
+            service.enterprise.archive('auditor', 1, OWNER)
+        else:
+            service.enterprise.set_group_role(team, GroupRoleChange(role_id='subset', revision=1), OWNER)
+        state = access(service, email)
+        seen.append(state.authority_entry())
+        assert state.default and seen[0] is None
+        assert len({json.dumps(entry, sort_keys=True) for entry in seen}) == 3, seen
+
+
+def test_role_renames_keep_holders_authority_and_admins_ignore_group_grants(governance):
+    """Regression: every role edit advanced the authority revision, so fixing a description revoked every
+    holder's saved grants; group grants also changed built-in administrators' versions."""
+    service = governance
+    role(service, 'operator', ['connections.manage', 'workspace.read'])
+    assign(service, 'bob@example.com', 'operator')
+    team = directory_group(service, 'Ops', [provision(service, 'lee@example.com'),
+                                            provision(service, 'owner@example.com')])
+    service.enterprise.set_group_role(team, GroupRoleChange(role_id='operator'), OWNER)
+    holders = ('bob@example.com', 'lee@example.com')
+
+    def entries():
+        return {email: access(service, email).authority_entry() for email in holders}
+
+    before = entries()
+    renamed = service.enterprise.update('operator', RoleUpdate(
+        name='Operations', description='Typo fixed', permissions=['workspace.read', 'connections.manage'],
+        revision=1), OWNER)
+    assert renamed['revision'] == 2 and entries() == before  # Still revision-checked, but nothing revoked.
+    with pytest.raises(GovernanceConflict):
+        service.enterprise.update('operator', RoleUpdate(name='Stale', permissions=[], revision=1), OWNER)
+    service.enterprise.update('operator', RoleUpdate(name='Operations', permissions=['workspace.read'],
+                                                     revision=2), OWNER)
+    narrowed = entries()
+    assert all(narrowed[email] != before[email] for email in holders)
+    assert narrowed['bob@example.com']['role_revision'] == 3
+    assert narrowed['lee@example.com']['grant_roles'] == [['operator', 3]]
+    service.enterprise.archive('operator', 3, OWNER)
+    assert all(entry not in (before[email], narrowed[email]) for email, entry in entries().items())
+    # A built-in administrator always holds every permission; group grants never touch their version.
+    admin = access(service, 'owner@example.com')
+    assert admin.permissions == ALL and admin.groups == () and admin.authority_entry() is None
+
+
 def test_delegates_cannot_strip_or_archive_access_they_do_not_hold(governance):
     """Regression: the delegation bound covered additions only, so delegates removed others' access."""
     service = governance

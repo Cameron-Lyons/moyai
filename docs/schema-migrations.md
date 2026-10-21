@@ -54,9 +54,9 @@ Complete this coordinated maintenance transition before enabling concurrent
 replacements of compatible runtime versions. A normal pre-deploy hook that runs while the old
 app is live will be rejected. Once this activation is complete, deploy the bridge
 at the same schema revision to all four roles before using online expansions.
-An installation still on an earlier revision, such as revision 14, first needs
-the one-time maintenance adoption of revision 21; the online registry only
-declares the additive step from revision 20 to 21.
+An installation still on an earlier revision, such as revision 14 or 22, first
+needs the one-time maintenance adoption of revision 23; the canonical online
+registry declares no steps at compatibility 23.
 
 ## Private-session upgrade
 
@@ -68,7 +68,7 @@ Use the coordinated maintenance steps above for an existing revision-18 deployme
 back up the database, drain work, stop **all four roles** (including the dedicated
 API), run `python -m app.schema_migrations --apply` from the target release, and
 start every role at that release with `MOYAI_SCHEMA_MODE=verify`. Confirm the
-migration prints the current revision 21, health checks pass, and an ordinary saved session
+migration prints the current revision 23, health checks pass, and an ordinary saved session
 opens before reopening ingress. Verify that a private test session returns 404
 for a second individual account.
 
@@ -85,9 +85,8 @@ support before applying it.
 `app/online_schema_migrations.json` is the explicit reviewed registry. Each step
 names its source and target revision, their digests from `schema_versions.json`,
 the unchanged compatibility revision, and a list of declarative operations.
-Steps must be contiguous. The current registry declares revision 20 to 21 at
-compatibility revision 20. It adds nullable timing fields to `performance_samples`;
-it does not authorize a rolling transition to the native runtime.
+Steps must be contiguous. The current registry is empty: raising the
+compatibility revision to 23 removed the earlier 20 to 21 step.
 
 Protocol 1 accepts only:
 
