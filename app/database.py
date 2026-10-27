@@ -87,13 +87,15 @@ RUNTIME_SETTINGS = ('session_secret', 'encryption_key', 'object_storage_bucket',
              'max_concurrent_runs', 'max_pending_runs', 'max_concurrent_model_requests', 'moyai_build_sha',
              'moyai_separate_broker', 'moyai_coordinator_handoff', 'sandbox_prepared_pool_size', 'sandbox_prepared_idle_seconds',
              'independent_agent_runtime')
-# Shared settings that join the role contracts only when set, so deployments
-# that leave them empty keep their fingerprints across the release adding them.
-OPTIONAL_RUNTIME_SETTINGS = ('moyai_required_guardrails',)
+# Shared settings that join the role contracts only when set (and not 'off'), so
+# deployments that leave them at their default keep their fingerprints across
+# the release adding them.
+OPTIONAL_RUNTIME_SETTINGS = ('moyai_required_guardrails', 'moyai_network_policy_enforcement')
 
 
 def runtime_settings(settings, exclude=()):
-    names = (*RUNTIME_SETTINGS, *(name for name in OPTIONAL_RUNTIME_SETTINGS if getattr(settings, name)))
+    names = (*RUNTIME_SETTINGS, *(name for name in OPTIONAL_RUNTIME_SETTINGS
+                                  if getattr(settings, name) not in ('', 'off', None)))
     return {name: getattr(settings, name) for name in names if name not in exclude}
 
 

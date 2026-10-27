@@ -119,6 +119,18 @@ def test_invalid_network_enforcement_is_rejected(install_environment, value):
         configuration({**install_environment, "MOYAI_NETWORK_POLICY_ENFORCEMENT": value}, None)
 
 
+@pytest.mark.parametrize("field", ["MOYAI_OIDC_PROVIDERS", "MOYAI_OIDC_CLIENT_SECRETS"])
+def test_standalone_refuses_organization_oidc_it_would_ignore(install_environment, field):
+    """Regression: standalone accepted OIDC settings, then offered only password sign-in."""
+    value = '{"okta":"synthetic-client-secret"}' if field.endswith("SECRETS") else '[{"id":"okta"}]'
+    with pytest.raises(InstallationError, match="requires MOYAI_INSTALL_TOPOLOGY=split"):
+        configuration({**install_environment, field: value}, None)
+    # The installer writes blank values for both topologies.
+    assert configuration({**install_environment, field: " "}, None)["MOYAI_PRODUCT_MODE"] == "standalone"
+    split = configuration({**install_environment, "MOYAI_INSTALL_TOPOLOGY": "split", field: value}, None)
+    assert split[field] == value
+
+
 def test_existing_deployment_without_runtime_uses_vm(install_environment):
     from moyai.deployment_checks import validate
 

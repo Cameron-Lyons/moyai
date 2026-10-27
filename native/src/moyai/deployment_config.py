@@ -166,6 +166,12 @@ def configuration(environment: Mapping[str, str], state: dict | None, *, role: s
     if enforcement not in {"off", "modal"}:
         raise InstallationError("MOYAI_NETWORK_POLICY_ENFORCEMENT must be off or modal.")
     values["MOYAI_NETWORK_POLICY_ENFORCEMENT"] = enforcement
+    # Standalone mode has no organization sign-in (or security policies, so the
+    # enforcement value above is inert there); refuse OIDC it would silently drop.
+    if topology == "standalone" and any(
+        values.get(field, "").strip() for field in ("MOYAI_OIDC_PROVIDERS", "MOYAI_OIDC_CLIENT_SECRETS")
+    ):
+        raise InstallationError("Organization OpenID Connect sign-in requires MOYAI_INSTALL_TOPOLOGY=split.")
     public_url = _public_origin(_required(values, "MOYAI_PUBLIC_URL"))
     temporal_mode = values.get("MOYAI_TEMPORAL_MODE", "external")
     if temporal_mode not in {"external", "bundled"}:

@@ -893,6 +893,24 @@ async def test_guardrail_refusal_is_audited_once_with_its_zero_spend_outcome(inf
         assert usage.coverage_error == "gateway_error" and usage.cost_usd is None
 
 
+async def test_guardrail_refusal_names_an_oidc_enrolled_person_by_email(inference, monkeypatch):
+    """Regression: only Google and Access accounts were named by email, so OIDC people appeared as their opaque id."""
+    ctx = inference
+    audit = ctx.service._audit_guardrail
+
+    async def enrolled_by_oidc(db, capture):
+        # Admission already authorized this Google account (OIDC sign-in needs a
+        # configured provider); the audit then reads the row an organization
+        # OpenID Connect enrollment (app.oidc_sso) creates, of kind 'oidc'.
+        await db.execute(text("UPDATE moyai.users SET kind='oidc' WHERE id=:id"),
+                         {"id": ctx.scope.product_grant.user_id})
+        await audit(db, capture)
+    monkeypatch.setattr(ctx.service, "_audit_guardrail", enrolled_by_oidc)
+    assert (await perform(ctx, handler=guardrail_refusal)).status_code == 400
+    event, = await guardrail_events(ctx)
+    assert (event["action"], event["actor"]) == ("ai_guardrail.violation", "admin@example.test")
+
+
 async def test_ordinary_gateway_error_is_not_audited_or_relayed_as_a_guardrail(inference):
     async def rejected(_):
         return httpx2.Response(429, stream=WireStream(b'{"error":{"message":"synthetic limit"}}'), headers={

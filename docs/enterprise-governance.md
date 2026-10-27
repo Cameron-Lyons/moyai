@@ -360,7 +360,10 @@ computer stops: the next turn restores the saved files into a computer created
 under the current policy. Removing a session's network restriction needs no
 action; any other change to its allowlist needs a new computer. The setting
 decides admission only; workers always create computers under the session's
-policy.
+policy. Use the same value in every API, worker, broker and coordinator: once it
+is not `off` it joins the shared role contract, so roles that disagree are not
+admitted together, and setting or changing it is a shared configuration change
+(restart the coordinator first).
 
 Modal matches outbound TLS on port 443 by SNI hostname; `*.example.com` covers the
 apex and every subdomain. Plain HTTP (including Debian `apt` mirrors), SSH,

@@ -152,6 +152,7 @@ class ProductConfig:
                 gateway_url=source.litellm_api_base,
                 gateway_key=SecretStr(source.litellm_api_key),
                 required_guardrails=source.moyai_required_guardrails,
+                network_policy_enforcement=source.moyai_network_policy_enforcement,
                 default_model=source.resolve_model(),
                 model_catalog=",".join(dict.fromkeys(
                     source.resolve_model(value) for value in source.allowed_models()

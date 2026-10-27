@@ -347,6 +347,9 @@ class Settings(BaseSettings):
     # LiteLLM guardrails every successful native gateway answer must attest
     # (comma-separated, at most ten); carried to every role's native settings.
     moyai_required_guardrails: str = Field(default='', pattern=GUARDRAIL_NAMES)
+    # Whether native admission accepts network-restricted security policies on
+    # Modal computers; carried to every role's native settings and role contract.
+    moyai_network_policy_enforcement: Literal['off', 'modal'] = 'off'
     model_context_limits: dict[str, ModelContextLimits] = Field(default_factory=dict)
     session_titles_enabled: bool = True
     session_title_model: str = Field(default="openai/gpt-4.1-nano", min_length=1, max_length=200)

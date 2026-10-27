@@ -172,7 +172,10 @@ Microsoft Entra ID): export `GOOGLE_ALLOWED_DOMAINS`, `GOOGLE_ADMIN_EMAILS`,
 `MOYAI_OIDC_PROVIDERS` and `MOYAI_OIDC_CLIENT_SECRETS` before `configure`, as
 described in [sign-in](../../docs/authentication.md#organization-openid-connect-okta-microsoft-entra-id).
 Every service receives the same values; with `--secrets-from-env` the client
-secrets stay in your environment like the other credentials.
+secrets stay in your environment like the other credentials. The standalone
+topology has no organization sign-in: it ignores the Google settings and
+refuses to configure, validate or start with `MOYAI_OIDC_PROVIDERS` or
+`MOYAI_OIDC_CLIENT_SECRETS` set.
 
 These modes have different identity/schema contracts. Changing the topology
 variable or `COMPOSE_FILE` does not migrate an existing standalone installation

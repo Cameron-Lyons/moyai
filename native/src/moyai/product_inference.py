@@ -411,6 +411,7 @@ class ProductInferenceService:
     async def _audit_guardrail(self, db: Any, capture: UsageCapture) -> None:
         """Record the refusal with its ledger outcome: names and identifiers, never content."""
         from app.enterprise_roles import GovernanceActor, actor_label
+        from app.identity_kinds import INDIVIDUAL_KINDS
 
         from .inference_guardrails import ACTIONS
         from .product_governance import record_runtime_event
@@ -421,11 +422,12 @@ class ProductInferenceService:
         user = (await db.execute(text(
             f"SELECT kind,email FROM {identity._table('users')} WHERE id=:id"
         ), {"id": grant.user_id})).first()
-        # Like actor_label for a principal, only an individual's email names the actor.
-        email = user.email if user is not None and user.kind in {"google", "cloudflare"} else ""
+        # Like actor_label for a principal, only an individual's email names the actor,
+        # whichever organization sign-in method enrolled them.
+        email = user.email if user is not None and user.kind in INDIVIDUAL_KINDS else ""
         await record_runtime_event(
             db, identity, activity.logical_identity, ACTIONS[guardrail.outcome],
-            actor_label(GovernanceActor(id=grant.user_id, email=email or "")),
+            actor_label(GovernanceActor(id=grant.user_id, email=email)),
             "ai_guardrail", guardrail.name or "gateway",
             guardrail.details(activity.scope.session_id, capture.values["model"]),
         )

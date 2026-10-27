@@ -96,7 +96,8 @@ class Settings(BaseSettings):
     )
     sandbox_provider: Literal["modal", "lambda"] = Field(default="modal", validation_alias="SANDBOX_PROVIDER")
     # Admits sessions with a network allowlist on Modal computers (modal_network).
-    # Deployment-wide: use the same value in every API, worker, broker and coordinator.
+    # Deployment-wide: existing mode passes the canonical value, which joins the
+    # shared role contract once it is not 'off', so mismatched roles are refused.
     network_policy_enforcement: Literal["off", "modal"] = Field(
         default="off", validation_alias="MOYAI_NETWORK_POLICY_ENFORCEMENT",
     )

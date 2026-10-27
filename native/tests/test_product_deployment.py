@@ -4,6 +4,7 @@ import json
 import os
 import subprocess
 import sys
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import AsyncMock
 from urllib.parse import urlsplit, urlunsplit
@@ -97,6 +98,30 @@ def test_required_guardrails_reach_native_settings_and_the_shared_role_contract(
     source = unset.legacy_settings()
     assert runtime_settings(source) == {name: getattr(source, name) for name in RUNTIME_SETTINGS}
     environment["MOYAI_REQUIRED_GUARDRAILS"] = "phi presidio"
+    with pytest.raises(ProductConfigurationError):
+        configured(environment)
+
+
+def test_network_enforcement_reaches_native_settings_and_the_shared_role_contract(environment):
+    """Regression: a worker left at 'off' joined an API at 'modal' and refused every restricted session's turns."""
+    from app.database import RUNTIME_SETTINGS, runtime_settings
+
+    unset = configured(environment)
+    environment["MOYAI_NETWORK_POLICY_ENFORCEMENT"] = "off"
+    off = configured(environment)
+    environment["MOYAI_NETWORK_POLICY_ENFORCEMENT"] = "modal"
+    modal = configured(environment)
+    assert Settings(_env_file=None, **modal.native_overrides()).network_policy_enforcement == "modal"
+    assert Settings(_env_file=None, **off.native_overrides()).network_policy_enforcement == "off"
+    for role in ("api", "worker", "broker", "coordinator"):
+        roles = [replace(config, role=role) for config in (unset, off, modal)]
+        # Roles that disagree on enforcement are not admitted together.
+        assert candidate_role_fingerprint(roles[0]) == candidate_role_fingerprint(roles[1])
+        assert candidate_role_fingerprint(roles[2]) != candidate_role_fingerprint(roles[1])
+    # Left off, the setting keeps the contract of releases that predate it.
+    source = off.legacy_settings()
+    assert runtime_settings(source) == {name: getattr(source, name) for name in RUNTIME_SETTINGS}
+    environment["MOYAI_NETWORK_POLICY_ENFORCEMENT"] = "on"
     with pytest.raises(ProductConfigurationError):
         configured(environment)
 
