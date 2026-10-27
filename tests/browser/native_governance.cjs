@@ -72,7 +72,8 @@ const auditPages=[
   [entry('a1','role.created','role','auditor',{permissions:['audit.read','sessions.read']}),entry('a2','scim_token.revoked','scim_token','tok-0',{label:'Old connector'}),
    entry('a3','role.changed','user_role','bob@example.test',{previous:'member',replacement:'admin'},'admin@example.test','user_roles')],
   [entry('a4','spend_limit.updated','spend_limit','organization',{limit_usd:5000,previous_usd:null}),
-   entry('a5','ai_guardrail.violation','ai_guardrail','phi-presidio',{session_id:'s1',model:'openai/gpt-6-astra',mode:'pre_call',guardrails:['phi-presidio','prompt-injection']},'bob@example.test')],
+   entry('a5','ai_guardrail.violation','ai_guardrail','phi-presidio',{session_id:'s1',model:'openai/gpt-6-astra',mode:'pre_call',guardrails:['phi-presidio','prompt-injection']},'bob@example.test'),
+   entry('a6','policy.tool_denied','policy','s1',{reason:'tool_disabled',tool:'shell',outcome:'denied',session_id:'s1'},'bob@example.test','activity')],
 ];
 const rolesView=()=>({roles:state.roles,assignments:state.assignments,group_roles:state.groupRoles,groups:state.groups,grantable:state.role==='admin'?null:state.permissions,builtin_admin:state.role==='admin'});
 // Like the server, spend.manage alone can read the listing, and both GET and writes return
@@ -200,9 +201,10 @@ async function handle(req,res,next) {
   if(p==='/api/admin/governance/audit') {
     if(!has('audit.read'))return deny();
     const page=url.searchParams.get('cursor')==='audit-2'?1:0;
-    let entries=page&&state.emptyNextPage?[]:auditPages[page];
+    const kind=url.searchParams.get('resource_type');
+    let entries=kind?auditPages.flat().filter(row=>row.resource_type===kind):page&&state.emptyNextPage?[]:auditPages[page];
     if(url.searchParams.get('action'))entries=entries.filter(row=>row.action===url.searchParams.get('action'));
-    return json({entries,next_cursor:page||url.searchParams.get('action')?null:'audit-2',facets:{actions:['ai_guardrail.violation','role.created','role.changed','scim_token.revoked','spend_limit.updated'],resource_types:['role','user_role','scim_token','spend_limit','ai_guardrail']}});
+    return json({entries,next_cursor:page||kind||url.searchParams.get('action')?null:'audit-2',facets:{actions:['ai_guardrail.violation','policy.tool_denied','role.created','role.changed','scim_token.revoked','spend_limit.updated'],resource_types:['role','user_role','scim_token','spend_limit','ai_guardrail','sign_in','session','policy']}});
   }
   // Users directory (existing route, governance fields)
   if(p==='/api/settings/users')return has('users.read')?json({source:'product',note:'Organization sign-in manages accounts.',capabilities:{roles:has('users.manage'),create:false,update:false,delete:false},
@@ -505,7 +507,10 @@ test('audit log: filters, date validation, cursor paging and exports',async t=>{
   reset();const page=await pageFor(t,'#settings/audit-log');
   const table=page.getByRole('region',{name:'Audit log entries'});await table.getByText('Role created',{exact:true}).waitFor();
   await page.getByText('3 entries shown; more are available.').waitFor();
-  await page.getByRole('button',{name:'Load more'}).click();await table.getByText('Spend limit updated',{exact:true}).waitFor();await page.getByText('5 entries shown.').waitFor();
+  await page.getByRole('button',{name:'Load more'}).click();await table.getByText('Spend limit updated',{exact:true}).waitFor();await page.getByText('6 entries shown.').waitFor();
+  const denial=table.getByRole('row').filter({hasText:'Policy tool denied'});await denial.getByText('Denied',{exact:true}).waitFor();
+  assert.ok((await denial.textContent()).includes('policy.tool_denied · Activity'),'activity rows name their source');
+  assert.equal(await table.getByText('Denied',{exact:true}).count(),1,'only the refused row carries an outcome badge');
   const refusal=table.getByRole('row').filter({hasText:'AI guardrail violation'}),refusalText=await refusal.textContent();
   assert.ok(['ai_guardrail.violation','bob@example.test','ai_guardrail','phi-presidio'].every(text=>refusalText.includes(text)));
   await refusal.locator('details summary').click();await refusal.getByText('phi-presidio, prompt-injection').waitFor();
@@ -534,6 +539,13 @@ test('audit log: filters, date validation, cursor paging and exports',async t=>{
   assert.equal(downloads,0,'a failed export downloads nothing');assert.equal(await page.getByRole('button',{name:'Export CSV'}).isEnabled(),true);
   await page.getByRole('button',{name:'Clear filters'}).first().click();await page.getByText('3 entries shown; more are available.').waitFor();
   assert.equal(await page.getByText(state.exportError).count(),0,'new filters clear the export error');
+  // Activity resource types have readable filter labels and round-trip their stored value.
+  await page.getByRole('combobox',{name:'Resource type'}).click();
+  for(const label of ['Sign-in','Sessions','Policy denials','scim token'])await page.getByRole('option',{name:label,exact:true}).waitFor();
+  await page.getByRole('option',{name:'Policy denials',exact:true}).click();await page.getByRole('button',{name:'Apply filters'}).click();
+  await waitFor(()=>new URLSearchParams(last('/api/admin/governance/audit').query).get('resource_type')==='policy','resource type request');
+  await page.getByText('1 entry shown.').waitFor();await table.getByText('Policy tool denied',{exact:true}).waitFor();
+  assert.equal(await page.getByRole('combobox',{name:'Resource type'}).innerText(),'Policy denials');
 });
 
 test('load more with an empty final page stops paging instead of returning to the first cursor',async t=>{

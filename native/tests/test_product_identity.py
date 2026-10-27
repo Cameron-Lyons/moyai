@@ -122,6 +122,7 @@ SCHEMA = (
     "CREATE TABLE security_profile_defaults (id INTEGER PRIMARY KEY CHECK(id=1), revision INTEGER NOT NULL, default_profile_id TEXT NOT NULL DEFAULT '', mandatory_profile_id TEXT NOT NULL DEFAULT '', updated_by TEXT NOT NULL, updated_at TEXT NOT NULL)",
     "CREATE TABLE spend_limits (id TEXT PRIMARY KEY, kind TEXT NOT NULL CHECK(kind IN ('organization','user-default','session-default','user')), subject TEXT NOT NULL DEFAULT '', limit_usd REAL, revision INTEGER NOT NULL, updated_by TEXT NOT NULL, updated_at TEXT NOT NULL)",
     "CREATE TABLE governance_audit_events (id TEXT PRIMARY KEY, action TEXT NOT NULL, actor TEXT NOT NULL, resource_type TEXT NOT NULL, resource_id TEXT NOT NULL, details TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL)",
+    "CREATE TABLE governance_activity_events (id TEXT PRIMARY KEY, action TEXT NOT NULL, outcome TEXT NOT NULL CHECK(outcome IN ('success','denied','failed')), actor TEXT NOT NULL, actor_key TEXT NOT NULL, actor_id TEXT NOT NULL DEFAULT '', resource_type TEXT NOT NULL, resource_id TEXT NOT NULL, session_id TEXT NOT NULL DEFAULT '', client TEXT NOT NULL DEFAULT '', details TEXT NOT NULL DEFAULT '{}' CHECK(length(details) <= 4096), created_at TEXT NOT NULL)",
 )
 
 

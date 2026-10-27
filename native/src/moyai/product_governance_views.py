@@ -86,7 +86,7 @@ class RolesAdmin(GovernanceView):
 
 class AuditEntry(GovernanceView):
     id: str
-    source: Literal["governance", "user_roles", "connections", "credentials"]
+    source: Literal["activity", "governance", "user_roles", "connections", "credentials"]
     action: str
     actor: str
     resource_type: str

@@ -273,8 +273,11 @@ class DelegationService:
             db.add(child)
             if database.governance is not None:
                 # Bind the parent's effective snapshot, never a newer default.
-                principal = await database.governance.principal(db, scope.product_grant)
-                await database.governance.bind(db, child, principal, inherited_from=scope.session_id)
+                principal = await database.governance.principal(
+                    db, scope.product_grant, action="policy.binding_denied", session_id=scope.session_id,
+                    turn_id=scope.turn_id)
+                await database.governance.bind(db, child, principal, inherited_from=scope.session_id,
+                                               origin="delegation", turn_id=scope.turn_id)
             await db.flush()
             uploads = list(await db.scalars(select(TurnImage.upload_id).where(
                 TurnImage.turn_id == scope.turn_id,

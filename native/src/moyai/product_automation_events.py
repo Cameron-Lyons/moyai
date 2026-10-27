@@ -762,7 +762,8 @@ class ProductAutomationEvents:
             if len(prompt) > 500_000:
                 return await settled("blocked", "Saved instructions and event context exceed the native input limit.")
             admitted = await service._admit_governed(
-                db, binding, grant=grant, title=f"Automation · {definition.name}", prompt=prompt,
+                db, binding, occurrence=occurrence, occurrence_kind="event", grant=grant,
+                title=f"Automation · {definition.name}", prompt=prompt,
                 model=service.settings.resolve_model(definition.model or None),
                 request_key="automation-" + hashlib.sha256(occurrence.encode()).hexdigest(),
                 connections=connections, session_id=definition.session_id,

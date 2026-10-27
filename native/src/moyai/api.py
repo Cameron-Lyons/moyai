@@ -424,7 +424,11 @@ def create_app(runtime: Runtime | None = None, *, run_dispatcher: bool = True) -
         return LoginResult(csrf=csrf)
 
     @app.post("/api/logout", operation_id="logout")
-    async def logout(response: Response, user: User = Depends(actor)) -> LogoutResult:
+    async def logout(request: Request, response: Response, user: User = Depends(actor)) -> LogoutResult:
+        principal = getattr(request.state, "product_principal", None)
+        if runtime.product is not None and principal is not None:
+            from .product_auth import record_sign_out
+            await record_sign_out(runtime.product, principal)
         response.delete_cookie("workspace_session" if runtime.product is not None else COOKIE)
         if runtime.product is not None and runtime.product.settings.cloudflare_access_login:
             return LogoutResult(signed_out=True, logout_url="/cdn-cgi/access/logout")
@@ -777,6 +781,11 @@ def create_app(runtime: Runtime | None = None, *, run_dispatcher: bool = True) -
                 if body.title is not None:
                     row.title = body.title
                 if body.archived is not None:
+                    governance = runtime.database.governance
+                    if governance is not None and body.archived != row.archived:
+                        await governance.record(
+                            db, "session.archived" if body.archived else "session.unarchived", actor_id=user.id,
+                            resource_id=session_id, session_id=session_id)
                     row.archived = body.archived
                     if body.archived:
                         from .goal_models import Goal

@@ -957,8 +957,13 @@ class Store:
     def has_queued_messages(self, run_id):
         return bool(self.rows("SELECT id FROM messages WHERE run_id=? AND status='queued' LIMIT 1", (run_id,)))
 
-    def identity(self, info):
-        """Only call with the server-verified session, never request JSON."""
+    def identity(self, info, *, sign_in=False):
+        """Only call with the server-verified session, never request JSON.
+
+        sign_in: a Google or password sign-in that is about to issue a session.
+        Its sign_in.succeeded event commits with the account refresh, so a
+        failed audit write issues no session.
+        """
         if info.get('method') == 'cloudflare':
             return self.access_identity(info['identity'])
         if info.get('method') == 'oidc':
@@ -986,6 +991,11 @@ class Store:
             if kind == 'google':
                 for value in {email, old['email'] if old else email}:
                     self.reconcile_email_in(conn, value)
+            if sign_in:
+                from .enterprise_roles import shared_label
+                from .sign_in_audit import succeeded_in
+                succeeded_in(conn, 'google' if kind == 'google' else 'password',
+                             email if kind == 'google' else shared_label(user_id) or user_id, enrolled=old is None)
         return user_id
 
     def access_actor(self, identity):
@@ -1042,6 +1052,7 @@ class Store:
         """
         from .enterprise_roles import scim_state_in
         from .governance_audit import record_event_in
+        from .sign_in_audit import succeeded_in
 
         issuer, subject, email = identity['issuer'], identity['sub'], identity['email']
         stamp = now()
@@ -1082,8 +1093,7 @@ class Store:
                 record_event_in(conn, 'identity_binding.created', email, 'identity_binding', user_id,
                                 {'provider': provider, 'linked_existing': linked})
         if provider:
-            record_event_in(conn, 'sign_in.succeeded', email, 'sign_in', provider,
-                            {'method': kind, 'enrolled': enrolled})
+            succeeded_in(conn, kind, email, resource_id=provider, enrolled=enrolled)
         self.reconcile_email_in(conn, email)
         return user_id
 

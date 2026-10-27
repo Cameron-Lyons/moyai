@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hmac
+import logging
 from typing import TYPE_CHECKING, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
@@ -13,6 +14,8 @@ from .models import User
 
 if TYPE_CHECKING:
     from .runtime import Runtime
+
+log = logging.getLogger(__name__)
 
 
 class RoleEdit(BaseModel):
@@ -117,12 +120,48 @@ async def password_login(runtime: Runtime, password: str, request: Request, resp
     elif settings.workspace_member_password and hmac.compare_digest(password, settings.workspace_member_password):
         role = "member"
     else:
+        from app import sign_in_audit
+        try:
+            # limit_login bounds these writes per client and in total.
+            await asyncio.to_thread(sign_in_audit.record, product.store, "sign_in.refused", "anonymous",
+                                    "password", reason="invalid_password")
+        except Exception as failure:  # noqa: BLE001 - the refusal stands whether or not it is recorded.
+            log.warning("Password sign-in refusal was not recorded: %s", type(failure).__name__)
         raise HTTPException(401, "Incorrect workspace password.")
     # Only a verified existing authentication path creates/refreshes canonical
-    # account rows. Native user projection never enrolls product accounts.
-    await asyncio.to_thread(product.store.identity, {"method": "password", "role": role})
+    # account rows. Native user projection never enrolls product accounts. The
+    # sign-in event commits with that refresh: without it, no session is issued.
+    from app.database import DatabaseError
+    try:
+        await asyncio.to_thread(product.store.identity, {"method": "password", "role": role}, sign_in=True)
+    except DatabaseError:
+        raise HTTPException(503, "Sign-in is temporarily unavailable. Try again shortly.") from None
     sid = security.new_session(response, role)
     return {"csrf": security.csrf(sid), "authenticated": True, "role": role}
+
+
+async def record_sign_out(product, principal) -> None:
+    """Record sign_in.signed_out once per organization or shared password session.
+
+    Logout only deletes the cookie, and the signed cookie stays valid until it
+    expires, so the event is keyed by the session (its CSRF token, an HMAC of
+    the session id): replaying one cookie records one sign-out. Other methods
+    (local preview) record nothing. Signing out never depends on the event: a
+    lost event is logged, not raised.
+    """
+    from app import sign_in_audit
+    if principal.method not in sign_in_audit.METHODS or not principal.csrf_token:
+        return
+    from app.enterprise_roles import actor_label
+    provider = product.settings.oidc_provider_for_domain(principal.email.rpartition("@")[2]) \
+        if principal.method == "oidc" else None
+    try:
+        await asyncio.to_thread(
+            sign_in_audit.record, product.store, "sign_in.signed_out", actor_label(principal), principal.method,
+            resource_id=provider.id if provider else None, key=principal.csrf_token,
+        )
+    except Exception as failure:  # noqa: BLE001 - a lost sign-out event never keeps the session.
+        log.warning("Sign-out was not recorded: %s", type(failure).__name__)
 
 
 def routes(runtime: Runtime, actor) -> APIRouter:

@@ -122,7 +122,7 @@ class SwarmService:
                 root = await self.database.create_session(actor, NewSession(
                     title=request.prompt.strip().splitlines()[0][:100],
                     visibility=request.visibility, model=request.model,
-                ), db=db)
+                ), db=db, origin="swarm")
                 await db.flush()
                 body = NewMessage(**request.model_dump(include=set(NewMessage.model_fields)))
                 turn = await self.database.submit(actor, root.id, body, db=db, received_at=received_at)
@@ -147,7 +147,7 @@ class SwarmService:
                     member_session = await self.database.create_session(actor, NewSession(
                         title=f"Agent {index + 1} · {root.title}"[:300],
                         visibility=request.visibility, model=models[index % len(models)],
-                    ), db=db, inherited_from=root.id)
+                    ), db=db, inherited_from=root.id, origin="swarm")
                     await db.flush()
                     member = SwarmMember(
                         session_id=member_session.id, mission_id=mission.id,
@@ -409,6 +409,9 @@ class SwarmService:
                 return False
             mission = await self.lock(db, member.mission_id, actor)
             await self.database.allowed_session(db, mission.id, actor)
+            stopped = await db.get(Session, session_id)
+            if stopped is not None:
+                await self.database.record_stop(db, actor, stopped)
             # The ordinary Stop button also has team-wide, durable semantics.
             await self.stop_in(db, mission, "stopped", "Stopped by you.")
             return True

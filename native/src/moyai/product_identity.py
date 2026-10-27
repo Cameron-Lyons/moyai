@@ -95,6 +95,9 @@ class _GrantedUser(Protocol):
     product_grant: ProductGrant
 
 
+ROLE_REFUSAL = 'Your workspace role does not allow this action.'
+
+
 @dataclass(frozen=True)
 class ProductPrincipal:
     id: str
@@ -120,7 +123,7 @@ class ProductPrincipal:
 
     def require(self, permission: str) -> None:
         if permission not in self.effective_permissions:
-            raise HTTPException(403, 'Your workspace role does not allow this action.')
+            raise HTTPException(403, ROLE_REFUSAL)
 
     @property
     def individual(self) -> bool:

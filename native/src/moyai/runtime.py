@@ -81,8 +81,11 @@ class Runtime:
         self.product_continuations: ProductContinuationService | None = None
         self.product_drain: ProductDrainService | None = None
         if self.product is not None:
+            from .product_activity_audit import ProductActivityAudit
             from .product_governance import ProductGovernance
-            self.database.governance = ProductGovernance(self.product, self.database)
+            self.database.governance = ProductGovernance(
+                self.product, self.database, ProductActivityAudit(self.product.identity, self.product.engine),
+            )
             from .product_automations import ProductAutomationService
             from .product_billing_routes import ProductBillingService
             from .product_connections import ProductConnections

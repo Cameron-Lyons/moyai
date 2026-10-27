@@ -351,6 +351,7 @@ class Database:
         self, actor: User, body: NewSession, *, db: AsyncSession | None = None,
         inherited_from: str | None = None,
         trusted_profile: bool = False,
+        origin: str = "user",
     ) -> Session:
         model = body.model or self.settings.default_model
         if model not in self.settings.models:
@@ -370,12 +371,14 @@ class Database:
             if governance is not None:
                 if grant is None:
                     raise HTTPException(503, 'Native governance requires current product authority.')
-                principal = await governance.principal(transaction, grant)
-                await governance.bind(transaction, session, principal, body.security_profile_id, inherited_from, trusted_profile)
+                principal = await governance.principal(transaction, grant, action="policy.binding_denied",
+                                                       session_id=inherited_from or "")
+                await governance.bind(transaction, session, principal, body.security_profile_id, inherited_from,
+                                      trusted_profile, origin=origin)
                 # A refused explicit model rolls back the whole admission.
-                session.model = governance.session_model(
+                session.model = await governance.session_model(
                     await governance.policy(transaction, session.id), body.model,
-                    self.settings.default_model, self.settings.models,
+                    self.settings.default_model, self.settings.models, actor_id=principal.id,
                 )
         return session
 
@@ -594,9 +597,9 @@ class Database:
             )
             governance = getattr(self, 'governance', None)
             if governance is not None:
-                principal = await governance.principal(transaction, product_grant)
+                principal = await governance.principal(transaction, product_grant, session_id=session.id)
                 policy = await governance.admission(transaction, session, principal, grants)
-                governance.require_model(policy, model)
+                await governance.require_model(policy, model, actor_id=principal.id, session_id=session.id)
             if delegated_authority is not None and grants != delegated_authority.grants:
                 raise PermissionError("Connection access changed before delegation.")
             selected_ids = [grant.id for grant in grants]
@@ -686,6 +689,12 @@ class Database:
                 role="system" if swarm_generated or automation_generated else "user", content=self.security.seal(body.authored_text),
                 identity=f"{'automation' if automation_generated else 'swarm' if swarm_generated else 'user'}:{turn_id}",
             ))
+            if governance is not None and not swarm_generated:
+                await governance.record_message(
+                    transaction, actor.id, session_id, turn_id, mode=body.mode, model=model, grants=grants,
+                    origin="automation" if automation_generated else "delegation"
+                    if delegated_authority is not None else "slack" if context.surface == "slack" else "user",
+                    steering=turn.status == "steering", attachments=len(body.attachments))
             from .message_sources import record_source
             if not automation_generated:
                 await record_source(self, transaction, f"{'swarm' if swarm_generated else 'user'}:{turn_id}", body)
@@ -731,11 +740,11 @@ class Database:
             if session_id:
                 session = await self.automation_session(db, actor.id, session_id)
                 if self.governance is not None:
-                    await self.governance.continuation(db, session.id, security_profile_id)
+                    await self.governance.continuation(db, session.id, security_profile_id, actor_id=actor.id)
             else:
                 session = await self.create_session(actor, NewSession(
                     title=title, model=model, visibility="shared", security_profile_id=security_profile_id,
-                ), db=db, trusted_profile=True)
+                ), db=db, trusted_profile=True, origin="automation")
                 session.surface = "automation"
             turn = await self.submit(actor, session.id, NewMessage(
                 prompt=prompt, model=model, request_key=request_key, connections=connections or [],
@@ -1092,8 +1101,9 @@ class Database:
             current = await self.scope_grants(db, scope, session)
             governance = getattr(self, 'governance', None)
             if governance is not None:
-                principal = await governance.principal(db, scope.product_grant)
-                await governance.admission(db, session, principal, current)
+                principal = await governance.principal(db, scope.product_grant, session_id=scope.session_id,
+                                                       turn_id=scope.turn_id)
+                await governance.admission(db, session, principal, current, turn_id=scope.turn_id)
             if [(g.id, g.revision) for g in current] != [(g.id, g.revision) for g in scope.grants]:
                 raise PermissionError("Connection access changed. Start a fresh authorized turn.")
             if input_id is not None:
@@ -1169,6 +1179,7 @@ class Database:
                 turn = await db.get(Turn, session.active_turn)
                 if turn:
                     workflow_id = turn.workflow_id
+            await self.record_stop(db, actor, session)
             await db.execute(update(Session).where(
                 Session.id == session_id
             ).values(status="stopped"))
@@ -1182,6 +1193,18 @@ class Database:
             ).values(status="stopped", finished_at=now()))
             # Keep ownership until execution/cleanup acknowledges Stop; don't admit competing work.
             return workflow_id
+
+    async def record_stop(self, db: AsyncSession, actor: User, session: Session) -> None:
+        """session.stopped in the Stop transaction, read before Stop changes the session.
+
+        A turn keeps the session until it acknowledges Stop, so repeated Stops
+        while it is stopping record once; Stop on a stopped session records nothing.
+        """
+        if self.governance is not None and (session.active_turn or session.status != "stopped"):
+            await self.governance.record(
+                db, "session.stopped", actor_id=actor.id, resource_id=session.id, session_id=session.id,
+                key=(session.id, session.active_turn) if session.active_turn else None,
+                details={"had_active_turn": session.active_turn is not None})
 
     async def delete_session(self, actor: User, session_id: str) -> None:
         """Hide a session and fence work atomically; the existing Stop dispatcher cancels execution."""
@@ -1209,6 +1232,10 @@ class Database:
                     db, mission, "attention", "A team conversation was deleted. Restore it before resuming.",
                 )
             session.deleted = True
+            if self.governance is not None:
+                await self.governance.record(
+                    db, "session.deleted", actor_id=actor.id, resource_id=session_id, session_id=session_id,
+                    key=(session_id, str(session.revision)))
             goal = await db.get(Goal, session_id, populate_existing=True)
             if goal is not None and goal.status == "active":
                 self.goals.change(goal, "paused", "The conversation was deleted.")
@@ -1243,6 +1270,10 @@ class Database:
             session.deleted = False
             session.archived = False
             session.updated_at = now()
+            if self.governance is not None:
+                await self.governance.record(
+                    db, "session.restored", actor_id=actor.id, resource_id=session_id, session_id=session_id,
+                    key=(session_id, str(session.revision)))
 
     async def stopped(self, turn_id: str, conversation: str | None = None) -> None:
         await self.answers.stopped(turn_id, conversation)
@@ -1434,6 +1465,10 @@ class Database:
                 ))
                 from .message_sources import record_source
                 await record_source(self, db, f"user:{turn.id}", reply)
+                if self.governance is not None:
+                    await self.governance.record_message(
+                        db, actor.id, session.id, turn.id, mode=reply.mode, model=previous.model,
+                        grants=current_grants, origin="slack" if session.surface == "slack" else "user", reply=True)
             if member is not None:
                 await self.swarms.bind(db, mission, turn, generated=True)
             automated = await db.get(ProductAutomationTurn, previous.id)

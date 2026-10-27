@@ -2,7 +2,7 @@
 // function validates locally with plain-language errors; the server remains
 // authoritative and re-validates every field.
 import type {
-  ExportGovernanceAuditData, GovernanceGroupRole, GovernanceRole, GovernanceRoleAssignment, GroupRoleChange, PermissionInfo, PolicyCatalog, PolicyCatalogRepository,
+  AuditEntry, ExportGovernanceAuditData, GovernanceGroupRole, GovernanceRole, GovernanceRoleAssignment, GroupRoleChange, PermissionInfo, PolicyCatalog, PolicyCatalogRepository,
   PolicyView, ProfileDefaults, ProfilePolicy, RoleAssignment, RoleCreate, RoleUpdate, SaveProfile, SecurityProfileView, SpendLimitChange, SpendLimitView,
 } from "./generated/api"
 import type { AuditExportFormat, AuditFilterQuery, AuditFilters, AuditQuery, ConnectedApp, GitAccess } from "./governance-types"
@@ -253,6 +253,18 @@ const ACRONYMS: Record<string, string> = { scim: "SCIM", usd: "USD", id: "ID", s
 export function actionLabel(action: string): string {
   const text = action.replace(/[._-]+/g, " ").trim().split(/\s+/).map(word => ACRONYMS[word.toLowerCase()] ?? word).join(" ")
   return text ? text[0].toUpperCase() + text.slice(1) : "Change recorded"
+}
+/** Filter labels for resource types; others read as their words ("scim_user" → "scim user"). */
+const RESOURCE_TYPE_LABELS: Record<string, string> = {
+  sign_in: "Sign-in", session: "Sessions", message: "Messages", policy: "Policy denials", automation: "Automations",
+}
+export function resourceTypeLabel(value: string): string {
+  return RESOURCE_TYPE_LABELS[value] ?? value.replace(/_/g, " ")
+}
+/** An activity row's outcome when it is not a success: the server folds it into details. */
+export function auditOutcome(entry: Pick<AuditEntry, "details">): "denied" | "failed" | null {
+  const outcome = entry.details?.outcome
+  return outcome === "denied" || outcome === "failed" ? outcome : null
 }
 export function detailText(value: unknown): string {
   if (value === null || value === undefined || value === "") return "None"

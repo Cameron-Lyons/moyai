@@ -241,8 +241,10 @@ Restricted sessions must list package registries such as `pypi.org`,
 the session computer only: Moyai's own model gateway, managed connector, Git fetch
 and object storage traffic, and image builds, are governed by connected apps, Git
 access and operator configuration instead. CIDR entries, narrowing running
-computers live, mid-session destination approvals and audit events for network
-refusals are not implemented.
+computers live, mid-session destination approvals and audit events for blocked
+connections or refused computers are not implemented. A policy refused because
+the deployment cannot enforce it is audited as a policy denial with the reason
+`network_unenforceable`.
 
 Keep the setting `off` until every API, worker, broker and coordinator runs this
 release, use the same value in every service, and first run the
@@ -398,18 +400,82 @@ refused.
 
 ## Audit and API
 
-The audit feed combines metadata-only role, SCIM, policy, spend, credential, and
-connection changes, AI guardrail refusals and attestation failures, and
-organization OpenID Connect enrollment and sign-in (`identity_binding.created`,
-`sign_in.succeeded`, and `sign_in.refused` with a fixed reason). Filters and
-signed cursors bound each page. Only the first page
-(no cursor) carries the filter facets, as only the provisioning directory's first
-page carries its groups, tokens and activity. CSV/NDJSON exports stream pages of up
-to 1,000 rows and recheck live permission before releasing each page. Tokens,
-credential contents, prompts, policy domain, tool, repository and model payloads,
-and identity provider tokens, codes and claims are excluded from governance events.
-Apart from AI guardrail refusals, attestation failures and sign-in, this records
-configuration history, not a transcript of every agent action.
+Settings → Audit log is the organization's configuration and activity history.
+It merges two metadata-only stores:
+
+- **Configuration and sign-in** (`governance_audit_events`): role, SCIM, policy,
+  spend, credential and connection changes; workflow changes
+  (`automation.created`, `updated`, `migrated`, `enabled`, `paused` and
+  `retired`, with the revision, native state, profile, trigger and connection
+  kinds, and whether an agent made the change); AI guardrail refusals and
+  attestation failures; and sign-in for every method (`identity_binding.created`,
+  `sign_in.succeeded`, `sign_in.refused` with a fixed reason, and
+  `sign_in.signed_out`; see [sign-in](authentication.md#google-and-cloudflare)).
+- **Activity** (`governance_activity_events`, source `Activity`): session
+  creation with its origin (web, Slack, workflow, delegated agent, team or
+  continuation), stop, archive, unarchive, delete and restore; each submitted
+  message or reply (origin, mode, model, attachment count and connection kinds);
+  every refusal by a session policy, role permission, spend limit or network
+  enforcement (`policy.tool_denied`, `model_denied`, `connection_denied`,
+  `admission_denied`, `binding_denied`, `workspace_denied`, `workflow_denied` and
+  `continuation_denied`, with a fixed reason); and each scheduled or
+  event-triggered run a policy blocks (`automation.blocked`). Each row shows an
+  outcome (`success` or `denied`) in its details; refusals show a Denied badge.
+
+Events hold identifiers, enumerated values, counts and flags only: never prompts,
+message text, titles, file names, tool arguments, tokens, credential contents,
+policy domain, tool, repository or model lists, or identity provider codes and
+claims. A tool name or model ID that is not a plain identifier is kept only as a
+digest, so an unusual configured model never blocks a message.
+Activity details are limited to 2 KB per event and every action has a fixed
+schema. Holders of `audit.read` see private sessions' IDs, models, connection
+kinds and actors, though never their content; grant it to compliance roles only.
+
+Session and message activity commits in the same transaction as the change it
+describes, so it cannot be lost or recorded for a change that rolled back.
+Refusals are counted, not transcribed: a refusal within a turn is recorded once
+per session, turn, refused tool, model, connection or workflow and reason, which
+collapses the policy check and activity-interceptor check of one call, Temporal
+retries and workflow resets. An agent that keeps calling a refused tool in one
+turn is recorded once. Refusals outside a turn (starting a session, sending a
+message, saving a workflow) are recorded once per person, session (if any),
+refused tool, model, connection or workflow, reason and minute, and a blocked
+run once per occurrence. A refusal's resource is its session; outside one it is
+the refused connection kind or workflow, else `workspace` (a tool name or model
+ID is kept only in the details). A refusal is still enforced, with its
+original status and message, when its event cannot be written: the write uses
+its own short transaction on the canonical pool, gives up after two seconds and
+is logged.
+
+Not recorded: refusals' own failures to record (logged instead), invalid or
+forged Access assertions, Google callbacks with an unknown or expired state,
+tools a catalog never offered, connections Slack leaves out of its automatic
+selection, route-level 403s outside the session policy checks, revocations of a
+running execution's authority (401), messages a team coordinator generates for
+its members, SCIM token use, approvals and goal changes, and anything in
+standalone native mode. A refused session start names no session, because none
+was created.
+
+Filters and signed cursors bound each page. The actor filter is
+case-insensitive; on the activity store it uses the folded-actor (`actor_key`)
+index, while on the configuration store and the legacy role, connection and
+credential audits no index covers it, so it is checked within the time and
+keyset bounds. Only the first page (no cursor) carries the filter
+facets, as only the provisioning directory's first page carries its groups,
+tokens and activity. CSV/NDJSON exports stream pages of up to 1,000 rows,
+recheck live permission before releasing each page and stop at 50,000 rows, so a
+SIEM collector should pull each day with an `after`/`before` window. Activity
+grows by roughly 1 KB per event (about 15 GB a year for 3,000 people sending
+50,000 messages a day); configuration events are small and rare. Activity rows
+cannot be updated (a trigger rejects `UPDATE`), and there is no retention job
+yet, so plan storage accordingly. Until there is one, the supported purge is a
+database owner deleting old activity rows only, after exporting any that must
+be kept: `DELETE FROM governance_activity_events WHERE created_at < '2026-01-01'`
+with a UTC date (on PostgreSQL, qualify the table with the canonical schema).
+The trigger allows `DELETE`, and issued cursors stay valid. Never delete from
+`governance_audit_events`: configuration and sign-in history has no retention
+limit. Deleting audit evidence is a compliance decision, so record who ran the
+purge and its cutoff in your change log.
 
 | Endpoint | Purpose |
 | --- | --- |

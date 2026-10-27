@@ -564,10 +564,12 @@ class ProductContinuationService:
         db.add(target)
         governance = getattr(self.runtime.database, 'governance', None)
         if governance is not None:
-            await governance.bind(db, target, current, ceiling=await self._saved_policy(db, source_id))
+            await governance.bind(db, target, current, ceiling=await self._saved_policy(db, source_id),
+                                  origin="continuation")
             settings = self.runtime.settings
-            target.model = governance.session_model(
+            target.model = await governance.session_model(
                 await governance.policy(db, target.id), body.model, settings.default_model, settings.models,
+                actor_id=current.id,
             )
         await db.flush()
         if narrow is not None:

@@ -1477,7 +1477,7 @@ export type AuditEntry = {
     /**
      * Source
      */
-    source: 'governance' | 'user_roles' | 'connections' | 'credentials';
+    source: 'activity' | 'governance' | 'user_roles' | 'connections' | 'credentials';
 };
 
 /**

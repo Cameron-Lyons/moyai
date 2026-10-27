@@ -91,7 +91,7 @@ const destinations = [
   { id: "provisioning", title: "Provisioning", description: "Connect your identity provider with SCIM and manage provisioning tokens.", group: "Governance", Icon: Workflow, productOnly: true },
   { id: "security-policies", title: "Security policies", description: "Limit the apps, tools, Git access and network destinations sessions can use.", group: "Governance", Icon: ShieldCheck, productOnly: true },
   { id: "spend-limits", title: "Spend limits", description: "Cap monthly model spend for the organization, each person and each session.", group: "Governance", Icon: CircleDollarSign, productOnly: true },
-  { id: "audit-log", title: "Audit log", description: "Review and export role, provisioning, policy, spend and access changes.", group: "Governance", Icon: FileClock, productOnly: true },
+  { id: "audit-log", title: "Audit log", description: "Review and export configuration and activity history: changes, sign-ins, sessions and policy denials.", group: "Governance", Icon: FileClock, productOnly: true },
 ]
 const groups = ["Preferences", "Workflows", "Integrations", "Administration", "Governance"]
 const scopeOptions = [{ value: "all", label: "All scopes" }, { value: "personal", label: "Personal" }, { value: "shared", label: "Shared" }, { value: "bundled", label: "Bundled" }]

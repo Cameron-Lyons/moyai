@@ -344,13 +344,23 @@ async def test_token_and_claim_failures_redirect_without_a_session(product, clai
     assert 'synthetic-code' not in response.headers['location']
 
 
-async def test_unsigned_confused_or_foreign_signatures_are_refused(product):
+def freeze_minute(monkeypatch, minute='2026-10-26T09:30'):
+    from app import governance_activity
+    monkeypatch.setattr(governance_activity, 'minute_bucket', lambda: minute)
+
+
+async def test_unsigned_confused_or_foreign_signatures_are_refused(product, monkeypatch):
+    freeze_minute(monkeypatch)
     idp = product.idp
     for header, key in (({'alg': 'none'}, None), ({'alg': 'HS256'}, idp.jwk(idp.key.public_key(), 'x')['n']),
                         ({'alg': 'PS256'}, idp.key), ({}, rsa.generate_private_key(public_exponent=65537, key_size=2048))):
         idp.header, idp.signing_key = header, key
         assert_failed(product, await sign_in(product), 'token')
-    assert len(refused(product)) == 4
+    # An anonymous refusal is kept once per client network, reason and minute.
+    assert len(refused(product)) == 1
+    freeze_minute(monkeypatch, '2026-10-26T09:31')
+    assert_failed(product, await sign_in(product), 'token')
+    assert len(refused(product)) == 2
     assert not product.store.rows('SELECT 1 FROM access_identities')
 
 
@@ -474,7 +484,8 @@ async def test_state_is_bound_to_this_browser_this_provider_and_one_use(product)
     assert expired.headers['location'] == '/?signin=failed#tasks'
 
 
-async def test_issuer_parameter_and_cancellation(product, tmp_path):
+async def test_issuer_parameter_and_cancellation(product, tmp_path, monkeypatch):
+    freeze_minute(monkeypatch)
     assert_failed(product, await sign_in(product, iss='https://other.example.test'), 'issuer')
     cancelled = await sign_in(product, code='', error='access_denied')
     assert cancelled.headers['location'] == '/?signin=cancelled#connections'
@@ -486,7 +497,9 @@ async def test_issuer_parameter_and_cancellation(product, tmp_path):
     idp.document['authorization_response_iss_parameter_supported'] = True
     current = service(tmp_path, product.store, product.settings, idp)
     try:
-        assert_failed(current, await sign_in(current), 'issuer')
+        assert_failed(current, await sign_in(current))
+        # The repeated anonymous refusal in this minute is kept once.
+        assert refused(current) == ['issuer', 'cancelled']
         response = await sign_in(current, iss=ISSUER)
         assert response.status_code == 303 and response.headers['location'] == '/#connections'
     finally:
@@ -603,14 +616,21 @@ async def test_unexpected_failures_redirect_and_log_only_their_type(product, mon
     def failing(*args, **kwargs):
         raise RuntimeError('synthetic failure for person@example.test')
 
-    monkeypatch.setattr(product.store, 'external_identity_in', failing)
+    def invalid(*args, **kwargs):
+        raise ValueError('synthetic account failure for person@example.test')
+
     with caplog.at_level('WARNING', logger='app.oidc_sso'):
+        # An account failure after verification is unavailable, never a token
+        # error, and names the verified person.
+        monkeypatch.setattr(product.store, 'external_identity_in', invalid)
+        assert_failed(product, await sign_in(product), 'unavailable')
+        monkeypatch.setattr(product.store, 'external_identity_in', failing)
         assert_failed(product, await sign_in(product), 'unavailable')
         monkeypatch.setattr(product.oidc, 'refuse', failing)
         response = await sign_in(product)
     assert response.status_code == 303 and response.headers['location'] == '/?signin=failed#connections'
-    assert 'RuntimeError' in caplog.text and 'person@example.test' not in caplog.text
-    assert len(refused(product)) == 1
+    assert 'RuntimeError' in caplog.text and 'ValueError' in caplog.text and 'person@example.test' not in caplog.text
+    assert [event['actor'] for event in events(product, 'sign_in.refused')] == ['person@example.test'] * 2
 
 
 async def test_an_inactive_person_rolls_back_the_recorded_sign_in(product, monkeypatch):
@@ -696,3 +716,192 @@ def test_provider_model_rejects_unsafe_values():
     with pytest.raises(ValueError):
         OidcProvider(**{**OKTA, 'domains': []})
     assert OidcProvider(**{**OKTA, 'domains': [' Example.TEST ']}).domains == ('example.test',)
+
+
+def google_service(product, tmp_path):
+    """Google sign-in whose token exchange is a correctly signed synthetic ID token."""
+    settings = settings_for(tmp_path, google_client_id='google-client', google_client_secret='google-secret')
+    google = GoogleSignIn(settings, Security(settings, UserRoles(product.store, settings)), product.store)
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+
+    async def signing_key(kid):
+        return key.public_key()
+
+    async def exchange(code, verifier, nonce):
+        now = int(time.time())
+        token = jwt.encode({'iss': 'https://accounts.google.com', 'aud': 'google-client', 'sub': 'google-subject',
+                            'iat': now, 'exp': now + 300, 'nonce': nonce, 'email': 'person@other.test',
+                            'email_verified': True, 'hd': 'other.test'}, key, algorithm='RS256', headers={'kid': 'k'})
+        return await google.verify(token, nonce)
+
+    google.signing_key, google.exchange = signing_key, exchange
+    app = FastAPI()
+    app.include_router(google.routes())
+    return google, httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url=ORIGIN)
+
+
+async def google_callback(client, **query):
+    started = await client.post('/api/auth/google/start', json={}, headers={'origin': ORIGIN})
+    state = parse_qs(urlsplit(started.json()['url']).query)['state'][0]
+    return await client.get('/auth/google/callback', params={'state': state, 'code': 'synthetic-code', **query})
+
+
+def sign_ins(product):
+    return [(event['action'], event['actor'], event['resource_id'], event['details'])
+            for event in events(product) if event['resource_type'] == 'sign_in']
+
+
+async def test_google_sign_in_success_and_refusals_are_audited_like_oidc(product, tmp_path, monkeypatch):
+    freeze_minute(monkeypatch)
+    google, client = google_service(product, tmp_path)
+    async with client:
+        assert (await google_callback(client)).headers['location'] == '/#tasks'
+        assert (await google_callback(client)).cookies.get('workspace_session')
+        succeeded = [
+            ('sign_in.succeeded', 'person@other.test', 'google', {'method': 'google', 'enrolled': True}),
+            ('sign_in.succeeded', 'person@other.test', 'google', {'method': 'google', 'enrolled': False})]
+        assert sign_ins(product) == succeeded
+        # A consumed state that fails records a fixed reason and issues no session.
+        cancelled = await google_callback(client, error='access_denied', code='')
+        assert cancelled.headers['location'] == '/?signin=cancelled#tasks'
+        assert_failed(product, await google_callback(client, code=''), 'token')
+
+        async def failing(code, verifier, nonce):
+            raise httpx.ConnectError('synthetic provider failure with sk-live-TOPSECRET')
+        with monkeypatch.context() as patch:
+            patch.setattr(google, 'exchange', failing)
+            # Kept once per client network, reason and minute.
+            assert_failed(product, await google_callback(client), 'token')
+            freeze_minute(patch, '2026-10-26T09:31')
+            assert_failed(product, await google_callback(client), 'token')
+        # Unknown or expired states are not recorded.
+        assert (await client.get('/auth/google/callback', params={'state': 'forged', 'code': 'x'})).status_code == 303
+        assert sign_ins(product)[2:] == [
+            ('sign_in.refused', 'anonymous', 'google', {'method': 'google', 'reason': reason})
+            for reason in ('cancelled', 'token', 'token')]
+        assert 'TOPSECRET' not in json.dumps(events(product))
+
+        # Any refusal after the provider verified the person names them, and an
+        # account failure after the exchange is unavailable, not a token error.
+        def review(*args, **kwargs):
+            raise IdentityRefused('mapping_review')
+
+        def broken(*args, **kwargs):
+            raise ValueError('synthetic account failure for person@other.test')
+
+        for patched, target, reason in ((google.security, 'person', 'deactivated'),
+                                        (product.store, 'identity', 'mapping_review'),
+                                        (product.store, 'identity', 'unavailable')):
+            with monkeypatch.context() as patch:
+                patch.setattr(patched, target, {'deactivated': lambda *args, **kwargs: None,
+                                                'mapping_review': review, 'unavailable': broken}[reason])
+                assert_failed(product, await google_callback(client), reason)
+            assert sign_ins(product)[-1][1:] == ('person@other.test', 'google', {'method': 'google', 'reason': reason})
+
+
+async def test_google_sign_in_fails_closed_when_its_audit_event_cannot_be_written(product, tmp_path, monkeypatch, caplog):
+    from app import sign_in_audit
+    _, client = google_service(product, tmp_path)
+
+    def failing(*args, **kwargs):
+        raise RuntimeError('synthetic audit failure for person@other.test')
+
+    monkeypatch.setattr(sign_in_audit, 'succeeded_in', failing)
+    async with client:
+        with caplog.at_level('WARNING', logger='app.google_sso'):
+            assert_failed(product, await google_callback(client), 'unavailable')
+    assert 'RuntimeError' in caplog.text and 'person@other.test' not in caplog.text
+    # The account refresh rolled back with its missing event.
+    assert not product.store.rows('SELECT 1 FROM users')
+    assert [event['action'] for event in events(product)] == ['sign_in.refused']
+
+
+def access_service(product, tmp_path):
+    settings = settings_for(tmp_path, cloudflare_access_login=True, public_url='https://workspace.example.test',
+                            cloudflare_access_team_domain='synthetic.cloudflareaccess.com',
+                            cloudflare_access_audience='employee', cloudflare_access_broker_audience='broker')
+    return Security(settings, UserRoles(product.store, settings))
+
+
+def access_request(cookie=None):
+    headers = [(b'cookie', b'workspace_session=' + cookie)] if cookie else []
+    return Request({'type': 'http', 'method': 'GET', 'path': '/api/me', 'query_string': b'', 'state': {},
+                    'headers': headers})
+
+
+ACCESS = {'sub': 'access-subject', 'issuer': 'https://synthetic.cloudflareaccess.com',
+          'email': 'person@example.test', 'domain': 'example.test'}
+
+
+async def test_access_sign_in_is_recorded_per_new_session_and_minute(product, tmp_path, monkeypatch):
+    from app import governance_activity
+    security = access_service(product, tmp_path)
+    issued = security.access_session(access_request(), ACCESS)
+    assert issued and sign_ins(product) == [
+        ('sign_in.succeeded', 'person@example.test', 'cloudflare', {'method': 'cloudflare', 'enrolled': True})]
+    # A client that never keeps its cookie records once per minute.
+    for _ in range(3):
+        assert security.access_session(access_request(), ACCESS)
+    assert len(sign_ins(product)) == 1
+    # A valid existing session records nothing.
+    cookie = SimpleCookie()
+    cookie.load(issued.decode('latin-1'))
+    assert security.access_session(access_request(cookie['workspace_session'].value.encode()), ACCESS) is None
+    monkeypatch.setattr(governance_activity, 'minute_bucket', lambda: '2099-01-01T00:00')
+    assert security.access_session(access_request(), ACCESS)
+    assert sign_ins(product)[1:] == [
+        ('sign_in.succeeded', 'person@example.test', 'cloudflare', {'method': 'cloudflare', 'enrolled': False})]
+
+
+async def test_access_refusals_are_recorded_and_unrecorded_sign_ins_issue_no_session(product, tmp_path, monkeypatch):
+    from app import sign_in_audit
+    from app.database import DatabaseError
+    security = access_service(product, tmp_path)
+    assert security.access_session(access_request(), ACCESS)
+    changed = {**ACCESS, 'email': 'renamed@example.test'}
+    for _ in range(2):
+        with pytest.raises(IdentityRefused):
+            security.access_session(access_request(), changed)
+    assert sign_ins(product)[1:] == [
+        ('sign_in.refused', 'renamed@example.test', 'cloudflare', {'method': 'cloudflare', 'reason': 'mapping_review'})]
+    monkeypatch.setattr(security, 'person', lambda *args, **kwargs: None)
+    connection = access_request()
+    assert security.access_session(connection, ACCESS) is None
+    assert not hasattr(connection.state, 'access_session')  # No session for a deactivated person.
+    assert sign_ins(product)[-1] == (
+        'sign_in.refused', 'person@example.test', 'cloudflare', {'method': 'cloudflare', 'reason': 'deactivated'})
+    monkeypatch.undo()
+
+    def failing(*args, **kwargs):
+        raise DatabaseError('synthetic audit failure')
+
+    monkeypatch.setattr(sign_in_audit, 'succeeded_in', failing)
+    with pytest.raises(DatabaseError):
+        security.access_session(access_request(), {**ACCESS, 'sub': 'another-subject', 'email': 'other@example.test'})
+
+
+async def test_repeated_access_sign_in_events_are_written_once_per_process(product, tmp_path, monkeypatch):
+    # access_actor runs for every request: a cookie-less client or a mapping in
+    # review writes its per-minute event once, then only reads.
+    from app import sign_in_audit
+    security = access_service(product, tmp_path)
+    writes = []
+    for name in ('succeeded', 'record'):
+        original = getattr(sign_in_audit, name)
+
+        def counted(*args, original=original, name=name, **kwargs):
+            writes.append(name)
+            return original(*args, **kwargs)
+        monkeypatch.setattr(sign_in_audit, name, counted)
+    for _ in range(3):
+        assert security.access_session(access_request(), ACCESS)
+    changed = {**ACCESS, 'email': 'renamed@example.test'}
+    for _ in range(3):
+        with pytest.raises(IdentityRefused):
+            security.access_session(access_request(), changed)
+    assert writes == ['succeeded', 'record']
+    assert [action for action, *_ in sign_ins(product)] == ['sign_in.succeeded', 'sign_in.refused']
+    # Another process (an empty memo) repeats the write, and the key keeps one row.
+    security.access_recorded.clear()
+    assert security.access_session(access_request(), ACCESS)
+    assert writes[-1] == 'succeeded' and len(sign_ins(product)) == 2

@@ -31,6 +31,30 @@ password login with `PASSWORD_LOGIN_ENABLED=false`. Preserve `SESSION_SECRET`,
 `ENCRYPTION_KEY` and existing data; do not rotate them as part of consolidation.
 Shared passwords do not identify an individual for personal data access.
 
+Every existing-product sign-in method records the same governance audit events as
+organization OpenID Connect below: `sign_in.succeeded` (with `enrolled` on a
+first sign-in), `sign_in.refused` with a fixed reason, and `sign_in.signed_out`.
+The resource is the method (`google`, `cloudflare`, `password`) or the OpenID
+Connect provider. Google records `cancelled`, `token`, `deactivated`,
+`mapping_review` or `unavailable` after a consumed sign-in attempt, and nothing
+for an unknown or expired one. A refusal names the person once the provider has
+verified them; before that its actor is `anonymous`, and Google and OpenID
+Connect keep an anonymous refusal once per client network, reason and minute.
+A wrong shared password records `invalid_password` with the actor `anonymous`
+(sign-in rate limits bound these); a password sign-in's actor is the shared
+account (`Shared password admin` or `member`), never the password. Cloudflare
+Access records a sign-in when it issues a new session cookie, at most once per
+person and minute, so a client that never keeps cookies cannot flood the audit;
+a mapping that needs review or a deactivated person records a refusal, also once
+per minute. Each process writes such an event once and then only reads, because
+the mapping is checked on every request. A sign-out is recorded once per
+session: signing out deletes the cookie, and replaying the same cookie records
+nothing more. New Google, password
+and Access sessions fail closed: if the event cannot be written, no session
+cookie is issued (Google redirects to `?signin=failed`, password and Access
+sign-in answer 503). Existing sessions keep working. A refusal or sign-out whose
+event cannot be written is logged and still refused or signed out.
+
 Authorization is checked at admission and again at model/tool boundaries.
 Approval does not override revoked permissions. Personal memory and credentials
 remain private to their owner even when a viewer is an administrator. UI tests
@@ -156,4 +180,5 @@ pinned, `sign_in.succeeded` for every sign-in, and `sign_in.refused` with a fixe
 reason (`cancelled`, `issuer`, `unavailable`, `token`, `claims`,
 `email_unverified`, `domain`, `mapping_review`, `not_provisioned` or
 `deactivated`) after a consumed sign-in attempt. Events carry no tokens, codes or
-claims; a refusal names the person only after their identity was verified.
+claims; a refusal names the person only after their identity was verified, and
+an anonymous refusal is kept once per provider, client network, reason and minute.

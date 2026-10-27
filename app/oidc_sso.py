@@ -29,10 +29,10 @@ import jwt
 from fastapi import APIRouter, HTTPException, Path, Request, Response
 from fastapi.responses import RedirectResponse
 
+from . import sign_in_audit
 from .config import LOOPBACK_HOSTS, OIDC_PROVIDER_ID, OidcProvider
 from .db import IdentityRefused
 from .enterprise_roles import EMAIL
-from .governance_audit import record_event_in
 from .google_sso import SignInRedirect, SignInStart, pkce_challenge, safe_return_path, save_login_state
 from .security import Throttle, digest
 
@@ -278,12 +278,34 @@ class OidcSignIn:
             return conn.execute('DELETE FROM login_states WHERE state_hash=? AND browser_hash=? AND expires>? RETURNING *',
                                 (state_digest(provider_id, state), digest(browser), time.time())).fetchone()
 
-    def refuse(self, provider_id, reason, email=''):
-        """Audit a refusal after a state was consumed; the start throttle bounds these writes."""
-        with self.store.connect() as conn:
-            conn.begin_write()
-            record_event_in(conn, 'sign_in.refused', email or 'anonymous', 'sign_in', provider_id,
-                            {'method': 'oidc', 'reason': reason})
+    def refuse(self, provider_id, reason, email='', client=''):
+        """Audit a refusal after a state was consumed.
+
+        A verified person is named; an anonymous refusal is kept once per
+        provider, client network, reason and minute (sign_in_audit.anonymous_key).
+        """
+        key = None if email else sign_in_audit.anonymous_key('oidc', client, reason, provider_id)
+        sign_in_audit.record(self.store, 'sign_in.refused', email or 'anonymous', 'oidc',
+                             resource_id=provider_id, reason=reason, key=key)
+
+    async def verified(self, provider_id, client, row, code, error, iss):
+        """The provider's verified identity for a consumed state, else IdentityRefused or OidcUnavailable."""
+        if error:
+            raise IdentityRefused('cancelled')
+        if not code:
+            raise IdentityRefused('token')
+        try:
+            metadata = await client.metadata()
+            # RFC 9207 mix-up defense: the response must name this issuer.
+            if (iss and iss != client.provider.issuer) or (not iss and metadata.iss_parameter):
+                raise IdentityRefused('issuer')
+            token = await client.exchange(code, row['verifier'], self.callback(provider_id))
+            return await client.verify(token, row['nonce'])
+        except (IdentityRefused, OidcUnavailable):
+            raise
+        except (httpx.HTTPError, jwt.PyJWTError, ValueError, KeyError, TypeError):
+            # Never echo provider errors, codes, tokens, or claims into the UI/logs.
+            raise IdentityRefused('token') from None
 
     def admit(self, provider, identity):
         """Enroll or resolve the pinned account and its role in one writer transaction.
@@ -358,24 +380,12 @@ class OidcSignIn:
                 return response
             identity = None
             try:
-                if error:
-                    raise IdentityRefused('cancelled')
-                if not code:
-                    raise IdentityRefused('token')
-                metadata = await client.metadata()
-                # RFC 9207 mix-up defense: the response must name this issuer.
-                if (iss and iss != client.provider.issuer) or (not iss and metadata.iss_parameter):
-                    raise IdentityRefused('issuer')
-                token = await client.exchange(code, row['verifier'], self.callback(provider))
-                identity = await client.verify(token, row['nonce'])
+                identity = await self.verified(provider, client, row, code, error, iss)
                 person = await asyncio.to_thread(self.admit, client.provider, identity)
             except IdentityRefused as refused:
                 reason = refused.reason
             except OidcUnavailable:
                 reason = 'unavailable'
-            except (httpx.HTTPError, jwt.PyJWTError, ValueError, KeyError, TypeError):
-                # Never echo provider errors, codes, tokens, or claims into the UI/logs.
-                reason = 'token'
             except Exception as failure:
                 # A database or other unexpected failure still fails closed with
                 # the same redirect. Log only its type: it may carry claims.
@@ -387,10 +397,11 @@ class OidcSignIn:
                 self.security.new_identity_session(response, person['role'], method='oidc', identity=identity,
                                                    client_id=client.provider.client_id)
                 return response
-            # Only a fully verified identity names the actor; claims alone do not.
-            verified = identity['email'] if identity and reason in {'mapping_review', 'not_provisioned', 'deactivated'} else ''
+            # Only a fully verified identity names the actor (any refusal after
+            # verification); claims alone do not.
             try:
-                await asyncio.to_thread(self.refuse, provider, reason, verified)
+                await asyncio.to_thread(self.refuse, provider, reason, identity['email'] if identity else '',
+                                        row['client'])
             except Exception as failure:
                 log.warning('Organization sign-in refusal was not recorded: %s', type(failure).__name__)
             return response

@@ -193,6 +193,17 @@ test('spend and audit rows: read-only viewers get no actions and details are esc
   assert.equal(render(gov.SpendSummary,{data:{limits:limits().map(row=>({...row,used_usd:null})),usage:null,can_manage:true}}),'','no summary without spend.read usage');
   const audit=render(gov.AuditRows,{entries:[{id:'a',source:'governance',action:'role.created',actor:'',resource_type:'role',resource_id:'<script>',details:{note:'<img src=x onerror=bad()>'},created_at:stamp}]});
   assert.doesNotMatch(audit,/<script>|<img/);assert.match(audit,/&lt;script&gt;/);assert.match(audit,/System/);assert.match(audit,/Role created/);
+  assert.doesNotMatch(audit,/Denied|Failed/,'configuration rows carry no outcome badge');
+  // Activity rows name their source and show a written outcome when it is not a success.
+  const activity=(action,outcome)=>({id:action,source:'activity',action,actor:'dana@example.test',resource_type:action.split('.')[0],resource_id:'s1',details:{outcome,session_id:'s1'},created_at:stamp});
+  const rows=render(gov.AuditRows,{entries:[activity('policy.tool_denied','denied'),activity('session.created','success'),activity('message.submitted','failed')]});
+  assert.match(rows,/Policy tool denied<\/strong> <span class="ns-badge ns-danger">Denied<\/span>/);
+  assert.match(rows,/Message submitted<\/strong> <span class="ns-badge ns-warning">Failed<\/span>/);
+  assert.match(rows,/session\.created<\/code> · Activity/);assert.doesNotMatch(rows,/Session created<\/strong> <span/);
+  assert.equal(gov.auditOutcome({details:{outcome:'denied'}}),'denied');assert.equal(gov.auditOutcome({details:{outcome:'success'}}),null);
+  assert.equal(gov.auditOutcome({details:{}}),null);assert.equal(gov.auditOutcome({details:{outcome:['denied']}}),null);
+  assert.deepEqual(['sign_in','session','message','policy','automation','scim_user'].map(gov.resourceTypeLabel),
+    ['Sign-in','Sessions','Messages','Policy denials','Automations','scim user']);
 });
 
 test('built-in role edits require explicit confirmation before replacing a custom role',()=>{

@@ -1,7 +1,8 @@
 """Governance audit feed and export on SQLite or --postgres-backend.
 
-The feed merges governance_audit_events with the legacy user_role_audit,
-connection_audit and credential_audit tables. Pages are keyset-paginated over
+The feed merges governance_audit_events and the activity audit
+(governance_activity_events) with the legacy user_role_audit, connection_audit
+and credential_audit tables. Pages are keyset-paginated over
 (created_at DESC, source, id DESC), read in one read-only snapshot and never
 take the canonical writer lock.
 """
@@ -21,6 +22,7 @@ import pytest
 from app import governance_audit
 from app.database import PostgresConnection, SQLiteConnection
 from app.db import Store
+from app.governance_activity import ACTIVITY_ACTIONS, activity_event
 from app.governance_audit import (
     EXPORT_COLUMNS,
     LEGACY_ACTIONS,
@@ -37,7 +39,7 @@ from itsdangerous.timed import TimestampSigner
 
 SECRET = b'governance-audit-test-secret'
 BASE = datetime(2026, 10, 16, 9, 30, tzinfo=UTC)
-SOURCE_ORDER = ('connections', 'credentials', 'governance', 'user_roles')
+SOURCE_ORDER = ('activity', 'connections', 'credentials', 'governance', 'user_roles')
 RELOAD = 'Reload the audit log and try again.'
 
 
@@ -75,6 +77,26 @@ def governance_row(store, instant, *, action='role.created', actor='owner@exampl
     return ident
 
 
+def activity_row(store, instant, action='session.created', *, actor='Owner@Example.com', actor_id='google:owner',
+                 resource_id=None, session_id=None, details=None, key=None):
+    """One validated activity event, as the native writer stores it."""
+    session_id = uuid4().hex if session_id is None else session_id
+    details = details if details is not None else {
+        'session.created': {'origin': 'user', 'visibility': 'shared', 'profile_revision': 0, 'inherited': False},
+        'session.stopped': {'had_active_turn': True},
+        'policy.tool_denied': {'reason': 'tool_disabled', 'tool': 'shell'},
+        'message.submitted': {'origin': 'user', 'mode': 'asap', 'reply': False, 'steering': False, 'model': 'test',
+                              'attachments': 0, 'connection_kinds': []},
+    }.get(action, {})
+    event = activity_event(action, actor_id=actor_id, resource_id=resource_id or session_id or 'workspace',
+                           session_id=session_id, details=details, key=key)
+    store.execute('''INSERT INTO governance_activity_events(id,action,outcome,actor,actor_key,actor_id,resource_type,
+        resource_id,session_id,details,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO NOTHING''',
+                  (event.id, event.action, event.outcome, actor, actor.lower(), event.actor_id, event.resource_type,
+                   event.resource_id, event.session_id, event.details, fixed(instant)))
+    return event.id
+
+
 def user_role_row(store, instant, *, email='bob@example.com', previous='member', role='admin',
                   actor='owner@example.com'):
     store.execute('INSERT INTO user_role_audit(email,previous_role,role,actor,created_at) VALUES(?,?,?,?,?)',
@@ -102,8 +124,9 @@ def user(store, ident, kind, email):
 def oracle(store):
     """Every source row as (source, id) in feed order, computed from raw rows."""
     keys = []
-    for source, table in (('connections', 'connection_audit'), ('credentials', 'credential_audit'),
-                          ('governance', 'governance_audit_events'), ('user_roles', 'user_role_audit')):
+    for source, table in (('activity', 'governance_activity_events'), ('connections', 'connection_audit'),
+                          ('credentials', 'credential_audit'), ('governance', 'governance_audit_events'),
+                          ('user_roles', 'user_role_audit')):
         for row in store.rows(f'SELECT id,created_at FROM {table}'):
             keys.append((datetime.fromisoformat(row['created_at']), source, row['id']))
     # Stable sorts, least significant first: id DESC, then source ASC, then instant DESC.
@@ -143,8 +166,8 @@ def test_constructor_initializes_every_source_on_a_core_store(tmp_path):
     store = Store(tmp_path / 'core-only')
     try:
         audit = GovernanceAudit(store, SECRET)
-        assert audit.listing(None) == {'entries': [], 'next_cursor': None,
-                                       'facets': {'actions': list(LEGACY_ACTIONS), 'resource_types': list(RESOURCE_TYPES)}}
+        assert audit.listing(None) == {'entries': [], 'next_cursor': None, 'facets': {
+            'actions': sorted({*LEGACY_ACTIONS, *ACTIVITY_ACTIONS}), 'resource_types': list(RESOURCE_TYPES)}}
         for secret in (b'', '', None, 7):
             with pytest.raises(ValueError, match='signing secret'):
                 GovernanceAudit(store, secret)
@@ -213,14 +236,14 @@ def test_entries_normalize_every_source_without_raw_legacy_text(store, audit):
 
 def test_pagination_is_total_and_stable_across_sources_ties_and_spellings(store, audit):
     random.seed(22)
-    writers = (governance_row, user_role_row, connection_row, credential_row)
-    for index in range(120):
+    writers = (governance_row, user_role_row, connection_row, credential_row, activity_row)
+    for index in range(150):
         # Few distinct instants: many ties within and across sources, and whole
         # seconds stored as both '...:00+00:00' and '...:00.000000+00:00'.
         instant = BASE + timedelta(seconds=random.randint(0, 4), microseconds=random.choice((0, 0, 1, 999999)))
-        writers[index % 4](store, instant)
+        writers[index % 5](store, instant)
     expected = oracle(store)
-    assert len(expected) == len(set(expected)) == 120
+    assert len(expected) == len(set(expected)) == 150
     assert pages(audit) == expected
     assert pages(audit, limit=1) == expected and pages(audit, limit=200) == expected
     first = audit.listing(None, None, 9)
@@ -397,8 +420,9 @@ def test_facets_list_known_and_recorded_actions(store, audit):
     for action in ('scim_user.deactivated', 'role.created', 'role.created', 'spend_limit.updated'):
         governance_row(store, BASE, action=action)
     facets = audit.listing(None)['facets']
-    assert facets == {'actions': sorted({*LEGACY_ACTIONS, 'scim_user.deactivated', 'role.created',
+    assert facets == {'actions': sorted({*LEGACY_ACTIONS, *ACTIVITY_ACTIONS, 'scim_user.deactivated', 'role.created',
                                          'spend_limit.updated'}), 'resource_types': list(RESOURCE_TYPES)}
+    assert {'session', 'message', 'policy', 'automation', 'sign_in'} <= set(facets['resource_types'])
     assert {'user_role.changed', 'connection.connected', 'credential.revoked'} <= set(facets['actions'])
 
 
@@ -506,8 +530,9 @@ def test_postgres_feed_pages_use_the_byte_ordered_indexes(store):
         pytest.skip('PostgreSQL plans only.')
     for action in ('scim_user.created', 'security_profile.created', 'security_profile.updated'):
         governance_row(store, BASE, action=action, resource_type=action.partition('.')[0])
-    expected = {'connections': 'idx_connection_audit_time', 'credentials': 'idx_credential_audit_time',
-                'governance': 'idx_governance_audit_time', 'user_roles': 'idx_user_role_audit_time'}
+    expected = {'activity': 'idx_activity_audit_time', 'connections': 'idx_connection_audit_time',
+                'credentials': 'idx_credential_audit_time', 'governance': 'idx_governance_audit_time',
+                'user_roles': 'idx_user_role_audit_time'}
     position = (BASE, 'governance', 'a' * 32)
     with store.connect() as conn:
         conn.execute('SET LOCAL enable_seqscan = off')
@@ -586,6 +611,34 @@ def test_recorded_actions_name_their_resource_type(store, audit):
     assert pages(audit, parse_filters(resource_type='CustomRole')) == [('governance', older)]
 
 
+def test_activity_only_types_never_read_the_governance_table(store):
+    """Session, message and policy rows live only in the activity table, so their filters skip the action scan."""
+    for kind in ('session', 'message', 'policy'):
+        with pytest.raises(ValueError, match=r'^Record session, message and policy activity in the activity audit\.$'):
+            event_values(kind + '.created', 'owner@example.com', kind, 'x')
+    governance_row(store, BASE, action='automation.created', resource_type='automation', resource_id='a' * 32)
+    source = next(source for source in governance_audit._SOURCES if source.name == 'governance')
+
+    class Counted:
+        def __init__(self, conn):
+            self.conn, self.scans = conn, 0
+
+        def execute(self, sql, *args):
+            self.scans += sql == governance_audit._ACTION_SCAN
+            return self.conn.execute(sql, *args)
+
+    with store.connect() as conn:
+        counted = Counted(conn)
+        for kind in ('session', 'message', 'policy'):
+            for filters in (parse_filters(resource_type=kind), parse_filters(resource_type=kind, action=kind + '.x')):
+                assert governance_audit._statements_in(counted, source, filters, None, 51) == []
+        assert counted.scans == 0
+        # Automation configuration changes are governance events: their filter still reads the table.
+        automation = parse_filters(resource_type='automation')
+        assert len(governance_audit._statements_in(counted, source, automation, None, 51)) == 1
+        assert counted.scans == 1
+
+
 def test_runtime_events_validate_like_governance_changes(store, audit):
     """Native AI guardrail refusals insert event_values rows from their own transaction."""
     with pytest.raises(ValueError, match=r'^Name governance actions <resource_type>\.<verb>\.$'):
@@ -619,3 +672,94 @@ def test_facets_come_only_with_the_first_page(store, audit):
     first = audit.listing(None, None, 2)
     assert first['facets']['actions'] and first['next_cursor']
     assert audit.listing(None, first['next_cursor'], 2)['facets'] is None
+
+
+def test_activity_rows_join_the_feed_filters_and_exports(store, audit):
+    session = 'c' * 32
+    created = activity_row(store, BASE, session_id=session, key=(session,))
+    denied = activity_row(store, BASE + timedelta(seconds=1), 'policy.tool_denied', session_id=session)
+    message = activity_row(store, BASE + timedelta(seconds=2), 'message.submitted', actor='Dana@Example.com',
+                           actor_id='google:dana', resource_id='t' * 32, session_id=session)
+    blocked = activity_row(store, BASE + timedelta(seconds=3), 'automation.blocked', resource_id='a' * 32,
+                           session_id='', details={'occurrence_kind': 'schedule', 'reason': 'governance'})
+    configured = governance_row(store, BASE + timedelta(seconds=4), action='automation.created',
+                                resource_type='automation', resource_id='a' * 32, actor='owner@example.com',
+                                details={'revision': 1, 'via': 'http'})
+    # A retried write of a deduplicated event adds nothing.
+    assert activity_row(store, BASE + timedelta(minutes=1), session_id=session, key=(session,)) == created
+    entries = {entry['id']: entry for entry in audit.listing(None)['entries']}
+    assert len(entries) == 5
+    assert entries[created] == {
+        'id': created, 'source': 'activity', 'action': 'session.created', 'actor': 'Owner@Example.com',
+        'resource_type': 'session', 'resource_id': session,
+        'details': {'origin': 'user', 'visibility': 'shared', 'profile_revision': 0, 'inherited': False,
+                    'outcome': 'success', 'session_id': session},
+        'created_at': fixed(BASE)}
+    assert entries[denied]['details'] == {'reason': 'tool_disabled', 'tool': 'shell', 'outcome': 'denied',
+                                          'session_id': session}
+    assert entries[blocked]['details'] == {'occurrence_kind': 'schedule', 'reason': 'governance', 'outcome': 'denied'}
+
+    def listed(**values):
+        return [(entry['source'], entry['id']) for entry in audit.listing(parse_filters(**values), limit=200)['entries']]
+
+    # The folded actor_key serves a case-insensitive actor filter.
+    assert listed(actor=' OWNER@example.com ') == [('governance', configured), ('activity', blocked),
+                                                   ('activity', denied), ('activity', created)]
+    assert listed(actor='dana@example.com') == [('activity', message)]
+    assert listed(resource_type='policy') == [('activity', denied)]
+    assert listed(resource_type='session') == [('activity', created)]
+    assert listed(resource_type='automation') == [('governance', configured), ('activity', blocked)]
+    assert listed(action='message.submitted') == [('activity', message)]
+    assert listed(action='automation.created') == [('governance', configured)]
+    assert listed(resource_type='message', action='session.created') == []
+    rows = records(audit.export(parse_filters(resource_type='policy'), 'ndjson'))
+    assert [(row['source'], row['details']['outcome']) for row in rows] == [('activity', 'denied')]
+    assert 'session_id' in rows[0]['details']
+
+
+def test_activity_cells_are_escaped_in_csv_exports(store, audit):
+    activity_row(store, BASE, actor='=HYPERLINK("https://evil.example")', session_id='+1')
+    rows = list(csv.reader(io.StringIO(''.join(audit.export(None, 'csv')), newline='')))
+    assert rows[1][1:6] == ['activity', 'session.created', '\'=HYPERLINK("https://evil.example")', 'session', "'+1"]
+    assert json.loads(rows[1][6])['session_id'] == '+1'
+
+
+def test_cursors_issued_before_activity_rows_stay_valid(store, audit):
+    for second in range(6):
+        governance_row(store, BASE + timedelta(seconds=second))
+    first = audit.listing(None, None, 3)
+    # Activity committed later, on both sides of the cursor.
+    activity_row(store, BASE + timedelta(seconds=1))
+    activity_row(store, BASE + timedelta(minutes=1))
+    rest = audit.listing(None, first['next_cursor'], 50)['entries']
+    assert [entry['source'] for entry in rest] == ['governance', 'activity', 'governance', 'governance']
+    digest, stamp = AuditFilters().digest(), fixed(BASE)
+    assert audit.listing(None, audit.signer.dumps({'v': 2, 'f': digest, 'k': [stamp, 'activity', 'a' * 32]}))
+    for ident in (7, '', 'a' * 513, None):
+        forged = audit.signer.dumps({'v': 2, 'f': digest, 'k': [stamp, 'activity', ident]})
+        assert detail(lambda forged=forged: audit.listing(None, forged)) == RELOAD
+
+
+def test_postgres_activity_filters_use_their_indexes(store):
+    if not store.database:
+        pytest.skip('PostgreSQL plans only.')
+    for second in range(3):
+        activity_row(store, BASE + timedelta(seconds=second))
+        activity_row(store, BASE + timedelta(seconds=second), 'policy.tool_denied')
+    source = next(source for source in governance_audit._POSTGRES_SOURCES if source.name == 'activity')
+    position = (BASE, 'governance', 'a' * 32)
+    with store.connect() as conn:
+        conn.execute('SET LOCAL enable_seqscan = off')
+        conn.execute('SET LOCAL enable_sort = off')
+        for filters, index in ((AuditFilters(), 'idx_activity_audit_time'),
+                               (parse_filters(actor='Owner@Example.com'), 'idx_activity_audit_actor'),
+                               (parse_filters(action='policy.tool_denied'), 'idx_activity_audit_action'),
+                               (parse_filters(resource_type='session'), 'idx_activity_audit_resource')):
+            for cursor in (None, position):
+                [statement] = governance_audit._statements_in(conn, source, filters, cursor, 51)
+                assert 'unicode_lower' not in statement[0]  # The actor filter compares actor_key itself.
+                plan = '\n'.join(row[0] for row in conn.execute('EXPLAIN ' + statement[0], statement[1]).fetchall())
+                assert index in plan and 'Sort' not in plan.replace('Sort Key', ''), (filters, plan)
+        # Governance-only filters never read the activity table.
+        for filters in (parse_filters(action='role.created'), parse_filters(resource_type='sign_in')):
+            assert governance_audit._statements_in(conn, source, filters, None, 51) == []

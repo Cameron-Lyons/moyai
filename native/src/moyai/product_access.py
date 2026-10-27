@@ -15,6 +15,7 @@ async def access_session(product: ProductResources, request: Request) -> bytes |
     if not product.settings.cloudflare_access_login:
         return None
     from app.cloudflare_access import AccessUnavailable
+    from app.database import DatabaseError
     from jwt import PyJWTError
 
     try:
@@ -26,5 +27,8 @@ async def access_session(product: ProductResources, request: Request) -> bytes |
         return await asyncio.to_thread(product.security.access_session, request, identity)
     except AccessUnavailable:
         raise HTTPException(503, "Organization sign-in verification is temporarily unavailable.") from None
+    except DatabaseError:
+        # Enrollment or the sign-in audit write failed: no session is issued.
+        raise HTTPException(503, "Organization sign-in is temporarily unavailable.") from None
     except (PyJWTError, ValueError, TypeError):
         raise HTTPException(401, "A valid organization sign-in is required.") from None

@@ -1,6 +1,7 @@
 import hashlib
 import hmac
 import ipaddress
+import logging
 import secrets
 from contextlib import nullcontext
 import time
@@ -31,6 +32,15 @@ def network_key(host: str) -> str:
         return str(address.ipv4_mapped)
     # One IPv6 subscriber usually controls a whole /56.
     return str(ipaddress.ip_network(f"{address}/56", strict=False)) if address.version == 6 else str(address)
+
+
+def access_key(identity: dict, outcome: str) -> str:
+    """One Access sign-in event per subject, outcome and UTC minute."""
+    from .governance_activity import minute_bucket
+    return '\x1f'.join(('cloudflare', identity['issuer'], identity['sub'], outcome, minute_bucket()))
+
+
+MAX_ACCESS_RECORDED = 10000
 
 
 def is_proxy_peer(host: str) -> bool:
@@ -86,6 +96,8 @@ class Security:
         key = settings.encryption_key or local_secret(settings.data_dir / "encryption.key", lambda: Fernet.generate_key().decode())
         self.fernet = Fernet(key.encode())
         self.signer = URLSafeTimedSerializer(self.secret, salt="workspace-session-v1")
+        # Access sign-in event keys (access_key) this process has recorded.
+        self.access_recorded: set[str] = set()
         self.origin = settings.public_url.rstrip("/")
         self.local = urlparse(self.origin).hostname in LOOPBACK_HOSTS
         if bool(settings.google_client_id) != bool(settings.google_client_secret):
@@ -168,10 +180,24 @@ class Security:
                     and identity.get("issuer") == provider.issuer and client_id == provider.client_id)
 
     def access_session(self, request: HTTPConnection, identity: dict) -> bytes | None:
-        """Establish a browser session from a verified employee assertion only."""
-        actor = self.user_roles.store.access_actor(identity)
-        if actor is None:
-            actor = self.user_roles.store.access_identity(identity)
+        """Establish a browser session from a verified employee assertion only.
+
+        Each new session records sign_in.succeeded before its cookie is issued
+        (a failed write raises, so no cookie is issued), once per subject and
+        minute, which bounds clients that never keep cookies. A mapping that
+        needs review, or a deactivated person, records sign_in.refused instead.
+        """
+        from .db import IdentityRefused
+
+        store = self.user_roles.store
+        try:
+            actor = store.access_actor(identity)
+            enrolled = actor is None
+            if actor is None:
+                actor = store.access_identity(identity)
+        except IdentityRefused as refused:
+            self.access_refused(identity, refused.reason)
+            raise
         # Rechecked for every assertion and kept only on this request. Cookies
         # never provide an account id or bypass the live mapping validation.
         request.state.access_actor = actor
@@ -187,12 +213,45 @@ class Security:
             return None
         # The store pins issuer/subject to one account. Ambiguous emails and
         # attempts to rebind a different subject fail closed with ValueError.
+        if not self.person(identity['email']):
+            # No session: every request would refuse it (session_info) anyway.
+            self.access_refused(identity, 'deactivated')
+            return None
+        from . import sign_in_audit
+        key = access_key(identity, 'succeeded')
+        self.access_event(key, lambda: sign_in_audit.succeeded(store, 'cloudflare', identity['email'],
+                                                               enrolled=enrolled, key=key))
         info = {'sid': secrets.token_urlsafe(32), 'method': 'cloudflare', 'identity': identity,
                 'audience': self.settings.cloudflare_access_audience}
         request.state.access_session = info
         response = Response()
         self.set_session_cookie(response, info)
         return response.headers['set-cookie'].encode('latin-1')
+
+    def access_event(self, key: str, write):
+        """Run write unless this process already recorded key.
+
+        access_actor runs for every request, so a client that never keeps its
+        cookie, or whose mapping needs review, would otherwise repeat a write
+        its per-minute key discards. Keys name their minute, so dropping them
+        all at the cap only costs a repeated write.
+        """
+        if key in self.access_recorded:
+            return
+        write()
+        if len(self.access_recorded) >= MAX_ACCESS_RECORDED:
+            self.access_recorded.clear()
+        self.access_recorded.add(key)
+
+    def access_refused(self, identity: dict, reason: str):
+        """Record a refused Access sign-in once per subject, reason and minute; never fatal."""
+        from . import sign_in_audit
+        key = access_key(identity, reason)
+        try:
+            self.access_event(key, lambda: sign_in_audit.record(
+                self.user_roles.store, 'sign_in.refused', identity['email'], 'cloudflare', reason=reason, key=key))
+        except Exception as failure:
+            logging.getLogger(__name__).warning('Access sign-in refusal was not recorded: %s', type(failure).__name__)
 
     def google_role(self, email: str, *, connection=None) -> str:
         if self.user_roles is not None:

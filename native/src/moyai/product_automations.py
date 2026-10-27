@@ -361,10 +361,12 @@ class ProductAutomationService:
             else:
                 if governance is not None:
                     try:
-                        await governance.continuation(
-                            db, definition.session_id, definition.security_profile_id, policy=policy,
-                        )
+                        # A probe: blockers are reported, not recorded as refusals.
+                        wider = await governance.continuation_wider(
+                            db, definition.session_id, definition.security_profile_id, policy=policy)
                     except HTTPException:
+                        wider = True
+                    if wider:
                         result.append("scheduled_chat_exceeds_security_policy")
         if definition.mode != "modal":
             result.append("execution_mode_not_supported")
@@ -1044,7 +1046,7 @@ class ProductAutomationService:
                         model = definition.model  # Reported by blockers when nothing refuses it first.
                     await governance.workflow(db, principal, definition,
                                               previous='' if action == 'create' else _definition(row).security_profile_id,
-                                              scope=scope, model=model)
+                                              scope=scope, model=model, automation_id=identity)
                 if action in {"migrate", "enable"}:
                     blockers = await self.blockers(db, row, definition, principal=principal)
                     if blockers:
@@ -1068,7 +1070,8 @@ class ProductAutomationService:
                 if action in {"create", "update"} and definition.session_id:
                     await self.database.automation_session(db, principal.id, definition.session_id)
                     if governance is not None:
-                        await governance.continuation(db, definition.session_id, definition.security_profile_id)
+                        await governance.continuation(db, definition.session_id, definition.security_profile_id,
+                                                      actor_id=principal.id, automation_id=identity)
                 revision = row["revision"] + (action != "create")
                 if action != "create":
                     await db.execute(text(
@@ -1109,6 +1112,8 @@ class ProductAutomationService:
                     fingerprint=fingerprint, automation_id=identity, source_revision=revision,
                     result=json.dumps(result),
                 ))
+                await self._audit(db, principal, action, identity, definition, result,
+                                  key=f"{principal.id}/{operation_scope}/{body.request_key}", scope=scope)
                 await self._confirm_effect(db, effect, scope, action, effect_attempt)
         # A saved canonical mutation remains successful when Temporal is down.
         # Pending intent is recovered by dispatch_pending on the existing owner.
@@ -1117,6 +1122,35 @@ class ProductAutomationService:
             await self.request_sync(identity)
         await self.identity.require_current(grant)
         return result
+
+    async def _audit(
+        self, db: AsyncSession, principal: Any, action: Action, identity: str, definition: Definition,
+        result: dict[str, Any], *, key: str, scope: RunScope | None,
+    ) -> None:
+        """One automation.<action> configuration event in mutate()'s writer transaction.
+
+        A replayed request key returns the earlier Operation before reaching
+        this, so it adds nothing. Details hold kinds, ids and flags only, never
+        the name, prompt, repository or trigger settings.
+        """
+        from app.enterprise_roles import actor_label
+
+        from .product_governance import record_runtime_event
+        details: dict[str, Any] = {
+            "revision": result["revision"], "native_state": result["native_state"],
+            "security_profile_id": definition.security_profile_id or None,
+            "trigger_kinds": sorted({trigger.event.provider if trigger.event else "schedule"
+                                     for trigger in definition.triggers}),
+            "connection_kinds": sorted(set(definition.plugins)),
+            "has_repository": bool(definition.repo_url or definition.github_repository_id),
+            "via": "agent" if scope is not None else "http",
+        }
+        if scope is not None:
+            details["session_id"] = scope.session_id
+        verb = {"create": "created", "update": "updated", "migrate": "migrated", "enable": "enabled",
+                "pause": "paused", "retire": "retired"}[action]
+        await record_runtime_event(db, self.identity, key, f"automation.{verb}", actor_label(principal),
+                                   "automation", identity, details)
 
     async def request_sync(self, identity: str) -> bool:
         try:
@@ -1313,11 +1347,16 @@ class ProductAutomationService:
         ))
         return {"status": status, "session_id": session_id, "turn_id": turn_id}
 
-    async def _admit_governed(self, db: AsyncSession, binding: Binding, **admission: Any) -> tuple[Session, Turn] | None:
+    async def _admit_governed(
+        self, db: AsyncSession, binding: Binding, *, occurrence: str, occurrence_kind: Literal["schedule", "event"],
+        **admission: Any,
+    ) -> tuple[Session, Turn] | None:
         """Admit an occurrence, or block its binding when governance refuses it.
 
         Policy and role refusals do not clear on retry. The savepoint discards
         any partially created session before the caller records its receipt.
+        The block's automation.blocked event commits with that receipt, once
+        per occurrence.
         """
         try:
             async with db.begin_nested():
@@ -1326,6 +1365,12 @@ class ProductAutomationService:
             if error.status_code not in {403, 409}:
                 raise
         binding.sync_state, binding.last_error = "blocked", GOVERNANCE_BLOCKED
+        governance = getattr(self.database, "governance", None)
+        if governance is not None:
+            await governance.record(
+                db, "automation.blocked", actor_id=binding.owner_id, resource_id=binding.id,
+                session_id=admission.get("session_id") or "", key=(occurrence,),
+                details={"occurrence_kind": occurrence_kind, "reason": "governance"})
         return None
 
     async def admit(
@@ -1400,7 +1445,8 @@ class ProductAutomationService:
                 if count >= definition.max_runs_per_hour:
                     return await receipt(db, row, binding, trigger_id, key, "skipped", "Hourly invocation limit reached.")
             admitted = await self._admit_governed(
-                db, binding, grant=original, title=f"Automation · {definition.name}",
+                db, binding, occurrence=key, occurrence_kind="schedule", grant=original,
+                title=f"Automation · {definition.name}",
                 prompt=definition.prompt, model=self.settings.resolve_model(definition.model or None),
                 request_key="automation-" + hashlib.sha256(key.encode()).hexdigest(),
                 connections=connections, session_id=definition.session_id,

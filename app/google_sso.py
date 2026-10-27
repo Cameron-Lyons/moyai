@@ -1,8 +1,14 @@
-"""Google OpenID Connect for organization sign-in; no Google API access is retained."""
+"""Google OpenID Connect for organization sign-in; no Google API access is retained.
+
+A successful callback records sign_in.succeeded with the account refresh, so a
+failed audit write issues no session. A refusal after a consumed state records
+only a fixed reason (app.sign_in_audit); unknown or expired states record nothing.
+"""
 import asyncio
 import base64
 import hashlib
 import hmac
+import logging
 import re
 import secrets
 import time
@@ -14,8 +20,12 @@ from fastapi import APIRouter, HTTPException, Request, Response
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, ConfigDict, Field
 
+from . import sign_in_audit
+from .db import IdentityRefused
 from .file_links import valid_file_return_path
 from .security import Throttle, digest
+
+log = logging.getLogger(__name__)
 
 AUTHORIZE_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 TOKEN_URL = "https://oauth2.googleapis.com/token"
@@ -108,6 +118,38 @@ class GoogleSignIn:
         return {"sub": claims["sub"], "email": email.lower(), "domain": domain.lower(),
                 "name": str(claims.get("name", email))[:160]}
 
+    def admit(self, identity):
+        """The person's role, after refreshing the account with its sign-in event.
+
+        A deactivated person is refused before any session or event exists.
+        """
+        person = self.security.person(identity['email'])
+        if not person:
+            raise IdentityRefused('deactivated')
+        self.store.identity({'method': 'google', 'identity': identity, 'role': person['role']}, sign_in=True)
+        return person['role']
+
+    def refuse(self, reason, email='', client=''):
+        """Audit a refusal after a state was consumed.
+
+        A verified person is named; an anonymous refusal is kept once per
+        client network, reason and minute (sign_in_audit.anonymous_key).
+        """
+        key = None if email else sign_in_audit.anonymous_key('google', client, reason)
+        sign_in_audit.record(self.store, 'sign_in.refused', email or 'anonymous', 'google', reason=reason, key=key)
+
+    async def verified(self, row, code, error):
+        """The provider's verified identity for a consumed state, else IdentityRefused."""
+        if error:
+            raise IdentityRefused('cancelled')
+        if not code:
+            raise IdentityRefused('token')
+        try:
+            return await self.exchange(code, row["verifier"], row["nonce"])
+        except (httpx.HTTPError, jwt.PyJWTError, ValueError, KeyError, TypeError):
+            # Never echo provider errors, codes, tokens, or claims into the UI/logs.
+            raise IdentityRefused('token') from None
+
     async def exchange(self, code, verifier, nonce):
         async with httpx.AsyncClient(timeout=20) as client:
             response = await client.post(TOKEN_URL, data={
@@ -166,18 +208,28 @@ class GoogleSignIn:
             return_hash = row["return_path"][1:] if row else "#tasks"
             response = RedirectResponse(f"/?signin={result}{return_hash}", status_code=303)
             response.delete_cookie(COOKIE, path="/auth/google")
-            if not row or not browser or error or not code:
+            if not row or not browser:
                 return response
+            identity = None
             try:
-                identity = await self.exchange(code, row["verifier"], row["nonce"])
-            except (httpx.HTTPError, jwt.PyJWTError, ValueError, KeyError, TypeError):
-                # Never echo provider errors, codes, tokens, or claims into the UI/logs.
+                identity = await self.verified(row, code, error)
+                role = await asyncio.to_thread(self.admit, identity)
+            except IdentityRefused as refused:
+                reason = refused.reason
+            except Exception as failure:
+                # A failed account or audit write fails closed with the same redirect.
+                log.warning('Google sign-in failed: %s', type(failure).__name__)
+                reason = 'unavailable'
+            else:
+                response = RedirectResponse(row["return_path"], status_code=303)
+                response.delete_cookie(COOKIE, path="/auth/google")
+                self.security.new_session(response, role, identity=identity)
                 return response
-            response = RedirectResponse(row["return_path"], status_code=303)
-            response.delete_cookie(COOKIE, path="/auth/google")
-            role = self.security.google_role(identity['email'])
-            self.store.identity({'method': 'google', 'identity': identity, 'role': role})
-            self.security.new_session(response, role, identity=identity)
+            # Only a verified identity names the actor: any refusal after the exchange.
+            try:
+                await asyncio.to_thread(self.refuse, reason, identity['email'] if identity else '', row["client"])
+            except Exception as failure:
+                log.warning('Google sign-in refusal was not recorded: %s', type(failure).__name__)
             return response
 
         return router

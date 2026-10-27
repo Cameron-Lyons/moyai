@@ -6,18 +6,24 @@ import { TableCell, TableRow } from "@/components/ui/table"
 import { ApiError, apiDownload, csrfToken } from "./api"
 import { saveBlob } from "./debug-trace"
 import { Choice, RecordTable, dateTime, errorText } from "./settings"
-import { actionLabel, auditExportPath, auditPageQuery, auditQuery, emptyAuditFilters } from "./governance-data"
-import { AuditDetails, LoadGate, MutationError, PageActions, accessChanged, dataOf, useGovMutation, useGovResource } from "./governance-shared"
+import { actionLabel, auditExportPath, auditOutcome, auditPageQuery, auditQuery, emptyAuditFilters, resourceTypeLabel } from "./governance-data"
+import { AuditDetails, LoadGate, MutationError, PageActions, StatusBadge, accessChanged, dataOf, useGovMutation, useGovResource } from "./governance-shared"
 import { listGovernanceAudit, type AuditEntry, type AuditFacets, type AuditPage as AuditResponse } from "./generated/api"
 import type { AuditExportFormat, AuditFilters } from "./governance-types"
 
 const ALL = "__all__"
-const sourceLabels: Record<string, string> = { governance: "Governance", user_roles: "Built-in roles", connections: "Connections", credentials: "Credentials" }
+const sourceLabels: Record<AuditEntry["source"], string> = { activity: "Activity", governance: "Governance", user_roles: "Built-in roles", connections: "Connections", credentials: "Credentials" }
+
+function Outcome({ entry }: { entry: AuditEntry }) {
+  const outcome = auditOutcome(entry)
+  if (!outcome) return null
+  return <StatusBadge tone={outcome === "denied" ? "danger" : "warning"}>{outcome === "denied" ? "Denied" : "Failed"}</StatusBadge>
+}
 
 export function AuditRows({ entries }: { entries: AuditEntry[] }) {
   return <RecordTable label="Audit log entries" headings={["When", "Action", "Actor", "Resource", "Details"]}>{entries.map(entry => <TableRow key={`${entry.source}:${entry.id}`}>
     <TableCell><time dateTime={entry.created_at}>{dateTime(entry.created_at)}</time></TableCell>
-    <TableCell><strong>{actionLabel(entry.action)}</strong><small><code>{entry.action}</code> · {sourceLabels[entry.source] ?? entry.source}</small></TableCell>
+    <TableCell><strong>{actionLabel(entry.action)}</strong> <Outcome entry={entry} /><small><code>{entry.action}</code> · {sourceLabels[entry.source] ?? entry.source}</small></TableCell>
     <TableCell>{entry.actor || "System"}</TableCell>
     <TableCell>{entry.resource_type}<small>{entry.resource_id}</small></TableCell>
     <TableCell><AuditDetails entry={entry} /></TableCell>
@@ -60,7 +66,7 @@ export function AuditLogPage() {
   return <>
     <form className="ns-gov-filters" aria-label="Audit log filters" noValidate onSubmit={event => { event.preventDefault(); apply(draft) }}>
       <div className="ns-field"><label htmlFor={`${id}-action`}>Action</label><Choice id={`${id}-action`} label="Action" value={draft.action || ALL} onChange={value => change({ action: value === ALL ? "" : value })} options={options(facets.actions, draft.action, "All actions", actionLabel)} /></div>
-      <div className="ns-field"><label htmlFor={`${id}-resource`}>Resource type</label><Choice id={`${id}-resource`} label="Resource type" value={draft.resource_type || ALL} onChange={value => change({ resource_type: value === ALL ? "" : value })} options={options(facets.resource_types, draft.resource_type, "All resource types", value => value.replace(/_/g, " "))} /></div>
+      <div className="ns-field"><label htmlFor={`${id}-resource`}>Resource type</label><Choice id={`${id}-resource`} label="Resource type" value={draft.resource_type || ALL} onChange={value => change({ resource_type: value === ALL ? "" : value })} options={options(facets.resource_types, draft.resource_type, "All resource types", resourceTypeLabel)} /></div>
       <div className="ns-field"><label htmlFor={`${id}-actor`}>Actor email</label><Input id={`${id}-actor`} type="email" autoComplete="off" maxLength={254} placeholder="name@example.com" value={draft.actor} onChange={event => change({ actor: event.target.value })} /></div>
       <div className="ns-field"><label htmlFor={`${id}-from`}>From (UTC)</label><Input id={`${id}-from`} type="date" value={draft.from} max={draft.to || undefined} onChange={event => change({ from: event.target.value })} /></div>
       <div className="ns-field"><label htmlFor={`${id}-to`}>To (UTC)</label><Input id={`${id}-to`} type="date" value={draft.to} min={draft.from || undefined} onChange={event => change({ to: event.target.value })} /></div>
@@ -99,7 +105,7 @@ export function AuditLogPage() {
       return <>
         <p className="ns-muted ns-gov-count" role="status">{entries.length.toLocaleString()} {entries.length === 1 ? "entry" : "entries"} shown{next ? "; more are available" : ""}.</p>
         {entries.length ? <AuditRows entries={entries} /> : <div className="ns-empty"><h2>{filtered(applied) ? "No matching audit entries" : "No audit entries yet"}</h2>
-          <p>{filtered(applied) ? "Try a wider date range or clear the filters." : "Role, provisioning, policy, spend, connection and credential changes appear here once they are saved."}</p>
+          <p>{filtered(applied) ? "Try a wider date range or clear the filters." : "Sign-ins, session activity, policy denials, and role, provisioning, policy, spend, connection and credential changes appear here as they happen."}</p>
           {filtered(applied) && <Button variant="outline" onClick={clear}>Clear filters</Button>}</div>}
         {pages.error && <p className="ns-error" role="alert">{pages.error}</p>}
         {next && <Button className="ns-gov-more" variant="outline" disabled={pages.loading} onClick={more}>{pages.loading ? "Loading entries…" : "Load more"}</Button>}

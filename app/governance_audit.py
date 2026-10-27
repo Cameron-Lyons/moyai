@@ -2,22 +2,32 @@
 
 Every successful governance change records exactly one event through
 record_event_in on the same canonical connection, after its writer lock is held,
-so a rolled-back change leaves no event. Native runtime outcomes, such as a
-gateway AI guardrail refusal, insert event_values rows in the native transaction
-that records the outcome instead; they change no configuration and take no writer
-lock. Events carry identifiers, actions, authenticated actors and bounded
-metadata; never tokens, secrets, policy bodies or user content. Schema lives in
-the canonical initializers; keep the import alias below instead of defining
-initialize_schema here.
+so a rolled-back change leaves no event. A native workflow (automation)
+configuration change is such a change: mutate() inserts its event_values row
+under the canonical writer lock it already holds. Native runtime outcomes, such
+as a gateway AI guardrail refusal, insert event_values rows in the native
+transaction that records the outcome instead. Sign-in events
+(app.sign_in_audit) commit with the account write they describe, or take a
+scoped write lock of their own; an event a client could repeat is keyed (an
+Access sign-in or anonymous refusal per minute, a sign-out per session). Events
+carry identifiers, actions, authenticated actors and bounded metadata; never
+tokens, secrets, policy bodies or user content.
+Schema lives in the canonical initializers; keep the import alias below instead
+of defining initialize_schema here.
 
-GovernanceAudit merges governance_audit_events with the existing user_role_audit,
+GovernanceAudit merges governance_audit_events with the activity audit
+(governance_activity_events: sessions, messages, policy refusals and blocked
+runs, see app.governance_activity) and the existing user_role_audit,
 connection_audit and credential_audit tables into one feed ordered by
-(created_at DESC, source, id DESC). Reads never take the writer lock: a page is
-one read-only snapshot (REPEATABLE READ READ ONLY on PostgreSQL) in which each
-source is read through its (created_at, id) index with the filters and a LIMIT in
-SQL. No index covers resource_type, but record_event_in requires
-'<resource_type>.<verb>' actions for RESOURCE_TYPES, so a filter on one of them
-reads one governance keyset statement per matching action through the action index.
+(created_at DESC, source, id DESC). Activity rows are append-only and written
+without the writer lock: a trigger rejects UPDATE, so never add one. Reads never
+take the writer lock: a page is one read-only snapshot (REPEATABLE READ READ
+ONLY on PostgreSQL) in which each source is read through its (created_at, id)
+index with the filters and a LIMIT in SQL. No index covers the governance
+resource_type, but record_event_in requires '<resource_type>.<verb>' actions for
+RESOURCE_TYPES, so a filter on one of them reads one governance keyset statement
+per matching action through the action index. The activity table indexes
+action, the folded actor (actor_key) and resource_type.
 Legacy rows are normalized to fixed actions and identifiers; their free-text
 action column is classified and never returned, and their details hold only
 enumerated values.
@@ -50,8 +60,9 @@ from fastapi import HTTPException
 from itsdangerous import BadData, URLSafeTimedSerializer
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
+from .governance_activity import ACTIVITY_ACTIONS, ACTIVITY_RESOURCE_TYPES, ACTIVITY_TABLE
 from .identity_kinds import INDIVIDUAL_KINDS_SQL
-from .schema_initializers import initialize_credentials, initialize_user_roles
+from .schema_initializers import initialize_credentials, initialize_governance_activity, initialize_user_roles
 from .schema_initializers import initialize_governance_audit as initialize_schema
 
 MAX_ACTION = 64
@@ -113,30 +124,42 @@ def event_values(action, actor, resource_type, resource_id, details=None):
     Validation happens before any SQL and never echoes values. TypeError: a
     field is not text or details are not a JSON object. ValueError: a field is
     empty, has NUL or exceeds its bound (action/resource_type 64 characters,
-    actor/resource_id 512), details exceed 4096 UTF-8 bytes or hold NaN, or a
-    resource type in RESOURCE_TYPES has an action outside '<resource_type>.'.
+    actor/resource_id 512), details exceed 4096 UTF-8 bytes or hold NaN, a
+    resource type in RESOURCE_TYPES has an action outside '<resource_type>.', or
+    the resource type is one only the activity audit holds (ACTIVITY_ONLY_TYPES).
     """
     values = (_text(action, 'action', MAX_ACTION), _text(actor, 'actor', MAX_IDENTIFIER),
               _text(resource_type, 'resource type', MAX_RESOURCE_TYPE),
               _text(resource_id, 'resource id', MAX_IDENTIFIER), _details(details))
-    # The feed's resource_type filter reads these rows through their actions.
+    # The feed's resource_type filter reads these rows through their actions,
+    # and never reads this table for an activity-only type.
+    if values[2] in ACTIVITY_ONLY_TYPES:
+        raise ValueError('Record session, message and policy activity in the activity audit.')
     if values[2] in RESOURCE_TYPES and not values[0].startswith(values[2] + '.'):
         raise ValueError('Name governance actions <resource_type>.<verb>.')
     return values
 
 
-def record_event_in(conn, action, actor, resource_type, resource_id, details=None):
+def event_id(action, key):
+    """The deterministic id of the one event an action records for key."""
+    return hashlib.sha256(f'{action}/{key}'.encode()).hexdigest()[:32]
+
+
+def record_event_in(conn, action, actor, resource_type, resource_id, details=None, *, key=None):
     """Insert one event in the caller's open write transaction and return its id.
 
+    With a key the id is event_id(action, key) and a repeat inserts nothing, so
+    an event a client can repeat (an Access sign-in per minute) is kept once.
     Raises event_values' TypeError and ValueError before any SQL. RuntimeError:
     the connection holds no write transaction.
     """
     values = event_values(action, actor, resource_type, resource_id, details)
     if not _in_write_transaction(conn):
         raise RuntimeError('Record governance audit events inside the mutation’s write transaction.')
-    identity = uuid4().hex
+    identity = uuid4().hex if key is None else event_id(action, key)
     conn.execute('''INSERT INTO governance_audit_events(id,action,actor,resource_type,resource_id,details,created_at)
-        VALUES(?,?,?,?,?,?,?)''', (identity, *values, timestamp()))
+        VALUES(?,?,?,?,?,?,?)''' + ('' if key is None else ' ON CONFLICT(id) DO NOTHING'),
+                 (identity, *values, timestamp()))
     return identity
 
 
@@ -154,9 +177,14 @@ EXPORT_FORMATS = ('csv', 'ndjson')
 EXPORT_COLUMNS = ('created_at', 'source', 'action', 'actor', 'resource_type', 'resource_id', 'details')
 # Spreadsheets evaluate cells starting with these; the quote keeps them literal text.
 FORMULA_PREFIXES = ('=', '+', '-', '@', '\t', '\r')
-RESOURCE_TYPES = ('role', 'role_assignment', 'group_role', 'scim_user', 'scim_group', 'scim_token',
-                  'security_profile', 'security_defaults', 'spend_limit', 'user_role', 'connection', 'credential',
-                  'ai_guardrail', 'identity_binding', 'sign_in')
+# Governance types, then the activity audit's: automation configuration changes
+# are governance events and blocked runs are activity, so it appears once.
+GOVERNANCE_TYPES = ('role', 'role_assignment', 'group_role', 'scim_user', 'scim_group', 'scim_token',
+                    'security_profile', 'security_defaults', 'spend_limit', 'user_role', 'connection', 'credential',
+                    'ai_guardrail', 'identity_binding', 'sign_in', 'automation')
+# Resource types only the activity table holds (session, message, policy).
+ACTIVITY_ONLY_TYPES = frozenset(ACTIVITY_RESOURCE_TYPES) - set(GOVERNANCE_TYPES)
+RESOURCE_TYPES = (*GOVERNANCE_TYPES, *(kind for kind in ACTIVITY_RESOURCE_TYPES if kind not in GOVERNANCE_TYPES))
 
 # Legacy free text maps to fixed actions; first match wins. Prefix rules cover
 # texts that interpolate labels, repository ids or reasons, none of which leave.
@@ -323,6 +351,17 @@ def _user_role_entry(row):
             {'previous': row['previous_role'] or None, 'replacement': row['role']})
 
 
+def _activity_entry(row):
+    try:
+        details = json.loads(row['details'])
+    except (TypeError, ValueError):
+        details = None
+    details = {**(details if isinstance(details, dict) else {}), 'outcome': row['outcome']}
+    if row['session_id']:
+        details['session_id'] = row['session_id']
+    return row['action'], row['actor'], row['resource_type'], row['resource_id'], details
+
+
 def _connection_entry(row):
     details: dict[str, Any] = {'provider': row['provider']}
     if row['action'] == 'connection.repositories_updated':
@@ -366,6 +405,7 @@ class _Source:
     resource_types: frozenset[str] | None
     entry: Callable[[Any], tuple[str, str, str, str, dict]]
     integer_ids: bool = True
+    actor_folded: bool = False  # The actor column is already unicode_lower(actor), and indexed.
 
     def statement(self, filters, position, limit):
         """Indexed keyset query for this source, or None when filters exclude it."""
@@ -380,7 +420,7 @@ class _Source:
                 where.append(f'{expression}=?')
                 params.append(value)
         if filters.actor is not None:
-            where.append(f'unicode_lower({self.actor})=?')
+            where.append(f'{self.actor}=?' if self.actor_folded else f'unicode_lower({self.actor})=?')
             params.append(filters.actor)
         if filters.after is not None:
             where.append(f'{self.time}>=?')
@@ -411,6 +451,12 @@ _CREDENTIAL_ACTION = _classifier('a.action', CREDENTIAL_ACTIONS, CREDENTIAL_FALL
 _CREDENTIAL_ACTOR = f"(CASE WHEN u.kind IN {INDIVIDUAL_KINDS_SQL} AND u.email<>'' THEN u.email ELSE a.actor_id END)"
 # Sorted by name: ties at one instant are delivered in this order.
 _SOURCES = tuple(sorted((
+    _Source('activity',
+            'SELECT e.id AS id,e.action AS action,e.outcome AS outcome,e.actor AS actor,'
+            'e.resource_type AS resource_type,e.resource_id AS resource_id,e.session_id AS session_id,'
+            f'e.details AS details,e.created_at AS created_at FROM {ACTIVITY_TABLE} e',
+            'e.created_at', 'e.id', 'e.action', frozenset(ACTIVITY_ACTIONS), 'e.actor_key', 'e.resource_type',
+            frozenset(ACTIVITY_RESOURCE_TYPES), _activity_entry, integer_ids=False, actor_folded=True),
     _Source('connections',
             f'SELECT a.id AS id,a.provider AS provider,{_CONNECTION_ACTION} AS action,a.action AS summary,'
             'a.actor AS actor,a.created_at AS created_at FROM connection_audit a',
@@ -458,6 +504,8 @@ def _statements_in(conn, source, filters, position, limit):
     outside RESOURCE_TYPES (older layouts wrote 'security.defaults.updated' as
     SecurityDefaults) and an action list at its cap keep one unsplit statement.
     """
+    if source.name == 'governance' and filters.resource_type in ACTIVITY_ONLY_TYPES:
+        return []  # Only the activity table holds these; skip the action scan.
     if source.name == 'governance' and filters.action is None and filters.resource_type in RESOURCE_TYPES:
         found = [row['action'] for row in conn.execute(_ACTION_SCAN, (MAX_FACET_ACTIONS,)).fetchall()]
         if len(found) < MAX_FACET_ACTIONS:
@@ -537,6 +585,7 @@ class GovernanceAudit:
             initialize_user_roles(store)
             initialize_credentials(store)
             initialize_schema(store)
+            initialize_governance_activity(store)
 
     def listing(self, filters=None, cursor=None, limit=DEFAULT_LIMIT):
         """{'entries', 'next_cursor', 'facets'}; facets only on the first page, None with a cursor.
@@ -611,8 +660,10 @@ class GovernanceAudit:
         return kept, boundary.position if boundary is not None else None
 
     def _facets_in(self, conn):
+        # Activity actions come from the static catalog: no scan of the larger table.
         found = {row['action'] for row in conn.execute(_ACTION_SCAN, (MAX_FACET_ACTIONS,)).fetchall()}
-        return {'actions': sorted(found | set(LEGACY_ACTIONS)), 'resource_types': list(RESOURCE_TYPES)}
+        return {'actions': sorted(found | set(LEGACY_ACTIONS) | set(ACTIVITY_ACTIONS)),
+                'resource_types': list(RESOURCE_TYPES)}
 
     def _cursor(self, position, filters):
         instant, source, ident = position

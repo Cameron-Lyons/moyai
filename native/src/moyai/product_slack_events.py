@@ -204,7 +204,7 @@ class SlackEvents:
         governance = getattr(self.slack.runtime.database, "governance", None)
         if governance is None:
             return body
-        current = await governance.principal(db, principal.grant)
+        current = await governance.principal(db, principal.grant, session_id=session_id)
         policy = await governance.policy(db, session_id)
         selected = [
             identity for identity in body.connections if governance.admits_grant(

@@ -111,6 +111,7 @@ class SlackConversations:
         if source is None:
             session = await self.database.create_session(
                 actor, NewSession(title=plain_slack_title(prompt)[:100] or "Slack conversation", visibility="shared"), db=db,
+                origin="slack",
             )
             session.surface = "slack"
             return session

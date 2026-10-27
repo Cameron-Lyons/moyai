@@ -2625,6 +2625,7 @@
           },
           "source": {
             "enum": [
+              "activity",
               "governance",
               "user_roles",
               "connections",
