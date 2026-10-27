@@ -33,7 +33,6 @@ export function homeSubmission(prompt: string, model: string, privateSession: bo
 
 export function Home({ models, defaultModel, initiallyPrivate = false, individual = true, productMode = "standalone", connectionVersion = "", preferences, securityPolicies = false, spendStatus = false, recentSessions, recentLoading, onSearchSessions, onCreated, onStarted }: {
   models: string[]; defaultModel: string; initiallyPrivate?: boolean; individual?: boolean; productMode?: "standalone" | "existing"; connectionVersion?: string; preferences?: GeneralPreferences; securityPolicies?: boolean
-  /** Show the personal monthly budget notice (existing product mode with spend.personal). */
   spendStatus?: boolean
   recentSessions: { key: string; title: Session["title"]; href: string }[]; recentLoading: boolean; onSearchSessions: () => void
   onCreated: () => Promise<void>; onStarted: (conversation: NewConversation) => void

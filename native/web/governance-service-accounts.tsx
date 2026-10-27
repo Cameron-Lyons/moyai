@@ -77,7 +77,6 @@ export function ServiceAccountsPage() {
   return <><LoadGate resource={both} label="service accounts">{({ catalog: permissions, admin }) => {
     const rows = admin.accounts.filter(account => (state === "all" || (state === "active") === account.active)
       && contains(search, account.name, account.description, ...account.keys.flatMap(key => [key.label, key.prefix])))
-    const keyCount = (account: ServiceAccount) => account.keys.filter(key => !key.revoked_at).length
     return <>
       <div className="ns-gov-intro"><p className="ns-notice">Service accounts let tools such as a SIEM collector read the audit log and organization spend without a person signing in. Their API keys are read-only, expire, work only on the endpoints listed below and can be revoked at any time.</p>
         <PageActions resource={both} /></div>
@@ -104,9 +103,11 @@ export function ServiceAccountsPage() {
       {editor && <AccountEditor account={editor === "new" ? undefined : editor} ceiling={admin.permission_ceiling} catalog={permissions}
         onClose={() => setEditor(null)} onSaved={resource.refresh} onReload={refresh} />}
       {disable && <GovConfirm title={`Disable ${disable.name}?`} label="Disable account" onReload={refresh} onClose={() => setDisable(null)}
-        description={disableEffect(keyCount(disable))}
+        description={disableEffect(disable.keys.filter(key => !key.revoked_at).length)}
         onConfirm={async () => { await disableServiceAccount({ path: { identity: disable.id }, query: { revision: disable.revision } }); resource.refresh() }} />}
-      {enable && <EnableDialog account={enable} onClose={() => setEnable(null)} onSaved={resource.refresh} onReload={refresh} />}
+      {enable && <GovConfirm title={`Enable ${enable.name}?`} label="Enable account" busyLabel="Enabling…" destructive={false} onReload={refresh} onClose={() => setEnable(null)}
+        description="The account can receive new keys again. Keys revoked when it was disabled stay revoked."
+        onConfirm={async () => { await updateServiceAccount({ path: { identity: enable.id }, body: serviceAccountState(enable, true) }); resource.refresh() }} />}
       {revoke && <GovConfirm title={`Revoke ${revoke.key.label}?`} label="Revoke key" onReload={refresh} onClose={() => setRevoke(null)}
         description={`Collectors using ${revoke.key.prefix}… stop on their next request, including downloads in progress. This cannot be undone; issue a new key to reconnect.`}
         onConfirm={async () => { await revokeServiceAccountKey({ path: { identity: revoke.account.id, key_id: revoke.key.id } }); resource.refresh() }} />}
@@ -149,16 +150,6 @@ function AccountEditor({ account, ceiling, catalog, onClose, onSaved, onReload }
       <MutationError mutation={mutation} onReload={() => { onReload(); onClose() }} />
       <DialogActions busy={mutation.busy} onCancel={onClose} submitLabel={account ? "Save account" : "Create account"} />
     </form>
-  </GovDialog>
-}
-
-function EnableDialog({ account, onClose, onSaved, onReload }: { account: ServiceAccount; onClose: () => void; onSaved: () => void; onReload: () => void }) {
-  const mutation = useGovMutation()
-  return <GovDialog title={`Enable ${account.name}?`} busy={mutation.busy} onClose={onClose}
-    description="The account can receive new keys again. Keys revoked when it was disabled stay revoked.">
-    <MutationError mutation={mutation} onReload={() => { onReload(); onClose() }} />
-    <DialogActions busy={mutation.busy} onCancel={onClose} submitLabel="Enable account" busyLabel="Enabling…"
-      onSubmit={() => void mutation.run(async () => { await updateServiceAccount({ path: { identity: account.id }, body: serviceAccountState(account, true) }) }, () => { onSaved(); onClose() })} />
   </GovDialog>
 }
 

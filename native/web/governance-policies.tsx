@@ -114,7 +114,6 @@ function ScopeChoice({ id, label, value, onChange, disabled, all, selected, none
     options={[{ value: "all", label: all }, { value: "selected", label: selected }, { value: "none", label: none }]} />
 }
 
-const SAVED_ONLY = "Saved, not in the current catalog"
 type PickItem<T> = { id: T; label: string; group: string }
 /** A filterable, grouped checkbox list; each item shows its ID under its label. */
 function PickList<T extends string | number>({ id, noun, items, selected, disabled, onPick }: {
@@ -134,10 +133,10 @@ function PickList<T extends string | number>({ id, noun, items, selected, disabl
     <p className="ns-field-hint">{selected.length} selected.</p>
   </>
 }
-/** Catalog entries, then saved entries the catalog no longer offers. */
+/** Catalog entries, then saved entries the catalog no longer offers, so an edit never silently drops them. */
 function withSaved<T extends string | number>(catalog: readonly PickItem<T>[], saved: readonly T[], label: (id: T) => string): PickItem<T>[] {
   const known = new Set(catalog.map(item => item.id))
-  return [...catalog, ...saved.filter(value => !known.has(value)).map(value => ({ id: value, label: label(value), group: SAVED_ONLY }))]
+  return [...catalog, ...saved.filter(value => !known.has(value)).map(value => ({ id: value, label: label(value), group: "Saved, not in the current catalog" }))]
 }
 
 export function PolicyEditor({ profile, catalog, defaults, onClose, onSaved }: {
@@ -152,7 +151,6 @@ export function PolicyEditor({ profile, catalog, defaults, onClose, onSaved }: {
   const pickModel = (model: string, checked: boolean) => setDraft(previous => ({ ...previous, model_ids: toggled(previous.model_ids, model, checked) }))
   const inUse = Boolean(profile && (defaults.default_profile_id === profile.id || defaults.mandatory_profile_id === profile.id))
   const tools = withSaved(catalog.tools, draft.tool_ids, tool => tool)
-  // Saved entries remain listed so editing never silently drops them.
   const repositories = withSaved(catalog.repositories.map(repository => ({ ...repository, group: "GitHub repositories" })), draft.repository_ids, repository => repositoryLabel(catalog.repositories, repository))
   const models = withSaved(catalog.models.map(model => ({ ...model, group: "Workspace models" })), draft.model_ids, model => model)
   return <GovDialog wide title={profile ? `Edit ${profile.name}` : "New security policy"} busy={mutation.busy} onClose={onClose}

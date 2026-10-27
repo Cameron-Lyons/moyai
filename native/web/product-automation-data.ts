@@ -120,11 +120,7 @@ export function automationBlocker(code: string): string {
   if (code.startsWith("once_requires_future_time:")) return `Choose a future date for one-time trigger ${code.split(":")[1]}.`
   return blockerMessages[code] ?? code.replaceAll("_", " ")
 }
-/**
- * Whether a refused write came from the workflow's security policy (its model,
- * repositories, connections or chat) rather than lost access, so the definition
- * can be changed and saved again. The service names the policy in these refusals.
- */
+/** A 403 naming the security policy (model, repositories, connections or chat) is a fixable refusal, not lost access. */
 export function automationPolicyRefusal(status: number, message: string): boolean {
   return status === 403 && message.includes("security policy")
 }

@@ -3,11 +3,11 @@ import { Download } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { TableCell, TableRow } from "@/components/ui/table"
-import { ApiError, apiDownload, csrfToken } from "./api"
+import { apiDownload, csrfToken } from "./api"
 import { saveBlob } from "./debug-trace"
-import { Choice, RecordTable, dateTime, errorText } from "./settings"
+import { Choice, RecordTable, dateTime } from "./settings"
 import { actionLabel, auditExportPath, auditOutcome, auditPageQuery, auditQuery, emptyAuditFilters, resourceTypeLabel } from "./governance-data"
-import { AuditDetails, LoadGate, MutationError, PageActions, StatusBadge, accessChanged, dataOf, useGovMutation, useGovResource } from "./governance-shared"
+import { AuditDetails, LoadGate, MutationError, PageActions, StatusBadge, dataOf, loadMoreFailed, useGovMutation, useGovResource } from "./governance-shared"
 import { listGovernanceAudit, type AuditEntry, type AuditFacets, type AuditPage as AuditResponse } from "./generated/api"
 import type { AuditExportFormat, AuditFilters } from "./governance-types"
 
@@ -94,13 +94,8 @@ export function AuditLogPage() {
           if (controller.signal.aborted || auth !== csrfToken()) return
           setPages(previous => previous.base === data ? { base: data, entries: [...previous.entries, ...page.entries], next: page.next_cursor, loaded: true, loading: false, error: "" } : previous)
         }, reason => {
-          if (controller.signal.aborted) return
-          if (reason instanceof ApiError && reason.status === 403) {
-            // Lost access: drop loaded pages now, re-read access and the gated first page.
-            setPages({ entries: [], next: null, loaded: false, loading: false, error: "" })
-            accessChanged(); resource.refresh(); return
-          }
-          setPages(previous => ({ ...previous, loading: false, error: errorText(reason) }))
+          if (!controller.signal.aborted) loadMoreFailed(reason, resource, () => setPages({ entries: [], next: null, loaded: false, loading: false, error: "" }),
+            error => setPages(previous => ({ ...previous, loading: false, error })))
         })
       }
       return <>

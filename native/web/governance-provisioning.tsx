@@ -3,9 +3,9 @@ import { KeyRound, Plus, TriangleAlert } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { TableCell, TableRow } from "@/components/ui/table"
-import { ApiError, csrfToken } from "./api"
-import { Choice, Empty, RecordTable, Toolbar, contains, dateTime, errorText } from "./settings"
-import { ActivityList, CopyField, DialogActions, GovConfirm, GovDialog, LoadGate, MutationError, PageActions, Section, StatusBadge, accessChanged, dataOf, useGovMutation, useGovResource } from "./governance-shared"
+import { csrfToken } from "./api"
+import { Choice, Empty, RecordTable, Toolbar, contains, dateTime } from "./settings"
+import { ActivityList, CopyField, DialogActions, GovConfirm, GovDialog, LoadGate, MutationError, PageActions, Section, StatusBadge, dataOf, loadMoreFailed, useGovMutation, useGovResource } from "./governance-shared"
 import {
   createScimToken, getScimAdmin, revokeScimToken,
   type CreatedScimToken, type ScimAdmin, type ScimGroupSummary as ScimGroup, type ScimToken, type ScimUserSummary as ScimUser,
@@ -62,13 +62,8 @@ export function ProvisioningPage({ canManageRoles }: { canManageRoles: boolean }
         if (controller.signal.aborted || auth !== csrfToken()) return
         setPages(previous => previous.base === data ? { base: data, items: [...previous.items, ...page.users.items], next: page.users.next_cursor, loaded: true, loading: false, error: "" } : previous)
       }, reason => {
-        if (controller.signal.aborted) return
-        if (reason instanceof ApiError && reason.status === 403) {
-          // Lost access: drop loaded pages now, re-read access and the gated first page.
-          setPages({ items: [], next: null, loaded: false, loading: false, error: "" })
-          accessChanged(); resource.refresh(); return
-        }
-        setPages(previous => ({ ...previous, loading: false, error: errorText(reason) }))
+        if (!controller.signal.aborted) loadMoreFailed(reason, resource, () => setPages({ items: [], next: null, loaded: false, loading: false, error: "" }),
+          error => setPages(previous => ({ ...previous, loading: false, error })))
       })
     }
     // The first page (no cursor) carries the sections; load-more pages only add users.

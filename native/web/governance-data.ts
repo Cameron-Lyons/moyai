@@ -306,25 +306,18 @@ type KeyLifetime = NonNullable<ServiceKeyCreate["expires_in_days"]>
 /** Every API key expires; these are the only lifetimes the server accepts. */
 export const EXPIRY_CHOICES: readonly KeyLifetime[] = [30, 90, 180, 365]
 export const DEFAULT_EXPIRY: KeyLifetime = 90
-/** Active keys closer than this to expiry are flagged. */
-export const EXPIRY_WARNING_DAYS = 14
+const EXPIRY_WARNING_DAYS = 14
 
-/** Whole days until a key expires (negative once it has), or null for an unreadable time. */
-export function daysRemaining(expiresAt: string, now = Date.now()): number | null {
-  const at = Date.parse(expiresAt)
-  return Number.isFinite(at) ? Math.floor((at - now) / DAY) : null
-}
 export type KeyState = { label: "Active" | "Expired" | "Revoked"; tone: "success" | "warning" | "danger" | "neutral"; note: string }
 /** A key's status in words, with an expiry warning; color only reinforces it. */
 export function keyState(key: ServiceAccountKey, now = Date.now()): KeyState {
   if (key.status === "revoked") return { label: "Revoked", tone: "neutral", note: "" }
-  const days = daysRemaining(key.expires_at, now)
-  if (key.status === "expired" || days === null || days < 0) return { label: "Expired", tone: "danger", note: "" }
+  const at = Date.parse(key.expires_at), days = Math.floor((at - now) / DAY)
+  if (key.status === "expired" || !Number.isFinite(at) || days < 0) return { label: "Expired", tone: "danger", note: "" }
   if (days < EXPIRY_WARNING_DAYS) return { label: "Active", tone: "warning", note: days === 0 ? "Expires today" : `Expires in ${days === 1 ? "1 day" : `${days} days`}` }
   return { label: "Active", tone: "success", note: "" }
 }
 export const activeKeys = (account: ServiceAccountView) => account.keys.filter(key => key.status === "active").length
-/** maxActiveKeys is the server's limit from the listing. */
 export const canIssueKey = (account: ServiceAccountView, maxActiveKeys: number) => account.active && activeKeys(account) < maxActiveKeys
 
 export type ServiceAccountDraft = { name: string; description: string; permissions: string[] }

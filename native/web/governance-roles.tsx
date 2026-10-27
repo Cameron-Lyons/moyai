@@ -69,9 +69,7 @@ export function RolesPage() {
   const catalog = useGovResource("permissions", signal => getPermissions({ signal }).then(dataOf))
   const resource = useGovResource("roles", signal => listGovernanceRoles({ signal }).then(dataOf))
   const refresh = () => { catalog.refresh(); resource.refresh() }
-  // The server refuses changes that reach the signed-in person's own access
-  // (SELF/OWN_GROUP); a 403 re-reads access through useGovMutation.
-  const saved = () => resource.refresh()
+  // Saves only refresh the listing: the server refuses changes to the signed-in person's own access, and a 403 re-reads it through useGovMutation.
   const both = { data: catalog.data && resource.data ? { catalog: catalog.data, admin: resource.data } : undefined, loading: catalog.loading || resource.loading,
     error: catalog.error || resource.error, status: catalog.error ? catalog.status : resource.status, refresh }
   const [search, setSearch] = useState(""), [state, setState] = useState("active"), [people, setPeople] = useState("")
@@ -109,15 +107,15 @@ export function RolesPage() {
         {admin.groups.length ? <GroupGrantRows groups={admin.groups} grants={admin.group_roles} roles={admin.roles} onChange={setGrant} />
           : <p className="ns-muted">No directory groups yet. Groups appear after your identity provider provisions them; see <a className="ns-link" href="#settings/provisioning">Provisioning</a>.</p>}
       </Section>
-      {editor && <RoleEditor role={editor === "new" ? undefined : editor} catalog={permissions.catalog} grantable={admin.grantable} onClose={() => setEditor(null)} onSaved={saved} onReload={refresh} />}
+      {editor && <RoleEditor role={editor === "new" ? undefined : editor} catalog={permissions.catalog} grantable={admin.grantable} onClose={() => setEditor(null)} onSaved={resource.refresh} onReload={refresh} />}
       {archive && <GovConfirm title={`Archive ${archive.name}?`} label="Archive role" onReload={refresh} onClose={() => setArchive(null)}
         description={<ArchiveEffect role={archive} admin={admin} />}
-        onConfirm={async () => { await archiveGovernanceRole({ path: { identity: archive.id }, query: { revision: archive.revision } }); saved() }} />}
-      {assign && <AssignmentEditor existing={assign === "new" ? undefined : assign} roles={active} onClose={() => setAssign(null)} onSaved={saved} onReload={refresh} />}
+        onConfirm={async () => { await archiveGovernanceRole({ path: { identity: archive.id }, query: { revision: archive.revision } }); resource.refresh() }} />}
+      {assign && <AssignmentEditor existing={assign === "new" ? undefined : assign} roles={active} onClose={() => setAssign(null)} onSaved={resource.refresh} onReload={refresh} />}
       {remove && <GovConfirm title={`Remove the custom role from ${remove.email}?`} label="Remove custom role" onReload={refresh} onClose={() => setRemove(null)}
         description="They return to the built-in Member permissions on their next request, plus any directory group grants. Administrator access is unchanged."
-        onConfirm={async () => { await assignGovernanceRole({ body: assignmentBody(remove.email, "member", remove) }); saved() }} />}
-      {grant && <GroupGrantEditor group={grant} existing={admin.group_roles.find(row => row.group_id === grant.id)} roles={active} onClose={() => setGrant(null)} onSaved={saved} onReload={refresh} />}
+        onConfirm={async () => { await assignGovernanceRole({ body: assignmentBody(remove.email, "member", remove) }); resource.refresh() }} />}
+      {grant && <GroupGrantEditor group={grant} existing={admin.group_roles.find(row => row.group_id === grant.id)} roles={active} onClose={() => setGrant(null)} onSaved={resource.refresh} onReload={refresh} />}
     </>
   }}</LoadGate>
 }

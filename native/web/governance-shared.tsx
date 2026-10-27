@@ -83,6 +83,12 @@ export function MutationError({ mutation, onReload }: { mutation: Pick<GovMutati
     {mutation.conflict && onReload && <Button type="button" variant="outline" size="sm" onClick={onReload}><RefreshCw />Reload</Button>}</div>
 }
 
+/** A failed load-more page: lost access (403) drops loaded pages now and re-reads access and the gated first page. */
+export function loadMoreFailed(reason: unknown, resource: { refresh: () => void }, clear: () => void, show: (error: string) => void) {
+  if (reason instanceof ApiError && reason.status === 403) { clear(); accessChanged(); resource.refresh() }
+  else show(errorText(reason))
+}
+
 /** Settings dialog shell: labelled, cancellable, contained scrolling and focus return. */
 export function GovDialog({ title, description, busy = false, onClose, children, wide = false, dismissible = true }: {
   title: string; description: React.ReactNode; busy?: boolean; onClose: () => void; children: React.ReactNode; wide?: boolean; dismissible?: boolean
@@ -106,14 +112,14 @@ export function DialogActions({ busy, onCancel, submitLabel, busyLabel = "Saving
     <Button type={onSubmit ? "button" : "submit"} variant={destructive ? "destructive" : "default"} disabled={busy || disabled} onClick={onSubmit}>{busy ? busyLabel : submitLabel}</Button></div>
 }
 
-/** Destructive confirmation with an explained effect and conflict reload. */
-export function GovConfirm({ title, description, label, onConfirm, onClose, onReload }: {
-  title: string; description: React.ReactNode; label: string; onConfirm: () => Promise<unknown>; onClose: () => void; onReload: () => void
+/** Confirmation with an explained effect and conflict reload; destructive unless `destructive={false}`. */
+export function GovConfirm({ title, description, label, busyLabel, destructive = true, onConfirm, onClose, onReload }: {
+  title: string; description: React.ReactNode; label: string; busyLabel?: string; destructive?: boolean; onConfirm: () => Promise<unknown>; onClose: () => void; onReload: () => void
 }) {
   const mutation = useGovMutation()
   return <GovDialog title={title} description={description} busy={mutation.busy} onClose={onClose}>
     <MutationError mutation={mutation} onReload={() => { onReload(); onClose() }} />
-    <DialogActions busy={mutation.busy} onCancel={onClose} submitLabel={label} destructive onSubmit={() => void mutation.run(onConfirm, onClose)} />
+    <DialogActions busy={mutation.busy} onCancel={onClose} submitLabel={label} busyLabel={busyLabel} destructive={destructive} onSubmit={() => void mutation.run(onConfirm, onClose)} />
   </GovDialog>
 }
 
