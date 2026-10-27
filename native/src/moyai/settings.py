@@ -86,6 +86,11 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices("MOYAI_MODAL_RUNTIME", "MODAL_FUNCTION_RUNTIME"),
     )
     sandbox_provider: Literal["modal", "lambda"] = Field(default="modal", validation_alias="SANDBOX_PROVIDER")
+    # Admits sessions with a network allowlist on Modal computers (modal_network).
+    # Deployment-wide: use the same value in every API, worker, broker and coordinator.
+    network_policy_enforcement: Literal["off", "modal"] = Field(
+        default="off", validation_alias="MOYAI_NETWORK_POLICY_ENFORCEMENT",
+    )
     lambda_region: str = Field(default="us-east-1", validation_alias="LAMBDA_REGION")
     lambda_profile: str = Field(default="", validation_alias="LAMBDA_PROFILE")
     lambda_image: str = Field(default="", validation_alias="LAMBDA_IMAGE")

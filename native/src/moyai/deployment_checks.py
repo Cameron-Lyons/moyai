@@ -56,6 +56,7 @@ def settings(values: Mapping[str, str]) -> Settings:
         artifact_session_token=SecretStr(values.get("OBJECT_STORAGE_SESSION_TOKEN", "")),
         sandbox_provider=values.get("SANDBOX_PROVIDER", "modal"),
         modal_runtime=values.get("MOYAI_MODAL_RUNTIME", "vm"),
+        network_policy_enforcement=values.get("MOYAI_NETWORK_POLICY_ENFORCEMENT", "off"),
         lambda_region=values.get("LAMBDA_REGION", "us-east-1"),
         lambda_profile=values.get("LAMBDA_PROFILE", ""),
         lambda_image=values.get("LAMBDA_IMAGE", ""),

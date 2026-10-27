@@ -136,14 +136,75 @@ async def test_default_binding_requires_no_management_but_explicit_selection_doe
     assert trusted.id != implicit.id
 
 
-async def test_network_policy_refused_atomically_before_native_session_exists(governed):
+@pytest.mark.parametrize(('enforcement', 'provider', 'refusal'), [
+    ('off', 'modal', 'This deployment cannot enforce'),
+    ('modal', 'modal', None),
+    ('modal', 'lambda', 'Lambda computers cannot enforce'),
+])
+async def test_network_policy_refused_atomically_before_native_session_exists(governed, monkeypatch, enforcement,
+                                                                            provider, refusal):
+    settings = governed.database.settings
+    monkeypatch.setattr(settings, 'network_policy_enforcement', enforcement)
+    monkeypatch.setattr(settings, 'sandbox_provider', provider)
     selected = await profile(governed, {'network_domains': ['example.test']})
     await defaults(governed, selected)
-    with pytest.raises(HTTPException, match='cannot enforce'):
+    if refusal is None:
+        session = await governed.database.create_session(governed.actor, NewSession())
+        plan = await governed.database.governance.network_plan(session.id)
+        assert (plan.domains, plan.session_id) == (('example.test',), session.id)
+        return
+    with pytest.raises(HTTPException, match=refusal) as denied:
         await governed.database.create_session(governed.actor, NewSession())
+    assert denied.value.status_code == 409
     async with governed.database.sessions() as db:
         assert not list(await db.scalars(select(Session.id)))
         assert not list(await db.scalars(select(ProductSessionPolicy.session_id)))
+
+
+async def test_restricted_sessions_run_on_modal_and_stop_on_an_existing_lambda_computer(governed, monkeypatch):
+    """A session's computer keeps its provider, so switching the default to Modal cannot admit a Lambda computer."""
+    product, governance = governed, governed.database.governance
+    monkeypatch.setattr(product.database.settings, 'network_policy_enforcement', 'modal')
+    await defaults(product, await profile(product, {'network_domains': ['pypi.org']}))
+    _, _, prepared = await authority.active_turn(product)
+    scope = prepared.scope
+    await governance.check_tool(scope, 'read_file', read_only=True)
+    await governance.check_model(scope, model=scope.model)
+    await product.database.authorize_scope(scope)
+    for provider, admitted in (('modal', True), ('lambda', False)):
+        async with product.database.sessions.begin() as db:
+            (await db.get(Session, scope.session_id)).workspace = json.dumps({'provider': provider, 'id': 'computer'})
+        for check in (lambda: governance.check_tool(scope, 'read_file', read_only=True),
+                      lambda: governance.check_model(scope, model=scope.model),
+                      lambda: product.database.authorize_scope(scope)):
+            if admitted:
+                await check()
+            else:
+                with pytest.raises(HTTPException, match='Lambda computers cannot enforce'):
+                    await check()
+
+
+async def test_mandatory_narrowing_changes_the_plan_and_refuses_the_running_computer(governed, monkeypatch):
+    from unittest.mock import AsyncMock
+
+    from moyai.modal_network import NETWORK_TAG, NetworkPolicyMismatch, modal_kwargs, require_compatible
+    product, governance = governed, governed.database.governance
+    monkeypatch.setattr(product.database.settings, 'network_policy_enforcement', 'modal')
+    await defaults(product, await profile(product, {'network_domains': ['pypi.org', '*.example.test']}))
+    _, _, prepared = await authority.active_turn(product)
+    created = await governance.network_plan(prepared.scope.session_id)
+    computer = SimpleNamespace(object_id='sb-' + uuid4().hex, get_tags=SimpleNamespace(
+        aio=AsyncMock(return_value=modal_kwargs(created)['tags'])))
+    await require_compatible(created, computer)
+    await defaults(product, mandatory=await profile(product, {'network_domains': ['pypi.org']}))
+    narrowed = await governance.network_plan(prepared.scope.session_id)
+    assert narrowed.domains == ('pypi.org',) and narrowed.tag != created.tag
+    with pytest.raises(NetworkPolicyMismatch):
+        await require_compatible(narrowed, computer)
+    # Loosening needs no action: the computer is within an unrestricted plan.
+    await defaults(product, mandatory='')
+    await defaults(product)
+    assert computer.get_tags.aio.await_count == 1 and NETWORK_TAG in computer.get_tags.aio.return_value
 
 
 async def test_tools_filtered_and_rechecked_for_policy_and_live_role(governed):
@@ -233,6 +294,23 @@ async def test_workflow_selection_and_session_ceiling_are_checked(governed):
     with pytest.raises(HTTPException):
         async with product.database.sessions.begin() as db:
             await governance.workflow(db, principal, definition, model='test')
+
+
+@pytest.mark.parametrize(('provider', 'admitted'), [('modal', True), ('lambda', False)])
+async def test_workflow_network_policies_follow_the_default_provider(governed, monkeypatch, provider, admitted):
+    from moyai.product_automations import AutomationDefinition
+    product, governance = governed, governed.database.governance
+    monkeypatch.setattr(product.database.settings, 'network_policy_enforcement', 'modal')
+    monkeypatch.setattr(product.database.settings, 'sandbox_provider', provider)
+    offline = await profile(product, {'network_domains': []})
+    definition = AutomationDefinition(name='Offline', prompt='Work', security_profile_id=offline)
+    async with product.database.sessions.begin() as db:
+        principal = await governance.principal(db, product.principal.grant)
+        if admitted:
+            await governance.workflow(db, principal, definition, model='test')
+        else:
+            with pytest.raises(HTTPException, match='Lambda computers cannot enforce'):
+                await governance.workflow(db, principal, definition, model='test')
 
 
 @pytest.mark.parametrize('kind', ['organization', 'user-default', 'session-default', 'user'])
@@ -619,10 +697,12 @@ async def test_scheduled_chat_destination_cannot_widen_the_workflow_policy(gover
         await governance.continuation(db, bound.id)
 
 
-async def test_delegated_child_binds_the_parent_snapshot_not_a_newer_default(governed):
+async def test_delegated_child_binds_the_parent_snapshot_not_a_newer_default(governed, monkeypatch):
     from moyai.delegation import DelegationService
     product = governed
-    selected = await profile(product, {'tools': ['read_file', 'shell'], 'git_access': 'read'})
+    monkeypatch.setattr(product.database.settings, 'network_policy_enforcement', 'modal')
+    selected = await profile(product, {'tools': ['read_file', 'shell'], 'git_access': 'read',
+                                       'network_domains': ['pypi.org', '*.example.test']})
     await defaults(product, selected)
     _, _, prepared = await authority.active_turn(product)
     await defaults(product)  # A newer unrestricted default must not reach the child.
@@ -632,6 +712,11 @@ async def test_delegated_child_binds_the_parent_snapshot_not_a_newer_default(gov
         assert (bound.profile_id, bound.inherited_from) == (selected, prepared.scope.session_id)
         policy = await product.database.governance.policy(db, child['session_id'])
         assert policy.tools == ('read_file', 'shell') and policy.git_access == 'read'
+    # The child's computer follows the parent snapshot, narrowed by the live mandatory policy.
+    plan = await product.database.governance.network_plan(child['session_id'])
+    assert plan.domains == ('*.example.test', 'pypi.org') and plan.session_id == child['session_id']
+    await defaults(product, mandatory=await profile(product, {'network_domains': ['api.example.test']}))
+    assert (await product.database.governance.network_plan(child['session_id'])).domains == ('api.example.test',)
 
 
 async def test_audit_feed_and_export_apply_the_requested_window(governed):
@@ -937,6 +1022,8 @@ async def test_effective_policy_is_read_once_per_transaction(governed, monkeypat
     async with product.database.sessions.begin() as db:
         await governance.principal(db, product.principal)
         assert (await governance.policy(db, session.id)).tools == ('read_file',) and len(reads) == 2
+        # A computer's network plan in the same transaction reuses the memo.
+        assert (await governance.network_plan(session.id, db=db)).domains is None and len(reads) == 2
 
 
 async def test_audit_routes_reject_bad_filters_with_the_tested_sentence(governed):

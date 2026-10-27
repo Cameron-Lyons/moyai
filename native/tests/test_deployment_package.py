@@ -94,6 +94,31 @@ def test_installer_preserves_modal_runtime_for_every_role(install_environment, r
         assert validate(configured).modal_runtime == expected
 
 
+@pytest.mark.parametrize("enforcement", [None, "off", "modal"])
+def test_installer_carries_network_enforcement_to_every_role(install_environment, enforcement):
+    from moyai.deployment_checks import validate
+    from moyai.install_config import prepare
+
+    if enforcement is not None:
+        install_environment["MOYAI_NETWORK_POLICY_ENFORCEMENT"] = enforcement
+    expected = enforcement or "off"
+    values, _ = prepare(
+        install_environment, image="moyai:test", topology="split", temporal="external",
+        secrets_from_env=False,
+    )
+    assert values["MOYAI_NETWORK_POLICY_ENFORCEMENT"] == expected
+    for role in ("api", "coordinator", "broker", "worker"):
+        configured = configuration({**install_environment, **values}, None, role=role)
+        configured = configuration(configured, new_state(install_environment, configured), role=role)
+        assert validate(configured).network_policy_enforcement == expected
+
+
+@pytest.mark.parametrize("value", ["", "on", "Modal", "lambda"])
+def test_invalid_network_enforcement_is_rejected(install_environment, value):
+    with pytest.raises(InstallationError, match="MOYAI_NETWORK_POLICY_ENFORCEMENT must be off or modal"):
+        configuration({**install_environment, "MOYAI_NETWORK_POLICY_ENFORCEMENT": value}, None)
+
+
 def test_existing_deployment_without_runtime_uses_vm(install_environment):
     from moyai.deployment_checks import validate
 

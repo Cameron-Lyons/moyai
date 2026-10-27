@@ -71,6 +71,33 @@ Keep transport errors and unsupported configurations visible. Do not
 automatically retry a failed VM allocation using gVisor: that would conceal the
 compatibility requirement.
 
+## Outbound network allowlists
+
+Security policies with network restrictions are enforced per computer, not
+through a deployment-wide SDK setting like the runtime: Moyai passes each
+session's allowlist to `Sandbox.create` with that computer, because Modal fixes a
+computer's network policy type when it is created. Modal documents that its
+network access controls apply to both runtimes. Before setting
+`MOYAI_NETWORK_POLICY_ENFORCEMENT=modal` (see
+[enterprise governance](enterprise-governance.md#network-allowlists)), run the
+manual egress probe against the deployment's Modal workspace under each runtime
+you use:
+
+```sh
+cd native
+uv run --frozen python tests/modal_egress_probe.py --runtime vm
+uv run --frozen python tests/modal_egress_probe.py --runtime gvisor
+```
+
+The probe creates short-lived sandboxes through Moyai's own create path in a
+dedicated `moyai-egress-probe` app and terminates them. It checks that a listed
+host is reachable over HTTPS and unlisted hosts, plain HTTP and IPv6 to unlisted
+hosts are not; that `*.` entries reach the apex and subdomains; that an empty
+allowlist blocks every host; that a connect token, which the desktop stream uses,
+still reaches a guest port; that 200 entries are accepted; and that the creation
+tag reads back. It records whether DNS resolves. It exits non-zero on any
+difference. Keep enforcement off if it fails. It is not part of CI.
+
 ## Persistence is separate
 
 This setting does not extend sandbox lifetimes or fix saving after human

@@ -14,10 +14,10 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, field_validator
 from pydantic_ai.workspaces import Workspace, WorkspaceRef, WorkspaceUnavailableError
-from pydantic_ai_harness import ModalSandbox
 from sqlalchemy import delete, select, update
 
 from .contracts import RunScope
+from .modal_network import GovernedModalSandboxBackend, NetworkGovernor, NetworkPolicyRefused
 from .models import ComputerDesktop, ComputerLease, ComputerOperation, Session, Turn, User, new_id
 
 if TYPE_CHECKING:
@@ -249,15 +249,19 @@ async def request(runtime: Runtime, session: Session, body: dict) -> dict:
     if not session.workspace:
         raise HTTPException(409, "Send Moyai a task to start this conversation's computer.")
     reference = TypeAdapter(WorkspaceRef).validate_json(session.workspace)
+    # Each backend checks the session's network plan before the guest runs.
+    governor = NetworkGovernor.of(runtime.database, session.id)
     if reference.provider == "lambda":
         from .lambda_workspace import LambdaBackend
-        workspace = Workspace(LambdaBackend(runtime.settings, ref=reference))
+        workspace = Workspace(LambdaBackend(runtime.settings, ref=reference, governor=governor))
     elif reference.provider == "modal":
-        workspace = Workspace(ModalSandbox(working_dir="/workspace").backend(reference))
+        workspace = Workspace(GovernedModalSandboxBackend(ref=reference, working_dir="/workspace", governor=governor))
     else:
         raise HTTPException(409, "Desktop access requires a supported cloud computer.")
     try:
         return await guest_request(workspace, body)
+    except NetworkPolicyRefused as error:
+        raise HTTPException(409, str(error)) from error
     except WorkspaceUnavailableError as error:
         raise HTTPException(410, "This computer has expired. Your saved files are still available.") from error
 

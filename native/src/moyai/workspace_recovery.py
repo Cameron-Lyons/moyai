@@ -16,6 +16,7 @@ from pydantic import BaseModel, ConfigDict, TypeAdapter, ValidationError
 from sqlalchemy import select, update
 
 from .contracts import PreparedTurn, RunScope
+from .modal_network import create_sandbox, network_plan, require_unrestricted, reusable
 from .models import ComputerLease, ComputerOperation, Effect, Session, Turn, User
 from .performance import ComputerTiming, computer_timing
 from .product_continuation_errors import preparation_blocked
@@ -130,6 +131,16 @@ async def product_bindings(db: AsyncSession, scope: RunScope, reference: dict) -
     )
 
 
+async def reused_sandbox(runtime: Runtime, scope: RunScope, reference: dict) -> None:
+    """Refuse a live computer created under another network policy before the turn's model runs.
+
+    The harness attach refuses it as well; this reports the reason as a preparation notice.
+    """
+    plan = await network_plan(runtime.database, scope.session_id)
+    if plan.domains is not None:
+        await reusable(plan, await modal.Sandbox.from_id.aio(reference["id"]))
+
+
 async def live_sandbox(reference: dict) -> bool:
     """Only an authoritative missing/terminated result permits restoration."""
     try:
@@ -180,20 +191,23 @@ async def restored_sandbox(runtime: Runtime, scope: RunScope, saved: WorkspaceCh
     name = "restore-" + hashlib.sha256(
         f"{scope.session_id}:{scope.turn_id}:{saved.image_id}:{saved.workspace['id']}".encode()
     ).hexdigest()[:48]
+    # The current plan, not the old computer's: a restore follows a narrowed policy.
+    plan = await network_plan(runtime.database, scope.session_id)
     try:
         existing = await modal.Sandbox.from_name.aio(runtime.settings.modal_app, name)
         if await existing.poll.aio() is None:
-            return existing
+            return await reusable(plan, existing)
     except modal.exception.NotFoundError:
         pass
     app = await modal.App.lookup.aio(runtime.settings.modal_app, create_if_missing=True)
     try:
-        return await modal.Sandbox.create.aio(
+        return await create_sandbox(
             app=app, name=name, image=modal.Image.from_id(saved.image_id), workdir="/workspace",
             timeout=runtime.settings.computer_lifetime, idle_timeout=runtime.settings.computer_idle_timeout,
+            plan=plan,
         )
     except modal.exception.AlreadyExistsError:
-        return await modal.Sandbox.from_name.aio(runtime.settings.modal_app, name)
+        return await reusable(plan, await modal.Sandbox.from_name.aio(runtime.settings.modal_app, name))
     except modal.exception.NotFoundError as error:
         raise preparation_blocked("workspace_checkpoint_missing") from error
 
@@ -275,6 +289,8 @@ async def _prepare_workspace(
                 alive = False
         else:
             alive = await live_sandbox(reference)
+            if alive:
+                await reused_sandbox(runtime, scope, reference)
     saved, expected = None, None
     if not alive:
         timing.mode = "restore"
@@ -288,6 +304,7 @@ async def _prepare_workspace(
             expected = session.snapshot
         if reference["provider"] == "lambda":
             from .lambda_control import LambdaControl
+            require_unrestricted(await network_plan(database, scope.session_id))
             name = "native-restore:" + hashlib.sha256(
                 f"{scope.workspace_key}:{scope.turn_id}:{saved.image_id}:{reference['id']}".encode()
             ).hexdigest()

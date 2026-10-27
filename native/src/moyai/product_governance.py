@@ -1,6 +1,7 @@
 """Live canonical governance on the native admission and execution transactions."""
 from __future__ import annotations
 
+import json
 import re
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
@@ -109,7 +110,7 @@ class ProductGovernance:
             policy = intersect(policy, await self.policy(db, inherited_from))
         if ceiling is not None:
             policy = intersect(policy, ceiling)
-        self.require_provider(policy)
+        self.require_provider(policy, self.database.settings.sandbox_provider)
         await db.flush()
         row = ProductSessionPolicy(session_id=session.id, profile_id=binding.profile_id,
                                    profile_revision=binding.revision, policy=dump_policy(policy),
@@ -146,17 +147,49 @@ class ProductGovernance:
             memo[session_id] = policy
         return policy
 
-    @staticmethod
-    def require_provider(policy):
-        # The installed Harness Modal adapter and Lambda provider do not expose
-        # a machine-level egress policy. Refuse restricted work before launch.
+    def require_provider(self, policy, provider):
+        """Refuse a network restriction where the session's computer cannot enforce it.
+
+        Modal enforces it at computer creation (modal_network) once an operator
+        sets MOYAI_NETWORK_POLICY_ENFORCEMENT=modal. The setting only decides
+        admission: a computer is always created under its session's plan.
+        """
+        if policy.network_domains is None:
+            return
+        if provider == 'lambda':
+            raise HTTPException(409, 'Lambda computers cannot enforce a network allowlist. Select a policy without network restrictions or use a Modal computer.')
+        if provider != 'modal':
+            raise HTTPException(409, 'This computer provider cannot enforce a network allowlist. Select a policy without network restrictions.')
+        if self.database.settings.network_policy_enforcement != 'modal':
+            raise HTTPException(409, 'This deployment cannot enforce network allowlists yet. Select a policy without network restrictions, or ask an operator to turn on Modal network enforcement.')
+
+    def provider_of(self, workspace):
+        """The provider of a session's stored computer, or the deployment default before it has one."""
+        reference = json.loads(workspace) if workspace else None
+        return reference.get('provider') if reference else self.database.settings.sandbox_provider
+
+    async def computer_provider(self, db, session_id):
+        from .models import Session
+        session = await db.get(Session, session_id)
+        return self.provider_of(session.workspace if session else None)
+
+    async def require_session_provider(self, db, policy, session_id):
+        """require_provider for the session's computer; its provider is read only under a restriction."""
         if policy.network_domains is not None:
-            raise HTTPException(409, 'This native computer provider cannot enforce a network allowlist. Select a policy without network restrictions or use an enforcing provider.')
+            self.require_provider(policy, await self.computer_provider(db, session_id))
+
+    async def network_plan(self, session_id, *, db=None):
+        """The plan the session's Modal computers are created and checked under (see modal_network)."""
+        from .modal_network import NetworkPlan
+        async with self._snapshot(db) as transaction:
+            policy = await self.policy(transaction, session_id)
+        return NetworkPlan.of(policy.network_domains, session_id)
 
     async def admission(self, db, session, principal, grants=()):
         principal.require('sessions.create')
         policy = await self.policy(db, session.id)
-        self.require_provider(policy)
+        # An existing computer keeps its provider when the deployment default changes.
+        self.require_provider(policy, self.provider_of(session.workspace))
         if not all(self.admits(policy, grant.kind) for grant in grants):
             raise HTTPException(403, 'A selected connection is disabled by the session security policy.')
         # authorize_scope runs this on every tool and activity authorization, so
@@ -269,7 +302,7 @@ class ProductGovernance:
         async with self._snapshot(db) as transaction:
             principal = await self.principal(transaction, scope.product_grant)
             policy = await self.policy(transaction, scope.session_id)
-            self.require_provider(policy)
+            await self.require_session_provider(transaction, policy, scope.session_id)
             if denial := self._tool_denial(principal, policy, name, read_only):
                 raise HTTPException(403, denial)
             return principal
@@ -306,7 +339,7 @@ class ProductGovernance:
         async with self._snapshot(db) as transaction:
             principal = await self.principal(transaction, scope.product_grant)
             policy = await self.policy(transaction, scope.session_id)
-            self.require_provider(policy)
+            await self.require_session_provider(transaction, policy, scope.session_id)
             # Before the spend lookup, which returns early when nothing is limited.
             self.require_model(policy, model)
             limits = await transaction.run_sync(lambda sync: SpendLimits.resolve_in(
@@ -353,7 +386,7 @@ class ProductGovernance:
         if selected != previous:
             principal.require('security.manage')
         policy = await self.profile_policy(db, selected)
-        self.require_provider(policy)
+        self.require_provider(policy, self.database.settings.sandbox_provider)
         if not all(self.admits(policy, kind) for kind in definition.plugins) or (
                 'github' in definition.plugins and policy.repositories == ()):
             raise HTTPException(403, 'The workflow connections exceed its security policy.')

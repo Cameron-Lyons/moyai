@@ -25,6 +25,7 @@ from temporalio.service import RPCError, RPCStatusCode
 
 from .coding_image import with_node
 from .contracts import PreparedTurn, RunScope
+from .modal_network import create_sandbox, network_plan, require_unrestricted, reusable
 from .models import Session, Turn
 from .postgres import create_engine
 from .product_continuation_errors import preparation_blocked
@@ -180,11 +181,15 @@ class ModalRecoveryTransport:
 
     async def native(self, scope: RunScope, context: dict[str, Any], reference: dict | None) -> Any:
         provider = reference.get("provider") if reference else self.runtime.settings.sandbox_provider
+        # Before any create or attach. Restoration and repository preparation
+        # run in the computer, so a reused one is checked before they do.
+        plan = await network_plan(self.runtime.database, scope.session_id)
         if provider == "lambda":
             from .lambda_control import LambdaControl
             from .lambda_workspace import LambdaProductComputer
             if context.get("environment_snapshot_id"):
                 raise ValueError("This prepared environment is a Modal image; select Modal or a plain repository.")
+            require_unrestricted(plan)
             control = LambdaControl(self.runtime.settings)
             vm = (
                 await control.get(reference["id"]) if reference else
@@ -200,22 +205,22 @@ class ModalRecoveryTransport:
             sandbox = await modal.Sandbox.from_id.aio(reference["id"])
             if await sandbox.poll.aio() is not None:
                 raise ValueError("The native computer stopped; restore its latest native snapshot before resuming.")
-            return sandbox
+            return await reusable(plan, sandbox)
         name = "product-" + scope.session_id + "-" + scope.workspace_key[:12]
         try:
-            return await modal.Sandbox.from_name.aio(self.runtime.settings.modal_app, name)
+            return await reusable(plan, await modal.Sandbox.from_name.aio(self.runtime.settings.modal_app, name))
         except modal.exception.NotFoundError:
             pass
         image = context.get("environment_snapshot_id")
         app = await modal.App.lookup.aio(self.runtime.settings.modal_app, create_if_missing=True)
         try:
-            return await modal.Sandbox.create.aio(
+            return await create_sandbox(
                 app=app, name=name, image=runtime_image(modal.Image.from_id(image) if image else None),
                 workdir="/workspace", timeout=self.runtime.settings.computer_lifetime,
-                idle_timeout=self.runtime.settings.computer_idle_timeout,
+                idle_timeout=self.runtime.settings.computer_idle_timeout, plan=plan,
             )
         except modal.exception.AlreadyExistsError:
-            return await modal.Sandbox.from_name.aio(self.runtime.settings.modal_app, name)
+            return await reusable(plan, await modal.Sandbox.from_name.aio(self.runtime.settings.modal_app, name))
 
     async def restore(self, sandbox: Any, package: Path, destination: str, digest: str) -> dict[str, Any]:
         remote = "/tmp/moyai-recovery-" + digest + ".zip"

@@ -31,7 +31,6 @@ from pydantic_ai_harness import (
     AskUser,
     ConversationSearch,
     Memory,
-    ModalSandbox,
     Planning,
     Skills,
     StepPersistence,
@@ -411,11 +410,12 @@ def make_agent(
     models = models or inference_models(settings)
     if workspace is None:
         from .lambda_workspace import WorkspaceProviders
+        from .modal_network import GovernedModalSandbox
         workspace = WorkspaceProviders(
-            settings, ModalSandbox(
-                image=workspace_image(), app_name=settings.modal_app, working_dir="/workspace",
+            settings, GovernedModalSandbox(
+                database=database, image=workspace_image(), app_name=settings.modal_app, working_dir="/workspace",
                 sandbox_timeout=settings.computer_lifetime, idle_timeout=settings.computer_idle_timeout,
-            ),
+            ), database=database,
         )
     durability: TemporalDurability[RunScope] = OnDemandDurability(
         models=models,

@@ -22,6 +22,7 @@ def isolated_environment(monkeypatch):
     monkeypatch.setattr(os, "environ", os.environ.copy())
     monkeypatch.delenv("MOYAI_MODAL_RUNTIME", raising=False)
     monkeypatch.delenv("MODAL_FUNCTION_RUNTIME", raising=False)
+    monkeypatch.delenv("MOYAI_NETWORK_POLICY_ENFORCEMENT", raising=False)
 
 
 @pytest.mark.parametrize("name", ["MOYAI_MODAL_RUNTIME", "MODAL_FUNCTION_RUNTIME"])
@@ -59,6 +60,17 @@ def test_invalid_runtime_fails_before_allocation(monkeypatch, value):
     monkeypatch.setenv("MOYAI_MODAL_RUNTIME", value)
     with pytest.raises(ValidationError):
         Settings(_env_file=None)
+
+
+def test_network_enforcement_defaults_off_and_accepts_only_modal(monkeypatch):
+    # Per-session network policy is passed to each create, never exported process-wide.
+    assert Settings(_env_file=None).network_policy_enforcement == "off"
+    monkeypatch.setenv("MOYAI_NETWORK_POLICY_ENFORCEMENT", "modal")
+    assert Settings(_env_file=None).network_policy_enforcement == "modal"
+    for value in ("", "on", "lambda", "MODAL"):
+        monkeypatch.setenv("MOYAI_NETWORK_POLICY_ENFORCEMENT", value)
+        with pytest.raises(ValidationError):
+            Settings(_env_file=None)
 
 
 def test_conflicting_environment_does_not_silently_override_sdk(monkeypatch):

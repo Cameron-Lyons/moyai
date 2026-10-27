@@ -15,7 +15,8 @@ from pydantic_ai.workspaces import (
 
 from moyai.activities import save_computer
 from moyai.contracts import NewMessage
-from moyai.lambda_workspace import LambdaBackend, LambdaProductComputer
+from moyai.lambda_workspace import LambdaBackend, LambdaProductComputer, WorkspaceProviders
+from moyai.modal_network import NetworkPlan, NetworkPolicyRefused
 from moyai.models import Session
 from moyai.settings import Settings
 from moyai.workspace_recovery import checkpoint, prepare_workspace
@@ -92,6 +93,35 @@ async def test_missing_attached_vm_never_creates_another():
     value.control.create.assert_not_awaited()
 
 
+@pytest.mark.parametrize("ref", [None, WorkspaceRef(**REFERENCE)])
+async def test_restricted_sessions_never_create_or_attach_a_lambda_vm(ref):
+    """Lambda has no per-session egress policy; LAMBDA_EGRESS_CONNECTOR is deployment-wide."""
+    value = LambdaBackend(Settings(_env_file=None), ref=ref,
+                          governor=SimpleNamespace(plan=AsyncMock(return_value=NetworkPlan.of([]))))
+    value.control.get, value.control.create = AsyncMock(), AsyncMock()
+    with pytest.raises(WorkspaceUnavailableError, match="Lambda computers cannot enforce"):
+        await value.run(["true"])
+    value.control.get.assert_not_awaited()
+    value.control.create.assert_not_awaited()
+
+
+async def test_unrestricted_governed_sessions_keep_lambda_acquisition():
+    ctx = SimpleNamespace(deps=SimpleNamespace(session_id="session", workspace_key="key"), run_id="run")
+    providers = WorkspaceProviders(Settings(_env_file=None, sandbox_provider="lambda"), SimpleNamespace(),
+                                   database=SimpleNamespace(governance=object()))
+    value = providers.get_workspace(ctx, ref=None)
+    assert value.governor.session_id == "session" and value.name == "native:key:run"
+    value.governor = SimpleNamespace(plan=AsyncMock(return_value=NetworkPlan.of(None)))
+    vm = SimpleNamespace(id=REFERENCE["id"])
+    async def create(name, *, created):
+        created(vm)
+        return vm
+    value.control.create = AsyncMock(side_effect=create)
+    assert await value.working_dir() == "/workspace"
+    value.governor.plan.assert_awaited_once()
+    assert value.ref == WorkspaceRef(**REFERENCE)
+
+
 @pytest.mark.parametrize("timed_out", [False, True])
 async def test_command_exit_and_partial_output(timed_out):
     value = backend()
@@ -133,6 +163,14 @@ async def test_lambda_checkpoint_settlement_and_cold_followup_use_native_authori
         get=AsyncMock(return_value=SimpleNamespace(alive=AsyncMock(return_value=False))), create=create,
     )
     monkeypatch.setattr("moyai.lambda_control.LambdaControl", lambda settings: control)
+    # A restricted session is refused before a Lambda VM is restored for it.
+    restricted = SimpleNamespace(principal=AsyncMock(), admission=AsyncMock(),
+                                 network_plan=AsyncMock(return_value=NetworkPlan.of(["example.com"])))
+    monkeypatch.setattr(runtime.database, "governance", restricted)
+    with pytest.raises(NetworkPolicyRefused, match="Lambda computers cannot enforce"):
+        await prepare_workspace(runtime, prepared)
+    create.assert_not_awaited()
+    monkeypatch.setattr(runtime.database, "governance", None)
     result = await prepare_workspace(runtime, prepared)
     assert result.workspace["provider"] == "lambda"
     assert result.workspace["id"].endswith("microvm-restored")

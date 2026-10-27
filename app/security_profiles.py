@@ -14,10 +14,12 @@ or model limits keeps the four-key document earlier releases wrote and read,
 byte for byte, and any such limit writes all six keys. Earlier releases therefore
 refuse (fail closed on) exactly the documents that use the new limits.
 
-network_domains is validated, stored and intersected, but no installed provider
-enforces egress, so ProductGovernance.require_provider refuses every non-null
-value at admission. Domains are exact hostnames or '*.' plus a hostname, with
-Modal's TLS SNI semantics on port 443: '*.example.com' covers example.com and
+network_domains is enforced on Modal computers at creation (moyai.modal_network)
+when MOYAI_NETWORK_POLICY_ENFORCEMENT=modal; otherwise, and on Lambda,
+ProductGovernance.require_provider refuses any non-null value. Modal matches TLS
+SNI on port 443 only: other ports and plain HTTP are blocked, DNS lookups are not
+restricted, and a shared CDN domain admits the other sites it serves. Domains are
+exact hostnames or '*.' plus a hostname: '*.example.com' covers example.com and
 every subdomain depth, and an exact entry covers only itself. Intersection and
 redundancy removal follow those semantics exactly. Hostnames are lowercase
 A-labels. Unicode input is converted with UTS #46 non-transitional (IDNA2008)

@@ -162,6 +162,10 @@ def configuration(environment: Mapping[str, str], state: dict | None, *, role: s
     if values.get("MODAL_FUNCTION_RUNTIME", modal_runtime) != modal_runtime:
         raise InstallationError("MOYAI_MODAL_RUNTIME and MODAL_FUNCTION_RUNTIME must agree.")
     values["MOYAI_MODAL_RUNTIME"] = modal_runtime
+    enforcement = values.get("MOYAI_NETWORK_POLICY_ENFORCEMENT", "off")
+    if enforcement not in {"off", "modal"}:
+        raise InstallationError("MOYAI_NETWORK_POLICY_ENFORCEMENT must be off or modal.")
+    values["MOYAI_NETWORK_POLICY_ENFORCEMENT"] = enforcement
     public_url = _public_origin(_required(values, "MOYAI_PUBLIC_URL"))
     temporal_mode = values.get("MOYAI_TEMPORAL_MODE", "external")
     if temporal_mode not in {"external", "bundled"}:

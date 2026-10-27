@@ -75,6 +75,7 @@ Each installation needs its own ID and Compose project.
 | `MODAL_TOKEN_ID`, `MODAL_TOKEN_SECRET` | A token pair for your Modal workspace. |
 | `MODAL_APP_NAME` | A dedicated Modal application name for this installation. |
 | `MOYAI_MODAL_RUNTIME` | `vm` (default) for a full Linux kernel, or explicit `gvisor`. Use the same value in every service; see [runtime selection](../../docs/modal-runtime.md). |
+| `MOYAI_NETWORK_POLICY_ENFORCEMENT` | `off` (default) refuses security policies with network restrictions; `modal` enforces them on Modal computers. Run the egress probe first; see [network allowlists](../../docs/enterprise-governance.md#network-allowlists). |
 | `WORKSPACE_PASSWORD` | An initial administrator password of at least 16 characters, or leave empty to generate one. |
 
 The app's `.env` uses Compose's raw env-file format. Enter values without adding

@@ -163,11 +163,62 @@ release and repository/environment preparation also recheck access. Git policy
 controls Moyai-managed GitHub operations; it does not inspect arbitrary shell text
 or files already present on a session computer.
 
-**Current Modal and Lambda computer adapters cannot enforce outbound network
-allowlists.** Native admission, tool checks, and model admission therefore refuse
-any policy with a non-null `network_domains` value, including an empty list. A
-default or mandatory profile with network restrictions stops new and running
-native sessions. This release does not claim machine-level egress support.
+### Network allowlists
+
+**Network allowlists are enforced only on Modal computers, and only after an
+operator sets `MOYAI_NETWORK_POLICY_ENFORCEMENT=modal`** (the default is `off`).
+Otherwise native admission, tool checks, model admission and workflow
+configuration refuse any policy with a non-null `network_domains` value,
+including an empty list, and a default or mandatory profile with network
+restrictions stops new and running native sessions. Lambda computers always
+refuse restricted policies: `LAMBDA_EGRESS_CONNECTOR` is deployment-wide. A
+session's provider is that of its existing computer, otherwise
+`SANDBOX_PROVIDER`, so changing the default never admits a restricted session on
+an existing Lambda computer.
+
+With enforcement on, the session's effective domains (its binding intersected
+with the live mandatory policy) are passed to Modal when its computer is created:
+on the agent's first workspace use, in continuation preparation, and when a
+checkpoint is restored. An empty list creates an allowlist with no entries, not
+Modal's `block_network`. An unrestricted session's computer is created exactly as
+before. A restricted computer records a digest of its creation-time allowlist in
+an immutable Modal sandbox tag. Every agent workspace or tool activity, human
+desktop or browser action, desktop stream, and preparation that reuses a computer
+compares that tag with the session's current effective policy, and refuses a
+computer created under a wider policy before anything runs in it. The tag holds
+only a digest, so a computer created under any other restricted list, even a
+narrower one, is refused as well. Computers created before this release have no
+tag and count as unrestricted.
+
+A narrowed mandatory policy therefore stops further work in running computers;
+processes already running in one keep its creation-time policy until it stops.
+Preparation reports the refusal; an agent step that meets such a computer ends
+the turn as an unavailable computer. Start a new chat, or continue after the
+computer stops: the next turn restores the saved files into a computer created
+under the current policy. Removing a session's network restriction needs no
+action; any other change to its allowlist needs a new computer. The setting
+decides admission only; workers always create computers under the session's
+policy.
+
+Modal matches outbound TLS on port 443 by SNI hostname; `*.example.com` covers the
+apex and every subdomain. Plain HTTP (including Debian `apt` mirrors), SSH,
+`git://` and other ports and protocols are blocked. **DNS lookups are not
+restricted**, so DNS tunnelling remains possible, and allowing a shared CDN domain
+such as `*.cloudfront.net` allows the other sites it serves (domain fronting).
+Restricted sessions must list package registries such as `pypi.org`,
+`files.pythonhosted.org` and `registry.npmjs.org` themselves. The policy covers
+the session computer only: Moyai's own model gateway, managed connector, Git fetch
+and object storage traffic, and image builds, are governed by connected apps, Git
+access and operator configuration instead. CIDR entries, narrowing running
+computers live, mid-session destination approvals and audit events for network
+refusals are not implemented.
+
+Keep the setting `off` until every API, worker, broker and coordinator runs this
+release, use the same value in every service, and first run the
+[operator egress probe](modal-runtime.md#outbound-network-allowlists) against your
+Modal workspace under the deployed runtime. Modal documents the domain allowlist
+as beta. An older worker creates untagged computers, which restricted sessions
+refuse, so a mixed rollout fails closed.
 
 ## Spend limits
 

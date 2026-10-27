@@ -34,6 +34,11 @@ MESSAGES = {
         "This stopped task retains a maintenance capture record, but it has not been published "
         "as a verified filesystem checkpoint. Reviewed recovery is required; no capture or old action was repeated."
     ),
+    "workspace_network_policy_changed": (
+        "This computer was started under a different network policy than the session now has. "
+        "Start a new chat or let the computer stop; its files are kept in the last checkpoint. "
+        "Nothing from this turn ran in it."
+    ),
     "recovery_collection_incomplete": (
         "The earlier recovery collector could not read every visible file. "
         "The old computer has not been drained. Review its original recovery package "

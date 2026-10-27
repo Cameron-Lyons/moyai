@@ -356,7 +356,7 @@ async def test_websocket_requires_same_origin_cookie_and_view_access(runtime, ac
     connections = []
 
     @asynccontextmanager
-    async def connected(access):
+    async def connected(runtime, access):
         connections.append(access)
         remote = Remote()
         remote.received.put_nowait(b"RFB 003.008\n")

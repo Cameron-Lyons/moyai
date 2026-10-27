@@ -22,6 +22,7 @@ from temporalio.exceptions import ApplicationError
 from .answer_settlement import transient_checkpoint_error
 from .contracts import PreparedTurn
 from .history_handoff import AgentCheckpoint, CheckpointSave, save_history_checkpoint
+from .modal_network import network_plan, require_unrestricted
 from .models import Event, Session, Turn, now
 from .product_continuation_errors import preparation_blocked
 from .product_drain import DrainDecision
@@ -568,6 +569,7 @@ async def resume(
             except WorkspaceUnavailableError:
                 alive = False
             if not alive:
+                require_unrestricted(await network_plan(database, scope.session_id))
                 restored = await control.create("maintenance-restore:" + point.identity.split(":")[-1], checkpoint=point.image_id)
                 workspace = {"provider": "lambda", "id": restored.id}
         else:

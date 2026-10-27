@@ -26,19 +26,23 @@ from pydantic_ai.workspaces.protocol import validate_timeout
 
 from .contracts import RunScope
 from .lambda_control import LambdaControl, LambdaVM, ObservationError
+from .modal_network import NetworkGovernor, require_unrestricted
 from .settings import Settings
 
 logger = logging.getLogger(__name__)
 FILE_CHUNK_BYTES = 64 * 1024  # Base64 must remain below Linux's per-argument limit.
 
 class LambdaSandbox(AbstractCapability[RunScope]):
-    def __init__(self, settings: Settings):
-        self.settings = settings
+    def __init__(self, settings: Settings, database: Any = None):
+        self.settings, self.database = settings, database
 
     def get_workspace(self, ctx: RunContext[RunScope], *, ref: WorkspaceRef | None) -> WorkspaceBackend | None:
         if ref is not None and ref.provider != "lambda":
             return None
-        return LambdaBackend(self.settings, ref=ref, name=f"native:{ctx.deps.workspace_key}:{ctx.run_id}")
+        return LambdaBackend(
+            self.settings, ref=ref, name=f"native:{ctx.deps.workspace_key}:{ctx.run_id}",
+            governor=NetworkGovernor.of(self.database, ctx.deps.session_id),
+        )
 
     async def destroy(self, ref: WorkspaceRef) -> None:
         if ref.provider != "lambda":
@@ -51,9 +55,9 @@ class LambdaSandbox(AbstractCapability[RunScope]):
 
 class WorkspaceProviders(AbstractCapability[RunScope]):
     """The configured default applies only to new workspaces; refs keep their provider."""
-    def __init__(self, settings: Settings, modal: AbstractCapability[RunScope]):
+    def __init__(self, settings: Settings, modal: AbstractCapability[RunScope], *, database: Any = None):
         self.settings, self.modal = settings, modal
-        self.lambda_sandbox = LambdaSandbox(settings)
+        self.lambda_sandbox = LambdaSandbox(settings, database)
 
     def get_workspace(self, ctx: RunContext[RunScope], *, ref: WorkspaceRef | None) -> WorkspaceBackend | None:
         provider = ref.provider if ref else self.settings.sandbox_provider
@@ -113,13 +117,21 @@ class LambdaProductComputer:
 
 
 class LambdaBackend:
-    """Commands supply the SDK's built-in filesystem fallback on the same VM."""
-    def __init__(self, settings: Settings, *, ref: WorkspaceRef | None = None, name: str | None = None):
+    """Commands supply the SDK's built-in filesystem fallback on the same VM.
+
+    Lambda has no per-session egress policy, so a governed session under a
+    network allowlist is refused before any VM is created or attached.
+    """
+    def __init__(
+        self, settings: Settings, *, ref: WorkspaceRef | None = None, name: str | None = None,
+        governor: NetworkGovernor | None = None,
+    ):
         if ref is not None and ref.provider != "lambda":
             raise ValueError("Expected a Lambda workspace")
         self.control = LambdaControl(settings)
         self._ref = ref
         self.name = name or "native:" + uuid4().hex
+        self.governor = governor
         self.vm: LambdaVM | None = None
         self.lock = asyncio.Lock()
 
@@ -131,6 +143,8 @@ class LambdaBackend:
         async with self.lock:
             if self.vm is not None:
                 return self.vm
+            if self.governor is not None:
+                require_unrestricted(await self.governor.plan())
             if self._ref is not None:
                 self.vm = await self.control.get(self._ref.id)
                 await self.vm.running()

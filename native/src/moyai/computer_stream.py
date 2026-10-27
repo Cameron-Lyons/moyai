@@ -16,12 +16,12 @@ from app.db import drain
 from fastapi import APIRouter, HTTPException, Request, WebSocket, WebSocketDisconnect
 from pydantic import TypeAdapter
 from pydantic_ai.workspaces import WorkspaceRef, WorkspaceUnavailableError
-from pydantic_ai_harness import ModalSandbox
 from sqlalchemy import update
 from websockets.asyncio.client import ClientConnection, connect
 from websockets.exceptions import ConnectionClosed
 
 from .computer import DESKTOP_VERSION, authorize
+from .modal_network import GovernedModalSandboxBackend, NetworkGovernor, NetworkPolicyRefused
 from .models import ComputerDesktop, ComputerLease, ComputerOperation, Session, User, new_id
 
 if TYPE_CHECKING:
@@ -165,11 +165,14 @@ async def release(runtime: Runtime, access: StreamAccess) -> None:
 
 
 @asynccontextmanager
-async def upstream(access: StreamAccess) -> AsyncIterator[ClientConnection]:
+async def upstream(runtime: Runtime, access: StreamAccess) -> AsyncIterator[ClientConnection]:
     reference = TypeAdapter(WorkspaceRef).validate_json(access.workspace)
     if reference.provider != "modal":
         raise HTTPException(409, "Desktop streaming requires a Modal computer.")
-    backend = ModalSandbox(working_dir="/workspace").backend(reference)
+    # Attaching checks the session's network plan before any connect token exists.
+    backend = GovernedModalSandboxBackend(
+        ref=reference, working_dir="/workspace", governor=NetworkGovernor.of(runtime.database, access.session_id),
+    )
     async with asyncio.timeout(15):
         sandbox = await backend.get_sandbox()
         if await sandbox.poll.aio() is not None:
@@ -271,13 +274,15 @@ def routes(runtime: Runtime, *, cookie_name: str) -> APIRouter:
             )
             await socket.accept()
             accepted = True
-            async with upstream(access) as remote:
+            async with upstream(runtime, access) as remote:
                 # Connection setup includes network awaits; recheck before any
                 # framebuffer or client input can pass through it.
                 await validate(runtime, access)
                 await relay(runtime, socket, remote, access)
         except HTTPException:
             code, reason = 1008, "Computer access or control changed. Refresh the panel."
+        except NetworkPolicyRefused:
+            code, reason = 1008, "This computer was started under a different network policy. Start a new chat."
         except WorkspaceUnavailableError:
             code, reason = 1011, "This computer expired. Saved files are still available."
         except (WebSocketDisconnect, ConnectionClosed):
