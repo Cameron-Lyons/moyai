@@ -338,6 +338,7 @@ test('pickers follow the effective policy: models, connections, workflow apps an
     assert.equal(pickers.policyAdmitsConnection(limited,refused),false,'an unlisted or unverified repository is refused');
   assert.equal(pickers.policyAdmitsConnection({...open,repositories:[]},repo(null,'linear')),true,'other apps ignore repository limits');
   assert.equal(pickers.policyAdmitsConnection({...open,connected_apps:['github']},repo(null,'linear')),false);
+  for(const policy of [null,open])assert.equal(pickers.policyAdmitsConnection(policy,{kind:'github'}),true,'rows from older servers carry no policy');
   assert.equal(pickers.policyAdmitsConnection({...open,git_access:'none'},repo(7)),false,'no Git access refuses GitHub');
   assert.equal(pickers.policyAdmitsApp({...open,repositories:[]},'github'),false,'a workflow cannot select GitHub with no repositories');
   assert.equal(pickers.policyAdmitsApp(limited,'github'),true);

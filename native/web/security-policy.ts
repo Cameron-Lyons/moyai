@@ -21,8 +21,10 @@ export function policyModel(models: readonly string[], policy: Pick<PolicyView, 
 /** Whether the policy allows selecting this connection (ProductGovernance.admits_grant); under a repository limit a GitHub row needs its listed permanent ID. */
 export function policyAdmitsConnection(policy: Limits | null | undefined, row: Pick<ConnectionView, "kind" | "policy">): boolean {
   if (!policyAdmitsApp(policy, row.kind)) return false
-  const identity = row.policy.product?.repository_id
-  return row.kind !== "github" || policy?.repositories == null || typeof identity === "number" && policy.repositories.includes(identity)
+  // Read the row's repository only under a repository limit: older servers send rows without a policy.
+  if (row.kind !== "github" || policy?.repositories == null) return true
+  const identity = row.policy?.product?.repository_id
+  return typeof identity === "number" && policy.repositories.includes(identity)
 }
 
 /** Whether the policy allows a workflow to select this connected app (ProductGovernance.workflow). */
