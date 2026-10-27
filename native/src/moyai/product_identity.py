@@ -224,6 +224,11 @@ class ProductIdentityAdapter:
     def _table(self, name: str) -> str:
         return f'"{self.schema}"."{name}"' if self.schema else f'"{name}"'
 
+    def _version(self, authority: Any) -> str:
+        """The keyed digest a grant pins; any change to the authority invalidates the grant."""
+        document = json.dumps(authority, sort_keys=True, separators=(",", ":"))
+        return hmac.new(self.legacy_security.secret.encode(), document.encode(), hashlib.sha256).hexdigest()
+
     @asynccontextmanager
     async def _reader(self, engine: AsyncEngine) -> AsyncIterator[AsyncSession]:
         async with engine.connect() as connection, connection.begin():
@@ -265,14 +270,10 @@ class ProductIdentityAdapter:
 
     def _service_principal(self, authority: Any) -> ProductPrincipal:
         """A service principal: no email, no built-in role authority and never individual."""
-        version = hmac.new(
-            self.legacy_security.secret.encode(),
-            json.dumps(authority.authority_entry(), sort_keys=True, separators=(",", ":")).encode(),
-            hashlib.sha256,
-        ).hexdigest()
         return ProductPrincipal(
             id=authority.principal_id, kind="service", method="api_key", email="", name=authority.name,
-            role="member", enabled=True, authority_version=version, permissions=frozenset(authority.permissions),
+            role="member", enabled=True, authority_version=self._version(authority.authority_entry()),
+            permissions=frozenset(authority.permissions),
         )
 
     async def _service_current(self, db: AsyncSession, user_id: str) -> ProductPrincipal:
@@ -288,13 +289,22 @@ class ProductIdentityAdapter:
             raise HTTPException(401, "This API key is no longer valid.")
         return self._service_principal(authority)
 
+    async def _enrolled(self, identity: Mapping[str, Any], unenrolled: str) -> str:
+        """The account a verified sign-in identity was enrolled to, only through its pinned binding."""
+        async with self._reader(self.source_engine) as db:
+            binding = (await db.execute(text(
+                f"SELECT user_id FROM {self._table('access_identities')} "
+                "WHERE issuer=:issuer AND subject=:subject AND email=:email"
+            ), {
+                "issuer": identity["issuer"], "subject": identity["sub"], "email": identity["email"],
+            })).mappings().first()
+        if binding is None:
+            raise HTTPException(401, unenrolled)
+        return binding["user_id"]
+
     async def _current(self, db: AsyncSession, user_id: str, controls: tuple[bool, int]) -> ProductPrincipal:
         from app.identity_kinds import INDIVIDUAL_KINDS
-        from app.service_accounts import is_principal_id
 
-        if is_principal_id(user_id):
-            # Before the users read: a service account is not a product account.
-            return await self._service_current(db, user_id)
         row = (await db.execute(
             text(f"SELECT * FROM {self._table('users')} WHERE id=:id"), {"id": user_id},
         )).mappings().first()
@@ -384,11 +394,7 @@ class ProductIdentityAdapter:
                 "provider": provider.id, "issuer": provider.issuer, "client_id": provider.client_id,
                 "domains": sorted(provider.domains), "require_scim_user": provider.require_scim_user,
             }
-        version = hmac.new(
-            self.legacy_security.secret.encode(),
-            json.dumps(authority, sort_keys=True, separators=(",", ":")).encode(),
-            hashlib.sha256,
-        ).hexdigest()
+        version = self._version(authority)
         principal = ProductPrincipal(
             id=user_id, kind=kind, method=method, email=email, name=row["name"] or email or user_id,
             role=role, enabled=True, authority_version=version, linked_user_id=row.get("linked_user_id"),
@@ -434,8 +440,7 @@ class ProductIdentityAdapter:
         entry = state.authority_entry()
         version = principal.authority_version
         if entry is not None:
-            version = hmac.new(self.legacy_security.secret.encode(), json.dumps(
-                [version, entry], sort_keys=True, separators=(',', ':')).encode(), hashlib.sha256).hexdigest()
+            version = self._version([version, entry])
         return replace(principal, permissions=permissions,
                        authority_version=version, access_role=(
                            {'id': state.role_id, 'name': state.role_name or state.role_id} if state.role_id else None))
@@ -642,17 +647,8 @@ class ProductIdentityAdapter:
         if method == "cloudflare":
             if access_identity is None:
                 raise HTTPException(401, "A verified Access identity is required.")
-            async with self._reader(self.source_engine) as db:
-                binding = (await db.execute(text(
-                    f"SELECT user_id FROM {self._table('access_identities')} "
-                    "WHERE issuer=:issuer AND subject=:subject AND email=:email"
-                ), {
-                    "issuer": access_identity["issuer"], "subject": access_identity["sub"],
-                    "email": access_identity["email"],
-                })).mappings().first()
-            if binding is None:
-                raise HTTPException(401, "This Access identity must be enrolled by the product first.")
-            user_id = binding["user_id"]
+            user_id = await self._enrolled(
+                access_identity, "This Access identity must be enrolled by the product first.")
         elif method == "google":
             subject = info["identity"]["sub"]
             if not isinstance(subject, str) or not subject:
@@ -661,17 +657,8 @@ class ProductIdentityAdapter:
         elif method == "oidc":
             # session_info checked the provider, issuer and client; the account
             # comes only from the binding the verified callback pinned.
-            identity = info["identity"]
-            async with self._reader(self.source_engine) as db:
-                binding = (await db.execute(text(
-                    f"SELECT user_id FROM {self._table('access_identities')} "
-                    "WHERE issuer=:issuer AND subject=:subject AND email=:email"
-                ), {
-                    "issuer": identity["issuer"], "subject": identity["sub"], "email": identity["email"],
-                })).mappings().first()
-            if binding is None:
-                raise HTTPException(401, "This sign-in must be enrolled by the product first.")
-            user_id = binding["user_id"]
+            user_id = await self._enrolled(
+                info["identity"], "This sign-in must be enrolled by the product first.")
         else:
             user_id = f"shared:{method}:{info['role']}"
         principal = await self.current(user_id)

@@ -421,20 +421,21 @@ class ProductAutomationService:
                 result.append("model_not_enabled_in_native_core")
         except ValueError:
             result.append("model_not_enabled")
-        if policy is not None:  # governance.workflow() refuses an unavailable profile.
-            result.extend(self._policy_blockers(governance, policy, definition, model))
-        if governance is not None and chat is not None:
-            # The chat's own limits, with continuation(); a chat run never uses the saved repository.
-            if (
-                governance.trigger_repository_denial(chat, definition)
-                and "repository_not_allowed_by_security_policy" not in result
-            ):
-                result.append("repository_not_allowed_by_security_policy")
-            if (
-                model is not None and not governance.admits_model(chat, model)
-                and "model_not_allowed_by_security_policy" not in result
-            ):
-                result.append("model_not_allowed_by_security_policy")
+        if governance is not None:
+            # The workflow profile's limits, with governance.workflow()'s checks, so a profile narrowed
+            # after saving is reported before the next enable or migration (workflow() refuses an
+            # unavailable profile); then the chat's own, with continuation()'s: a chat run never uses
+            # the saved repository. Each code is reported once.
+            limits = [(policy, governance.workflow_repository_denial)] if policy is not None else []
+            if chat is not None:
+                limits.append((chat, governance.trigger_repository_denial))
+            refused = []
+            for limit, repository_denial in limits:
+                if repository_denial(limit, definition):
+                    refused.append("repository_not_allowed_by_security_policy")
+                if model is not None and not governance.admits_model(limit, model):
+                    refused.append("model_not_allowed_by_security_policy")
+            result.extend(dict.fromkeys(refused))
         if await self._old_active(db, row["id"]):
             result.append("legacy_occurrences_must_finish")
         for trigger in definition.triggers:
@@ -475,20 +476,6 @@ class ProductAutomationService:
             "automation_id": identity, "generation": generation, "owner_id": owner,
             "authority_version": authority, "connection_ids": connections, "workspace_context": workspace,
         })
-
-    @staticmethod
-    def _policy_blockers(governance: Any, policy: Any, definition: Definition, model: str | None) -> list[str]:
-        """Repository and model limits the workflow's profile now refuses, with governance.workflow()'s checks.
-
-        A profile narrowed after the workflow was saved would otherwise only
-        refuse the next enable or migration.
-        """
-        result = []
-        if governance.workflow_repository_denial(policy, definition):
-            result.append("repository_not_allowed_by_security_policy")
-        if model is not None and not governance.admits_model(policy, model):
-            result.append("model_not_allowed_by_security_policy")
-        return result
 
     async def _admitted(
         self, db: AsyncSession, definition: Definition, grants: list[Grant], policy: Any = None,

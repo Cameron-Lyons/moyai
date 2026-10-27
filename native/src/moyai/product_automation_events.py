@@ -683,12 +683,8 @@ class ProductAutomationEvents:
     ) -> bool:
         """Whether a policy this run binds now refuses its repositories; records the refusal.
 
-        Saving and enabling check the GitHub trigger and saved repositories
-        against the workflow profile, and the trigger repositories against the
-        chat a run continues. A profile, mandatory or chat policy narrowed since
-        then refuses the run here, before the delivered event's content reaches
-        a prompt. A run in an existing chat never uses the saved repository, so
-        the chat's policy is checked against the GitHub repositories only.
+        The workflow profile and the continued chat (trigger repositories only) may have narrowed
+        since saving, so this runs before the delivered event's content reaches a prompt.
         """
         from .product_governance import Denial
         try:

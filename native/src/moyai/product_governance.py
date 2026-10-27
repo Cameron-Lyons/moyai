@@ -142,6 +142,8 @@ class Denial:
     session_id: str = ''
     turn_id: str = ''
     subject: str = ''
+    # Details every refusal at this check records.
+    details: dict[str, Any] = field(default_factory=dict, compare=False)
 
     @property
     def resource_id(self):
@@ -169,12 +171,12 @@ class ProductGovernance:
 
         The record is detached and fails open, and successful checks never
         reach it, so it adds no round trip to an allowed tool or model call.
-        Its resource is Denial.resource_id.
         """
         if self.activity is not None:
             await self.activity.refused(
                 denial.action, actor_id=denial.actor_id, resource_id=denial.resource_id,
-                session_id=denial.session_id, details={'reason': reason, **details}, key=denial.key(reason))
+                session_id=denial.session_id, details={'reason': reason, **denial.details, **details},
+                key=denial.key(reason))
         return HTTPException(status, detail)
 
     async def record(self, db, action, **event):
@@ -192,18 +194,24 @@ class ProductGovernance:
                               **model_fields(model), 'attachments': attachments,
                               'connection_kinds': sorted({grant.kind for grant in grants})})
 
-    async def require(self, principal, permission, denial, /, **details):
+    async def require(self, principal, permission, denial):
         """principal.require, recording the refusal with its status and message unchanged."""
         if permission not in principal.effective_permissions:
-            raise await self._refuse(denial, 'role_permission', ROLE_REFUSAL, permission=permission, **details)
+            raise await self._refuse(denial, 'role_permission', ROLE_REFUSAL, permission=permission)
 
     async def principal(self, db, grant, permission='sessions.create', *, action='policy.admission_denied',
-                        session_id='', turn_id='', subject='', details=None):
-        """The admitted principal; a missing permission records action with these details."""
+                        session_id='', turn_id=''):
+        """The admitted principal; a missing permission records action."""
         principal = await self.identity.authorize_admission(db, grant)
-        await self.require(principal, permission, Denial(action, principal.id, session_id, turn_id, subject),
-                           **(details or {}))
+        await self.require(principal, permission, Denial(action, principal.id, session_id, turn_id))
         return principal
+
+    async def _scoped(self, db, scope, action, permission='sessions.create', *, subject='', **details):
+        """The scope's admitted principal and the Denial its refusals record, with these details."""
+        principal = await self.identity.authorize_admission(db, scope.product_grant)
+        denial = Denial(action, principal.id, scope.session_id, scope.turn_id, subject, details)
+        await self.require(principal, permission, denial)
+        return principal, denial
 
     async def bind(self, db, session, principal, requested='', inherited_from=None, trusted_profile=False, ceiling=None,
                    *, origin='user', turn_id=''):
@@ -295,7 +303,7 @@ class ProductGovernance:
         bound = await db.get(ProductSessionPolicy, session_id)
         return bound.family_root if bound else session_id
 
-    async def require_provider(self, policy, provider, denial, /, **details):
+    async def require_provider(self, policy, provider, denial):
         """Refuse a network restriction where the session's computer cannot enforce it.
 
         Modal enforces it at computer creation (modal_network) once an operator
@@ -312,22 +320,20 @@ class ProductGovernance:
             message = 'This deployment cannot enforce network allowlists yet. Select a policy without network restrictions, or ask an operator to turn on Modal network enforcement.'
         else:
             return
-        raise await self._refuse(denial, 'network_unenforceable', message, 409, **details)
+        raise await self._refuse(denial, 'network_unenforceable', message, 409)
 
     def provider_of(self, workspace):
         """The provider of a session's stored computer, or the deployment default before it has one."""
         reference = json.loads(workspace) if workspace else None
         return reference.get('provider') if reference else self.database.settings.sandbox_provider
 
-    async def computer_provider(self, db, session_id):
-        from .models import Session
-        session = await db.get(Session, session_id)
-        return self.provider_of(session.workspace if session else None)
-
-    async def require_session_provider(self, db, policy, session_id, denial, /, **details):
+    async def require_session_provider(self, db, policy, session_id, denial):
         """require_provider for the session's computer; its provider is read only under a restriction."""
+        from .models import Session
         if policy.network_domains is not None:
-            await self.require_provider(policy, await self.computer_provider(db, session_id), denial, **details)
+            session = await db.get(Session, session_id)
+            provider = self.provider_of(session.workspace if session else None)
+            await self.require_provider(policy, provider, denial)
 
     async def network_plan(self, session_id, *, db=None):
         """The plan the session's Modal computers are created and checked under (see modal_network)."""
@@ -362,7 +368,7 @@ class ProductGovernance:
         """Whether a session under this policy may select a connection of this kind."""
         # A GitHub grant under no Git access would only fail every turn's tool
         # discovery, so it is refused with the other disallowed connections.
-        return ProductGovernance.connection_denial(policy, kind) is None
+        return ProductGovernance._connection_refusal(policy, kind) is None
 
     @staticmethod
     def repository_of(grant):
@@ -387,11 +393,7 @@ class ProductGovernance:
 
     @staticmethod
     def workflow_repository_denial(policy, definition):
-        """Why this policy refuses a workflow's saved repository or a GitHub trigger repository, or None.
-
-        workflow() refuses with it and the automation readiness review reports
-        it, so both check the same repositories.
-        """
+        """Why this policy refuses a workflow's saved repository or a GitHub trigger repository, or None."""
         if (definition.repo_url or definition.github_repository_id) and not ProductGovernance.admits_repository(
                 policy, definition.github_repository_id):
             return 'The workflow repository exceeds its security policy.'
@@ -411,42 +413,41 @@ class ProductGovernance:
 
     @staticmethod
     def admits_model(policy, model):
-        """Whether the policy allows this model."""
         return policy.models is None or model in policy.models
 
-    async def _require_model(self, policy, model, denial, *, reason='model_policy', message=MODEL_REFUSAL):
-        from app.governance_activity import model_fields
+    async def _require_model(self, policy, model, denial):
         if not self.admits_model(policy, model):
-            details = {'automation_id': denial.subject or None} if denial.action == 'policy.workflow_denied' \
-                else model_fields(model)
-            raise await self._refuse(denial, reason, message, **details)
+            raise await self._refuse(denial, 'model_policy', MODEL_REFUSAL)
 
     async def require_model(self, policy, model, *, actor_id, session_id='', turn_id=''):
         """Refuse a model the session policy does not allow."""
-        await self._require_model(policy, model, Denial('policy.model_denied', actor_id, session_id, turn_id, model))
+        from app.governance_activity import model_fields
+        await self._require_model(policy, model, Denial(
+            'policy.model_denied', actor_id, session_id, turn_id, model, model_fields(model)))
 
-    async def session_model(self, policy, requested, default, available, *, actor_id):
+    async def session_model(self, db, session_id, requested, *, actor_id):
         """A new session's model under its bound policy.
 
         An explicit request must be allowed. Otherwise the default is used when
         allowed, else the first allowed model in the workspace's order. A
         refusal names no session: the new one never exists.
         """
+        policy = await self.policy(db, session_id)
         if requested:
             await self.require_model(policy, requested, actor_id=actor_id)
             return requested
-        if (allowed := self.implicit_model(policy, default, available)) is None:
+        if (allowed := self.implicit_model(policy)) is None:
             raise await self._refuse(
                 Denial('policy.model_denied', actor_id), 'no_allowed_model',
                 'No model enabled for this workspace is allowed by the session security policy.')
         return allowed
 
-    @staticmethod
-    def implicit_model(policy, default, available):
+    def implicit_model(self, policy):
         """The default when allowed, else the first allowed model in the workspace's order, else None."""
-        if ProductGovernance.admits_model(policy, default):
-            return default
-        return next((model for model in available if model in policy.models), None)
+        settings = self.database.settings
+        if self.admits_model(policy, settings.default_model):
+            return settings.default_model
+        return next((model for model in settings.models if model in policy.models), None)
 
     @staticmethod
     def _connection_refusal(policy, kind, *, write=False):
@@ -457,16 +458,8 @@ class ProductGovernance:
             return 'git_access', 'Managed Git access is disabled by the session security policy.'
         return None
 
-    @staticmethod
-    def connection_denial(policy, kind, *, write=False):
-        """Why this policy refuses a connection of this kind, or None."""
-        refusal = ProductGovernance._connection_refusal(policy, kind, write=write)
-        return refusal and refusal[1]
-
     async def workspace(self, db, scope, context):
-        principal = await self.principal(db, scope.product_grant, action='policy.workspace_denied',
-                                         session_id=scope.session_id, turn_id=scope.turn_id)
-        denial = Denial('policy.workspace_denied', principal.id, scope.session_id, scope.turn_id)
+        principal, denial = await self._scoped(db, scope, 'policy.workspace_denied')
         if context.get('environment_build_id'):
             await self.require(principal, 'environments.read', denial)
         if not context.get('repo_url') and not context.get('repository_id'):
@@ -481,17 +474,15 @@ class ProductGovernance:
         if not self.admits_repository(policy, context.get('repository_id')):
             raise await self._refuse(denial, 'repository_policy', REPOSITORY_REFUSAL)
 
-    async def repository(self, scope, repository_id, *, db=None):
+    async def repository(self, scope, repository_id):
         """Refuse a repository checkout the session policy does not allow, before any provider read."""
-        async with self._snapshot(db) as transaction:
-            principal = await self.principal(transaction, scope.product_grant, action='policy.workspace_denied',
-                                             session_id=scope.session_id, turn_id=scope.turn_id)
+        async with self.database.sessions.begin() as transaction:
+            _, denial = await self._scoped(transaction, scope, 'policy.workspace_denied')
             policy = await self.policy(transaction, scope.session_id)
-            if not self.admits(policy, 'github') or not self.admits_repository(policy, repository_id):
-                raise await self._refuse(
-                    Denial('policy.workspace_denied', principal.id, scope.session_id, scope.turn_id),
-                    'connection_disabled' if not self.admits(policy, 'github') else 'repository_policy',
-                    REPOSITORY_REFUSAL)
+            if not self.admits(policy, 'github'):
+                raise await self._refuse(denial, 'connection_disabled', REPOSITORY_REFUSAL)
+            if not self.admits_repository(policy, repository_id):
+                raise await self._refuse(denial, 'repository_policy', REPOSITORY_REFUSAL)
 
     @staticmethod
     def _tool_denial(principal, policy, name, read_only):
@@ -512,36 +503,30 @@ class ProductGovernance:
     async def check_tool(self, scope, name, *, read_only=None, db=None):
         from app.governance_activity import tool_fields
         async with self._snapshot(db) as transaction:
-            principal = await self.principal(transaction, scope.product_grant, action='policy.tool_denied',
-                                             session_id=scope.session_id, turn_id=scope.turn_id, subject=name,
-                                             details=tool_fields(name))
-            denial = Denial('policy.tool_denied', principal.id, scope.session_id, scope.turn_id, name)
+            principal, denial = await self._scoped(
+                transaction, scope, 'policy.tool_denied', subject=name, **tool_fields(name))
             policy = await self.policy(transaction, scope.session_id)
-            await self.require_session_provider(transaction, policy, scope.session_id, denial, **tool_fields(name))
+            await self.require_session_provider(transaction, policy, scope.session_id, denial)
             if refusal := self._tool_denial(principal, policy, name, read_only):
                 reason, message, details = refusal
-                raise await self._refuse(denial, reason, message, **tool_fields(name), **details)
+                raise await self._refuse(denial, reason, message, **details)
             return principal
 
     async def connection(self, scope, grant, *, write=False):
         async with self.database.sessions.begin() as db:
-            principal = await self.principal(
-                db, scope.product_grant, 'connections.write' if write else 'connections.read',
-                action='policy.connection_denied', session_id=scope.session_id, turn_id=scope.turn_id,
-                subject=grant.kind, details={'kind': grant.kind, 'write': write})
-            denial = Denial('policy.connection_denied', principal.id, scope.session_id, scope.turn_id, grant.kind)
+            _, denial = await self._scoped(
+                db, scope, 'policy.connection_denied', 'connections.write' if write else 'connections.read',
+                subject=grant.kind, kind=grant.kind, write=write)
             policy = await self.policy(db, scope.session_id)
             if refusal := self._connection_refusal(policy, grant.kind, write=write):
-                raise await self._refuse(denial, *refusal, kind=grant.kind, write=write)
+                raise await self._refuse(denial, *refusal)
             if not self.admits_grant(policy, grant.kind, self.repository_of(grant)):
                 raise await self._refuse(denial, 'repository_policy',
-                                         'This GitHub repository is not allowed by the session security policy.',
-                                         kind=grant.kind, write=write)
+                                         'This GitHub repository is not allowed by the session security policy.')
 
     async def tools(self, scope, definitions, *, db=None):
         async with self._snapshot(db) as transaction:
-            principal = await self.principal(transaction, scope.product_grant,
-                                             session_id=scope.session_id, turn_id=scope.turn_id)
+            principal, _ = await self._scoped(transaction, scope, 'policy.admission_denied')
             policy = await self.policy(transaction, scope.session_id)
             return [name for name, read_only in definitions
                     if self._tool_denial(principal, policy, name, read_only) is None]
@@ -564,9 +549,8 @@ class ProductGovernance:
     async def spend_state(self, db, principal, session_id: str | None = None) -> SpendState:
         """Limits and usage for one principal in db's snapshot; without session_id, no session scope.
 
-        Admission and the personal status share it. One canonical statement
-        reads the limits, directory tiers included; each limited scope then
-        adds one ledger sum (_spent), and nothing is written.
+        One canonical statement reads the limits, directory tiers included; each limited scope adds
+        one ledger sum. Nothing is written.
         """
         from app.spend_limits import SpendLimits
 
@@ -600,10 +584,7 @@ class ProductGovernance:
         return None if awaiting else total
 
     async def month_spend(self, db, email):
-        """A person's month-to-date spend, the sum spend_state reads for their monthly limit.
-
-        The limit lookup reads it whether or not a limit applies, which spend_state skips.
-        """
+        """A person's month-to-date spend as spend_state counts it, read even when no monthly limit applies."""
         from .inference_usage import InferenceUsage
         ledger = SpendLedger(self.database)
         return await self._spent(db, ledger, InferenceUsage.created_at >= ledger.period_start, self._person(email, ''))
@@ -613,12 +594,10 @@ class ProductGovernance:
         from app.governance_activity import model_fields
         from app.spend_limits import SpendLimitReached, evaluation, refusal
         async with self._snapshot(db) as transaction:
-            principal = await self.principal(transaction, scope.product_grant, action='policy.model_denied',
-                                             session_id=scope.session_id, turn_id=scope.turn_id, subject=model,
-                                             details=model_fields(model))
-            denial = Denial('policy.model_denied', principal.id, scope.session_id, scope.turn_id, model)
+            principal, denial = await self._scoped(
+                transaction, scope, 'policy.model_denied', subject=model, **model_fields(model))
             policy = await self.policy(transaction, scope.session_id)
-            await self.require_session_provider(transaction, policy, scope.session_id, denial, **model_fields(model))
+            await self.require_session_provider(transaction, policy, scope.session_id, denial)
             # Before the spend lookup, which returns early when nothing is limited.
             await self._require_model(policy, model, denial)
             state = await self.spend_state(transaction, principal, scope.session_id)
@@ -626,7 +605,7 @@ class ProductGovernance:
                 refused = SpendLimitReached(reason)
                 exceeded, pending = evaluation(state.limits, state.usage)
                 # Scopes only: no amounts, limits or receipts.
-                await self._refuse(denial, 'spend_limit', refused.detail, **model_fields(model),
+                await self._refuse(denial, 'spend_limit', refused.detail,
                                    scopes=exceeded, awaiting_cost=bool(pending))
                 raise refused
 
@@ -637,51 +616,47 @@ class ProductGovernance:
         return binding.policy
 
     async def new_session_policy(self, db, principal, requested=''):
-        """The policy and implicit model of a new session under this profile, for model and connection pickers.
+        """A new session's policy under this profile and its implicit model (None when none is allowed).
 
-        Selecting a profile needs security.manage, as in bind(). The model is the
-        one session_model gives a session that does not ask for one; None when
-        the policy allows no enabled model. Admission still decides, so this
-        probe records nothing.
+        Selecting a profile needs security.manage, as in bind(). A picker probe: admission still decides,
+        so it records nothing.
         """
         principal.require('sessions.create')
         if requested:
             principal.require('security.manage')
         policy = await self.profile_policy(db, requested)
-        settings = self.database.settings
-        return policy, self.implicit_model(policy, settings.default_model, settings.models)
+        return policy, self.implicit_model(policy)
 
     async def workflow(self, db, principal, definition, *, previous='', scope=None, model, automation_id=''):
         """Check a workflow definition against its profile; model is its resolved model choice."""
         from app.security_profiles import intersect
         denial = Denial('policy.workflow_denied', principal.id, scope.session_id if scope else '',
-                        scope.turn_id if scope else '', automation_id)
-        workflow = {'automation_id': automation_id or None}
-        await self.require(principal, 'automations.manage', denial, **workflow)
+                        scope.turn_id if scope else '', automation_id,
+                        details={'automation_id': automation_id or None})
+        await self.require(principal, 'automations.manage', denial)
         selected = definition.security_profile_id
         if selected != previous:
-            await self.require(principal, 'security.manage', denial, **workflow)
+            await self.require(principal, 'security.manage', denial)
         policy = await self.profile_policy(db, selected)
-        await self.require_provider(policy, self.database.settings.sandbox_provider, denial, **workflow)
-
-        async def refuse(reason, message):
-            return await self._refuse(denial, reason, message, **workflow)
+        await self.require_provider(policy, self.database.settings.sandbox_provider, denial)
         if not all(self.admits(policy, kind) for kind in definition.plugins) or (
                 'github' in definition.plugins and policy.repositories == ()):
-            raise await refuse('connection_policy', 'The workflow connections exceed its security policy.')
+            raise await self._refuse(
+                denial, 'connection_policy', 'The workflow connections exceed its security policy.')
         if definition.repo_url and not self.admits(policy, 'github'):
-            raise await refuse('connection_policy', 'The workflow repository exceeds its security policy.')
+            raise await self._refuse(
+                denial, 'connection_policy', 'The workflow repository exceeds its security policy.')
         if message := self.workflow_repository_denial(policy, definition):
-            raise await refuse('repository_policy', message)
-        await self._require_model(policy, model, denial, message='The workflow model exceeds its security policy.')
+            raise await self._refuse(denial, 'repository_policy', message)
+        if not self.admits_model(policy, model):
+            raise await self._refuse(
+                denial, 'model_policy', 'The workflow model exceeds its security policy.')
         if scope is not None and intersect(await self.policy(db, scope.session_id), policy) != policy:
-            raise await refuse('exceeds_session', 'A workflow cannot exceed the security policy of its creating session.')
+            raise await self._refuse(
+                denial, 'exceeds_session', 'A workflow cannot exceed the security policy of its creating session.')
 
     async def continuation_wider(self, db, session_id, requested='', *, policy=None):
-        """Whether the chat allows more than the workflow profile; a probe that records nothing.
-
-        policy is the requested profile's policy when the caller already resolved it.
-        """
+        """Whether the chat allows more than the workflow profile (policy, when resolved); records nothing."""
         from app.security_profiles import intersect
         if policy is None:
             policy = await self.profile_policy(db, requested)
@@ -699,23 +674,22 @@ class ProductGovernance:
         trigger repositories against the chat).
         """
         from app.governance_activity import model_fields
-        denial = Denial('policy.continuation_denied', actor_id, session_id, subject=automation_id)
+        denial = Denial('policy.continuation_denied', actor_id, session_id, subject=automation_id,
+                        details={'automation_id': automation_id or None})
         if await self.continuation_wider(db, session_id, requested):
             raise await self._refuse(
                 denial, 'continuation_wider', 'This chat allows more than the workflow security policy. '
-                                              'Choose a chat started under that policy, or a new chat for each run.',
-                automation_id=automation_id or None)
+                                              'Choose a chat started under that policy, or a new chat for each run.')
         chat = await self.policy(db, session_id)
         if definition is not None and self.trigger_repository_denial(chat, definition):
             raise await self._refuse(
                 denial, 'repository_policy', "The chat's security policy does not allow a workflow trigger "
-                                             'repository. Choose a chat that allows it, or a new chat for each run.',
-                automation_id=automation_id or None)
+                                             'repository. Choose a chat that allows it, or a new chat for each run.')
         if model is not None and not self.admits_model(chat, model):
             raise await self._refuse(
                 denial, 'model_policy', "The chat's security policy does not allow the workflow model. "
                                         'Choose a model it allows, or a new chat for each run.',
-                automation_id=automation_id or None, **model_fields(model))
+                **model_fields(model))
 
 
 def permission_for_user(user, permission):

@@ -377,9 +377,7 @@ class Database:
                                       trusted_profile, origin=origin)
                 # A refused explicit model rolls back the whole admission.
                 session.model = await governance.session_model(
-                    await governance.policy(transaction, session.id), body.model,
-                    self.settings.default_model, self.settings.models, actor_id=principal.id,
-                )
+                    transaction, session.id, body.model, actor_id=principal.id)
         return session
 
     async def list_sessions(self, actor: User, *, archived: bool = False, deleted: bool = False) -> list[Session]:
