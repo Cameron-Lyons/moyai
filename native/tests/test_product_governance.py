@@ -647,6 +647,9 @@ async def test_policy_editor_offers_installation_repositories_and_workspace_mode
     connections = SimpleNamespace(connectors=SimpleNamespace(github=Repositories()))
     async with governance_client(product, profiles=Profiles(), product_connections=connections) as client:
         listing = (await client.get('/api/admin/security-profiles')).json()
+        assert listing['catalog']['network_enforcement'] == 'off'
+        monkeypatch.setattr(product.database.settings, 'network_policy_enforcement', 'modal')
+        assert (await client.get('/api/admin/security-profiles')).json()['catalog']['network_enforcement'] == 'modal'
         assert listing['catalog']['repositories'] == [{'id': 7, 'label': 'acme/app'}]
         assert listing['catalog']['models'] == [{'id': 'test', 'label': 'test'},
                                                 {'id': 'openai/gpt-6-astra', 'label': 'GPT-6 Astra'}]

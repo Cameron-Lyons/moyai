@@ -283,7 +283,7 @@ This records configuration history, not a transcript of every agent action.
 | `/api/admin/scim`, `/api/admin/scim/tokens` | Provisioning administration |
 | `/scim/v2/*` | Bearer-authenticated directory protocol |
 | `/api/security-profiles` | Enabled profile selection catalog |
-| `/api/admin/security-profiles`, `/api/admin/security-profiles/defaults` | Revision-checked policy configuration, with the editor's app, tool, repository and model choices |
+| `/api/admin/security-profiles`, `/api/admin/security-profiles/defaults` | Revision-checked policy configuration, with the editor's app, tool, repository and model choices and the deployment's network enforcement |
 | `/api/sessions/{id}/security-policy` | Accessible session's effective policy |
 | `/api/admin/spend-limits` | Spend configuration and reported usage |
 | `/api/admin/governance/audit`, `/api/admin/governance/audit/export` | Audit feed and export |

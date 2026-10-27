@@ -29,7 +29,7 @@ const MEMBER=['workspace.read','sessions.read','sessions.create','sessions.manag
 const entry=(id,action,resource_type,resource_id,details={},actor='admin@example.test',source='governance',created_at=stamp)=>({id,source,action,actor,resource_type,resource_id,details,created_at});
 const profile=(id,name,policy,patch={})=>({id,name,enabled:true,revision:2,policy:{connected_apps:null,tools:null,git_access:'write',network_domains:null,repositories:null,models:null,...policy},updated_at:stamp,updated_by:'admin@example.test',...patch});
 function reset(overrides={}) {
-  state={mode:'existing',role:'admin',permissions:[...ALL],accessRole:null,requests:[],conflict:false,forbidRoles:false,
+  state={mode:'existing',role:'admin',permissions:[...ALL],accessRole:null,requests:[],conflict:false,forbidRoles:false,networkEnforcement:'off',
     roles:[
       {id:'auditor',name:'Auditor',description:'Read-only compliance access for reviews.',permissions:['audit.read','sessions.read','spend.read'],revision:3,archived:false,updated_at:stamp,updated_by:'admin@example.test'},
       {id:'contractor',name:'Contractor',description:'Project sessions without organization settings.',permissions:['sessions.create','sessions.read'],revision:1,archived:false,updated_at:stamp,updated_by:'admin@example.test'},
@@ -135,7 +135,8 @@ async function handle(req,res,next) {
       tools:[{id:'read_file',label:'Read files',group:'Workspace'},{id:'write_file',label:'Write files',group:'Workspace'},{id:'search_files',label:'Search files',group:'Workspace'},{id:'run_shell',label:'Run shell commands',group:'Workspace'},
         {id:'create_pull_request',label:'Create pull request',group:'GitHub'},{id:'update_pull_request',label:'Update pull request',group:'GitHub'},{id:'browser_navigate',label:'Browse the web',group:'Browser'},{id:'memory_save',label:'Save memory',group:'Memory'}],
       repositories:[{id:101,label:'synthetic-org/api'},{id:102,label:'synthetic-org/web'},{id:103,label:'synthetic-org/infra'}],
-      models:[{id:'openai/gpt-6-astra',label:'GPT-6 Astra'},{id:'openai/gpt-6-astra-ultrafast',label:'GPT-6 Astra Ultrafast'},{id:'anthropic/claude-opus-5-5',label:'Claude Opus 5.5'}]}});
+      models:[{id:'openai/gpt-6-astra',label:'GPT-6 Astra'},{id:'openai/gpt-6-astra-ultrafast',label:'GPT-6 Astra Ultrafast'},{id:'anthropic/claude-opus-5-5',label:'Claude Opus 5.5'}],
+      network_enforcement:state.networkEnforcement}});
     if(p==='/api/admin/security-profiles/defaults'&&method==='PUT'){if(data.revision!==state.defaults.revision)return json({detail:STALE},409);state.defaults={...data,revision:data.revision+1,updated_at:stamp,updated_by:'admin@example.test'};return json(state.defaults);}
     if(p==='/api/admin/security-profiles'&&method==='POST'){const row={...profile('abcdefabcdefabcdefabcdefabcdefab',data.name,data.policy),enabled:data.enabled,revision:1};state.profiles.push(row);return json(row,201);}
     const match=p.match(/^\/api\/admin\/security-profiles\/([0-9a-f]{32})$/);
@@ -380,6 +381,7 @@ test('security policies: explicit null-versus-empty choices, validation, default
   await choose(dialog,page,'Models','Only selected models');
   await dialog.getByRole('checkbox',{name:'GPT-6 Astra Ultrafast'}).click();
   await choose(dialog,page,'Network access','Only listed domains');
+  await dialog.getByText(/Network enforcement is off in this deployment, so sessions with a restricted network policy are refused/).waitFor();
   await dialog.getByRole('textbox',{name:'Allowed domains'}).fill('https://evil.test/path');
   await dialog.getByRole('button',{name:'Create policy'}).click();
   await dialog.getByRole('alert').getByText(/Use hostnames such as registry\.npmjs\.org/).waitFor();
@@ -410,6 +412,16 @@ test('security policies: explicit null-versus-empty choices, validation, default
   await page.getByRole('button',{name:'Disable Contractor sandbox'}).click();const disable=page.getByRole('dialog',{name:'Disable Contractor sandbox?'});
   await disable.getByText(/keep their recorded policy/).waitFor();await disable.getByRole('button',{name:'Disable policy'}).click();await disable.waitFor({state:'hidden'});
   assert.match(last('/api/admin/security-profiles/abcdefabcdefabcdefabcdefabcdefab','DELETE').query,/revision=1/);
+});
+
+test('security policies: the network hint states what Modal enforcement covers',async t=>{
+  reset({networkEnforcement:'modal'});const page=await pageFor(t,'#settings/security-policies');
+  await page.getByRole('button',{name:'Edit Restricted review'}).click();const review=page.getByRole('dialog',{name:'Edit Restricted review'});
+  await review.getByText(/cannot open outbound connections\. .*Enforced on Modal computers for HTTPS \(port 443\) by hostname; plain HTTP, SSH and other ports are blocked\. DNS lookups are not restricted/).waitFor();
+  await review.getByText(/Lambda computers refuse restricted policies\. A running computer started under a wider policy must restart\./).waitFor();
+  assert.equal(await review.getByText(/Network enforcement is off/).count(),0);
+  await choose(review,page,'Network access','Unrestricted');await review.getByText('No outbound restriction is applied.',{exact:true}).waitFor();
+  assert.equal(await review.getByText(/Enforced on Modal computers/).count(),0,'an unrestricted choice has no enforcement caveats');
 });
 
 test('spend limits: blank means no limit, overrides add/edit/remove, and only changed rows are sent',async t=>{

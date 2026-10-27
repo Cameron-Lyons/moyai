@@ -219,6 +219,8 @@ class PolicyCatalog(GovernanceView):
     # The GitHub App installation's repositories and the workspace's models.
     repositories: list[PolicyCatalogRepository]
     models: list[PolicyCatalogModel]
+    # MOYAI_NETWORK_POLICY_ENFORCEMENT: whether restricted network policies are admitted on Modal.
+    network_enforcement: Literal["off", "modal"]
 
 
 class SecurityProfilesAdmin(GovernanceView):

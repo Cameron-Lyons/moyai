@@ -5822,6 +5822,10 @@ export type PolicyCatalog = {
      */
     models: Array<PolicyCatalogModel>;
     /**
+     * Network Enforcement
+     */
+    network_enforcement: 'off' | 'modal';
+    /**
      * Repositories
      */
     repositories: Array<PolicyCatalogRepository>;

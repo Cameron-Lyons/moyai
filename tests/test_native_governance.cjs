@@ -159,6 +159,15 @@ test('provisioning rows never render token secrets and state status in text',()=
   assert.match(users,/Deactivated/);assert.match(users,/dana@example.test/);
 });
 
+test('the network hint follows the deployment enforcement setting',()=>{
+  for(const network of ['all','listed','none'])assert.match(gov.networkHint(network,'off'),/Network enforcement is off in this deployment, so sessions with a restricted network policy are refused before they start\.$/);
+  assert.equal(gov.networkHint('all','modal'),'No outbound restriction is applied.');
+  for(const network of ['listed','none']){const hint=gov.networkHint(network,'modal');
+    assert.match(hint,/HTTPS \(port 443\) by hostname; plain HTTP, SSH and other ports are blocked\./);assert.match(hint,/DNS lookups are not restricted/);
+    assert.match(hint,/shared CDN domain/);assert.match(hint,/Lambda computers refuse restricted policies/);assert.match(hint,/must restart\.$/);}
+  assert.match(gov.networkHint('none','modal'),/^The machine cannot open outbound connections\./);assert.match(gov.networkHint('listed','modal'),/^Only these hostnames are reachable\./);
+});
+
 test('policy rows mark defaults, keep defaults enabled and summarize empty lists as nothing allowed',()=>{
   const defaults={default_profile_id:profile().id,mandatory_profile_id:'',revision:1,updated_at:stamp,updated_by:''};
   const other=profile({id:'f'.repeat(32),name:'Open',policy:{connected_apps:null,tools:null,git_access:'write',network_domains:[],repositories:null,models:null}});

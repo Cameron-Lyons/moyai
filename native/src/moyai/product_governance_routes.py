@@ -120,8 +120,9 @@ def routes(runtime):
     @router.get('/api/admin/security-profiles', operation_id='listSecurityProfiles')
     async def profiles_admin(user=Depends(principal)) -> SecurityProfilesAdmin:
         user.require('security.manage')
-        return SecurityProfilesAdmin.model_validate(
-            await asyncio.to_thread(lambda: product.profiles.admin_listing(*policy_choices())))
+        listing = await asyncio.to_thread(lambda: product.profiles.admin_listing(*policy_choices()))
+        listing['catalog']['network_enforcement'] = runtime.settings.network_policy_enforcement
+        return SecurityProfilesAdmin.model_validate(listing)
 
     @router.post('/api/admin/security-profiles', status_code=201, operation_id='createSecurityProfile')
     async def profile_create(body: SaveProfile, user=Depends(principal)) -> SecurityProfileView:

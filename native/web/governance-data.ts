@@ -2,7 +2,7 @@
 // function validates locally with plain-language errors; the server remains
 // authoritative and re-validates every field.
 import type {
-  ExportGovernanceAuditData, GovernanceGroupRole, GovernanceRole, GovernanceRoleAssignment, GroupRoleChange, PermissionInfo, PolicyCatalogRepository,
+  ExportGovernanceAuditData, GovernanceGroupRole, GovernanceRole, GovernanceRoleAssignment, GroupRoleChange, PermissionInfo, PolicyCatalog, PolicyCatalogRepository,
   PolicyView, ProfileDefaults, ProfilePolicy, RoleAssignment, RoleCreate, RoleUpdate, SaveProfile, SecurityProfileView, SpendLimitChange, SpendLimitView,
 } from "./generated/api"
 import type { AuditExportFormat, AuditFilterQuery, AuditFilters, AuditQuery, ConnectedApp, GitAccess } from "./governance-types"
@@ -96,6 +96,18 @@ export function policyDraft(profile?: SecurityProfileView): PolicyDraft {
 /** A saved repository keeps its ID as its label once it leaves the catalog. */
 export function repositoryLabel(repositories: readonly PolicyCatalogRepository[], id: number): string {
   return repositories.find(repository => repository.id === id)?.label ?? `Repository ${id}`
+}
+
+/** The network choice's effect, then how this deployment enforces it (MOYAI_NETWORK_POLICY_ENFORCEMENT). */
+export function networkHint(network: PolicyDraft["network"], enforcement: PolicyCatalog["network_enforcement"]): string {
+  const choice = network === "all" ? "No outbound restriction is applied."
+    : network === "none" ? "The machine cannot open outbound connections. Package installs and downloads will fail."
+    : "Only these hostnames are reachable."
+  if (enforcement === "off") return `${choice} Network enforcement is off in this deployment, so sessions with a restricted network policy are refused before they start.`
+  if (network === "all") return choice
+  return `${choice} Enforced on Modal computers for HTTPS (port 443) by hostname; plain HTTP, SSH and other ports are blocked. `
+    + "DNS lookups are not restricted, and allowing a shared CDN domain can allow other sites it serves. "
+    + "Lambda computers refuse restricted policies. A running computer started under a wider policy must restart."
 }
 
 const HOST_LABEL = /^[a-z0-9¡-￿](?:[a-z0-9¡-￿-]{0,61}[a-z0-9¡-￿])?$/

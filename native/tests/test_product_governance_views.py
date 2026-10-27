@@ -101,7 +101,9 @@ def test_policy_spend_and_audit_responses_keep_every_service_key(services):
                                             [{'id': 'openai/gpt-6-astra', 'label': 'GPT-6 Astra'}])
     assert admin['catalog']['connected_apps'] and admin['catalog']['tools']
     assert admin['catalog']['repositories'] and admin['catalog']['models']
-    same(SecurityProfilesAdmin, admin)
+    # The route adds the deployment's network enforcement to the catalog.
+    for enforcement in ('off', 'modal'):
+        same(SecurityProfilesAdmin, {**admin, 'catalog': {**admin['catalog'], 'network_enforcement': enforcement}})
     spare = services.profiles.save(SaveProfile(name='Spare', enabled=True, policy=policy, revision=0), OWNER)
     same(SecurityProfileView, services.profiles.disable(spare['id'], spare['revision'], OWNER))
     services.spend.save(SpendLimitChanges(changes=[{'id': 'organization', 'limit_usd': 25.0, 'revision': 0}]), OWNER)

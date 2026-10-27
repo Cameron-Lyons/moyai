@@ -5,7 +5,7 @@ import { Input } from "@/components/ui/input"
 import { Textarea } from "@/components/ui/textarea"
 import { Checkbox } from "@/components/ui/checkbox"
 import { Choice, Empty, Toolbar, contains, dateTime } from "./settings"
-import { defaultsBody, policyBody, policyDraft, policySummary, repositoryLabel, type PolicyDraft, type ScopeMode } from "./governance-data"
+import { defaultsBody, networkHint, policyBody, policyDraft, policySummary, repositoryLabel, type PolicyDraft, type ScopeMode } from "./governance-data"
 import { DialogActions, GovConfirm, GovDialog, LoadGate, MutationError, PageActions, Section, StatusBadge, dataOf, useGovMutation, useGovResource } from "./governance-shared"
 import {
   createSecurityProfile, disableSecurityProfile, listSecurityProfiles, updateSecurityProfile, updateSecurityProfileDefaults,
@@ -206,7 +206,7 @@ export function PolicyEditor({ profile, catalog, defaults, onClose, onSaved }: {
         <div className="ns-field"><label htmlFor={`${id}-network`}>Where can the session’s cloud machine connect?</label>
           <Choice id={`${id}-network`} label="Network access" value={draft.network} disabled={mutation.busy} onChange={network => change({ network: network as PolicyDraft["network"] })}
             options={[{ value: "all", label: "Unrestricted" }, { value: "listed", label: "Only listed domains" }, { value: "none", label: "Block all outbound network access" }]} />
-          <p className="ns-field-hint">{draft.network === "all" ? "No outbound restriction is applied." : draft.network === "none" ? "The machine cannot reach the internet. Package installs and downloads will fail." : "Only these hostnames are reachable."} Current native computer providers cannot enforce network restrictions. Sessions with a restricted network policy are refused before they start.</p></div>
+          <p className="ns-field-hint">{networkHint(draft.network, catalog.network_enforcement)}</p></div>
         {draft.network === "listed" && <div className="ns-field"><label htmlFor={`${id}-domains`}>Allowed domains</label>
           <Textarea id={`${id}-domains`} className="ns-gov-short" rows={4} disabled={mutation.busy} value={draft.domains} spellCheck={false} placeholder={"registry.npmjs.org\n*.githubusercontent.com"} aria-describedby={`${id}-domains-hint`} onChange={event => change({ domains: event.target.value })} />
           <p id={`${id}-domains-hint`} className="ns-field-hint">One hostname per line. Use *.example.com to include its subdomains. No URLs, ports or IP addresses; up to 200 entries.</p></div>}

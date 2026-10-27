@@ -10320,6 +10320,14 @@
             "title": "Models",
             "type": "array"
           },
+          "network_enforcement": {
+            "enum": [
+              "off",
+              "modal"
+            ],
+            "title": "Network Enforcement",
+            "type": "string"
+          },
           "repositories": {
             "items": {
               "$ref": "#/components/schemas/PolicyCatalogRepository"
@@ -10339,7 +10347,8 @@
           "connected_apps",
           "tools",
           "repositories",
-          "models"
+          "models",
+          "network_enforcement"
         ],
         "title": "PolicyCatalog",
         "type": "object"
