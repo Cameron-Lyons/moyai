@@ -13,7 +13,8 @@ from starlette.responses import Response
 from starlette.requests import HTTPConnection
 from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 
-from .config import Settings
+from .config import LOOPBACK_HOSTS, Settings
+from .identity_kinds import INDIVIDUAL_METHODS
 from .permissions import BUILTIN_PERMISSIONS, MEMBER_PERMISSIONS, PERMISSIONS, route_permission, shared_actor_role
 
 
@@ -86,14 +87,14 @@ class Security:
         self.fernet = Fernet(key.encode())
         self.signer = URLSafeTimedSerializer(self.secret, salt="workspace-session-v1")
         self.origin = settings.public_url.rstrip("/")
-        self.local = urlparse(self.origin).hostname in {"localhost", "127.0.0.1", "::1"}
+        self.local = urlparse(self.origin).hostname in LOOPBACK_HOSTS
         if bool(settings.google_client_id) != bool(settings.google_client_secret):
             raise ValueError("Set both GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET.")
         if settings.google_enabled() and (not settings.google_domains() or not settings.google_admins()
                 or any(email.rpartition("@")[2] not in settings.google_domains() for email in settings.google_admins())):
             raise ValueError("Configure GOOGLE_ALLOWED_DOMAINS and GOOGLE_ADMIN_EMAILS in those domains.")
         if not self.local and not settings.person_login_enabled() and (not settings.password_login_enabled or not settings.workspace_password):
-            raise ValueError("Configure Google sign-in or WORKSPACE_PASSWORD before exposing the workspace.")
+            raise ValueError("Configure organization sign-in or WORKSPACE_PASSWORD before exposing the workspace.")
         if settings.workspace_password and len(settings.workspace_password) < 16:
             raise ValueError("Set WORKSPACE_PASSWORD to at least 16 characters before exposing the workspace.")
         if not self.local and not self.origin.startswith("https://"):
@@ -123,14 +124,14 @@ class Security:
             if role not in {"admin", "member"} or not isinstance(info.get("sid"), str):
                 return None
             method = info.get("method", "password")
-            if method == "google":
+            if method in {"google", "oidc"}:
                 identity = info.get("identity", {})
-                email, domain = identity.get("email", ""), identity.get("domain", "")
-                if (not self.settings.google_enabled() or domain not in self.settings.google_domains()
-                        or email.rpartition("@")[2] != domain or not identity.get("sub")
-                        or info.get("client_id") != self.settings.google_client_id):
+                email = identity.get("email", "")
+                if not self.signin_current(method, identity, info.get("client_id")):
                     return None
-                person = self.person(email, connection=connection)
+                provider = self.settings.oidc_provider_for_domain(identity["domain"]) if method == "oidc" else None
+                person = self.person(email, connection=connection,
+                                     require_scim=bool(provider and provider.require_scim_user))
                 if not person:
                     return None
                 return {**info, **person}
@@ -147,6 +148,24 @@ class Security:
             return {**info, "role": role}
         except (BadSignature, SignatureExpired, KeyError, TypeError, AttributeError):
             return None
+
+    def signin_current(self, method: str, identity: dict, client_id) -> bool:
+        """Whether a signed Google or OIDC session still matches the live configuration.
+
+        Each allowed domain signs in through exactly one method, so moving a
+        domain to an OIDC provider ends its Google sessions, and removing or
+        reconfiguring a provider ends that provider's sessions.
+        """
+        email, domain = identity.get("email", ""), identity.get("domain", "")
+        if (not isinstance(email, str) or not isinstance(domain, str) or email.rpartition("@")[2] != domain
+                or not identity.get("sub") or domain not in self.settings.google_domains()):
+            return False
+        if method == "google":
+            return (self.settings.google_enabled() and domain in self.settings.google_signin_domains()
+                    and client_id == self.settings.google_client_id)
+        provider = self.settings.oidc_provider_for_domain(domain)
+        return bool(provider and provider.id == identity.get("provider")
+                    and identity.get("issuer") == provider.issuer and client_id == provider.client_id)
 
     def access_session(self, request: HTTPConnection, identity: dict) -> bytes | None:
         """Establish a browser session from a verified employee assertion only."""
@@ -182,12 +201,13 @@ class Security:
             return self.user_roles.role(email)
         return 'admin' if email in self.settings.google_admins() else 'member'
 
-    def person(self, email: str, *, connection=None) -> dict | None:
+    def person(self, email: str, *, connection=None, require_scim=False) -> dict | None:
         """Directory status, built-in role and permissions on one connection.
 
         Every authorization resolves these together, so a request borrows one
         pooled connection per check rather than one for each value. None means
-        the provisioned account is inactive.
+        the provisioned account is inactive or, with require_scim (an OIDC
+        provider's require_scim_user), not provisioned and active.
         """
         if self.user_roles is None:
             return {'role': self.google_role(email)}
@@ -195,14 +215,14 @@ class Security:
         with self.user_roles.store.connect() if connection is None else nullcontext(connection) as conn:
             role = self.user_roles.role_in(conn, email)
             state = self.user_roles.access_in(conn, email, role)
-            if state.scim_active is False:
+            if state.scim_active is False or require_scim and state.scim_active is not True:
                 return None
             return {'role': role, '_permissions': state.permissions if self.user_roles.eligible(email) else frozenset()}
 
     def permissions_for_info(self, info):
         if not info:
             return frozenset()
-        if info.get('method') in {'google', 'cloudflare'} and self.user_roles is not None:
+        if info.get('method') in INDIVIDUAL_METHODS and self.user_roles is not None:
             if '_permissions' in info:
                 return info['_permissions']  # Resolved with this session_info's role.
             return self.user_roles.permissions(info['identity']['email'])
@@ -279,6 +299,13 @@ class Security:
         elif role == "member":
             info["password_tag"] = digest(self.settings.workspace_member_password)
         self.set_session_cookie(response, info)
+        return sid
+
+    def new_identity_session(self, response, role: str, *, method: str, identity: dict, client_id: str) -> str:
+        """A session for a verified individual from an organization identity provider."""
+        sid = secrets.token_urlsafe(32)
+        self.set_session_cookie(response, {"sid": sid, "role": role, "method": method,
+                                           "identity": identity, "client_id": client_id})
         return sid
 
     def set_session_cookie(self, response, info):

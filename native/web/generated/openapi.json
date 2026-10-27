@@ -2728,6 +2728,13 @@
             "title": "Mode",
             "type": "string"
           },
+          "oidc_providers": {
+            "items": {
+              "$ref": "#/components/schemas/AuthProviderOption"
+            },
+            "title": "Oidc Providers",
+            "type": "array"
+          },
           "password_enabled": {
             "title": "Password Enabled",
             "type": "boolean"
@@ -2737,9 +2744,29 @@
           "mode",
           "password_enabled",
           "google_enabled",
-          "access_enabled"
+          "access_enabled",
+          "oidc_providers"
         ],
         "title": "AuthConfig",
+        "type": "object"
+      },
+      "AuthProviderOption": {
+        "description": "An organization OpenID Connect provider offered on the sign-in page.",
+        "properties": {
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "label": {
+            "title": "Label",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "label"
+        ],
+        "title": "AuthProviderOption",
         "type": "object"
       },
       "AutomationDefinition": {
@@ -18595,7 +18622,7 @@
         "type": "object"
       },
       "SignInRedirect": {
-        "description": "Where the browser goes next: Google's authorization page, or a local path.",
+        "description": "Where the browser goes next: the provider's authorization page, or a local path.",
         "properties": {
           "url": {
             "title": "Url",
@@ -22220,6 +22247,56 @@
     "/api/auth/google/start": {
       "post": {
         "operationId": "startGoogleSignIn",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SignInStart"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SignInRedirect"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Start"
+      }
+    },
+    "/api/auth/oidc/{provider}/start": {
+      "post": {
+        "operationId": "startOidcSignIn",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "provider",
+            "required": true,
+            "schema": {
+              "pattern": "^[a-z][a-z0-9-]{0,31}$",
+              "title": "Provider",
+              "type": "string"
+            }
+          }
+        ],
         "requestBody": {
           "content": {
             "application/json": {
@@ -29710,6 +29787,84 @@
             "schema": {
               "default": "",
               "title": "Error",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Callback"
+      }
+    },
+    "/auth/oidc/{provider}/callback": {
+      "get": {
+        "operationId": "completeOidcSignIn",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "provider",
+            "required": true,
+            "schema": {
+              "pattern": "^[a-z][a-z0-9-]{0,31}$",
+              "title": "Provider",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "state",
+            "required": false,
+            "schema": {
+              "default": "",
+              "title": "State",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "code",
+            "required": false,
+            "schema": {
+              "default": "",
+              "title": "Code",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "error",
+            "required": false,
+            "schema": {
+              "default": "",
+              "title": "Error",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "iss",
+            "required": false,
+            "schema": {
+              "default": "",
+              "title": "Iss",
               "type": "string"
             }
           }

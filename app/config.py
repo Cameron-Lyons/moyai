@@ -1,13 +1,99 @@
 from pathlib import Path
-from typing import Literal
+from typing import Annotated, Literal
 import base64
+import json
 import re
 from urllib.parse import urlsplit
 
-from pydantic import AliasChoices, Field, field_validator, model_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 from .context_budget import ModelContextLimits
 from .model_selection import ASTRA, ASTRA_ULTRAFAST
+
+LOOPBACK_HOSTS = {'127.0.0.1', 'localhost', '::1'}
+OIDC_PROVIDER_ID = r'^[a-z][a-z0-9-]{0,31}$'
+# Microsoft's shared multi-tenant and personal-account issuers accept any
+# tenant's users, so an email claim there proves nothing about the organization.
+MICROSOFT_LOGIN_HOSTS = {'login.microsoftonline.com', 'login.microsoft.com', 'login.microsoftonline.us',
+                         'login.partner.microsoftonline.cn', 'sts.windows.net'}
+MICROSOFT_SHARED_TENANTS = {'common', 'organizations', 'consumers', '{tenantid}',
+                            '9188040d-6c67-4c5b-b112-36a304b66dad'}
+# Google's consumer issuer signs in any Google account, with no hosted-domain
+# check; Google Workspace domains use the built-in Google sign-in instead.
+GOOGLE_ISSUER_HOSTS = {'accounts.google.com'}
+OIDC_PROMPTS = {'none', 'login', 'consent', 'select_account'}
+
+
+class OidcProvider(BaseModel):
+    """One organization OpenID Connect provider from MOYAI_OIDC_PROVIDERS.
+
+    Contains no credentials; MOYAI_OIDC_CLIENT_SECRETS holds the client secret
+    for each id. Domains are always explicit: a provider owns sign-in for each
+    of its domains, and Google sign-in no longer accepts them.
+    """
+    model_config = ConfigDict(extra='forbid', frozen=True)
+    id: str = Field(pattern=OIDC_PROVIDER_ID)
+    label: str = Field(min_length=1, max_length=40)
+    issuer: str = Field(min_length=8, max_length=512)
+    client_id: str = Field(min_length=1, max_length=512)
+    domains: tuple[str, ...] = Field(min_length=1, max_length=50)
+    scopes: tuple[str, ...] = Field(default=('openid', 'email', 'profile'), min_length=1, max_length=20)
+    algorithms: tuple[Literal['RS256', 'PS256', 'ES256'], ...] = Field(default=('RS256',), min_length=1)
+    email_claim: str = Field(default='email', pattern=r'^[!-~]{1,128}$')
+    # Entra ID: 'xms_edov', an optional claim that is true only for a domain-verified email.
+    email_verified_claim: str = Field(default='email_verified', pattern=r'^[!-~]{1,128}$')
+    token_auth: Literal['client_secret_basic', 'client_secret_post'] = 'client_secret_basic'
+    prompt: str = Field(default='', max_length=64)
+    require_scim_user: bool = False
+
+    @field_validator('label', 'issuer', 'client_id')
+    @classmethod
+    def printable(cls, value):
+        if any(ord(char) < 32 or ord(char) == 127 for char in value):
+            raise ValueError('OpenID Connect settings cannot contain control characters or line breaks.')
+        return value
+
+    @field_validator('issuer')
+    @classmethod
+    def issuer_url(cls, value):
+        parsed = urlsplit(value)
+        if (parsed.scheme not in {'https', 'http'} or not parsed.hostname or parsed.username or parsed.password
+                or parsed.query or parsed.fragment or ' ' in value):
+            raise ValueError('Use the exact issuer URL, without credentials, a query or a fragment.')
+        _ = parsed.port
+        return value
+
+    @field_validator('domains')
+    @classmethod
+    def domain_names(cls, value):
+        domains = tuple(domain.strip().lower() for domain in value)
+        if len(set(domains)) != len(domains) or any(
+                not re.fullmatch(r'(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z][a-z0-9-]{0,62}', domain)
+                for domain in domains):
+            raise ValueError('List each verified email domain once, as a hostname.')
+        return domains
+
+    @field_validator('scopes')
+    @classmethod
+    def scope_tokens(cls, value):
+        if 'openid' not in value or len(set(value)) != len(value) or any(
+                not re.fullmatch(r'[!#-\[\]-~]{1,128}', scope) for scope in value):
+            raise ValueError("Scopes must be distinct OAuth scope tokens and include 'openid'.")
+        return value
+
+    @field_validator('algorithms')
+    @classmethod
+    def distinct_algorithms(cls, value):
+        if len(set(value)) != len(value):
+            raise ValueError('List each signing algorithm once.')
+        return value
+
+    @field_validator('prompt')
+    @classmethod
+    def prompt_values(cls, value):
+        if value and (value != value.strip() or not set(value.split(' ')) <= OIDC_PROMPTS):
+            raise ValueError('Use OpenID Connect prompt values separated by single spaces.')
+        return value
 
 
 # Keep picker IDs and labels in code so a stale deployment environment cannot
@@ -172,8 +258,78 @@ class Settings(BaseSettings):
                 'WORKSPACE_ACCESS_CLIENT_ID': self.cloudflare_access_client_id,
                 'WORKSPACE_ACCESS_CLIENT_SECRET': self.cloudflare_access_client_secret}
 
+    # Organization OpenID Connect (Okta, Microsoft Entra ID): a JSON provider
+    # list, and a separate JSON object of client secrets keyed by provider id.
+    oidc_providers: Annotated[list[OidcProvider], NoDecode] = Field(
+        default_factory=list, validation_alias=AliasChoices('MOYAI_OIDC_PROVIDERS', 'oidc_providers'))
+    oidc_client_secrets: Annotated[dict[str, str], NoDecode] = Field(
+        default_factory=dict, repr=False,
+        validation_alias=AliasChoices('MOYAI_OIDC_CLIENT_SECRETS', 'oidc_client_secrets'))
+
+    @field_validator('oidc_providers', 'oidc_client_secrets', mode='before')
+    @classmethod
+    def oidc_json(cls, value, info):
+        # Environment values are JSON text; an empty value configures nothing.
+        if not isinstance(value, str):
+            return value
+        if not value.strip():
+            return [] if info.field_name == 'oidc_providers' else {}
+        try:
+            return json.loads(value)
+        except ValueError:
+            raise ValueError('Use JSON for MOYAI_OIDC_PROVIDERS and MOYAI_OIDC_CLIENT_SECRETS.') from None
+
+    @model_validator(mode='after')
+    def validate_oidc(self):
+        if not self.oidc_providers and not self.oidc_client_secrets:
+            return self
+        ids = [provider.id for provider in self.oidc_providers]
+        if len(set(ids)) != len(ids) or {'google', 'cloudflare', 'password', 'local'} & set(ids):
+            raise ValueError('Give each OpenID Connect provider a distinct id other than google, cloudflare, password or local.')
+        # Never echo a value: these messages only name the settings.
+        if set(self.oidc_client_secrets) != set(ids) or any(
+                not secret or len(secret) > 1024 or any(ord(char) < 32 or ord(char) == 127 for char in secret)
+                for secret in self.oidc_client_secrets.values()):
+            raise ValueError('MOYAI_OIDC_CLIENT_SECRETS must hold one client secret for each configured provider id, without line breaks.')
+        local = urlsplit(self.public_url).hostname in LOOPBACK_HOSTS
+        for provider in self.oidc_providers:
+            issuer = urlsplit(provider.issuer)
+            # A loopback HTTP issuer serves backend tests only: the sign-in page
+            # navigates to an HTTPS authorization endpoint or to this origin.
+            if issuer.scheme != 'https' and not (local and issuer.hostname in LOOPBACK_HOSTS):
+                raise ValueError('Use an HTTPS OpenID Connect issuer. HTTP is allowed only on loopback for backend tests.')
+            tenant = issuer.path.strip('/').split('/')[0].lower()
+            if (issuer.hostname or '').lower() in MICROSOFT_LOGIN_HOSTS and tenant in MICROSOFT_SHARED_TENANTS:
+                raise ValueError('Use your single-tenant Microsoft Entra issuer (https://login.microsoftonline.com/<tenant-id>/v2.0).')
+            if (issuer.hostname or '').lower() in GOOGLE_ISSUER_HOSTS:
+                raise ValueError('Use the built-in Google sign-in for Google Workspace domains; it checks the hosted domain.')
+        organization = self.google_domains()
+        claimed = [domain for provider in self.oidc_providers for domain in provider.domains]
+        if not organization or len(set(claimed)) != len(claimed) or not set(claimed) <= organization:
+            raise ValueError('Each OpenID Connect domain must belong to one provider and be listed in GOOGLE_ALLOWED_DOMAINS.')
+        if not self.google_admins() or any(email.rpartition('@')[2] not in organization for email in self.google_admins()):
+            raise ValueError('OpenID Connect sign-in requires GOOGLE_ADMIN_EMAILS in the allowed domains.')
+        return self
+
+    def oidc_provider(self, provider_id: str) -> OidcProvider | None:
+        return next((provider for provider in self.oidc_providers if provider.id == provider_id), None)
+
+    def oidc_provider_for_domain(self, domain: str) -> OidcProvider | None:
+        """The one provider that owns sign-in for this email domain, if any."""
+        return next((provider for provider in self.oidc_providers if domain in provider.domains), None)
+
+    def oidc_domains(self) -> set[str]:
+        return {domain for provider in self.oidc_providers for domain in provider.domains}
+
+    def oidc_secret(self, provider_id: str) -> str:
+        return self.oidc_client_secrets[provider_id]
+
+    def google_signin_domains(self) -> set[str]:
+        """Allowed domains that sign in with Google: each domain has exactly one method."""
+        return self.google_domains() - self.oidc_domains()
+
     def person_login_enabled(self) -> bool:
-        return self.google_enabled() or self.cloudflare_access_login
+        return self.google_enabled() or self.cloudflare_access_login or bool(self.oidc_providers)
 
     workspace_password: str = ""
     workspace_member_password: str = ""
@@ -351,7 +507,7 @@ class Settings(BaseSettings):
         if not value:
             return value
         parsed = urlsplit(value)
-        local = parsed.hostname in {'127.0.0.1', 'localhost', '::1'}
+        local = parsed.hostname in LOOPBACK_HOSTS
         if (not parsed.hostname or parsed.username or parsed.password or parsed.query or parsed.fragment or
                 parsed.path not in {'', '/'} or (parsed.scheme != 'https' and not (local and parsed.scheme == 'http'))):
             raise ValueError('Use an HTTPS object-storage endpoint without credentials or a path. HTTP is allowed only on loopback for testing.')
@@ -546,7 +702,7 @@ class Settings(BaseSettings):
         parsed = urlsplit(value)
         if value and (not parsed.hostname or parsed.username or parsed.password or parsed.query or parsed.fragment
                       or parsed.path not in ('', '/') or (parsed.scheme != 'https' and not
-                      (parsed.scheme == 'http' and parsed.hostname in {'localhost', '127.0.0.1', '::1'}))):
+                      (parsed.scheme == 'http' and parsed.hostname in LOOPBACK_HOSTS))):
             raise ValueError('Use an HTTPS origin, or HTTP on loopback for a local port-forward.')
         return value.rstrip('/')
 

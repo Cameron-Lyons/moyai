@@ -234,6 +234,59 @@ async def test_cloudflare_access_secret_mutations_stay_on_the_writer_connection(
         await source.dispose()
 
 
+async def test_oidc_personal_secrets_recheck_the_pinned_subject_at_the_writer(runtime, bridge):
+    from app.config import OidcProvider
+    from app.security import Security
+
+    issuer = "https://idp.example.test/oauth2/default"
+    settings = bridge.settings.model_copy(update={
+        "oidc_providers": [OidcProvider(id="okta", label="Okta", issuer=issuer, client_id="okta-client",
+                                        domains=("example.test",))],
+        "oidc_client_secrets": {"okta": "synthetic-okta-secret"},
+    })
+    security = Security(settings, UserRoles(bridge.store, settings))
+    source = create_async_engine(f"sqlite+aiosqlite:///file:{bridge.store.path}?mode=ro&uri=true")
+    identity = ProductIdentityAdapter(settings, source, native_engine=runtime.database.engine)
+    person = {"provider": "okta", "issuer": issuer, "sub": "okta-subject", "email": "person@example.test",
+              "domain": "example.test", "name": "Person"}
+    with bridge.store.connect() as db:
+        db.execute("INSERT INTO users(id,kind,email,name,created_at,updated_at) VALUES(?,?,?,?,?,?)",
+                   ("oidc:person", "oidc", person["email"], "Person", "2026-10-15", "2026-10-15"))
+        db.execute("INSERT INTO access_identities VALUES(?,?,?,?,?)",
+                   (issuer, person["sub"], person["email"], "oidc:person", "created"))
+    runtime.product = SimpleNamespace(
+        store_proxy=bridge.store, security=security, settings=settings, identity=identity,
+        history=ProductHistoryAdapter(identity, source),
+    )
+    app = FastAPI()
+    app.include_router(ProductSecrets(runtime).routes())
+    info = {"sid": "signed-oidc-session", "role": "member", "method": "oidc", "identity": person,
+            "client_id": "okta-client"}
+    try:
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url=settings.public_url) as client:
+            client.cookies.set("workspace_session", security.signer.dumps(info))
+            client.headers.update({"Origin": settings.public_url, "X-CSRF-Token": security.csrf(info["sid"])})
+            created = await client.post("/api/credentials/secrets", json=secret())
+            assert created.status_code == 201, created.text
+            assert bridge.store.rows("SELECT owner_id FROM provider_secrets") == [{"owner_id": "oidc:person"}]
+
+            # An administrator rebinds the account after this request's authority check.
+            current = identity.require_current
+
+            async def rebound(grant):
+                principal = await current(grant)
+                bridge.store.execute("UPDATE access_identities SET subject='another-subject'")
+                return principal
+            identity.require_current = rebound
+            refused = await client.post("/api/credentials/secrets", json=secret(client_id="second-save"))
+            assert refused.status_code == 401
+            assert refused.json()["detail"] == "The sign-in account mapping changed before saving."
+            assert len(bridge.store.rows("SELECT 1 FROM provider_secrets")) == 1
+    finally:
+        runtime.product = None
+        await source.dispose()
+
+
 async def test_postgres_pool_one_secret_mutations_reuse_live_role_transaction(tmp_path):
     from app.db import Store, database
     from app.security import Security

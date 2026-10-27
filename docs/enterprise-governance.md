@@ -86,6 +86,13 @@ requests Access blocks. Directory writes take the canonical writer lock and
 briefly pause native admissions, so run large initial imports or group
 replacements off-peak.
 
+People can also sign in through an organization OpenID Connect provider (Okta,
+Microsoft Entra ID); see [sign-in](authentication.md#organization-openid-connect-okta-microsoft-entra-id).
+Sign-in and every later request recheck SCIM state: a deactivated person is
+refused, and a provider with `require_scim_user` accepts only active provisioned
+people. Its group claims grant nothing; SCIM groups remain the source of group
+grants.
+
 | Permission | Governance access |
 | --- | --- |
 | `users.read` / `users.manage` | User directory / built-in role assignments |
@@ -368,14 +375,16 @@ refused.
 ## Audit and API
 
 The audit feed combines metadata-only role, SCIM, policy, spend, credential, and
-connection changes with AI guardrail refusals and attestation failures. Filters
-and signed cursors bound each page. Only the first page
+connection changes, AI guardrail refusals and attestation failures, and
+organization OpenID Connect enrollment and sign-in (`identity_binding.created`,
+`sign_in.succeeded`, and `sign_in.refused` with a fixed reason). Filters and
+signed cursors bound each page. Only the first page
 (no cursor) carries the filter facets, as only the provisioning directory's first
 page carries its groups, tokens and activity. CSV/NDJSON exports stream pages of up
 to 1,000 rows and recheck live permission before releasing each page. Tokens,
-credential contents, prompts, and policy domain, tool, repository and model
-payloads are excluded from governance events.
-Apart from AI guardrail refusals and attestation failures, this records
+credential contents, prompts, policy domain, tool, repository and model payloads,
+and identity provider tokens, codes and claims are excluded from governance events.
+Apart from AI guardrail refusals, attestation failures and sign-in, this records
 configuration history, not a transcript of every agent action.
 
 | Endpoint | Purpose |

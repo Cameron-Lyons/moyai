@@ -300,6 +300,16 @@ class ProductSecrets:
             ).fetchone()
             if not binding or binding["subject"] != identity.get("sub"):
                 raise HTTPException(401, "The Access identity mapping changed before saving.")
+        elif principal.method == "oidc":
+            # session_info matched the cookie's issuer to the live provider; the
+            # pinned subject must still be the one that signed in.
+            identity = info.get("identity") or {}
+            binding = connection.execute(
+                "SELECT subject FROM access_identities WHERE issuer=? AND user_id=? AND email=?",
+                (identity.get("issuer"), principal.id, principal.email),
+            ).fetchone()
+            if not binding or binding["subject"] != identity.get("sub"):
+                raise HTTPException(401, "The sign-in account mapping changed before saving.")
         # Live permissions from the same resolution. Organization credentials
         # follow credentials.publish, which custom roles can delegate.
         return security.permissions_for_info(info)

@@ -767,7 +767,7 @@ class ProductAutomationService:
             not principal.individual or not self.settings.person_login_enabled()
             or principal.email.rpartition("@")[2] not in self.settings.google_domains()
         ):
-            raise HTTPException(403, "Automation tools require an individual Google or Cloudflare identity.")
+            raise HTTPException(403, "Automation tools require an individual organization identity.")
         return principal
 
     async def check_tool_caller(self, scope: RunScope, run_id: str | None, grant: ProductGrant) -> None:

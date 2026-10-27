@@ -12,6 +12,7 @@ from pydantic import Field
 
 from .db import Store, database, now
 from .connector_errors import ConnectorError
+from .identity_kinds import INDIVIDUAL_KINDS
 from .github import GitHub, TOOLS as GITHUB_TOOLS
 from .github_coding import READS as GITHUB_CODING_READS
 from .slack_origin import metadata as slack_metadata
@@ -74,7 +75,7 @@ class SlackThread(SlackChannel):
 
 
 class SlackSend(Args):
-    channel: str = Field(pattern=r"^(?:me|[CDGUW][A-Z0-9]{7,30})$", description="Use 'me' to DM the authenticated requester (the owner in an automation run), resolved through their verified Slack/Google account. Otherwise use a channel/conversation or Slack user ID. Do not reuse another person's DM ID.")
+    channel: str = Field(pattern=r"^(?:me|[CDGUW][A-Z0-9]{7,30})$", description="Use 'me' to DM the authenticated requester (the owner in an automation run), resolved through their verified Slack or organization account. Otherwise use a channel/conversation or Slack user ID. Do not reuse another person's DM ID.")
     text: str = Field(min_length=1, description="Message body only. The server adds the requesting person's name as 'Name: message'. Long bodies continue in replies at Slack's per-message limit; receipts identify each part.")
 
 
@@ -359,8 +360,8 @@ class Connectors:
         rows = self.store.rows("""SELECT COALESCE(linked.email,u.email) AS email,
             COALESCE(linked.kind,u.kind) AS kind FROM users u
             LEFT JOIN users linked ON linked.id=u.linked_user_id WHERE u.id=?""", (user_id,))
-        if not rows or rows[0]['kind'] not in {'google', 'cloudflare'} or not rows[0]['email']:
-            raise ConnectorError('Sign in with Google or link your Slack identity before using My Linear tickets.', dispatched=False)
+        if not rows or rows[0]['kind'] not in INDIVIDUAL_KINDS or not rows[0]['email']:
+            raise ConnectorError('Sign in with your organization account or link your Slack identity before using My Linear tickets.', dispatched=False)
         if rows[0]['email'].rpartition('@')[2] not in self.settings.google_domains():
             raise ConnectorError('Your work email is no longer allowed in this workspace.', dispatched=False)
         if not self.allowed('linear_my_issues'):
@@ -597,8 +598,8 @@ class Connectors:
         if not actor and run and not run.get('chat_enabled'):
             actor = run.get('owner_id')
         rows = self.store.rows('SELECT name,email,kind FROM users WHERE id=?', (actor,)) if actor else []
-        if not rows or rows[0]['kind'] not in {'google', 'cloudflare', 'slack'}:
-            raise ConnectorError('Slack sends require an identified requester. Sign in with Google or send from your Slack account.', dispatched=False)
+        if not rows or rows[0]['kind'] not in INDIVIDUAL_KINDS | {'slack'}:
+            raise ConnectorError('Slack sends require an identified requester. Sign in with your organization account or send from your Slack account.', dispatched=False)
         label = ' '.join((rows[0]['name'] or rows[0]['email']).split())
         if not label:
             raise ConnectorError('The Slack requester has no profile name. Reconnect your sign-in before sending.', dispatched=False)

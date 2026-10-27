@@ -35,9 +35,10 @@ async function handle(req,res,next) {
     res.writeHead(failure.status,{'Content-Type':failure.type||'text/plain','Cache-Control':'no-store'});
     res.end(failure.body??'Internal Server Error');return;
   }
-  if(url.pathname==='/api/auth/config')return json({mode:state.mode,password_enabled:state.password,google_enabled:state.google,access_enabled:state.access});
+  if(url.pathname==='/api/auth/config')return json({mode:state.mode,password_enabled:state.password,google_enabled:state.google,access_enabled:state.access,oidc_providers:state.oidc||[]});
   if(url.pathname==='/api/login'){state.signedIn=true;return json({csrf:'fixture-csrf'});}
   if(url.pathname==='/api/auth/google/start')return json({url:'https://accounts.google.com/fixture'});
+  if(url.pathname.startsWith('/api/auth/oidc/'))return json({url:'https://idp.example.test/authorize?fixture=1'});
   if(url.pathname==='/api/logout'){state.signedIn=false;return json({signed_out:true});}
   if(!state.signedIn)return json({detail:'Sign in.'},401);
   if(url.pathname==='/api/me')return json({user:{id:'viewer',name:state.viewerName||'Test viewer',role:'admin',individual:state.individual},csrf:'fixture-csrf',models:state.models||['test-model'],default_model:state.defaultModel||'test-model',product_mode:state.mode,preferences:state.preferences||{delivery_mode:'when_idle',connection_ids:null}});
@@ -2258,6 +2259,21 @@ test('capability-driven product/standalone login and shared session admission',a
   await waitFor(()=>state.requests.some(req=>req.path==='/api/sessions'&&req.method==='POST'));assert.equal(state.requests.find(req=>req.path==='/api/sessions'&&req.method==='POST').body.visibility,'shared');
   const login=state.requests.find(req=>req.path==='/api/login');assert.equal(login.body.username,undefined);
   reset({signedIn:false,mode:'standalone',google:false});await page.goto(base+'/');await page.getByLabel('Username',{exact:true}).waitFor();assert.equal(await page.getByRole('button',{name:'Continue with Google'}).count(),0);
+});
+
+test('organization OpenID Connect providers start their own sign-in',async t=>{
+  reset({signedIn:false,individual:false,google:false,password:false,oidc:[{id:'okta',label:'Okta'},{id:'entra',label:'Microsoft Entra ID'}]});
+  const page=await pageFor(t,'',768,page=>page.route('https://idp.example.test/**',route=>route.fulfill({contentType:'text/html',body:'<title>Synthetic provider</title>'})));
+  const okta=page.getByRole('button',{name:'Continue with Okta',exact:true});await okta.waitFor();
+  assert.equal(await page.getByRole('button',{name:'Continue with Microsoft Entra ID',exact:true}).count(),1);
+  assert.equal(await page.getByRole('button',{name:'Continue with Google'}).count(),0);
+  assert.equal(await page.getByText('No sign-in method is enabled.',{exact:false}).count(),0);
+  await okta.click();await page.waitForURL('https://idp.example.test/**');
+  const started=state.requests.find(req=>req.path==='/api/auth/oidc/okta/start');
+  assert.equal(started.method,'POST');assert.deepEqual(started.body,{return_to:'/'});
+  reset({signedIn:false,individual:false,google:false,password:false,access:true});const access=await pageFor(t,'');
+  await access.getByRole('button',{name:'Continue to workspace'}).waitFor();
+  assert.equal(await access.getByRole('button',{name:/^Continue with /}).count(),0);
 });
 
 for(const privateSession of [false,true])test(`individual home defaults to shared with private opt-in: ${privateSession}`,async t=>{

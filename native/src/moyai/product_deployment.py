@@ -79,7 +79,7 @@ def check_runtime_dependencies() -> dict[str, str]:
     try:
         for name in (
             "jwt", "psycopg", "psycopg_pool", "app.config", "app.security",
-            "app.db", "app.blob_storage", "app.google_sso",
+            "app.db", "app.blob_storage", "app.google_sso", "app.oidc_sso",
         ):
             import_module(name)
     except ImportError:

@@ -1888,7 +1888,7 @@ requires-dist = [
     { name = "pydantic-ai", extras = ["temporal"], specifier = "==2.55.0" },
     { name = "pydantic-ai-harness", extras = ["coder", "modal", "skills", "github", "linear", "notion", "slack", "temporal", "playwright", "code-mode"], specifier = "==0.55.0" },
     { name = "pydantic-settings", specifier = ">=2.8,<3" },
-    { name = "pyjwt", extras = ["crypto"], specifier = ">=2.10,<3" },
+    { name = "pyjwt", extras = ["crypto"], specifier = ">=2.10.1,<3" },
     { name = "python-dotenv", specifier = ">=1,<2" },
     { name = "sqlalchemy", extras = ["asyncio"], specifier = ">=2.0,<3" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.34,<1" },
@@ -1900,7 +1900,7 @@ provides-extras = ["product"]
 dev = [
     { name = "httpx", specifier = ">=0.28" },
     { name = "psycopg", extras = ["binary", "pool"], specifier = ">=3.2,<4" },
-    { name = "pyjwt", extras = ["crypto"], specifier = ">=2.10,<3" },
+    { name = "pyjwt", extras = ["crypto"], specifier = ">=2.10.1,<3" },
     { name = "pyright", specifier = ">=1.1" },
     { name = "pytest", specifier = ">=8" },
     { name = "pytest-asyncio", specifier = ">=1" },

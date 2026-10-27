@@ -45,6 +45,7 @@ class ProductResources:
         )
         from app.blob_storage import ObjectStorage
         from app.google_sso import GoogleSignIn
+        from app.oidc_sso import OidcSignIn
         from app.security import Security
         from app.user_roles import UserRoles
 
@@ -63,6 +64,7 @@ class ProductResources:
         self.spend_limits = SpendLimits(self.store_proxy, roles=self.roles.enterprise)
         self.security = Security(settings, self.roles)
         self.google = GoogleSignIn(settings, self.security, self.store_proxy)
+        self.oidc = OidcSignIn(settings, self.security, self.store_proxy)
         self.identity = ProductIdentityAdapter(
             settings, self.engine, native_engine=self.native_engine,
             allow_shared_identities=True,

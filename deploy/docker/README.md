@@ -167,6 +167,13 @@ balancer during this check. If Cloudflare Access protects the public origin,
 configure `CLOUDFLARE_ACCESS_CLIENT_ID` and `CLOUDFLARE_ACCESS_CLIENT_SECRET`
 with permission to reach the broker routes.
 
+The split topology can also use organization OpenID Connect sign-in (Okta,
+Microsoft Entra ID): export `GOOGLE_ALLOWED_DOMAINS`, `GOOGLE_ADMIN_EMAILS`,
+`MOYAI_OIDC_PROVIDERS` and `MOYAI_OIDC_CLIENT_SECRETS` before `configure`, as
+described in [sign-in](../../docs/authentication.md#organization-openid-connect-okta-microsoft-entra-id).
+Every service receives the same values; with `--secrets-from-env` the client
+secrets stay in your environment like the other credentials.
+
 These modes have different identity/schema contracts. Changing the topology
 variable or `COMPOSE_FILE` does not migrate an existing standalone installation
 into the split topology. Use a new installation or an explicitly verified

@@ -57,6 +57,76 @@ def test_google_login_requires_an_explicit_allowed_domain(tmp_path, monkeypatch)
     Security(settings)
 
 
+OKTA = {'id': 'okta', 'label': 'Okta', 'issuer': 'https://example.okta.com/oauth2/default',
+        'client_id': 'synthetic-client', 'domains': ['example.test']}
+
+
+def oidc_settings(tmp_path, providers=(OKTA,), secrets=None, **overrides):
+    values = {'_env_file': None, 'data_dir': tmp_path, 'public_url': 'https://workspace.example.test',
+              'google_allowed_domains': 'example.test,other.test', 'google_admin_emails': 'admin@example.test',
+              'oidc_providers': list(providers),
+              'oidc_client_secrets': {item['id']: 'synthetic-secret' for item in providers} if secrets is None else secrets}
+    return Settings(**{**values, **overrides})
+
+
+@pytest.mark.parametrize('providers, secrets, overrides', [
+    ((OKTA,), None, {'google_allowed_domains': ''}),
+    (({**OKTA, 'domains': ['unlisted.test']},), None, {}),
+    ((OKTA, {**OKTA, 'id': 'entra'}), None, {}),
+    ((OKTA, OKTA), {'okta': 'synthetic-secret'}, {}),
+    (({**OKTA, 'id': 'google'},), None, {}),
+    ((OKTA,), {}, {}),
+    ((OKTA,), {'okta': 'synthetic-secret', 'unknown': 'synthetic-secret'}, {}),
+    ((OKTA,), {'okta': 'synthetic\nsecret'}, {}),
+    (({**OKTA, 'issuer': 'http://example.okta.com'},), None, {}),
+    (({**OKTA, 'issuer': 'http://127.0.0.1:9000'},), None, {}),
+    (({**OKTA, 'issuer': 'https://login.microsoftonline.com/common/v2.0'},), None, {}),
+    (({**OKTA, 'issuer': 'https://login.microsoftonline.com/organizations/v2.0'},), None, {}),
+    (({**OKTA, 'issuer': 'https://login.microsoftonline.com/{tenantid}/v2.0'},), None, {}),
+    (({**OKTA, 'issuer': 'https://accounts.google.com'},), None, {}),
+    (({**OKTA, 'issuer': 'https://Accounts.Google.com/'},), None, {}),
+    (({**OKTA, 'label': 'Okta\r\nSet-Cookie: x'},), None, {}),
+    ((OKTA,), None, {'google_admin_emails': 'admin@elsewhere.test'}),
+    ((OKTA,), None, {'google_admin_emails': ''}),
+])
+def test_oidc_providers_require_explicit_distinct_domains_and_secrets(tmp_path, providers, secrets, overrides):
+    with pytest.raises(ValidationError) as error:
+        oidc_settings(tmp_path, providers, secrets, **overrides)
+    assert 'synthetic-secret' not in str(error.value) and 'synthetic\nsecret' not in str(error.value)
+
+
+def test_oidc_owns_its_domains_and_counts_as_person_sign_in(tmp_path, monkeypatch):
+    from app.security import Security
+
+    settings = oidc_settings(tmp_path, public_url='http://127.0.0.1:8787')
+    assert settings.google_signin_domains() == {'other.test'} and settings.oidc_domains() == {'example.test'}
+    assert settings.oidc_provider_for_domain('example.test').id == 'okta'
+    assert settings.oidc_provider_for_domain('other.test') is None
+    # Without this, an OIDC-only loopback deployment would be an anonymous local preview.
+    assert settings.person_login_enabled() and not Security(settings).local_preview()
+    assert 'synthetic-secret' not in repr(settings)
+    loopback = oidc_settings(tmp_path, ({**OKTA, 'issuer': 'http://127.0.0.1:9000/realms/test'},),
+                             public_url='http://127.0.0.1:8787')
+    assert loopback.oidc_providers[0].issuer == 'http://127.0.0.1:9000/realms/test'
+    tenant = oidc_settings(tmp_path, ({**OKTA, 'issuer': 'https://login.microsoftonline.com/0000-tenant/v2.0'},))
+    assert tenant.oidc_secret('okta') == 'synthetic-secret'
+
+    monkeypatch.setenv('MOYAI_OIDC_PROVIDERS', '[{"id":"okta","label":"Okta","issuer":"https://example.okta.com",'
+                                               '"client_id":"c","domains":["Example.TEST"]}]')
+    monkeypatch.setenv('MOYAI_OIDC_CLIENT_SECRETS', '{"okta":"synthetic-secret"}')
+    monkeypatch.setenv('GOOGLE_ALLOWED_DOMAINS', 'example.test')
+    monkeypatch.setenv('GOOGLE_ADMIN_EMAILS', 'admin@example.test')
+    assert Settings(_env_file=None).oidc_providers[0].domains == ('example.test',)
+    # An empty environment value (as in .env.example) configures nothing.
+    monkeypatch.setenv('MOYAI_OIDC_PROVIDERS', '')
+    monkeypatch.setenv('MOYAI_OIDC_CLIENT_SECRETS', '')
+    assert Settings(_env_file=None).oidc_providers == [] and not Settings(_env_file=None).person_login_enabled()
+    monkeypatch.setenv('MOYAI_OIDC_CLIENT_SECRETS', '{not json synthetic-secret')
+    with pytest.raises(ValidationError) as error:
+        Settings(_env_file=None)
+    assert 'synthetic-secret' not in str(error.value)
+
+
 def test_deployment_cannot_select_github_repositories(monkeypatch):
     monkeypatch.setenv('GITHUB_REPOSITORIES', 'OtherOrg/private')
     settings = Settings(_env_file=None)

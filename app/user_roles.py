@@ -33,6 +33,7 @@ from .enterprise_roles import (
     scim_state_in,
 )
 from .governance_audit import record_event_in
+from .identity_kinds import INDIVIDUAL_KINDS, INDIVIDUAL_KINDS_SQL
 from .permissions import BUILTIN_PERMISSIONS
 
 CUSTOM_ROLE = 'This person has a custom role. Confirm replacing it to continue.'
@@ -82,7 +83,7 @@ class UserRoles:
         row = conn.execute('SELECT * FROM users WHERE id=?', (actor_id,)).fetchone()
         if row is None:
             return frozenset()
-        if row['kind'] in {'google', 'cloudflare'}:
+        if row['kind'] in INDIVIDUAL_KINDS:
             return self.permissions_in(conn, row['email'])
         if row['kind'] == 'slack':
             from datetime import datetime, timezone
@@ -156,13 +157,14 @@ class UserRoles:
             assignments = {row['email']: dict(row) for row in conn.execute('SELECT * FROM user_roles')}
             people = {email: {'email': email, 'name': '', 'has_signed_in': False, 'last_seen': None}
                       for email in set(self.settings.google_admins()) | assignments.keys() if self.eligible(email)}
-            # Slack profiles may appear before Google sign-in. They do not grant authentication.
-            for row in conn.execute("SELECT email,name,kind,updated_at FROM users WHERE kind IN ('google','cloudflare') OR (kind='slack' AND profile_eligible=1) ORDER BY updated_at"):
+            # Slack profiles may appear before organization sign-in. They do not grant authentication.
+            for row in conn.execute('SELECT email,name,kind,updated_at FROM users WHERE kind IN ' + INDIVIDUAL_KINDS_SQL
+                                     + " OR (kind='slack' AND profile_eligible=1) ORDER BY updated_at"):
                 email = row['email'].strip().lower()
                 if not self.eligible(email):
                     continue
                 person = people.setdefault(email, {'email': email, 'name': '', 'has_signed_in': False, 'last_seen': None})
-                if row['kind'] in {'google', 'cloudflare'}:
+                if row['kind'] in INDIVIDUAL_KINDS:
                     person.update(name=row['name'], has_signed_in=True, last_seen=row['updated_at'])
                 elif not person['name']:
                     person['name'] = row['name']
@@ -187,7 +189,7 @@ class UserRoles:
         if not actor:
             raise HTTPException(401, 'Sign in to the workspace.')
         if not self.eligible(body.email):
-            raise HTTPException(422, 'Use an email in the workspace’s allowed Google domains.')
+            raise HTTPException(422, 'Use an email in the workspace’s allowed domains.')
         with self.store.connect() as conn:
             # Serialize authorization, the last-admin check, and the write. Two
             # concurrent demotions must never remove both remaining admins.

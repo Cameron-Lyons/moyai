@@ -16,6 +16,7 @@ from .database import Connection, DatabaseRow
 from .db import database, now
 from .enterprise_roles import FORBIDDEN
 from .identities import PROFILE_MAX_AGE_SECONDS
+from .identity_kinds import INDIVIDUAL_ID_PREFIXES
 from .aws_login import AWSLogin, AWS_LOGIN_DESCRIPTION, login_required
 from app.aws_credentials import bundle as aws_bundle
 
@@ -472,8 +473,8 @@ class Credentials:
             admin = 'credentials.publish' in self.write_permissions(conn, user_id, permissions)
         if body.scope == 'organization' and not admin:
             raise HTTPException(403, 'Only an administrator can save organization credentials.')
-        if body.scope != 'organization' and not user_id.startswith(('google:', 'cloudflare:')) and not self.security.local_preview():
-            raise HTTPException(403, 'Use Google sign-in to save personal credentials.')
+        if body.scope != 'organization' and not user_id.startswith(INDIVIDUAL_ID_PREFIXES) and not self.security.local_preview():
+            raise HTTPException(403, 'Use individual organization sign-in to save personal credentials.')
         root_id = root_id or body.root_id if body.lifetime == 'session' else ''
         if body.lifetime == 'session' and not root_id:
             raise HTTPException(422, 'Session credentials must be associated with a session.')
@@ -1141,8 +1142,8 @@ class Credentials:
                 # An administrator can make a shared credential personal only to themselves.
                 values['owner_id'] = user_id
                 values['client_id'] = 'ownership-' + secret_id
-                if not user_id.startswith(('google:', 'cloudflare:')) and not self.security.local_preview():
-                    raise HTTPException(403, 'Use Google sign-in to save personal credentials.')
+                if not user_id.startswith(INDIVIDUAL_ID_PREFIXES) and not self.security.local_preview():
+                    raise HTTPException(403, 'Use individual organization sign-in to save personal credentials.')
             if values['lifetime'] == 'session':
                 if not authorized_native_root or values['root_id'] != authorized_native_root:
                     root = self.store.run(values['root_id'], connection=conn) if values['root_id'] else None

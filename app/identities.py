@@ -1,7 +1,7 @@
 """Resolve Slack senders outside webhook acknowledgement and sandbox execution.
 
-Profiles can create an email-labelled local identity; only Google OIDC can
-authenticate a web session. This is JIT matching, not SCIM lifecycle management.
+Profiles can create an email-labelled local identity; only organization sign-in
+(Google, Access or OIDC) can authenticate a web session. This is JIT matching, not SCIM lifecycle management.
 """
 import asyncio
 import re
@@ -16,6 +16,7 @@ from fastapi import APIRouter, HTTPException, Request
 from .db import database, now
 from .database import DatabaseError
 from .connector_errors import ConnectorError
+from .identity_kinds import INDIVIDUAL_KINDS, INDIVIDUAL_KINDS_SQL
 
 PROFILE_SCOPES = {'users:read', 'users:read.email'}
 # Refresh with headroom for worker delays and retries, without extending the
@@ -50,8 +51,8 @@ class SlackIdentities:
         if not actor and run and not run.get('chat_enabled'):
             actor = run.get('owner_id')
         rows = await database(self.store.rows, 'SELECT * FROM users WHERE id=?', (actor,)) if isinstance(actor, str) and actor else []
-        if not rows or rows[0]['kind'] not in {'google', 'cloudflare', 'slack'} or not run:
-            raise ConnectorError('Slack identity requires an identified requester. Sign in with Google or message the bot in Slack.')
+        if not rows or rows[0]['kind'] not in INDIVIDUAL_KINDS | {'slack'} or not run:
+            raise ConnectorError('Slack identity requires an identified requester. Sign in with your organization account or message the bot in Slack.')
         user = rows[0]
         installation = await database(self.connectors.slack_installation)
         await database(self.check_requester, run, installation)
@@ -102,7 +103,7 @@ class SlackIdentities:
             await self.checkpoints.flush()
         await database(self.check_requester, run, installation)
         # Re-read after provider awaits; historical/manual spend links alone never select a recipient.
-        google = await database(self.store.rows, "SELECT id FROM users WHERE kind IN ('google','cloudflare') AND email=?", (email,))
+        google = await database(self.store.rows, 'SELECT id FROM users WHERE kind IN ' + INDIVIDUAL_KINDS_SQL + ' AND email=?', (email,))
         matches = await database(candidates)
         if len(google) != 1 or google[0]['id'] != actor or len(matches) != 1:
             raise ConnectorError('Your Slack identity is ambiguous. Review the linked accounts before sending a DM.')

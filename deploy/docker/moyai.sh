@@ -68,6 +68,7 @@ if [ "$action" = configure ]; then
         --env TEMPORAL_ADDRESS --env TEMPORAL_NAMESPACE --env TEMPORAL_TLS --env TEMPORAL_API_KEY \
         --env MOYAI_TEMPORAL_DATABASE_PASSWORD \
         --env CLOUDFLARE_ACCESS_CLIENT_ID --env CLOUDFLARE_ACCESS_CLIENT_SECRET \
+        --env GOOGLE_ALLOWED_DOMAINS --env GOOGLE_ADMIN_EMAILS --env MOYAI_OIDC_PROVIDERS --env MOYAI_OIDC_CLIENT_SECRETS \
         --env WORKSPACE_PASSWORD --env SESSION_SECRET --env ENCRYPTION_KEY --env MOYAI_NATIVE_ENCRYPTION_KEY \
         --entrypoint "$python" "$image" -m moyai.install_config --directory /install --image "$image" "$@"
 fi

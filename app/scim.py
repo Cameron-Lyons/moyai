@@ -1,7 +1,7 @@
 """SCIM 2.0 Users and Groups provisioning with bearer tokens stored as hashes.
 
 The supported schema, filter and PATCH subset is explicit. Provisioning never
-creates sign-in sessions or replaces verified Google/Access identities; it
+creates sign-in sessions or replaces verified Google, Access or OIDC identities; it
 controls whether an email may act (deactivation and deletion revoke access) and
 which directory groups receive custom-role grants. Deleted resources keep
 tombstones so a reused userName or externalId cannot revive old grants.

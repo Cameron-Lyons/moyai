@@ -327,3 +327,26 @@ def test_security_person_resolves_directory_state_and_permissions(directory):
     assert security.person('dan@other.test')['_permissions'] == frozenset()  # Ineligible domain.
     deactivate(directory, provision(directory, 'dan@example.com'))
     assert security.person('dan@example.com') is None
+
+
+def test_oidc_accounts_are_individuals_for_directory_actors_and_audit(directory):
+    service = directory
+    signed_in(service, 'ida@example.com', kind='oidc')
+    custom(service, 'ida@example.com')
+    row = next(row for row in service.roles.directory()['users'] if row['email'] == 'ida@example.com')
+    assert row['has_signed_in'] and row['permissions'] == ['sessions.read', 'workspace.read']
+    with service.store.connect() as conn:
+        assert service.roles.permissions_for_actor_in(conn, 'oidc:ida@example.com') == {'sessions.read', 'workspace.read'}
+    principal = SimpleNamespace(id='oidc:ida@example.com', kind='oidc', method='oidc', email='Ida@example.com',
+                                role='member', permissions=frozenset({'sessions.read'}))
+    actor = GovernanceActor.from_principal(principal)
+    assert (actor.resolved_kind, actor.email) == ('individual', 'ida@example.com')
+    # An earlier Google account that now signs in through the organization's provider.
+    linked = GovernanceActor.from_principal(SimpleNamespace(**{**vars(principal), 'kind': 'google'}))
+    assert linked.resolved_kind == 'individual'
+    from app.governance_audit import record_event_in
+    with service.store.connect() as conn:
+        conn.begin_write()
+        record_event_in(conn, 'sign_in.refused', 'anonymous', 'sign_in', 'okta', {'method': 'oidc', 'reason': 'token'})
+        with pytest.raises(ValueError, match='resource_type'):
+            record_event_in(conn, 'enrolled', 'ida@example.com', 'identity_binding', 'oidc:ida', {})

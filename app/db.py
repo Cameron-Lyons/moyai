@@ -12,6 +12,7 @@ from uuid import uuid4
 from .database import PostgresDatabase, sqlite_connection, connection_scope
 from .attachments import Attachments
 from .blob_storage import ArtifactStore, ObjectStorage
+from .identity_kinds import INDIVIDUAL_KINDS, INDIVIDUAL_KINDS_SQL
 from .slack_mentions import SlackMentions
 from .scheduling_diagnostics import age_ms, record, slow_database
 
@@ -75,6 +76,21 @@ def require_database_owner(path: Path) -> None:
         if os.geteuid() != owner:
             # Even read-only root connections can race the owner's WAL/SHM creation.
             raise PermissionError(f"Database access requires UID {owner}; run maintenance as the database owner.")
+
+
+class IdentityRefused(ValueError):
+    """An external sign-in Moyai will not accept, enroll or resolve.
+
+    reason is a fixed audit value, never provider claims: the store refuses
+    with mapping_review, deactivated or not_provisioned, and OIDC sign-in
+    (app.oidc_sso) with cancelled, issuer, token, claims, email_unverified or
+    domain.
+    """
+
+    def __init__(self, reason):
+        super().__init__('The sign-in account mapping requires administrator review.'
+                         if reason == 'mapping_review' else 'This sign-in was refused.')
+        self.reason = reason
 
 
 class Store:
@@ -480,7 +496,7 @@ class Store:
     def session_view_owner_in(conn, user_id: str) -> str:
         """Resolve shared-workspace view links, never authentication or authorship."""
         linked = conn.execute("""SELECT target.id FROM users source JOIN users target
-            ON target.id=source.linked_user_id AND target.kind IN ('google','cloudflare')
+            ON target.id=source.linked_user_id AND target.kind IN """ + INDIVIDUAL_KINDS_SQL + """
             WHERE source.id=? AND source.kind='slack'""", (user_id,)).fetchone()
         return linked['id'] if linked else user_id
 
@@ -607,7 +623,7 @@ class Store:
     def create_run(self, prompt: str, repo_url: str, mode: str, plugins: list[str], *, chat_enabled=False, model='', user_id='', attachment_ids=None, client_id=None, environment_id='auto', side_chat_of='', harness='hermes', github_repository_id=None, sandbox_provider=None, metadata_request=False, swarm_budget_seconds=None, durable_submit=None, swarm_bootstrap=None, received_at=None, private_owner_id=''):
         if private_owner_id:
             owners = self.rows('SELECT kind FROM users WHERE id=?', (private_owner_id,))
-            if private_owner_id != user_id or not owners or owners[0]['kind'] not in {'google', 'cloudflare'}:
+            if private_owner_id != user_id or not owners or owners[0]['kind'] not in INDIVIDUAL_KINDS:
                 raise ValueError('Private sessions require a verified individual owner.')
             if not chat_enabled or side_chat_of or swarm_budget_seconds is not None:
                 raise ValueError('Private sessions require a direct chat without derivation or swarms.')
@@ -945,6 +961,14 @@ class Store:
         """Only call with the server-verified session, never request JSON."""
         if info.get('method') == 'cloudflare':
             return self.access_identity(info['identity'])
+        if info.get('method') == 'oidc':
+            # Resolve only. Enrollment happens in the verified callback, so a
+            # binding an administrator removed is never restored from a cookie.
+            with self.connect() as conn:
+                actor = self.access_actor_in(conn, info['identity'])
+            if actor is None:
+                raise IdentityRefused('mapping_review')
+            return actor
         if info.get('method') == 'google':
             identity = info['identity']
             user_id = 'google:' + identity['sub']
@@ -977,9 +1001,9 @@ class Store:
             WHERE binding.issuer=? AND binding.subject=?''', (identity['issuer'], identity['sub'])).fetchone()
         if not binding:
             return None
-        if (binding['kind'] not in {'google', 'cloudflare'}
+        if (binding['kind'] not in INDIVIDUAL_KINDS
                 or binding['access_email'] != identity['email'] or binding['user_email'] != identity['email']):
-            raise ValueError('Access account mapping requires administrator review.')
+            raise IdentityRefused('mapping_review')
         return binding['user_id']
 
     def touch_access_identity(self, identity, actor, seen_at):
@@ -997,50 +1021,81 @@ class Store:
             self.reconcile_email_in(conn, identity['email'])
 
     def access_identity(self, identity):
-        """Pin a verified Access subject to a person without changing ownership.
+        """Pin a verified Access subject to a person without changing ownership."""
+        return self.external_identity(identity, kind='cloudflare')
 
-        The employee Access policy and signed email are authoritative for the
-        one-time match to an existing work account. Once enrolled, a different
-        subject or changed/ambiguous email requires administrator review.
-        """
-        issuer, subject, email = identity['issuer'], identity['sub'], identity['email']
-        stamp = now()
+    def external_identity(self, identity, *, kind, provider='', require_scim=False):
+        """external_identity_in, in its own writer transaction."""
         with self.connect() as conn:
             conn.begin_write()
-            binding = conn.execute('SELECT * FROM access_identities WHERE issuer=? AND subject=?',
-                                   (issuer, subject)).fetchone()
-            if binding:
-                user = conn.execute('SELECT * FROM users WHERE id=?', (binding['user_id'],)).fetchone()
-                if (not user or user['kind'] not in {'google', 'cloudflare'}
-                        or binding['email'] != email or user['email'] != email):
-                    raise ValueError('Access account mapping requires administrator review.')
-                user_id = user['id']
-                conn.execute('UPDATE users SET updated_at=? WHERE id=?', (stamp, user_id))
+            return self.external_identity_in(conn, identity, kind=kind, provider=provider, require_scim=require_scim)
+
+    def external_identity_in(self, conn, identity, *, kind, provider='', require_scim=False):
+        """Pin a verified (issuer, subject) to a person without changing ownership.
+
+        The identity provider's policy and verified email are authoritative for
+        the one-time match to the one existing work account with that email.
+        Once enrolled, a different subject or a changed or ambiguous email
+        requires administrator review (IdentityRefused). OIDC enrollment (a
+        provider id) is audited in the caller's writer transaction, and with
+        require_scim only an active SCIM-provisioned email may sign in.
+        """
+        from .enterprise_roles import scim_state_in
+        from .governance_audit import record_event_in
+
+        issuer, subject, email = identity['issuer'], identity['sub'], identity['email']
+        stamp = now()
+        scim = scim_state_in(conn, email) if provider else None
+        if scim is False:
+            raise IdentityRefused('deactivated')
+        if require_scim and scim is not True:
+            raise IdentityRefused('not_provisioned')
+        binding = conn.execute('SELECT * FROM access_identities WHERE issuer=? AND subject=?',
+                               (issuer, subject)).fetchone()
+        enrolled = linked = False
+        if binding:
+            user = conn.execute('SELECT * FROM users WHERE id=?', (binding['user_id'],)).fetchone()
+            if (not user or user['kind'] not in INDIVIDUAL_KINDS
+                    or binding['email'] != email or user['email'] != email):
+                raise IdentityRefused('mapping_review')
+            user_id = user['id']
+            conn.execute('UPDATE users SET updated_at=? WHERE id=?', (stamp, user_id))
+        else:
+            matches = conn.execute('SELECT id FROM users WHERE kind IN ' + INDIVIDUAL_KINDS_SQL + ' AND email=?', (email,)).fetchall()
+            if len(matches) > 1 or conn.execute('SELECT 1 FROM access_identities WHERE issuer=? AND email=?', (issuer, email)).fetchone():
+                raise IdentityRefused('mapping_review')
+            if matches:
+                user_id, linked = matches[0]['id'], True
+                if conn.execute('SELECT 1 FROM access_identities WHERE issuer=? AND user_id=?', (issuer, user_id)).fetchone():
+                    raise IdentityRefused('mapping_review')
             else:
-                matches = conn.execute("SELECT id FROM users WHERE kind IN ('google','cloudflare') AND email=?", (email,)).fetchall()
-                if len(matches) > 1 or conn.execute('SELECT 1 FROM access_identities WHERE issuer=? AND email=?', (issuer, email)).fetchone():
-                    raise ValueError('Access account mapping requires administrator review.')
-                if matches:
-                    user_id = matches[0]['id']
-                    if conn.execute('SELECT 1 FROM access_identities WHERE issuer=? AND user_id=?', (issuer, user_id)).fetchone():
-                        raise ValueError('Access account mapping requires administrator review.')
-                else:
-                    user_id = 'cloudflare:' + hashlib.sha256((issuer + '\0' + subject).encode()).hexdigest()
-                    conn.execute('INSERT INTO users(id,kind,email,name,created_at,updated_at) VALUES(?,?,?,?,?,?)',
-                                 (user_id, 'cloudflare', email, email, stamp, stamp))
-                conn.execute('INSERT INTO access_identities VALUES(?,?,?,?,?)', (issuer, subject, email, user_id, stamp))
-            self.reconcile_email_in(conn, email)
+                user_id = kind + ':' + hashlib.sha256((issuer + '\0' + subject).encode()).hexdigest()
+                if conn.execute('SELECT 1 FROM users WHERE id=?', (user_id,)).fetchone():
+                    # The account first created for this subject remains after its
+                    # binding was removed: administrator review, never a second account.
+                    raise IdentityRefused('mapping_review')
+                conn.execute('INSERT INTO users(id,kind,email,name,created_at,updated_at) VALUES(?,?,?,?,?,?)',
+                             (user_id, kind, email, identity.get('name') or email, stamp, stamp))
+            conn.execute('INSERT INTO access_identities VALUES(?,?,?,?,?)', (issuer, subject, email, user_id, stamp))
+            enrolled = True
+            if provider:
+                record_event_in(conn, 'identity_binding.created', email, 'identity_binding', user_id,
+                                {'provider': provider, 'linked_existing': linked})
+        if provider:
+            record_event_in(conn, 'sign_in.succeeded', email, 'sign_in', provider,
+                            {'method': kind, 'enrolled': enrolled})
+        self.reconcile_email_in(conn, email)
         return user_id
 
     def reconcile_email_in(self, conn, email):
         """Accounting links only. Never authenticate a user or grant a role here.
 
-        The email must have come from a checked Slack profile or Google OIDC.
+        The email must have come from a checked Slack profile or a verified sign-in.
         Once bound, provider IDs stay authoritative; changes need admin review.
         """
         if not email or not self.auto_link_identities:
             return
-        google = conn.execute("SELECT id FROM users WHERE kind IN ('google','cloudflare') AND email=?", (email,)).fetchall()
+        google = conn.execute('SELECT id FROM users WHERE kind IN ' + INDIVIDUAL_KINDS_SQL + ' AND email=?', (email,)).fetchall()
         slack = conn.execute("SELECT * FROM users WHERE kind='slack' AND email=? AND profile_eligible=1", (email,)).fetchall()
         fresh_after = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
         # Retain collision detection for older/deactivated Slack identities too:

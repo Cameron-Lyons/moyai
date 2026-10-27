@@ -14,6 +14,7 @@ from moyai.openapi_dump import schema_app
 UNGATED = {
     ("GET", "/api/auth/config"): "sign-in options before authentication",
     ("POST", "/api/auth/google/start"): "starts sign-in",
+    ("POST", "/api/auth/oidc/{provider}/start"): "starts sign-in",
     ("POST", "/api/login"): "starts sign-in",
     ("POST", "/api/logout"): "ends the caller's own sign-in",
     ("GET", "/api/me"): "the caller's own identity and permissions",

@@ -50,6 +50,7 @@ from fastapi import HTTPException
 from itsdangerous import BadData, URLSafeTimedSerializer
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
+from .identity_kinds import INDIVIDUAL_KINDS_SQL
 from .schema_initializers import initialize_credentials, initialize_user_roles
 from .schema_initializers import initialize_governance_audit as initialize_schema
 
@@ -155,7 +156,7 @@ EXPORT_COLUMNS = ('created_at', 'source', 'action', 'actor', 'resource_type', 'r
 FORMULA_PREFIXES = ('=', '+', '-', '@', '\t', '\r')
 RESOURCE_TYPES = ('role', 'role_assignment', 'group_role', 'scim_user', 'scim_group', 'scim_token',
                   'security_profile', 'security_defaults', 'spend_limit', 'user_role', 'connection', 'credential',
-                  'ai_guardrail')
+                  'ai_guardrail', 'identity_binding', 'sign_in')
 
 # Legacy free text maps to fixed actions; first match wins. Prefix rules cover
 # texts that interpolate labels, repository ids or reasons, none of which leave.
@@ -407,7 +408,7 @@ class _Source:
 _CONNECTION_ACTION = _classifier('a.action', CONNECTION_ACTIONS, CONNECTION_FALLBACK)
 _CREDENTIAL_ACTION = _classifier('a.action', CREDENTIAL_ACTIONS, CREDENTIAL_FALLBACK, ('', 'native '))
 # Credential actors are user ids; show the signed-in email when the id has one.
-_CREDENTIAL_ACTOR = "(CASE WHEN u.kind IN ('google','cloudflare') AND u.email<>'' THEN u.email ELSE a.actor_id END)"
+_CREDENTIAL_ACTOR = f"(CASE WHEN u.kind IN {INDIVIDUAL_KINDS_SQL} AND u.email<>'' THEN u.email ELSE a.actor_id END)"
 # Sorted by name: ties at one instant are delivered in this order.
 _SOURCES = tuple(sorted((
     _Source('connections',

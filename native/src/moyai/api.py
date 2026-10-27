@@ -27,6 +27,7 @@ from temporalio.service import RPCError
 
 from .api_views import (
     AuthConfig,
+    AuthProviderOption,
     ConnectionView,
     EffectResolveResult,
     GoalCommandResult,
@@ -440,8 +441,12 @@ def create_app(runtime: Runtime | None = None, *, run_dispatcher: bool = True) -
                 and not product.settings.cloudflare_access_login
             ) if product is not None else True,
             google_enabled=bool(product and product.settings.google_enabled()
+                                and product.settings.google_signin_domains()
                                 and not product.settings.cloudflare_access_login),
             access_enabled=bool(product and product.settings.cloudflare_access_login),
+            # Access is authoritative when enabled; organization OIDC then short-circuits like Google.
+            oidc_providers=[AuthProviderOption.model_validate(option) for option in product.oidc.options()]
+            if product is not None and not product.settings.cloudflare_access_login else [],
         )
 
     @app.get("/api/me", operation_id="getMe")

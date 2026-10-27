@@ -28,9 +28,30 @@ class SignInStart(BaseModel):
 
 
 class SignInRedirect(BaseModel):
-    """Where the browser goes next: Google's authorization page, or a local path."""
+    """Where the browser goes next: the provider's authorization page, or a local path."""
     model_config = ConfigDict(json_schema_serialization_defaults_required=True)
     url: str
+
+
+def safe_return_path(value: str) -> str:
+    """A known in-app destination after sign-in; anything else returns to the task list."""
+    allowed = re.fullmatch(r"/#(?:tasks|connections|runtime|spend|users|run=[a-f0-9]{32}(?:&credential=[a-f0-9]{32}&generation=(?:0|[1-9][0-9]{0,14}))?)", value)
+    return value if allowed or valid_file_return_path(value) else "/#tasks"
+
+
+def save_login_state(store, client, state_hash, browser, nonce, verifier, return_to):
+    """Store one pending sign-in for ten minutes; state_hash is the provider's digest of its state."""
+    store.execute("DELETE FROM login_states WHERE expires<?", (time.time(),))
+    # Keep each client's newest few unfinished sign-ins, so no client can fill the table for others.
+    store.execute("DELETE FROM login_states WHERE client=? AND state_hash NOT IN "
+                  "(SELECT state_hash FROM login_states WHERE client=? ORDER BY expires DESC LIMIT 4)", (client, client))
+    store.execute("INSERT INTO login_states(state_hash, browser_hash, nonce, verifier, return_path, expires, client) "
+                  "VALUES(?,?,?,?,?,?,?)", (state_hash, digest(browser), nonce, verifier, return_to, time.time() + 600, client))
+
+
+def pkce_challenge(verifier):
+    """The RFC 7636 S256 code challenge."""
+    return base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
 
 
 class GoogleSignIn:
@@ -81,7 +102,7 @@ class GoogleSignIn:
         email, domain = claims["email"], claims["hd"]
         if (claims["email_verified"] is not True or not isinstance(email, str)
                 or not isinstance(domain, str) or not claims["sub"]
-                or domain.lower() not in self.settings.google_domains()
+                or domain.lower() not in self.settings.google_signin_domains()
                 or email.lower().rpartition("@")[2] != domain.lower()):
             raise ValueError("Not an allowed Google Workspace identity")
         return {"sub": claims["sub"], "email": email.lower(), "domain": domain.lower(),
@@ -109,24 +130,18 @@ class GoogleSignIn:
                 return SignInRedirect(url='/#tasks')
             if not self.settings.google_enabled():
                 raise HTTPException(409, "Google sign-in is not configured yet.")
+            domains = sorted(self.settings.google_signin_domains())
+            if not domains:
+                raise HTTPException(409, "Google sign-in is not available for this organization's domains.")
             client = self.security.client_key(request)
             if self.attempts.blocked(client):
                 raise HTTPException(429, "Too many sign-in attempts. Wait a minute.")
             self.attempts.record(client)
             state, browser, nonce, verifier = (secrets.token_urlsafe(32) for _ in range(4))
-            allowed = re.fullmatch(r"/#(?:tasks|connections|runtime|spend|users|run=[a-f0-9]{32}(?:&credential=[a-f0-9]{32}&generation=(?:0|[1-9][0-9]{0,14}))?)", body.return_to)
-            return_to = body.return_to if allowed or valid_file_return_path(body.return_to) else "/#tasks"
-            self.store.execute("DELETE FROM login_states WHERE expires<?", (time.time(),))
-            # Keep each client's newest few unfinished sign-ins, so no client can fill the table for others.
-            self.store.execute("DELETE FROM login_states WHERE client=? AND state_hash NOT IN "
-                               "(SELECT state_hash FROM login_states WHERE client=? ORDER BY expires DESC LIMIT 4)", (client, client))
-            self.store.execute("INSERT INTO login_states(state_hash, browser_hash, nonce, verifier, return_path, expires, client) "
-                               "VALUES(?,?,?,?,?,?,?)", (digest(state), digest(browser), nonce, verifier, return_to, time.time() + 600, client))
-            challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
-            domains = sorted(self.settings.google_domains())
+            save_login_state(self.store, client, digest(state), browser, nonce, verifier, safe_return_path(body.return_to))
             params = {"client_id": self.settings.google_client_id, "redirect_uri": self.callback,
                       "response_type": "code", "scope": "openid email profile", "state": state,
-                      "nonce": nonce, "code_challenge": challenge, "code_challenge_method": "S256",
+                      "nonce": nonce, "code_challenge": pkce_challenge(verifier), "code_challenge_method": "S256",
                       "prompt": "select_account", "hd": domains[0] if len(domains) == 1 else "*"}
             response.set_cookie(COOKIE, browser, max_age=600, httponly=True,
                                 secure=not self.security.local, samesite="lax", path="/auth/google")

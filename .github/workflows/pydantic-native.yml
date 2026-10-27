@@ -98,8 +98,8 @@ jobs:
   governance:
     name: Canonical governance services
     # Native enforcement calls these app/ services (roles, SCIM, policies,
-    # spend limits, audit). postgres-runtime runs their suites on SQLite;
-    # this job runs them against real PostgreSQL.
+    # spend limits, audit, OIDC sign-in). postgres-runtime runs their suites
+    # on SQLite; this job runs them against real PostgreSQL.
     runs-on: ubuntu-latest
     timeout-minutes: 15
     services:
@@ -118,7 +118,7 @@ jobs:
       GOVERNANCE_TESTS: >-
         tests/test_enterprise_roles.py tests/test_scim.py tests/test_security_profiles.py
         tests/test_spend_limits.py tests/test_governance_audit.py tests/test_governance_schema.py
-        tests/test_governance_foundation.py tests/test_user_roles_governance.py
+        tests/test_governance_foundation.py tests/test_user_roles_governance.py tests/test_oidc_sso.py
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.88.0

@@ -1,6 +1,8 @@
 """One authorization boundary for immutable, individually owned sessions."""
 from fastapi import HTTPException
 
+from .identity_kinds import INDIVIDUAL_METHODS
+
 
 class PrivateExportDenied(HTTPException):
     """Typed evidence of the existing export guard, not a retryable failure."""
@@ -26,8 +28,8 @@ class SessionPrivacy:
     def individual_owner(self, request, *, info=None):
         if info is None:
             info = self.security.session_info(request)
-        if not info or info.get('method') not in {'google', 'cloudflare'}:
-            raise HTTPException(403, 'Private sessions require individual Google or Cloudflare sign-in.')
+        if not info or info.get('method') not in INDIVIDUAL_METHODS:
+            raise HTTPException(403, 'Private sessions require individual organization sign-in.')
         actor = getattr(request.state, 'access_actor', None) if info['method'] == 'cloudflare' else None
         return actor if actor is not None else self.store.identity(info)
 
@@ -41,7 +43,7 @@ class SessionPrivacy:
             run = rows[0] if rows else None
         else:
             run = run_or_id
-        actor = self.individual_owner(request, info=info) if self.is_private(run) and info.get('method') in {'google', 'cloudflare'} else ''
+        actor = self.individual_owner(request, info=info) if self.is_private(run) and info.get('method') in INDIVIDUAL_METHODS else ''
         return self.require_owner(run, actor)
 
     @staticmethod

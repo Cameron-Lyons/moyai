@@ -43,6 +43,7 @@ from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from .governance_audit import record_event_in, timestamp
+from .identity_kinds import INDIVIDUAL_KINDS, INDIVIDUAL_METHODS
 from .permissions import BUILTIN_PERMISSIONS, MEMBER_PERMISSIONS, PERMISSIONS, shared_actor_role
 from .schema_initializers import initialize_enterprise_roles as initialize_schema
 
@@ -416,7 +417,7 @@ class GovernanceActor:
     for shared actors. builtin_role: 'admin' or 'member' as authenticated, or
     None for no claim, which defers to the canonical role. permissions: the
     principal's effective permissions, or None when the caller has no snapshot.
-    kind: 'individual' (verified Google/Access person), 'shared', or another
+    kind: 'individual' (verified Google, Access or OIDC person), 'shared', or another
     principal kind, which is refused; empty infers it from id.
 
     Services never trust these alone. Each operation re-resolves the actor's
@@ -441,7 +442,7 @@ class GovernanceActor:
     def from_principal(cls, principal) -> 'GovernanceActor':
         """From a native ProductPrincipal (id, kind, method, email, role, permissions)."""
         kind = getattr(principal, 'kind', '')
-        individual = kind in {'google', 'cloudflare'} and getattr(principal, 'method', '') in {'google', 'cloudflare'}
+        individual = kind in INDIVIDUAL_KINDS and getattr(principal, 'method', '') in INDIVIDUAL_METHODS
         permissions = getattr(principal, 'permissions', None)
         return cls(id=principal.id, email=(principal.email or '').strip().lower() if individual else '',
                    builtin_role=principal.role,

@@ -15,7 +15,7 @@ import "@/theme.css"
 import "./style.css"
 import "./product-shell.css"
 import { ApiError, csrfToken, setCsrf } from "./api"
-import { getMe, listPullRequestStatuses, startGoogleSignIn, listSessionFolders, markSessionRead, type Me, type PullRequestStatus } from "./generated/api"
+import { getMe, listPullRequestStatuses, startGoogleSignIn, startOidcSignIn, listSessionFolders, markSessionRead, type Me, type PullRequestStatus, type SignInRedirect } from "./generated/api"
 import { cancelQueuedTurn, createSession, createSessionAnswer, createSessionMessage, getAuthConfig, getSession, getSessionActivity, getSessionPlan, listConnections, listSessionMessages, listSessions, loginWithPassword, logout, retrySlackDelivery, steerQueuedTurn, stopSession, updateQueuedTurn, type AuthConfig, type ConnectionView, type PendingRequests as Pending, type PlanStep, type SessionDetail } from "./generated/api"
 import { listHistorySessions, searchHistory, type HistorySessionList, type SourcedHistorySession } from "./generated/api"
 import { downloadDebugTrace } from "./debug-trace"
@@ -434,14 +434,20 @@ function Login({ onLogin }: { onLogin: (me: Me) => void }) {
     void getAuthConfig({ signal: controller.signal }).then(({ data: value }) => { if (!controller.signal.aborted) setConfig(value) }, reason => { if (!controller.signal.aborted) setError(String(reason)) })
     return () => controller.abort()
   }, [retry])
+  // No organization providers until the configuration loads.
+  const providers = config?.oidc_providers ?? []
+  const redirect = async (start: () => Promise<{ data: SignInRedirect }>) => {
+    setBusy(true); setError("")
+    try { const { data: result } = await start(); navigateAuth(result.url) }
+    catch (reason) { setError(String(reason)); setBusy(false) }
+  }
   return <main className="center"><section className="login" aria-labelledby="login-title">
     <h1 id="login-title">Welcome to Moyai</h1><p className="muted">Sign in to your workspace.</p>
     {!config && !error && <p role="status">Loading sign-in options…</p>}
-    {config?.google_enabled && <Button variant="outline" disabled={busy} onClick={async () => {
-      setBusy(true); setError("")
-      try { const { data: result } = await startGoogleSignIn({ body: { return_to: "/" } }); navigateAuth(result.url) }
-      catch (reason) { setError(String(reason)); setBusy(false) }
-    }}>Continue with Google</Button>}
+    {providers.map(provider => <Button key={provider.id} variant="outline" disabled={busy}
+      onClick={() => redirect(() => startOidcSignIn({ path: { provider: provider.id }, body: { return_to: "/" } }))}>Continue with {provider.label}</Button>)}
+    {config?.google_enabled && <Button variant="outline" disabled={busy}
+      onClick={() => redirect(() => startGoogleSignIn({ body: { return_to: "/" } }))}>Continue with Google</Button>}
     {config?.password_enabled && <form className="login-password" onSubmit={async event => {
       event.preventDefault(); setBusy(true); setError("")
       const form = new FormData(event.currentTarget)
@@ -455,11 +461,11 @@ function Login({ onLogin }: { onLogin: (me: Me) => void }) {
       } catch (reason) { setError(String(reason)) } finally { setBusy(false) }
     }}>
       {config.mode === "standalone" && <label>Username<Input name="username" autoComplete="username" required autoFocus disabled={busy} /></label>}
-      <label>{config.mode === "existing" ? "Workspace password" : "Password"}<Input name="password" type="password" autoComplete="current-password" required autoFocus={config.mode === "existing" && !config.google_enabled} disabled={busy} /></label>
+      <label>{config.mode === "existing" ? "Workspace password" : "Password"}<Input name="password" type="password" autoComplete="current-password" required autoFocus={config.mode === "existing" && !config.google_enabled && !providers.length} disabled={busy} /></label>
       <Button type="submit" disabled={busy}>{busy ? "Signing in…" : "Sign in"}</Button>
     </form>}
     {config?.access_enabled && <><p>Your organization uses Cloudflare Access. Continue through your organization’s sign-in to open Moyai.</p><Button onClick={() => location.reload()}>Continue to workspace</Button></>}
-    {config && !config.password_enabled && !config.google_enabled && !config.access_enabled && <p>No sign-in method is enabled. Contact your workspace administrator.</p>}
+    {config && !config.password_enabled && !config.google_enabled && !config.access_enabled && !providers.length && <p>No sign-in method is enabled. Contact your workspace administrator.</p>}
     {error && <p className="error" role="alert">{error}</p>}
     {!config && error && <Button variant="outline" onClick={() => setRetry(value => value + 1)}>Retry sign-in options</Button>}
   </section></main>

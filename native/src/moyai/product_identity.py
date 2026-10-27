@@ -33,8 +33,9 @@ Integration contract (the caller owns activation and reviewed schema migrations)
   onboarding as a second canonical user directory. Native disable/auth_version
   overrides are enforced as an additional fence and are never reset by projection.
   If shared-password identities are explicitly allowed, they remain nonindividual:
-  private sessions still require an individual Google/Access principal. Historical
-  sessions retain their original SessionPrivacy rules, including no admin bypass.
+  private sessions still require an individual Google, Access or OIDC principal.
+  Historical sessions retain their original SessionPrivacy rules, including no
+  admin bypass.
 
 ``legacy_security.decrypt`` reads explicitly legacy-tagged ciphertext only.
 Native Security derives a different key and uses a different session salt.
@@ -123,7 +124,8 @@ class ProductPrincipal:
 
     @property
     def individual(self) -> bool:
-        return self.kind in {"google", "cloudflare"} and self.method in {"google", "cloudflare"}
+        from app.identity_kinds import INDIVIDUAL_KINDS, INDIVIDUAL_METHODS
+        return self.kind in INDIVIDUAL_KINDS and self.method in INDIVIDUAL_METHODS
 
     @property
     def grant(self) -> ProductGrant:
@@ -231,6 +233,8 @@ class ProductIdentityAdapter:
             return await read(session)
 
     async def _current(self, db: AsyncSession, user_id: str, controls: tuple[bool, int]) -> ProductPrincipal:
+        from app.identity_kinds import INDIVIDUAL_KINDS
+
         row = (await db.execute(
             text(f"SELECT * FROM {self._table('users')} WHERE id=:id"), {"id": user_id},
         )).mappings().first()
@@ -250,8 +254,8 @@ class ProductIdentityAdapter:
             principal = await self.slack_authority.current(db, dict(row), (enabled, controls[1]))
             return await self.govern_principal(db, principal)
         revision = 0
-        binding = None
-        if kind in {"google", "cloudflare"}:
+        binding = provider = None
+        if kind in INDIVIDUAL_KINDS:
             if not self.roles.eligible(email):
                 raise HTTPException(401, "The product account is outside the allowed organization.")
             if self.settings.cloudflare_access_login:
@@ -262,6 +266,16 @@ class ProductIdentityAdapter:
                 ), {"issuer": self.access.issuer, "id": user_id})).mappings().first()
                 if binding is None or binding["email"] != email:
                     raise HTTPException(401, "The Access account mapping requires review.")
+            elif provider := self.settings.oidc_provider_for_domain(email.rpartition("@")[2]):
+                # The provider owns its domains: any account there, including an
+                # earlier Google account, acts only through its pinned binding.
+                method = "oidc"
+                binding = (await db.execute(text(
+                    f"SELECT issuer,subject,email,user_id FROM {self._table('access_identities')} "
+                    "WHERE issuer=:issuer AND user_id=:id"
+                ), {"issuer": provider.issuer, "id": user_id})).mappings().first()
+                if binding is None or binding["email"] != email:
+                    raise HTTPException(401, "The sign-in account mapping requires review.")
             elif kind == "google" and self.settings.google_enabled():
                 method = "google"
             else:
@@ -304,6 +318,12 @@ class ProductIdentityAdapter:
                 "password": self.settings.workspace_member_password if role == "member" else self.settings.workspace_password,
             },
         }
+        if method == "oidc" and provider is not None:
+            # Per method, so configuring OIDC leaves Google and Access grants valid.
+            authority["oidc"] = {
+                "provider": provider.id, "issuer": provider.issuer, "client_id": provider.client_id,
+                "domains": sorted(provider.domains), "require_scim_user": provider.require_scim_user,
+            }
         version = hmac.new(
             self.legacy_security.secret.encode(),
             json.dumps(authority, sort_keys=True, separators=(",", ":")).encode(),
@@ -338,6 +358,11 @@ class ProductIdentityAdapter:
             principal.email, principal.role if principal.individual else 'member'))
         if state.scim_active is False:
             raise HTTPException(401, 'This workspace account has been deactivated.')
+        provider = (self.settings.oidc_provider_for_domain(principal.email.rpartition('@')[2])
+                    if principal.method == 'oidc' else None)
+        if provider is not None and provider.require_scim_user and state.scim_active is not True:
+            # As at sign-in, so enabling the setting also ends earlier sessions and grants.
+            raise HTTPException(401, 'This workspace account is not provisioned.')
         permissions = state.permissions
         if principal.kind == 'slack':
             # As in canonical actor checks, a Slack sender never exceeds member access.
@@ -382,6 +407,7 @@ class ProductIdentityAdapter:
         Accounting/manual links alone are deliberately not an authentication path.
         """
         from app.identities import PROFILE_MAX_AGE_SECONDS
+        from app.identity_kinds import INDIVIDUAL_KINDS_SQL
 
         if not self.settings.person_login_enabled():
             return None
@@ -400,7 +426,7 @@ class ProductIdentityAdapter:
         if not 0 <= age < PROFILE_MAX_AGE_SECONDS or not self.roles.eligible(actor["email"]):
             return None
         owners = (await db.execute(text(
-            f"SELECT id FROM {self._table('users')} WHERE kind IN ('google','cloudflare') AND email=:email",
+            f"SELECT id FROM {self._table('users')} WHERE kind IN {INDIVIDUAL_KINDS_SQL} AND email=:email",
         ), {"email": actor["email"]})).scalars().all()
         if len(owners) != 1 or not (await self._native_controls(owners[0], db))[0]:
             return None
@@ -431,6 +457,7 @@ class ProductIdentityAdapter:
         from dataclasses import replace
 
         from app.cloudflare_access import AccessUnavailable
+        from app.identity_kinds import INDIVIDUAL_METHODS
         from jwt import PyJWTError
 
         # Ignore even prepopulated state: the assertion must be checked here.
@@ -489,10 +516,24 @@ class ProductIdentityAdapter:
             if not isinstance(subject, str) or not subject:
                 raise HTTPException(401, "Invalid product identity subject.")
             user_id = "google:" + subject
+        elif method == "oidc":
+            # session_info checked the provider, issuer and client; the account
+            # comes only from the binding the verified callback pinned.
+            identity = info["identity"]
+            async with self._reader(self.source_engine) as db:
+                binding = (await db.execute(text(
+                    f"SELECT user_id FROM {self._table('access_identities')} "
+                    "WHERE issuer=:issuer AND subject=:subject AND email=:email"
+                ), {
+                    "issuer": identity["issuer"], "subject": identity["sub"], "email": identity["email"],
+                })).mappings().first()
+            if binding is None:
+                raise HTTPException(401, "This sign-in must be enrolled by the product first.")
+            user_id = binding["user_id"]
         else:
             user_id = f"shared:{method}:{info['role']}"
         principal = await self.current(user_id)
-        if method in {"google", "cloudflare"} and principal.email != info["identity"]["email"].strip().lower():
+        if method in INDIVIDUAL_METHODS and principal.email != info["identity"]["email"].strip().lower():
             raise HTTPException(401, "The product identity mapping changed.")
         if principal.method != method:
             raise HTTPException(401, "The product sign-in method changed.")

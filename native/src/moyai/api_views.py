@@ -51,11 +51,18 @@ class HealthStatus(ApiView):
     durability: str
 
 
+class AuthProviderOption(ApiView):
+    """An organization OpenID Connect provider offered on the sign-in page."""
+    id: str
+    label: str
+
+
 class AuthConfig(ApiView):
     mode: Literal["existing", "standalone"]
     password_enabled: bool
     google_enabled: bool
     access_enabled: bool
+    oidc_providers: list[AuthProviderOption]
 
 
 class LoginResult(ApiView):

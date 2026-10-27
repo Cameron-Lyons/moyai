@@ -1526,9 +1526,29 @@ export type AuthConfig = {
      */
     mode: 'existing' | 'standalone';
     /**
+     * Oidc Providers
+     */
+    oidc_providers: Array<AuthProviderOption>;
+    /**
      * Password Enabled
      */
     password_enabled: boolean;
+};
+
+/**
+ * AuthProviderOption
+ *
+ * An organization OpenID Connect provider offered on the sign-in page.
+ */
+export type AuthProviderOption = {
+    /**
+     * Id
+     */
+    id: string;
+    /**
+     * Label
+     */
+    label: string;
 };
 
 /**
@@ -10506,7 +10526,7 @@ export type SettingsSkillList = {
 /**
  * SignInRedirect
  *
- * Where the browser goes next: Google's authorization page, or a local path.
+ * Where the browser goes next: the provider's authorization page, or a local path.
  */
 export type SignInRedirect = {
     /**
@@ -12951,6 +12971,36 @@ export type StartGoogleSignInResponses = {
 };
 
 export type StartGoogleSignInResponse = StartGoogleSignInResponses[keyof StartGoogleSignInResponses];
+
+export type StartOidcSignInData = {
+    body: SignInStart;
+    path: {
+        /**
+         * Provider
+         */
+        provider: string;
+    };
+    query?: never;
+    url: '/api/auth/oidc/{provider}/start';
+};
+
+export type StartOidcSignInErrors = {
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+};
+
+export type StartOidcSignInError = StartOidcSignInErrors[keyof StartOidcSignInErrors];
+
+export type StartOidcSignInResponses = {
+    /**
+     * Successful Response
+     */
+    200: SignInRedirect;
+};
+
+export type StartOidcSignInResponse = StartOidcSignInResponses[keyof StartOidcSignInResponses];
 
 export type ListConnectionsData = {
     body?: never;
@@ -17575,6 +17625,51 @@ export type CallbackAuthGoogleCallbackGetErrors = {
 export type CallbackAuthGoogleCallbackGetError = CallbackAuthGoogleCallbackGetErrors[keyof CallbackAuthGoogleCallbackGetErrors];
 
 export type CallbackAuthGoogleCallbackGetResponses = {
+    /**
+     * Successful Response
+     */
+    200: unknown;
+};
+
+export type CompleteOidcSignInData = {
+    body?: never;
+    path: {
+        /**
+         * Provider
+         */
+        provider: string;
+    };
+    query?: {
+        /**
+         * State
+         */
+        state?: string;
+        /**
+         * Code
+         */
+        code?: string;
+        /**
+         * Error
+         */
+        error?: string;
+        /**
+         * Iss
+         */
+        iss?: string;
+    };
+    url: '/auth/oidc/{provider}/callback';
+};
+
+export type CompleteOidcSignInErrors = {
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+};
+
+export type CompleteOidcSignInError = CompleteOidcSignInErrors[keyof CompleteOidcSignInErrors];
+
+export type CompleteOidcSignInResponses = {
     /**
      * Successful Response
      */
