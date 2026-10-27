@@ -371,6 +371,11 @@ class Database:
                     raise HTTPException(503, 'Native governance requires current product authority.')
                 principal = await governance.principal(transaction, grant)
                 await governance.bind(transaction, session, principal, body.security_profile_id, inherited_from, trusted_profile)
+                # A refused explicit model rolls back the whole admission.
+                session.model = governance.session_model(
+                    await governance.policy(transaction, session.id), body.model,
+                    self.settings.default_model, self.settings.models,
+                )
         return session
 
     async def list_sessions(self, actor: User, *, archived: bool = False, deleted: bool = False) -> list[Session]:
@@ -589,7 +594,8 @@ class Database:
             governance = getattr(self, 'governance', None)
             if governance is not None:
                 principal = await governance.principal(transaction, product_grant)
-                await governance.admission(transaction, session, principal, grants)
+                policy = await governance.admission(transaction, session, principal, grants)
+                governance.require_model(policy, model)
             if delegated_authority is not None and grants != delegated_authority.grants:
                 raise PermissionError("Connection access changed before delegation.")
             selected_ids = [grant.id for grant in grants]

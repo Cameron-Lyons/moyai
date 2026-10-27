@@ -171,8 +171,12 @@ async def prepare_repository(
     )]
     grant = selected[0] if len(selected) == 1 else None
     public_info = None
+    governance = getattr(service.database, "governance", None)
     if grant is None:
         target = explicit_target
+        if governance is not None:
+            # Before the provider lookup: a repository limit needs this checkout's verified ID.
+            await governance.repository(scope, target)
         public_info = await service.public_repository(repository, target, refresh=True)
         if (
             not isinstance(public_info, dict) or public_info.get("private") is not False
@@ -181,6 +185,8 @@ async def prepare_repository(
             raise HTTPException(403, "Private repository checkout requires its exact selected GitHub connection.")
         target = public_info["id"]
     else:
+        if governance is not None:
+            await governance.repository(scope, target)
         permitted = await source_database(service.connectors.allowed, "github_checkout")
         if not permitted:
             raise HTTPException(403, "Repository checkout is disabled by the current connection policy.")

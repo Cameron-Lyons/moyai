@@ -284,7 +284,8 @@ class ProductInferenceService:
                     raise InferenceAdmissionError("The inference policy changed during admission.")
                 governance = getattr(self.database, 'governance', None)
                 if governance is not None:
-                    await governance.check_model(scope, db=db)
+                    # The saved choice ID that validate_request matched to the body.
+                    await governance.check_model(scope, model=capture.values["model"], db=db)
                 capture.values["provider_scope"] = gateway
                 db.add(ProductInferenceRequest(
                     id=request_id, request_key=capture.values["request_key"], logical_key=logical_key,

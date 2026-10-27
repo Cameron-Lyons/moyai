@@ -18,7 +18,7 @@ import test_product_inference as inference_fixtures
 import test_product_skill_tools as skill_fixtures
 from app.security_profiles import ProfilePolicy, SecurityProfiles, dump_policy
 from fastapi import HTTPException
-from sqlalchemy import select, text, update
+from sqlalchemy import func, select, text, update
 from sqlalchemy.exc import DBAPIError
 from test_inference_usage import WireStream, payload
 from test_product_identity import google_cookie, request
@@ -220,19 +220,19 @@ async def test_workflow_selection_and_session_ceiling_are_checked(governed):
     governance = product.database.governance
     async with product.database.sessions.begin() as db:
         principal = await governance.principal(db, product.principal.grant)
-        await governance.workflow(db, principal, definition, scope=prepared.scope)
+        await governance.workflow(db, principal, definition, scope=prepared.scope, model='test')
     await defaults(product)  # A source session cannot create an unrestricted workflow.
     definition.security_profile_id = ''
     with pytest.raises(HTTPException, match='cannot exceed'):
         async with product.database.sessions.begin() as db:
-            await governance.workflow(db, product.principal, definition, scope=prepared.scope)
+            await governance.workflow(db, product.principal, definition, scope=prepared.scope, model='test')
     principal = await member_role(product, ['sessions.create', 'sessions.read', 'automations.manage'])
     definition.security_profile_id = restricted
     async with product.database.sessions.begin() as db:
-        await governance.workflow(db, principal, definition, previous=restricted)
+        await governance.workflow(db, principal, definition, previous=restricted, model='test')
     with pytest.raises(HTTPException):
         async with product.database.sessions.begin() as db:
-            await governance.workflow(db, principal, definition)
+            await governance.workflow(db, principal, definition, model='test')
 
 
 @pytest.mark.parametrize('kind', ['organization', 'user-default', 'session-default', 'user'])
@@ -331,7 +331,7 @@ async def test_child_spend_is_charged_to_the_parent_session_limit(inference):
         assert (await db.get(ProductSessionPolicy, grandchild.id)).family_root == ctx.session.id
     for member in (child, grandchild):
         with pytest.raises(HTTPException, match='spend limit'):
-            await ctx.product.database.governance.check_model(replace(ctx.scope, session_id=member.id))
+            await ctx.product.database.governance.check_model(replace(ctx.scope, session_id=member.id), model='test')
 
 
 async def session_limit(product):
@@ -687,12 +687,14 @@ async def test_no_git_access_refuses_github_grants_and_workflow_plugins(governed
     session = await product.database.create_session(product.actor, NewSession())
     async with product.database.sessions.begin() as db:
         principal = await governance.principal(db, product.principal.grant)
-        await governance.admission(db, session, principal, [SimpleNamespace(kind='linear')])
-        await governance.workflow(db, principal, AutomationDefinition(name='Issues', prompt='Work', plugins=['linear']))
+        await governance.admission(db, session, principal, [SimpleNamespace(kind='linear', policy={})])
+        await governance.workflow(db, principal, AutomationDefinition(name='Issues', prompt='Work', plugins=['linear']),
+                                  model='test')
         with pytest.raises(HTTPException, match='disabled by the session security policy'):
-            await governance.admission(db, session, principal, [SimpleNamespace(kind='github')])
+            await governance.admission(db, session, principal, [SimpleNamespace(kind='github', policy={})])
         with pytest.raises(HTTPException, match='connections exceed'):
-            await governance.workflow(db, principal, AutomationDefinition(name='Git', prompt='Work', plugins=['github']))
+            await governance.workflow(db, principal, AutomationDefinition(name='Git', prompt='Work', plugins=['github']),
+                                      model='test')
 
 
 async def test_credential_release_and_workspace_preparation_recheck_live_policy(governed):
@@ -701,7 +703,7 @@ async def test_credential_release_and_workspace_preparation_recheck_live_policy(
     from moyai.product_continuation_workspace import ProductWorkspaceCompatibility, fingerprint
     product, governance = governed, governed.database.governance
     _, _, prepared = await authority.active_turn(product)
-    scope, github = prepared.scope, SimpleNamespace(kind='github')
+    scope, github = prepared.scope, SimpleNamespace(kind='github', policy={})
     repository = {'source_schema': 'moyai', 'repo_url': 'https://github.com/acme/app'}
     async with product.database.sessions.begin() as db:
         db.add(ProductExecutionContext(turn_id=scope.turn_id, actor_id=scope.actor_id,
@@ -741,10 +743,10 @@ async def test_network_mandatory_policy_stops_a_running_session(governed):
     _, _, prepared = await authority.active_turn(product)
     scope = prepared.scope
     await governance.check_tool(scope, 'read_file', read_only=True)
-    await governance.check_model(scope)
+    await governance.check_model(scope, model=scope.model)
     await defaults(product, mandatory=await profile(product, {'network_domains': []}))
     for check in (lambda: governance.check_tool(scope, 'read_file', read_only=True),
-                  lambda: governance.check_model(scope), lambda: product.database.authorize_scope(scope)):
+                  lambda: governance.check_model(scope, model=scope.model), lambda: product.database.authorize_scope(scope)):
         with pytest.raises(HTTPException, match='cannot enforce'):
             await check()
 
@@ -801,7 +803,7 @@ async def test_slack_auto_selection_keeps_only_connections_the_policy_and_role_a
     await automation_fixtures.bind_slack_test_session(product.database, session.id, product.actor)
 
     async def catalog(actor_id, *, shared_session, surface):
-        return [{'id': grant.id, 'kind': grant.kind} for grant in grants]
+        return [{'id': grant.id, 'kind': grant.kind, 'policy': grant.policy} for grant in grants]
 
     events = SlackEvents(SimpleNamespace(
         runtime=SimpleNamespace(database=product.database, slack_activity=SimpleNamespace(wake=asyncio.Event())),
@@ -967,3 +969,210 @@ async def test_load_more_pages_carry_only_their_rows(governed):
         assert audit.status_code == 200 and audit.json()['facets'] is None
         page = (await client.get('/api/admin/scim', params={'cursor': 'next'})).json()
         assert (page['groups'], page['tokens'], page['activity']) == (None, None, None)
+
+
+def github(repository_id):
+    from moyai.contracts import Grant
+    return Grant(f'github-{repository_id}', 'github', 1, '', policy={'product': {'repository_id': repository_id}})
+
+
+async def test_repository_limits_admit_only_listed_github_grants(governed):
+    from moyai.contracts import Grant
+    product, governance = governed, governed.database.governance
+    linear = Grant('linear', 'linear', 1, '', policy={'product': {'repository_id': None}})
+    await defaults(product, await profile(product, {'repositories': [7]}))
+    session = await product.database.create_session(product.actor, NewSession())
+    async with product.database.sessions.begin() as db:
+        principal = await governance.principal(db, product.principal.grant)
+        await governance.admission(db, session, principal, [github(7), linear])
+        for refused in ([github(8)], [github(7), github(8)], [github(None)], [github(True)]):
+            with pytest.raises(HTTPException, match='GitHub repository is not allowed') as caught:
+                await governance.admission(db, session, principal, refused)
+            assert caught.value.status_code == 403
+    await defaults(product, await profile(product, {'repositories': []}))
+    nothing = await product.database.create_session(product.actor, NewSession())
+    async with product.database.sessions.begin() as db:
+        principal = await governance.principal(db, product.principal.grant)
+        await governance.admission(db, nothing, principal, [linear])  # Other kinds are unaffected.
+        with pytest.raises(HTTPException, match='GitHub repository is not allowed'):
+            await governance.admission(db, nothing, principal, [github(7)])
+        # Kind-level checks (workflow plugins) do not depend on a repository.
+        assert governance.admits(await governance.policy(db, nothing.id), 'github')
+
+
+async def test_legacy_four_key_bindings_load_unrestricted_and_the_mandatory_limit_still_applies(governed):
+    """Immutable v24 bindings keep loading; a document missing one new key never reads as unrestricted."""
+    from app.security_profiles import InvalidPolicy
+    product, governance = governed, governed.database.governance
+    product.database.governance = None  # Sessions that predate their binding, bound by hand below.
+    legacy = await product.database.create_session(product.actor, NewSession())
+    partial = await product.database.create_session(product.actor, NewSession())
+    product.database.governance = governance
+    stored = '{"connected_apps":null,"git_access":"read","network_domains":null,"tools":["read_file"]}'
+    async with product.database.sessions.begin() as db:
+        for session, policy in ((legacy, stored), (partial, stored[:-1] + ',"repositories":[7]}')):
+            db.add(ProductSessionPolicy(session_id=session.id, profile_id='', profile_revision=0, policy=policy,
+                                        inherited_from=None, family_root=session.id))
+    async with product.database.sessions() as db:
+        policy = await governance.policy(db, legacy.id)
+        assert policy == ProfilePolicy(git_access='read', tools=['read_file']) and dump_policy(policy) == stored
+        with pytest.raises(InvalidPolicy):
+            await governance.policy(db, partial.id)
+    await defaults(product, mandatory=await profile(product, {'repositories': [7], 'models': ['test']}))
+    async with product.database.sessions() as db:
+        policy = await governance.policy(db, legacy.id)
+    assert (policy.repositories, policy.models, policy.git_access, policy.tools) == ((7,), ('test',), 'read', ('read_file',))
+
+
+async def test_workspace_and_public_checkout_require_a_listed_repository(governed):
+    """Environment snapshots skip preparation, so the workspace check governs the recorded ID."""
+    from moyai.product_github_bootstrap import prepare_repository
+    product, governance = governed, governed.database.governance
+    _, _, prepared = await authority.active_turn(product)
+    scope, url = prepared.scope, 'https://github.com/acme/app'
+    async with product.database.sessions.begin() as db:
+        await governance.workspace(db, scope, {'repo_url': url})  # Unrestricted: no ID needed.
+    await defaults(product, mandatory=await profile(product, {'repositories': [7]}))
+    async with product.database.sessions.begin() as db:
+        await governance.workspace(db, scope, {'repo_url': url, 'repository_id': 7})
+        await governance.workspace(db, scope, {'environment_build_id': 'build'})  # No repository at all.
+    for context in ({'repo_url': url, 'repository_id': 8}, {'repo_url': url}, {'repository_id': 8},
+                    {'environment_build_id': 'build', 'repo_url': 'https://github.com/acme/other', 'repository_id': 8}):
+        with pytest.raises(HTTPException, match='repository exceeds'):
+            async with product.database.sessions.begin() as db:
+                await governance.workspace(db, scope, context)
+
+    class Lookup(Exception):
+        pass
+
+    async def require_scope(scope):
+        pass
+
+    async def public_repository(*args, **kwargs):
+        raise Lookup()
+    service = SimpleNamespace(database=product.database, require_scope=require_scope, public_repository=public_repository)
+    checkout = {'repo_url': url, 'working_dir': '/workspace/repo'}
+    for target in (8, None):  # Refused before the credential-free provider lookup.
+        with pytest.raises(HTTPException, match='repository exceeds'):
+            await prepare_repository(service, scope, SimpleNamespace(), {**checkout, 'repository_id': target})
+    with pytest.raises(Lookup):
+        await prepare_repository(service, scope, SimpleNamespace(), {**checkout, 'repository_id': 7})
+
+
+async def test_model_limits_choose_the_session_model_and_refuse_disallowed_turns(governed, monkeypatch):
+    from moyai.contracts import NewMessage
+    product = governed
+    monkeypatch.setattr(product.database.settings, 'model_catalog', 'other,third')
+    assert product.database.settings.models == ['test', 'other', 'third']
+    await defaults(product, await profile(product, {'models': ['third', 'other']}))
+    implicit = await product.database.create_session(product.actor, NewSession())
+    assert implicit.model == 'other'  # The default is not allowed: the first allowed, in workspace order.
+    assert (await product.database.create_session(product.actor, NewSession(model='third'))).model == 'third'
+
+    async def counts():
+        async with product.database.sessions() as db:
+            return [await db.scalar(select(func.count()).select_from(table)) for table in (Session, ProductSessionPolicy)]
+    before = await counts()
+    with pytest.raises(HTTPException, match='model is not allowed') as refused:
+        await product.database.create_session(product.actor, NewSession(model='test'))
+    assert refused.value.status_code == 403 and await counts() == before  # Nothing is left behind.
+    with pytest.raises(HTTPException, match='model is not allowed'):
+        await product.database.submit(product.actor, implicit.id, NewMessage(
+            prompt='Work', request_key='disallowed', model='test'))
+    turn = await product.database.submit(product.actor, implicit.id, NewMessage(prompt='Work', request_key='allowed'))
+    assert turn.model == 'other'
+    await defaults(product, await profile(product, {'models': []}))
+    with pytest.raises(HTTPException, match='No model enabled'):
+        await product.database.create_session(product.actor, NewSession())
+
+
+async def test_model_limit_refuses_paid_dispatch_even_without_spend_limits(inference):
+    """Regression guard: the spend lookup returns early when nothing is limited."""
+    ctx = inference
+    governance = attach(ctx.product)
+    with pytest.raises(TypeError):
+        await governance.check_model(ctx.scope)  # The model is required, never skipped.
+    await defaults(ctx.product, mandatory=await profile(ctx.product, {'models': ['other']}))
+    with pytest.raises(HTTPException, match='model is not allowed'):
+        await perform(ctx)
+    assert not ctx.calls and not await requests(ctx)
+    await defaults(ctx.product, mandatory=await profile(ctx.product, {'models': ['test']}))
+    await perform(ctx, logical='allowed')
+    assert len(ctx.calls) == len(await requests(ctx)) == 1
+
+
+async def test_workflow_repositories_triggers_plugins_and_model_are_checked(governed):
+    from moyai.product_automations import AutomationDefinition
+    product, governance = governed, governed.database.governance
+    selected = await profile(product, {'repositories': [7], 'models': ['test']})
+
+    async def check(profile_id=selected, model='test', **fields):
+        definition = AutomationDefinition(name='Governed', prompt='Work', security_profile_id=profile_id, **fields)
+        async with product.database.sessions.begin() as db:
+            principal = await governance.principal(db, product.principal.grant)
+            await governance.workflow(db, principal, definition, model=model)
+
+    def trigger(**event):
+        return [{'id': 'push', 'event': {'provider': 'github', 'event': 'pull_request', **event}}]
+    await check(repo_url='https://github.com/acme/app', github_repository_id=7, plugins=['github'],
+                triggers=trigger(repository_id=7))
+    for message, fields in (
+        ('workflow repository exceeds', {'github_repository_id': 8}),
+        ('workflow repository exceeds', {'repo_url': 'https://github.com/acme/app'}),
+        ('trigger repository exceeds', {'triggers': trigger(repository_id=8)}),
+        ('trigger repository exceeds', {'triggers': trigger(repository='acme/app')}),
+        ('workflow model exceeds', {'model': 'other'}),
+    ):
+        with pytest.raises(HTTPException, match=message):
+            await check(**fields)
+    with pytest.raises(HTTPException, match='connections exceed'):
+        await check(await profile(product, {'repositories': []}), plugins=['github'])
+    # An agent-created workflow cannot exceed its session's repository or model limits.
+    await defaults(product, await profile(product, {'repositories': [7], 'models': ['test']}))
+    _, _, prepared = await authority.active_turn(product)
+    wider = AutomationDefinition(name='Wider', prompt='Work', security_profile_id=await profile(product, {'models': ['test']}))
+    with pytest.raises(HTTPException, match='cannot exceed'):
+        async with product.database.sessions.begin() as db:
+            await governance.workflow(db, product.principal, wider, scope=prepared.scope, model='test')
+    async with product.database.sessions.begin() as db:
+        await governance.workflow(db, product.principal, wider.model_copy(update={'security_profile_id': selected}),
+                                  scope=prepared.scope, model='test')
+
+
+async def test_plugin_expansion_keeps_only_listed_repositories_in_the_saved_context(automations, canonical_connections):
+    """Regression guard: every installation repository was captured and then refused at each run's admission."""
+    from moyai.product_automation_context_models import ProductAutomationExecutionContext as ExecutionContext
+    ctx = automations
+    product = ctx.product
+    attach(product)
+    await automation_fixtures.save_connection(ctx, 'github', kind='github_app', installation_id=1, repository_ids=[7, 8])
+    selected = await profile(product, {'repositories': [7]})
+    async with product.database.sessions() as db:
+        grants = await canonical_connections.resolve_grants(
+            product.actor.id, ['github'], shared_session=True, surface='automation', db=db)
+    assert sorted(ProductGovernance.repository_of(grant) for grant in grants) == [7, 8]
+    row, _ = await automation_fixtures.activate(ctx, plugins=['github'], security_profile_id=selected)
+    async with product.database.sessions() as db:
+        saved = await db.scalar(select(ExecutionContext).where(ExecutionContext.automation_id == row['id']))
+    assert json.loads(saved.connection_ids) == [grant.id for grant in grants if ProductGovernance.repository_of(grant) == 7]
+
+
+async def test_slack_auto_selection_drops_repositories_the_policy_excludes(automations, canonical_connections):
+    ctx = automations
+    product = ctx.product
+    attach(product)
+    await automation_fixtures.save_connection(ctx, 'github', kind='github_app', installation_id=1, repository_ids=[7, 8])
+    await defaults(product, await profile(product, {'repositories': [7]}))
+    session = await product.database.create_session(product.actor, NewSession(visibility='shared'))
+    async with product.database.sessions() as db:
+        grants = await canonical_connections.resolve_grants(
+            product.actor.id, ['github'], shared_session=True, surface='slack', db=db)
+    from moyai.contracts import NewMessage
+    from moyai.product_slack_events import SlackEvents, SlackSubmission
+    events = SlackEvents(SimpleNamespace(runtime=SimpleNamespace(database=product.database)))
+    body = NewMessage(prompt='Work', request_key='slack', connections=[grant.id for grant in grants])
+    submission = SlackSubmission(body, [], {grant.id: 'github' for grant in grants},
+                                 {grant.id: ProductGovernance.repository_of(grant) for grant in grants})
+    async with product.database.sessions.begin() as db:
+        narrowed = await events._automatic(db, session.id, product.principal, submission)
+    assert narrowed.connections == [grant.id for grant in grants if ProductGovernance.repository_of(grant) == 7]

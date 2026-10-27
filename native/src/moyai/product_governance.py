@@ -159,6 +159,10 @@ class ProductGovernance:
         self.require_provider(policy)
         if not all(self.admits(policy, grant.kind) for grant in grants):
             raise HTTPException(403, 'A selected connection is disabled by the session security policy.')
+        # authorize_scope runs this on every tool and activity authorization, so
+        # a narrower mandatory repository limit also stops running sessions.
+        if not all(self.admits_grant(policy, grant.kind, self.repository_of(grant)) for grant in grants):
+            raise HTTPException(403, 'A selected GitHub repository is not allowed by the session security policy.')
         if grants:
             principal.require('connections.read')
         return policy
@@ -169,6 +173,49 @@ class ProductGovernance:
         # A GitHub grant under no Git access would only fail every turn's tool
         # discovery, so it is refused with the other disallowed connections.
         return ProductGovernance.connection_denial(policy, kind) is None
+
+    @staticmethod
+    def repository_of(grant):
+        """A GitHub grant's permanent repository ID, or None."""
+        identity = (grant.policy.get('product') or {}).get('repository_id')
+        return identity if type(identity) is int and identity > 0 else None
+
+    @staticmethod
+    def admits_repository(policy, repository_id):
+        """Whether the policy allows this repository; under a limit a missing ID is refused."""
+        return policy.repositories is None or (type(repository_id) is int and repository_id in policy.repositories)
+
+    @staticmethod
+    def admits_grant(policy, kind, repository_id):
+        """admits() plus the repository limit for a GitHub grant.
+
+        admits() stays kind-only, so kind-level callers such as workflow
+        plugins do not refuse GitHub because a repository is unknown there.
+        """
+        return ProductGovernance.admits(policy, kind) and (
+            kind != 'github' or ProductGovernance.admits_repository(policy, repository_id))
+
+    @staticmethod
+    def require_model(policy, model, message='This model is not allowed by the session security policy.'):
+        if policy.models is not None and model not in policy.models:
+            raise HTTPException(403, message)
+
+    @staticmethod
+    def session_model(policy, requested, default, available):
+        """A new session's model under its bound policy.
+
+        An explicit request must be allowed. Otherwise the default is used when
+        allowed, else the first allowed model in the workspace's order.
+        """
+        if requested:
+            ProductGovernance.require_model(policy, requested)
+            return requested
+        if policy.models is None or default in policy.models:
+            return default
+        allowed = next((model for model in available if model in policy.models), None)
+        if allowed is None:
+            raise HTTPException(403, 'No model enabled for this workspace is allowed by the session security policy.')
+        return allowed
 
     @staticmethod
     def connection_denial(policy, kind, *, write=False):
@@ -183,9 +230,24 @@ class ProductGovernance:
         principal = await self.principal(db, scope.product_grant)
         if context.get('environment_build_id'):
             principal.require('environments.read')
+        if not context.get('repo_url') and not context.get('repository_id'):
+            return
+        policy = await self.policy(db, scope.session_id)
         if context.get('repo_url'):
             principal.require('connections.read')
-            if not self.admits(await self.policy(db, scope.session_id), 'github'):
+            if not self.admits(policy, 'github'):
+                raise HTTPException(403, 'The repository exceeds the session security policy.')
+        # An environment snapshot already contains its repository, and
+        # repository preparation skips it, so the recorded ID is checked here.
+        if not self.admits_repository(policy, context.get('repository_id')):
+            raise HTTPException(403, 'The repository exceeds the session security policy.')
+
+    async def repository(self, scope, repository_id, *, db=None):
+        """Refuse a repository checkout the session policy does not allow, before any provider read."""
+        async with self._snapshot(db) as transaction:
+            await self.principal(transaction, scope.product_grant)
+            policy = await self.policy(transaction, scope.session_id)
+            if not self.admits(policy, 'github') or not self.admits_repository(policy, repository_id):
                 raise HTTPException(403, 'The repository exceeds the session security policy.')
 
     @staticmethod
@@ -215,8 +277,11 @@ class ProductGovernance:
     async def connection(self, scope, grant, *, write=False):
         async with self.database.sessions.begin() as db:
             await self.principal(db, scope.product_grant, 'connections.write' if write else 'connections.read')
-            if denial := self.connection_denial(await self.policy(db, scope.session_id), grant.kind, write=write):
+            policy = await self.policy(db, scope.session_id)
+            if denial := self.connection_denial(policy, grant.kind, write=write):
                 raise HTTPException(403, denial)
+            if not self.admits_grant(policy, grant.kind, self.repository_of(grant)):
+                raise HTTPException(403, 'This GitHub repository is not allowed by the session security policy.')
 
     async def tools(self, scope, definitions, *, db=None):
         async with self._snapshot(db) as transaction:
@@ -233,13 +298,17 @@ class ProductGovernance:
             async with self.database.sessions.begin() as snapshot:
                 yield snapshot
 
-    async def check_model(self, scope, *, db=None):
+    async def check_model(self, scope, *, model, db=None):
+        """Admit one paid request for this model: the session policy, then spend limits."""
         from app.spend_limits import SpendLimits, evaluate
 
         from .inference_usage import InferenceUsage
         async with self._snapshot(db) as transaction:
             principal = await self.principal(transaction, scope.product_grant)
-            self.require_provider(await self.policy(transaction, scope.session_id))
+            policy = await self.policy(transaction, scope.session_id)
+            self.require_provider(policy)
+            # Before the spend lookup, which returns early when nothing is limited.
+            self.require_model(policy, model)
             limits = await transaction.run_sync(lambda sync: SpendLimits.resolve_in(
                 CanonicalRead(sync, self.identity), principal.email))
             if limits.unlimited:
@@ -270,20 +339,34 @@ class ProductGovernance:
             if evaluate(limits, usage):
                 raise HTTPException(403, 'The configured spend limit has been reached. Ask a spend manager to review it.')
 
-    async def workflow(self, db, principal, definition, *, previous='', scope=None):
+    async def profile_policy(self, db, requested=''):
+        """The policy a new session would bind under this profile ('' is the default), mandatory included."""
+        binding = await db.run_sync(lambda sync: self.product.profiles.resolve_for_new_session_in(
+            CanonicalRead(sync, self.identity), requested))
+        return binding.policy
+
+    async def workflow(self, db, principal, definition, *, previous='', scope=None, model):
+        """Check a workflow definition against its profile; model is its resolved model choice."""
         from app.security_profiles import intersect
         principal.require('automations.manage')
         selected = definition.security_profile_id
         if selected != previous:
             principal.require('security.manage')
-        binding = await db.run_sync(lambda sync: self.product.profiles.resolve_for_new_session_in(
-            CanonicalRead(sync, self.identity), selected))
-        self.require_provider(binding.policy)
-        if not all(self.admits(binding.policy, kind) for kind in definition.plugins):
+        policy = await self.profile_policy(db, selected)
+        self.require_provider(policy)
+        if not all(self.admits(policy, kind) for kind in definition.plugins) or (
+                'github' in definition.plugins and policy.repositories == ()):
             raise HTTPException(403, 'The workflow connections exceed its security policy.')
-        if definition.repo_url and not self.admits(binding.policy, 'github'):
+        if definition.repo_url and not self.admits(policy, 'github'):
             raise HTTPException(403, 'The workflow repository exceeds its security policy.')
-        if scope is not None and intersect(await self.policy(db, scope.session_id), binding.policy) != binding.policy:
+        if (definition.repo_url or definition.github_repository_id) and not self.admits_repository(
+                policy, definition.github_repository_id):
+            raise HTTPException(403, 'The workflow repository exceeds its security policy.')
+        if not all(self.admits_repository(policy, trigger.event.repository_id) for trigger in definition.triggers
+                   if trigger.event is not None and trigger.event.provider == 'github'):
+            raise HTTPException(403, 'A workflow trigger repository exceeds its security policy.')
+        self.require_model(policy, model, 'The workflow model exceeds its security policy.')
+        if scope is not None and intersect(await self.policy(db, scope.session_id), policy) != policy:
             raise HTTPException(403, 'A workflow cannot exceed the security policy of its creating session.')
 
     async def continuation(self, db, session_id, requested=''):
@@ -292,10 +375,9 @@ class ProductGovernance:
         A chat's binding is immutable, so it cannot adopt the workflow's profile.
         """
         from app.security_profiles import intersect
-        binding = await db.run_sync(lambda sync: self.product.profiles.resolve_for_new_session_in(
-            CanonicalRead(sync, self.identity), requested))
+        policy = await self.profile_policy(db, requested)
         current = await self.policy(db, session_id)
-        if intersect(current, binding.policy) != current:
+        if intersect(current, policy) != current:
             raise HTTPException(403, 'This chat allows more than the workflow security policy. '
                                      'Choose a chat started under that policy, or a new chat for each run.')
 

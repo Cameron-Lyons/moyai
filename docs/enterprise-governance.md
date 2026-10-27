@@ -27,6 +27,15 @@ subject to the current mandatory policy. A continuation of a historical governed
 session intersects its saved policy with the new native binding; an unreadable
 saved policy blocks the continuation for review.
 
+Repository and model limits need no schema change. A stored policy without them
+keeps the four-key document v24 wrote, byte for byte, so existing profiles,
+revisions and immutable session bindings load unchanged. A policy that uses
+either limit is stored with all six keys, which a v24 binary refuses as invalid
+(it fails closed). Configure these limits only after every service runs this
+release. Before rolling back to a v24 binary, clear them from every profile:
+otherwise v24 blocks admissions under a default or mandatory profile that uses
+them, and sessions already bound with them stay unreadable to v24.
+
 Use `MOYAI_ORGANIZATION_ID` for one organization per deployment and database.
 The immutable database pin rejects a different organization at startup. An existing
 populated database cannot acquire a new pin without a separate namespace migration.
@@ -96,11 +105,39 @@ live authority before releasing their results.
 ## Session policies
 
 Policies constrain connected apps, tool names, managed Git access (`write`,
-`read`, or `none`), and network destinations. For apps, tools, and domains,
-`null` is unrestricted, an empty list permits nothing, and a populated list is an
-allowlist. Intersections can only narrow a bound policy. Git access `none` also
-refuses GitHub connections. Slack has no account picker, so a Slack message
-selects only the connections its session policy and the sender's role allow.
+`read`, or `none`), network destinations, GitHub repositories, and models. For
+apps, tools, domains, repositories, and models, `null` is unrestricted, an empty
+list permits nothing, and a populated list is an allowlist. Intersections can
+only narrow a bound policy. Git access `none` also refuses GitHub connections.
+Slack has no account picker, so a Slack message selects only the connections its
+session policy and the sender's role allow.
+
+Repository limits list permanent GitHub repository IDs, not owner/name text, so
+a rename or transfer cannot change what they allow. The editor offers the GitHub
+App installation's repositories by their last known names; a saved repository
+that later leaves the installation is shown as `Repository <id>` and stays in
+the policy until removed. Only repositories the editor currently offers can be
+added. A limit refuses every other repository, including public ones and
+environments built from them, and a repository whose ID was never verified. It
+is checked when GitHub connections are selected for a turn and on every later
+tool or activity authorization, before any GitHub token is released, and before
+repository checkout or environment use. A narrower mandatory limit therefore
+also stops running sessions that use a repository it no longer lists.
+Selecting the GitHub app for a workflow keeps only its policy's repositories.
+
+Model limits list the workspace's model IDs exactly as Settings offers them;
+GPT-6 Astra and GPT-6 Astra Ultrafast are separate entries. Every paid model
+request is checked against the session's effective policy, including delegated
+agents, swarms, goals, automations, Slack and memory review, whether or not a
+spend limit is configured. A new session that does not ask for a model starts on
+the workspace default when the policy allows it, otherwise on the first allowed
+model; an explicitly requested model must be allowed. A policy that allows no
+model stops all sessions under it.
+
+These limits govern Moyai-managed access only. They do not stop a session's shell
+from cloning a public repository, using credentials a person supplies, or calling
+another model provider with its own key. Exclude the credential tools in the same
+policy where that matters.
 
 New native sessions pin the selected/default profile's revision and complete
 policy in one admission transaction. PostgreSQL rejects updates and deletes of
@@ -112,9 +149,10 @@ default; mandatory policy remains live.
 Only `security.manage` holders can enumerate profiles or explicitly choose one
 from Home or workflow configuration. Other users receive the organization default.
 A workflow may retain its saved profile without regaining policy-management
-permission. Workflow edits recheck selection and connected-app/repository limits
-inside the writer transaction. A workflow created or updated by an agent cannot
-exceed the creating session's effective policy. Both scheduled and event-triggered
+permission. Workflow edits recheck selection and the connected-app, repository
+(including GitHub trigger repositories) and model limits inside the writer
+transaction. A workflow created or updated by an agent cannot exceed the
+creating session's effective policy. Both scheduled and event-triggered
 admissions bind that workflow's profile before admitting work. A run refused by
 that profile, the effective policy or the owner's role is recorded as blocked,
 and the workflow stays blocked until its owner enables it again.
@@ -184,8 +222,8 @@ connection changes. Filters and signed cursors bound each page. Only the first p
 (no cursor) carries the filter facets, as only the provisioning directory's first
 page carries its groups, tokens and activity. CSV/NDJSON exports stream pages of up
 to 1,000 rows and recheck live permission before releasing each page. Tokens,
-credential contents, prompts, and policy domain/tool payloads are excluded from
-governance events.
+credential contents, prompts, and policy domain, tool, repository and model
+payloads are excluded from governance events.
 This records configuration history, not a transcript of every agent action.
 
 | Endpoint | Purpose |
@@ -194,12 +232,15 @@ This records configuration history, not a transcript of every agent action.
 | `/api/admin/scim`, `/api/admin/scim/tokens` | Provisioning administration |
 | `/scim/v2/*` | Bearer-authenticated directory protocol |
 | `/api/security-profiles` | Enabled profile selection catalog |
-| `/api/admin/security-profiles`, `/api/admin/security-profiles/defaults` | Revision-checked policy configuration |
+| `/api/admin/security-profiles`, `/api/admin/security-profiles/defaults` | Revision-checked policy configuration, with the editor's app, tool, repository and model choices |
 | `/api/sessions/{id}/security-policy` | Accessible session's effective policy |
 | `/api/admin/spend-limits` | Spend configuration and reported usage |
 | `/api/admin/governance/audit`, `/api/admin/governance/audit/export` | Audit feed and export |
 
 Configuration writes reuse canonical optimistic revisions, live writer-fenced
 permissions, CSRF protection for browser requests, and transaction-local audit
-records. Standalone native mode keeps its existing built-in account behavior;
-these enterprise settings require the canonical existing-product deployment.
+records. A policy update must include `repositories` and `models` whenever the
+saved policy limits them; an older editor or script that omits them is refused
+(409) instead of clearing the limits. Standalone native mode keeps its existing
+built-in account behavior; these enterprise settings require the canonical
+existing-product deployment.

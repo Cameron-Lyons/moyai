@@ -565,6 +565,10 @@ class ProductContinuationService:
         governance = getattr(self.runtime.database, 'governance', None)
         if governance is not None:
             await governance.bind(db, target, current, ceiling=await self._saved_policy(db, source_id))
+            settings = self.runtime.settings
+            target.model = governance.session_model(
+                await governance.policy(db, target.id), body.model, settings.default_model, settings.models,
+            )
         await db.flush()
         if narrow is not None:
             # An automatic selection is narrowed to the policy just bound.

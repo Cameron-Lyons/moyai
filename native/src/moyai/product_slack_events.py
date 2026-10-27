@@ -95,6 +95,8 @@ class SlackSubmission:
     uploads: list[str]
     # Connection kind of each automatically selected catalog grant.
     kinds: dict[str, str]
+    # Permanent repository ID of each automatically selected GitHub grant.
+    repositories: dict[str, int | None]
 
 
 class SlackEvents:
@@ -184,7 +186,10 @@ class SlackEvents:
             attachments=tuple(attachments["images"]),
             provenance={**message.origin, "files": attachments.get("files", [])},
         ), connections=[grant["id"] for grant in catalog])
-        return SlackSubmission(body, attachments["uploads"], {grant["id"]: grant["kind"] for grant in catalog})
+        return SlackSubmission(
+            body, attachments["uploads"], {grant["id"]: grant["kind"] for grant in catalog},
+            {grant["id"]: grant["policy"]["product"]["repository_id"] for grant in catalog if grant["kind"] == "github"},
+        )
 
     async def _automatic(
         self, db: AsyncSession, session_id: str, principal: ProductPrincipal, submission: SlackSubmission,
@@ -202,7 +207,9 @@ class SlackEvents:
         current = await governance.principal(db, principal.grant)
         policy = await governance.policy(db, session_id)
         selected = [
-            identity for identity in body.connections if governance.admits(policy, submission.kinds[identity])
+            identity for identity in body.connections if governance.admits_grant(
+                policy, submission.kinds[identity], submission.repositories.get(identity),
+            )
         ] if "connections.read" in current.effective_permissions else []
         return body.model_copy(update={"connections": selected})
 

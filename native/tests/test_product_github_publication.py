@@ -417,6 +417,26 @@ async def test_write_tokens_recheck_live_git_access_and_reads_rely_on_the_scope_
     assert minted == [False, True, False]
 
 
+async def test_a_narrower_mandatory_repository_limit_stops_token_release_before_minting(publication, monkeypatch):
+    """Live narrowing: the running session's grant leaves the limit, so no token is minted."""
+    from test_product_governance import attach, defaults, profile
+    f = publication
+    governance = attach(f.product)
+    minted = []
+    async def installation_token(**kwargs):
+        minted.append(kwargs.get("write", False))
+        return "synthetic-token"
+    monkeypatch.setattr(f.service.connectors.github, "installation_token", installation_token)
+    await defaults(f.product, mandatory=await profile(f.product, {"repositories": [123]}))
+    assert await f.publisher.token() == "synthetic-token"
+    await defaults(f.product, mandatory=await profile(f.product, {"repositories": [456]}))
+    for release in (f.publisher.token, f.publisher.protection_token,
+                    lambda: f.product.database.authorize_scope(f.scope), lambda: governance.connection(f.scope, f.grant)):
+        with pytest.raises(HTTPException, match="GitHub repository is not allowed"):
+            await release()
+    assert minted == [True]
+
+
 async def test_external_pr_access_requires_sdk_approval_and_current_head(publication):
     f = publication
     tools = toolset(f.service, f.scope, f.grant)

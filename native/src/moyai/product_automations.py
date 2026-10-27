@@ -42,7 +42,7 @@ with workflow.unsafe.imports_passed_through():
     from temporalio.exceptions import ApplicationError, WorkflowAlreadyStartedError
     from temporalio.service import RPCError, RPCStatusCode
 
-    from .contracts import RunScope
+    from .contracts import Grant, RunScope
     from .models import Effect, Message, Session, Turn, User, now
     from .product_automation_context_models import ProductAutomationExecutionContext as ExecutionContext
     from .product_automation_models import (
@@ -370,9 +370,9 @@ class ProductAutomationService:
                 result.append("connection_mapping_required")
             else:
                 try:
-                    project_grants = await self.connections.resolve_grants(
+                    project_grants = await self._admitted(db, definition, await self.connections.resolve_grants(
                         row["owner_id"], definition.plugins, shared_session=True, surface="automation", db=db,
-                    )
+                    ))
                 except (HTTPException, ValueError):
                     result.append("selected_connections_require_onboarding_or_authorization")
         if definition.session_id:
@@ -446,6 +446,19 @@ class ProductAutomationService:
             "authority_version": authority, "connection_ids": connections, "workspace_context": workspace,
         })
 
+    async def _admitted(self, db: AsyncSession, definition: Definition, grants: list[Grant]) -> list[Grant]:
+        """Keep the plugin grants the workflow's security policy admits.
+
+        A plugin selects every installation repository; a repository limit would
+        otherwise refuse each run at admission.
+        """
+        governance = getattr(self.database, "governance", None)
+        if governance is None:
+            return grants
+        policy = await governance.profile_policy(db, definition.security_profile_id)
+        return [grant for grant in grants
+                if governance.admits_grant(policy, grant.kind, governance.repository_of(grant))]
+
     @staticmethod
     def _repository_identity_known(workspace: dict) -> bool:
         identity = workspace.get("repository_id")
@@ -485,9 +498,9 @@ class ProductAutomationService:
                 )
             else:
                 if definition.plugins:
-                    grants = await self.connections.resolve_grants(
+                    grants = await self._admitted(db, definition, await self.connections.resolve_grants(
                         binding.owner_id, definition.plugins, shared_session=True, surface="automation", db=db,
-                    )
+                    ))
                     connections = sorted({grant.id for grant in grants})
                 workspace = await self.workspace.capture_workspace_context(db, principal, {
                     "repo_url": definition.repo_url, "github_repository_id": definition.github_repository_id,
@@ -994,9 +1007,13 @@ class ProductAutomationService:
                         await self.events.remove_receivers(db, identity, definition)
                 governance = getattr(self.database, 'governance', None)
                 if governance is not None and action in {'create', 'update', 'enable', 'migrate'}:
+                    try:
+                        model = self.settings.resolve_model(definition.model or None)
+                    except ValueError:
+                        model = definition.model  # Reported by blockers when nothing refuses it first.
                     await governance.workflow(db, principal, definition,
                                               previous='' if action == 'create' else _definition(row).security_profile_id,
-                                              scope=scope)
+                                              scope=scope, model=model)
                 if action in {"migrate", "enable"}:
                     blockers = await self.blockers(db, row, definition, principal=principal)
                     if blockers:
