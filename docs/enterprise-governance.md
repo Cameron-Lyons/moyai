@@ -198,9 +198,10 @@ existing-product deployment; standalone native mode refuses them.
 
 ### Collector contract
 
-Pull the audit log as NDJSON, overlapping each window by 5 minutes and
-deduplicating on `(source, id)`, since a row can commit after a later page was
-read with an earlier `created_at`. CSV exports have no `id` column.
+Pull the audit log as NDJSON in hourly windows, overlapping each window by 5
+minutes and deduplicating on `(source, id)`, since a row can commit after a later
+page was read with an earlier `created_at`. CSV exports have no `id` column, so
+a collector cannot deduplicate them.
 
 ```sh
 curl --fail -G "https://moyai.example.com/api/admin/governance/audit/export" \
@@ -214,9 +215,18 @@ curl --fail -G "https://moyai.example.com/api/admin/governance/audit/export" \
 
 - Set `after` to the previous call's `before` minus 5 minutes and `before` to
   about one minute ago. A window may span at most 100 days and an export at most
-  50,000 rows; split larger ranges.
+  50,000 rows, newest first.
 - Each NDJSON line is one entry with `id`, `source`, `action`, `actor`,
   `resource_type`, `resource_id`, `details` and `created_at`.
+- When a window holds more than 50,000 rows, the export stops at the cap and its
+  last line (the last CSV row) is a truncation record, not an audit entry: source
+  `export`, action `export.truncated`, and `details` with `rows` (the rows sent)
+  and `next_before`. Do not store it. Request the same `after` again with
+  `before` set to `next_before`, and repeat until an export ends without the
+  record; only then move `after` forward. Because `before` is exclusive,
+  `next_before` is one microsecond after the last instant the export reached:
+  rows sharing that instant are sent again rather than skipped, and
+  deduplication drops them.
 - A 401 means the key is invalid, revoked or expired, or its account is disabled;
   a 403 means the account lacks the permission or the route does not accept keys;
   a 429 asks the collector to wait a minute. A download that ends early means the
@@ -664,8 +674,10 @@ credential audits no index covers it, so it is checked within the time and
 keyset bounds. Only the first page (no cursor) carries the filter
 facets, as only the provisioning directory's first page carries its groups,
 tokens and activity. CSV/NDJSON exports stream pages of up to 1,000 rows,
-recheck live permission before releasing each page and stop at 50,000 rows, so a
-SIEM collector should pull each day with an `after`/`before` window. Activity
+recheck live permission before releasing each page and stop at 50,000 rows with
+a truncation record when older rows remain, so a SIEM collector should pull
+hourly `after`/`before` windows and re-request any window that ends with that
+record, as the [collector contract](#collector-contract) describes. Activity
 grows by roughly 1 KB per event (about 15 GB a year for 3,000 people sending
 50,000 messages a day); configuration events are small and rare. Activity rows
 cannot be updated (a trigger rejects `UPDATE`), and there is no retention job

@@ -401,11 +401,44 @@ def test_ndjson_and_csv_exports_follow_feed_order_in_pages_and_are_capped(store,
     monkeypatch.setattr(governance_audit, 'EXPORT_PAGE', 4)
     assert records(audit.export(None, 'ndjson')) == listing
     monkeypatch.setattr(governance_audit, 'MAX_EXPORT_ROWS', 10)
-    assert records(audit.export(None, 'ndjson')) == listing[:10]
+    *exported, truncated = records(audit.export(None, 'ndjson'))
+    assert exported == listing[:10] and truncated['action'] == 'export.truncated'
     rows = list(csv.reader(io.StringIO(''.join(audit.export(None, 'csv')), newline='')))
-    assert len(rows) == 11 and [row[0] for row in rows[1:]] == [entry['created_at'] for entry in listing[:10]]
+    assert len(rows) == 12 and [row[0] for row in rows[1:11]] == [entry['created_at'] for entry in listing[:10]]
+    assert rows[11][1:3] == ['export', 'export.truncated']
+    # Exactly the cap, with nothing older left: no truncation record.
     filters = parse_filters(resource_type='credential')
     assert [entry['source'] for entry in records(audit.export(filters, 'ndjson'))] == ['credentials'] * 10
+
+
+def test_capped_exports_end_with_a_record_that_resumes_without_skipping_rows(store, audit, monkeypatch):
+    """Regression: a capped export ended like a complete one, so a collector moving its window on lost the oldest rows."""
+    for second in (0, 1, 2, 3, 4, 6, 7, 8, 9):
+        governance_row(store, BASE + timedelta(seconds=second))
+    tie = BASE + timedelta(seconds=5)
+    for _ in range(2):  # The cap cuts between rows of two sources at one instant.
+        activity_row(store, tie)
+        governance_row(store, tie)
+    complete = [(entry['source'], entry['id']) for entry in audit.listing(None, None, 200)['entries']]
+    window = parse_filters(after=BASE.isoformat(), before=(BASE + timedelta(minutes=1)).isoformat())
+    monkeypatch.setattr(governance_audit, 'MAX_EXPORT_ROWS', 6)
+    received, filters, markers = [], window, []
+    while True:  # The documented collector loop.
+        *entries, last = records(audit.export(filters, 'ndjson'))
+        if last['source'] != 'export':
+            received.extend([*entries, last])
+            break
+        received.extend(entries)
+        markers.append(last)
+        # CSV ends with the same record as its last row.
+        rows = list(csv.reader(io.StringIO(''.join(audit.export(filters, 'csv')), newline='')))
+        assert rows[-1] == [last['created_at'], 'export', 'export.truncated', '', 'export', '',
+                            json.dumps(last['details'], sort_keys=True, separators=(',', ':'))]
+        filters = parse_filters(after=window.after, before=last['details']['next_before'])
+    assert [marker['details'] for marker in markers] == [
+        {'rows': 6, 'next_before': (tie + timedelta(microseconds=1)).isoformat(timespec='microseconds')},
+        {'rows': 6, 'next_before': (BASE + timedelta(seconds=3, microseconds=1)).isoformat(timespec='microseconds')}]
+    assert list(dict.fromkeys((entry['source'], entry['id']) for entry in received)) == complete
 
 
 def test_export_validates_before_streaming(audit, monkeypatch):

@@ -191,6 +191,10 @@ CURSOR_MAX_AGE = 86400
 MAX_CURSOR = 2048
 MAX_EXPORT_ROWS = 50_000
 EXPORT_PAGE = 1000
+# An export cut at MAX_EXPORT_ROWS ends with one entry-shaped record of this
+# source and action (never an audit source), whose details.next_before is the
+# exclusive bound that re-requests the rest of the window.
+TRUNCATED_SOURCE, TRUNCATED_ACTION = 'export', 'export.truncated'
 MAX_FACET_ACTIONS = 200
 EXPORT_FORMATS = ('csv', 'ndjson')
 EXPORT_COLUMNS = ('created_at', 'source', 'action', 'actor', 'resource_type', 'resource_id', 'details')
@@ -564,6 +568,21 @@ def _item(source, row):
         'created_at': _canonical(instant)})
 
 
+def _truncated(position, rows):
+    """The record ending an export the cap cut while older rows remained in its window.
+
+    Every row left is at or before the last position's instant, and before is
+    exclusive, so next_before is that instant plus one microsecond: re-requesting
+    the window with it cannot skip a row sharing that instant (the collector
+    deduplicates the rows it already received).
+    """
+    instant = position[0]
+    return {'id': 'truncated', 'source': TRUNCATED_SOURCE, 'action': TRUNCATED_ACTION, 'actor': '',
+            'resource_type': TRUNCATED_SOURCE, 'resource_id': '',
+            'details': {'rows': rows, 'next_before': _canonical(instant + timedelta(microseconds=1))},
+            'created_at': _canonical(instant)}
+
+
 def _cell(value):
     return "'" + value if value.startswith(FORMULA_PREFIXES) else value
 
@@ -631,7 +650,8 @@ class GovernanceAudit:
         and the first page run before this returns, so failures are ordinary
         errors rather than a truncated download. Each later page opens its own
         read snapshot inside next(), so no connection is held between chunks of
-        a slow download.
+        a slow download. When the cap stops an export with older rows left in
+        the window, its last chunk is one truncation record (_truncated).
         """
         filters = _filters(filters)
         if fmt not in EXPORT_FORMATS:
@@ -648,7 +668,11 @@ class GovernanceAudit:
             if chunk := header + ''.join(line(item.entry) for item in items):
                 yield chunk
             header, sent = '', sent + len(items)
-            if position is None or sent >= MAX_EXPORT_ROWS:
+            if position is None:
+                return
+            if sent >= MAX_EXPORT_ROWS:
+                if self._page(filters, position, 1)[0]:
+                    yield line(_truncated(position, sent))
                 return
             page = self._page(filters, position, min(EXPORT_PAGE, MAX_EXPORT_ROWS - sent))
 
