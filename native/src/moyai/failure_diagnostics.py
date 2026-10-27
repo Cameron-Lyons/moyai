@@ -15,7 +15,7 @@ from temporalio.exceptions import ActivityError, ApplicationError
 from .history_handoff import is_turn_run, latest_turn_snapshot
 from .inference_guardrails import ERROR_TYPES as GUARDRAIL_ERRORS
 from .inference_spend import ERROR_TYPE as SPEND_ERROR
-from .inference_spend import REACHED as SPEND_NOTICES
+from .inference_spend import notice as spend_sentence
 from .models import Event, Turn
 from .presentation import private_tool, redact
 from .progress import progress_secrets
@@ -109,7 +109,7 @@ def spend_notice(error: BaseException | None) -> str | None:
     """
     denial = next((item for item in failure_chain(error)
                    if isinstance(item, ApplicationError) and item.type == SPEND_ERROR), None)
-    return denial.message if denial is not None and denial.message in SPEND_NOTICES.values() else None
+    return spend_sentence(denial.message) if denial is not None else None
 
 
 async def guardrail_refused(database: Database, turn: Turn) -> bool:

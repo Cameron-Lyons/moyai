@@ -1,16 +1,15 @@
 """Finite read-only canonical Store seam on the caller's SQLAlchemy transaction."""
 
 import re
+from functools import cache
 from typing import Any
 
-from app.identity_kinds import INDIVIDUAL_USERS_QUERY
 from sqlalchemy import text
 
 QUERIES = {
     "SELECT * FROM connections WHERE provider=?": "connections",
     "SELECT enabled,read_only,checked_at,check_status FROM connection_policies WHERE provider=?": "connection_policies",
     "SELECT * FROM users WHERE id=?": "users",
-    INDIVIDUAL_USERS_QUERY: "users",
     "SELECT * FROM users WHERE id IN (?,?)": "users",
     "SELECT * FROM personal_slack_grants WHERE owner_id=?": "personal_slack_grants",
     "SELECT encrypted FROM connections WHERE provider='github'": "connections",
@@ -18,6 +17,17 @@ QUERIES = {
     "SELECT encrypted FROM github_app WHERE id=1": "github_app",
     "SELECT MAX(id) AS revision FROM connection_audit WHERE provider=?": "connection_audit",
 }
+
+
+@cache
+def queries() -> dict[str, str]:
+    """QUERIES plus the individual-account read, whose exact text app.identity_kinds owns.
+
+    Only existing-product mode reads through this seam, so standalone native
+    never imports the canonical app package for it.
+    """
+    from app.identity_kinds import INDIVIDUAL_USERS_QUERY
+    return {**QUERIES, INDIVIDUAL_USERS_QUERY: "users"}
 
 
 class ConnectionSnapshot:
@@ -29,9 +39,9 @@ class ConnectionSnapshot:
         self.session, self.schema = session, schema
 
     def rows(self, query: str, parameters=(), *, connection=None):
-        if connection is not None or query not in QUERIES:
+        if connection is not None or query not in queries():
             raise RuntimeError("The canonical grant query changed; review its transaction adapter.")
-        table = QUERIES[query]
+        table = queries()[query]
         qualified = f'"{self.schema}"."{table}"' if self.schema else f'"{table}"'
         query = query.replace("FROM " + table, "FROM " + qualified, 1)
         pieces = query.split("?")

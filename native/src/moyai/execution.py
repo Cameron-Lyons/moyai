@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from typing import Any
 
-from app.spend_limits import SpendLimitReached
 from fastapi import HTTPException
 from temporalio import activity
 from temporalio.exceptions import ApplicationError
@@ -14,6 +13,7 @@ from .contracts import GuidanceChanged, RunScope
 from .database import Database
 from .inference_guardrails import denial
 from .inference_spend import denial as spend_denial
+from .inference_spend import is_refusal as spend_refusal
 from .inference_usage import INFERENCE_ACTIVITY, InferenceActivity
 from .performance import computer_timing
 
@@ -100,7 +100,7 @@ class AuthorizedActivity(ActivityInboundInterceptor):
             except Exception as error:
                 if usage.guardrail is not None:
                     raise denial(usage.guardrail) from None
-                if isinstance(usage.admission_error, SpendLimitReached):
+                if spend_refusal(usage.admission_error):
                     # Its fixed sentence becomes the turn's error (TurnWorkflow), and
                     # as the chain's last failure it names a delegated child's failure.
                     raise spend_denial(usage.admission_error) from None
