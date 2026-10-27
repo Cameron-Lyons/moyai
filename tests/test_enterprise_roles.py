@@ -125,7 +125,7 @@ def test_catalog_lists_every_permission_once_with_labels_and_groups():
         'automations.manage', 'automations.read', 'connections.read', 'connections.write', 'credentials.manage',
         'credentials.read', 'environments.read', 'memory.manage', 'memory.read', 'sessions.create', 'sessions.manage',
         'sessions.read', 'skills.manage', 'skills.read', 'spend.personal', 'workspace.read']
-    assert len(PERMISSIONS) == 28
+    assert len(PERMISSIONS) == 29
 
 
 def tool_names_of(capability):

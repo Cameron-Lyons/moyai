@@ -156,6 +156,63 @@ class ScimAdmin(GovernanceView):
     can_create_tokens: bool
 
 
+class ServiceAccountKey(GovernanceView):
+    id: str
+    account_id: str
+    label: str
+    # "moyai_sk_" and the first 8 characters of the key id; never the secret.
+    prefix: str
+    created_at: str
+    created_by: str
+    expires_at: str
+    last_used_at: str | None
+    # The network of the last recorded use (IPv4 address or IPv6 /56).
+    last_used_from: str | None
+    revoked_at: str | None
+    # The revoking administrator, or "service_account.disabled".
+    revoked_by: str | None
+    status: Literal["active", "expired", "revoked"]
+
+
+class CreatedServiceAccountKey(ServiceAccountKey):
+    # The API key is returned once, here, and never again.
+    token: str
+
+
+class ServiceAccountView(GovernanceView):
+    id: str
+    name: str
+    description: str
+    permissions: list[str]
+    revision: int
+    active: bool
+    created_at: str
+    created_by: str
+    updated_at: str
+    updated_by: str
+    # Newest first, including expired and revoked keys.
+    keys: list[ServiceAccountKey]
+
+
+class ApiKeyRoute(GovernanceView):
+    method: Literal["GET"]
+    path: str
+    permission: str
+
+
+class ServiceAccountsAdmin(GovernanceView):
+    accounts: list[ServiceAccountView]
+    # The permissions a service account may hold.
+    permission_ceiling: list[str]
+    # The only operations that accept an API key.
+    key_routes: list[ApiKeyRoute]
+    # Unrevoked, unexpired keys an account may hold at once.
+    max_active_keys: int
+    # Only a built-in administrator creates and edits accounts and issues keys.
+    can_create: bool
+    activity: list[AuditEntry]
+
+
 AppName = Literal["github", "linear", "slack", "notion"]
 
 

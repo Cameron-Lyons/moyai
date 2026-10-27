@@ -793,6 +793,9 @@ def routes(service: ProductBillingService, *, runtime: Any | None = None) -> API
         format: Literal["json", "csv"] = "json",
         export: Literal["daily", "users", "models", "sessions", "requests", "turns"] = "daily",
     ) -> Any:
+        if getattr(principal, "kind", "") == "service" and (include_activity or request.url.path != "/api/admin/spend"):
+            # API keys read only the organization accounting report; activity needs a native user.
+            raise HTTPException(403, "API keys cannot access this report.")
         personal = not permission_for_user(principal, 'spend.read')
         if include_activity and personal:
             raise HTTPException(403, "Administrator access is required for organization activity.")

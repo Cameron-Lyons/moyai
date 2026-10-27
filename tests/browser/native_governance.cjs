@@ -25,6 +25,7 @@ const catalogRows=[
   ['users.read','View the user directory','People'],['users.manage','Change built-in roles','People'],['roles.manage','Manage custom roles and grants','People'],['scim.manage','Manage directory provisioning','People'],
   ['spend.personal','View personal spend','Spend'],['spend.read','View organization spend and limits','Spend'],['spend.manage','Manage spend limits and billing','Spend'],
   ['runtime.manage','View performance and runtime details','Operations'],['security.manage','Manage security policies','Security'],['audit.read','Read the audit log','Security'],
+  ['service_accounts.manage','Manage service accounts','Security'],
 ];
 const ALL=catalogRows.map(row=>row[0]);
 const MEMBER=['workspace.read','sessions.read','sessions.create','sessions.manage','connections.read','connections.write','automations.read','automations.manage','environments.read','skills.read','skills.manage','memory.read','memory.manage','credentials.read','credentials.manage','spend.personal'];
@@ -35,8 +36,17 @@ const connection=(id,kind,name,repository_id=null)=>({id,name,kind,owner_id:'',s
   policy:{allowed_tools:null,require_approval:false,product:{repository_id}}});
 const CONNECTIONS=[connection('gh-101','github','synthetic-org/api',101),connection('gh-102','github','synthetic-org/web',102),connection('linear','linear','Linear')];
 const profile=(id,name,policy,patch={})=>({id,name,enabled:true,revision:2,policy:{connected_apps:null,tools:null,git_access:'write',network_domains:null,repositories:null,models:null,...policy},updated_at:stamp,updated_by:'admin@example.test',...patch});
+const SA1='a1'.repeat(16), SA2='a2'.repeat(16), K1='b1'.repeat(16), K0='b0'.repeat(16);
+const inDays=days=>new Date(Date.now()+days*86_400_000).toISOString();
+const serviceKey=(patch)=>({account_id:SA1,created_at:stamp,created_by:'admin@example.test',expires_at:inDays(90),last_used_at:null,last_used_from:null,revoked_at:null,revoked_by:null,status:'active',...patch});
 function reset(overrides={}) {
-  state={mode:'existing',role:'admin',permissions:[...ALL],accessRole:null,requests:[],conflict:false,forbidRoles:false,networkEnforcement:'off',
+  state={serviceAccounts:[
+      {id:SA1,name:'SIEM collector',description:'Splunk pulls the audit export nightly.',permissions:['audit.read'],revision:2,active:true,created_at:stamp,created_by:'admin@example.test',updated_at:stamp,updated_by:'admin@example.test',
+        keys:[serviceKey({id:K1,label:'Splunk production',prefix:'moyai_sk_b1b1b1b1',expires_at:inDays(3.5),last_used_at:stamp,last_used_from:'203.0.113.7'}),
+          serviceKey({id:K0,label:'Old collector',prefix:'moyai_sk_b0b0b0b0',revoked_at:stamp,revoked_by:'admin@example.test',status:'revoked'})]},
+      {id:SA2,name:'Finance export',description:'',permissions:['spend.read'],revision:3,active:false,created_at:stamp,created_by:'admin@example.test',updated_at:stamp,updated_by:'admin@example.test',
+        keys:[serviceKey({id:'b2'.repeat(16),account_id:SA2,label:'Warehouse',prefix:'moyai_sk_b2b2b2b2',revoked_at:stamp,revoked_by:'service_account.disabled',status:'revoked'})]}],
+    failServiceAccounts:false,mode:'existing',role:'admin',permissions:[...ALL],accessRole:null,requests:[],conflict:false,forbidRoles:false,networkEnforcement:'off',
     connections:[],preferences:{delivery_mode:'when_idle',connection_ids:null},session:false,sessionModel:'test-model',sessionPolicy:null,
     roles:[
       {id:'auditor',name:'Auditor',description:'Read-only compliance access for reviews.',permissions:['audit.read','sessions.read','spend.read'],revision:3,archived:false,updated_at:stamp,updated_by:'admin@example.test'},
@@ -171,6 +181,30 @@ async function handle(req,res,next) {
     // 200 with the revoked token record.
     if(tokenMatch&&method==='DELETE'){const token=state.tokens.find(row=>row.id===decodeURIComponent(tokenMatch[1]));token.revoked_at=stamp;return json(token);}
   }
+  // Service accounts
+  if(p.startsWith('/api/admin/service-accounts')) {
+    if(!has('service_accounts.manage'))return deny();
+    const admin=state.role==='admin', find=id=>state.serviceAccounts.find(row=>row.id===decodeURIComponent(id));
+    if(p==='/api/admin/service-accounts'&&method==='GET'){
+      if(state.failServiceAccounts)return json({detail:'Service accounts are temporarily unavailable.'},503);
+      return json({accounts:state.serviceAccounts,permission_ceiling:['audit.read','spend.read'],max_active_keys:5,can_create:admin,
+        key_routes:[['/api/admin/governance/audit','audit.read'],['/api/admin/governance/audit/export','audit.read'],['/api/admin/spend','spend.read']].map(([path,permission])=>({method:'GET',path,permission})),
+        activity:[entry('v1','service_account_key.created','service_account_key',K1,{label:'Splunk production',prefix:'moyai_sk_b1b1b1b1'})]});}
+    if(!admin&&(method==='POST'||method==='PUT'))return json({detail:'Only a built-in administrator can create service accounts, change their access or issue API keys.'},403);
+    if(p==='/api/admin/service-accounts'&&method==='POST'){const account={id:'a3'.repeat(16),...data,description:data.description??'',revision:1,active:true,created_at:stamp,created_by:'admin@example.test',updated_at:stamp,updated_by:'admin@example.test',keys:[]};
+      state.serviceAccounts.push(account);return json(account,201);}
+    const keyMatch=p.match(/^\/api\/admin\/service-accounts\/([^/]+)\/keys(?:\/([^/]+))?$/);
+    if(keyMatch){const account=find(keyMatch[1]);
+      // 201 with the key record plus its one-time secret; the following listing fails when requested.
+      if(method==='POST'){const key=serviceKey({id:'b3'.repeat(16),account_id:account.id,label:data.label,prefix:'moyai_sk_b3b3b3b3',expires_at:inDays(data.expires_in_days)});
+        account.keys.unshift(key);state.failServiceAccounts=Boolean(state.failAfterIssue);return json({...key,token:'moyai_sk_b3_SYNTHETIC_ONE_TIME_SECRET'},201);}
+      if(method==='DELETE'){const key=account.keys.find(row=>row.id===decodeURIComponent(keyMatch[2]));Object.assign(key,{revoked_at:stamp,revoked_by:'admin@example.test',status:'revoked'});return json(key);}}
+    const accountMatch=p.match(/^\/api\/admin\/service-accounts\/([^/]+)$/);
+    if(accountMatch){const account=find(accountMatch[1]);
+      if(method==='PUT'){if(data.revision!==account.revision)return json({detail:STALE},409);Object.assign(account,{name:data.name,description:data.description,permissions:data.permissions,active:data.active,revision:account.revision+1});return json(account);}
+      if(method==='DELETE'){if(Number(url.searchParams.get('revision'))!==account.revision)return json({detail:STALE},409);
+        account.active=false;account.revision++;for(const key of account.keys)if(!key.revoked_at)Object.assign(key,{revoked_at:stamp,revoked_by:'service_account.disabled',status:'revoked'});return json(account);}}
+  }
   // Security policies
   if(p.startsWith('/api/admin/security-profiles')) {
     if(!has('security.manage'))return deny();
@@ -271,6 +305,7 @@ after(async()=>{await browser?.close();await server?.close();});
 const pages=[
   {id:'roles',title:'Roles & access',ready:'Custom roles',api:'/api/admin/roles'},
   {id:'provisioning',title:'Provisioning',ready:'Provisioning tokens',api:'/api/admin/scim'},
+  {id:'service-accounts',title:'Service accounts',ready:'Endpoints that accept API keys',api:'/api/admin/service-accounts'},
   {id:'security-policies',title:'Security policies',ready:'Organization defaults',api:'/api/admin/security-profiles'},
   {id:'spend-limits',title:'Spend limits',ready:'Per-person overrides',api:'/api/admin/spend-limits'},
   {id:'audit-log',title:'Audit log',ready:'Apply filters',api:'/api/admin/governance/audit'},
@@ -407,6 +442,80 @@ test('provisioning: copy the SCIM URL, show a new token once, page directory use
   await page.getByRole('button',{name:'Revoke Okta production'}).waitFor({state:'detached'});
   assert.equal(await page.getByRole('row').filter({hasText:'Okta production'}).getByText('Revoked',{exact:true}).count(),1,'the revoked token is listed as revoked');
   await page.getByRole('region',{name:'Directory groups'}).getByText('Contractor').waitFor();
+});
+
+test('service accounts: an administrator creates an account, sees a new key once and revokes or disables with explained effects',async t=>{
+  reset({failAfterIssue:true});const page=await pageFor(t,'#settings/service-accounts');
+  const siem=page.locator('article').filter({has:page.getByRole('heading',{name:'SIEM collector'})});await siem.waitFor();
+  const keys=siem.getByRole('region',{name:'API keys'});
+  await keys.getByText('moyai_sk_b1b1b1b1…').waitFor();await keys.getByText('Expires in 3 days').waitFor();await keys.getByText('203.0.113.7').waitFor();
+  assert.equal(await keys.getByRole('row').filter({hasText:'Old collector'}).getByText('Revoked',{exact:true}).count(),1);
+  assert.equal(await page.getByRole('heading',{name:'Finance export'}).count(),0,'disabled accounts are filtered out by default');
+  await page.getByText('GET /api/admin/governance/audit/export').waitFor();
+  assert.match(await page.getByRole('textbox',{name:'Example audit export request'}).inputValue(),/^curl --fail -G -H "Authorization: Bearer \$MOYAI_API_KEY" -d format=ndjson "http:\/\/127\.0\.0\.1:\d+\/api\/admin\/governance\/audit\/export"$/);
+  await page.getByRole('button',{name:'New service account'}).click();
+  const create=page.getByRole('dialog',{name:'New service account'});await create.getByRole('textbox',{name:'Name'}).fill('  Audit exporter ');
+  assert.equal(await create.getByRole('checkbox').count(),2,'only the key ceiling is offered');
+  await create.getByRole('checkbox',{name:'View organization spend and limits'}).waitFor();
+  await create.getByRole('button',{name:'Create account'}).click();await create.getByRole('alert').getByText('Choose at least one permission.').waitFor();
+  await create.getByRole('checkbox',{name:'Read the audit log'}).click();await create.getByRole('button',{name:'Create account'}).click();await create.waitFor({state:'hidden'});
+  assert.deepEqual(last('/api/admin/service-accounts','POST').body,{name:'Audit exporter',description:'',permissions:['audit.read']});
+  await page.getByRole('heading',{name:'Audit exporter'}).waitFor();
+
+  await page.getByRole('button',{name:'New key for SIEM collector'}).click();
+  const issue=page.getByRole('dialog',{name:'New key for SIEM collector'});await issue.getByRole('textbox',{name:'Key label'}).fill('Splunk staging');
+  await choose(issue,page,'Expires after','365 days');await issue.getByRole('button',{name:'Issue key'}).click();
+  const reveal=page.getByRole('dialog',{name:'Copy your API key'});await reveal.waitFor();
+  assert.deepEqual(last(`/api/admin/service-accounts/${SA1}/keys`,'POST').body,{label:'Splunk staging',expires_in_days:365});
+  await reveal.getByRole('alert').getByText('This key is shown only once.').waitFor();
+  const secret=reveal.getByRole('textbox',{name:'API key Splunk staging'});assert.equal(await secret.inputValue(),'moyai_sk_b3_SYNTHETIC_ONE_TIME_SECRET');
+  // The list refresh after issuing fails; the one-time key stays until Done.
+  await page.getByText('Unable to load service accounts').waitFor();
+  await page.keyboard.press('Escape');assert.equal(await reveal.isVisible(),true,'Escape cannot discard the key');
+  assert.equal(await reveal.getByRole('button',{name:'Close'}).count(),0,'only Done closes the one-time view');
+  await reveal.getByRole('button',{name:/^Copy/}).click();assert.equal(await page.evaluate(()=>navigator.clipboard.readText()),'moyai_sk_b3_SYNTHETIC_ONE_TIME_SECRET');
+  await shoot(page,'service-accounts-key-dialog-1440.png');
+  await reveal.getByRole('button',{name:'Done'}).click();await reveal.waitFor({state:'hidden'});
+  assert.equal(await page.evaluate(()=>document.body.innerHTML.includes('SYNTHETIC_ONE_TIME_SECRET')),false,'the key is not retained in the DOM');
+  state.failServiceAccounts=false;state.failAfterIssue=false;await page.getByRole('button',{name:'Try again'}).click();
+  await siem.getByRole('cell',{name:/^Splunk staging/}).waitFor();
+
+  await page.getByRole('button',{name:'Revoke Splunk production'}).click();const revoke=page.getByRole('dialog',{name:'Revoke Splunk production?'});
+  await revoke.getByText(/stop on their next request, including downloads in progress/).waitFor();
+  await revoke.getByRole('button',{name:'Cancel'}).click();await revoke.waitFor({state:'hidden'});
+  assert.equal(state.requests.filter(req=>req.method==='DELETE').length,0,'cancel sends nothing');
+  await page.getByRole('button',{name:'Revoke Splunk production'}).click();await page.getByRole('dialog',{name:'Revoke Splunk production?'}).getByRole('button',{name:'Revoke key'}).click();
+  await waitFor(()=>last(`/api/admin/service-accounts/${SA1}/keys/${K1}`,'DELETE'),'revoke');
+  await page.getByRole('button',{name:'Revoke Splunk production'}).waitFor({state:'detached'});
+
+  await page.getByRole('button',{name:'Disable SIEM collector'}).click();const disable=page.getByRole('dialog',{name:'Disable SIEM collector?'});
+  await disable.getByText(/Its key is revoked permanently.*does not restore revoked keys/).waitFor();
+  await disable.getByRole('button',{name:'Disable account'}).click();await disable.waitFor({state:'hidden'});
+  assert.equal(last(`/api/admin/service-accounts/${SA1}`,'DELETE').query,'?revision=2');
+  await page.getByRole('heading',{name:'SIEM collector'}).waitFor({state:'detached'});
+  await choose(page,page,'Account status','All accounts');
+  await page.getByRole('button',{name:'Enable Finance export'}).click();const enable=page.getByRole('dialog',{name:'Enable Finance export?'});
+  await enable.getByText('Keys revoked when it was disabled stay revoked.').waitFor();await enable.getByRole('button',{name:'Enable account'}).click();await enable.waitFor({state:'hidden'});
+  assert.deepEqual(last(`/api/admin/service-accounts/${SA2}`,'PUT').body,{name:'Finance export',description:'',permissions:['spend.read'],active:true,revision:3});
+  await page.getByRole('button',{name:'Disable Finance export'}).waitFor();
+});
+
+test('service accounts: a delegate reviews, revokes and disables but cannot create or issue, and others never see the page',async t=>{
+  reset({role:'member',permissions:[...MEMBER,'service_accounts.manage']});const page=await pageFor(t,'#settings/service-accounts');
+  await page.getByRole('heading',{name:'SIEM collector'}).waitFor();
+  await page.getByText(/A built-in administrator creates service accounts/).waitFor();
+  for(const name of [/New service account/,/^New key/,/^Edit /])assert.equal(await page.getByRole('button',{name}).count(),0,String(name));
+  await page.getByRole('button',{name:'Revoke Splunk production'}).click();await page.getByRole('dialog',{name:'Revoke Splunk production?'}).getByRole('button',{name:'Revoke key'}).click();
+  await waitFor(()=>last(`/api/admin/service-accounts/${SA1}/keys/${K1}`,'DELETE'),'delegate revoke');
+  await page.getByRole('button',{name:'Disable SIEM collector'}).click();const disable=page.getByRole('dialog',{name:'Disable SIEM collector?'});
+  await disable.getByText(/It has no unrevoked keys\./).waitFor();await disable.getByRole('button',{name:'Disable account'}).click();await disable.waitFor({state:'hidden'});
+  await choose(page,page,'Account status','Disabled accounts');await page.getByRole('heading',{name:'Finance export'}).waitFor();
+  assert.equal(await page.getByRole('button',{name:'Enable Finance export'}).count(),0,'only a built-in administrator re-enables');
+  reset({role:'member',permissions:[...MEMBER,'audit.read','spend.read']});await page.evaluate(()=>{location.hash='settings/overview';});await page.reload();
+  const nav=page.getByRole('navigation',{name:'Settings'});await nav.getByRole('link',{name:'Audit log'}).waitFor();
+  assert.equal(await nav.getByRole('link',{name:'Service accounts'}).count(),0);
+  await page.evaluate(()=>{location.hash='settings/service-accounts';});await page.getByRole('heading',{name:'Permission required'}).waitFor();
+  assert.ok(!state.requests.some(req=>req.path==='/api/admin/service-accounts'),'no protected request without the permission');
 });
 
 test('security policies: explicit null-versus-empty choices, validation, defaults and disable',async t=>{

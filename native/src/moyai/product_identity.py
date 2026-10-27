@@ -41,6 +41,14 @@ Integration contract (the caller owns activation and reviewed schema migrations)
 Native Security derives a different key and uses a different session salt.
 Do not try both decoders or exchange cookies between those formats.
 
+API keys (app.service_accounts) authenticate in a bearer-only branch that runs
+before any cookie, Access or CSRF check and never falls back to them. Only the
+exact GET operations in app.permissions.API_KEY_ROUTES accept one. The principal
+id service:<account>:<key> names the key, so require_current rechecks that key's
+revocation and expiry and its account's state on every call. Service principals
+hold only their stored permissions, are never governed as people, and are
+refused at admission, native projection and every governance write.
+
 The legacy users schema currently has no enabled/auth_version columns. Existing
 columns, if present, are honored; live user_roles revisions, account deletion,
 login policy and Access bindings are checked regardless. Native local controls
@@ -50,12 +58,13 @@ existing validated assertion/cookie policy; this is not an IdP introspection API
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import json
 import logging
 import re
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Callable, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -73,6 +82,8 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
 from .models import User
 
+# Key use and refusals: prefixes, account ids and routes only, never the key.
+key_logger = logging.getLogger("moyai.api_keys")
 # Principals admitted in each root transaction. Its shared writer lock keeps
 # canonical role writers out until it ends, so a repeat check is the same read.
 _ADMITTED: WeakKeyDictionary[Any, dict[str, ProductPrincipal]] = WeakKeyDictionary()
@@ -119,7 +130,10 @@ class ProductPrincipal:
     @property
     def effective_permissions(self) -> frozenset[str]:
         from app.permissions import BUILTIN_PERMISSIONS
-        return self.permissions if self.permissions is not None else BUILTIN_PERMISSIONS[self.role]
+        if self.permissions is not None:
+            return self.permissions
+        # A service account never falls back to a built-in role's permissions.
+        return frozenset() if self.kind == "service" else BUILTIN_PERMISSIONS[self.role]
 
     def require(self, permission: str) -> None:
         if permission not in self.effective_permissions:
@@ -199,6 +213,13 @@ class ProductIdentityAdapter:
         self.legacy_security = Security(legacy_settings)
         self.roles = UserRoles(SimpleNamespace(schema_updates=False), legacy_settings)
         self.access = CloudflareAccess(legacy_settings)
+        from app.security import Throttle
+
+        # Per process: failed key attempts per network, and requests per key.
+        self.key_failures = Throttle(30)
+        self.key_rate = Throttle(120)
+        # ServiceAccounts.touch(key_id, last_used_at, network), wired by ProductResources.
+        self.service_key_touch: Callable[[str, str, str], None] | None = None
 
     def _table(self, name: str) -> str:
         return f'"{self.schema}"."{name}"' if self.schema else f'"{name}"'
@@ -235,9 +256,45 @@ class ProductIdentityAdapter:
         async with self._reader(self.native_engine) as session:
             return await read(session)
 
+    def _key_query(self) -> str:
+        from app.service_accounts import KEY_QUERY
+
+        return KEY_QUERY.format(
+            keys=self._table("service_account_keys"), accounts=self._table("service_accounts"),
+        )
+
+    def _service_principal(self, authority: Any) -> ProductPrincipal:
+        """A service principal: no email, no built-in role authority and never individual."""
+        version = hmac.new(
+            self.legacy_security.secret.encode(),
+            json.dumps(authority.authority_entry(), sort_keys=True, separators=(",", ":")).encode(),
+            hashlib.sha256,
+        ).hexdigest()
+        return ProductPrincipal(
+            id=authority.principal_id, kind="service", method="api_key", email="", name=authority.name,
+            role="member", enabled=True, authority_version=version, permissions=frozenset(authority.permissions),
+        )
+
+    async def _service_current(self, db: AsyncSession, user_id: str) -> ProductPrincipal:
+        """Recheck the exact key a service principal names, and its account, in this read."""
+        from app.service_accounts import parse_principal_id, verify
+
+        ids = parse_principal_id(user_id)
+        row = None if ids is None else (await db.execute(
+            text(self._key_query()), {"key_id": ids[1]},
+        )).mappings().first()
+        authority = None if ids is None else verify(row, account_id=ids[0], now=datetime.now(UTC))
+        if authority is None:
+            raise HTTPException(401, "This API key is no longer valid.")
+        return self._service_principal(authority)
+
     async def _current(self, db: AsyncSession, user_id: str, controls: tuple[bool, int]) -> ProductPrincipal:
         from app.identity_kinds import INDIVIDUAL_KINDS
+        from app.service_accounts import is_principal_id
 
+        if is_principal_id(user_id):
+            # Before the users read: a service account is not a product account.
+            return await self._service_current(db, user_id)
         row = (await db.execute(
             text(f"SELECT * FROM {self._table('users')} WHERE id=:id"), {"id": user_id},
         )).mappings().first()
@@ -347,6 +404,10 @@ class ProductIdentityAdapter:
         from app.permissions import BUILTIN_PERMISSIONS
 
         from .product_governance import CanonicalRead
+        if principal.kind == 'service':
+            # Never governed as a person: the email-less branch below would
+            # grant built-in member permissions.
+            return principal
         if principal.kind == 'shared':
             return replace(principal, permissions=BUILTIN_PERMISSIONS[principal.role])
         if not principal.email or not self.roles.eligible(principal.email):
@@ -380,7 +441,12 @@ class ProductIdentityAdapter:
                            {'id': state.role_id, 'name': state.role_name or state.role_id} if state.role_id else None))
 
     async def current(self, user_id: str) -> ProductPrincipal:
+        from app.service_accounts import is_principal_id
+
         try:
+            if is_principal_id(user_id):
+                async with self._reader(self.source_engine) as db:
+                    return await self._service_current(db, user_id)
             controls = await self._native_controls(user_id)
             async with self._reader(self.source_engine) as db:
                 return await self._current(db, user_id, controls)
@@ -456,13 +522,86 @@ class ProductIdentityAdapter:
             raise HTTPException(403, "The linked account is not an eligible individual.")
         return individual
 
+    async def _authenticate_service_key(self, request: Request, *, mutation: bool, admin: bool) -> ProductPrincipal:
+        """Bearer API key authentication. Reads no cookie, Access assertion or CSRF token.
+
+        Skipping CSRF is safe: an Authorization header is not an ambient
+        credential, no CORS policy lets another origin send one, every key
+        route is a GET and keys in query strings are never read.
+        """
+        from app.permissions import MEMBER_PERMISSIONS, api_key_route, route_permission
+        from app.service_accounts import (
+            REFUSED_ROUTE,
+            UNAUTHENTICATED,
+            logged_prefix,
+            parse,
+            stale_use,
+            verify,
+        )
+
+        method, path = request.method, request.url.path
+        required = api_key_route(method, path)
+        if required is None or mutation:
+            key_logger.warning("API key refused: route prefix=%s method=%s path=%r",
+                               logged_prefix(request.headers.get("authorization")) or "malformed",
+                               method[:16], path[:200])
+            raise HTTPException(403, REFUSED_ROUTE)
+        network = self.legacy_security.client_key(request)
+        if self.key_failures.blocked(network):
+            key_logger.warning("API key refused: failure throttle method=%s path=%s", method, path)
+            raise HTTPException(429, "Too many failed API key attempts. Try again in a minute.",
+                                headers={"Retry-After": "60"})
+        refused = HTTPException(401, UNAUTHENTICATED, headers={"WWW-Authenticate": "Bearer"})
+        try:
+            key_id, token = parse(request.headers.get("authorization"))
+        except HTTPException:
+            self.key_failures.record(network)
+            key_logger.warning("API key refused: malformed method=%s path=%s", method, path)
+            raise refused from None
+        try:
+            async with self._reader(self.source_engine) as db:
+                row = (await db.execute(text(self._key_query()), {"key_id": key_id})).mappings().first()
+        except SQLAlchemyError:
+            raise HTTPException(503, "Current product authority is unavailable.") from None
+        authority = verify(row, token, now=datetime.now(UTC))
+        if authority is None:
+            self.key_failures.record(network)
+            key_logger.warning("API key refused: invalid prefix=moyai_sk_%s method=%s path=%s",
+                               key_id[:8], method, path)
+            raise refused
+        if self.key_rate.blocked(key_id):
+            key_logger.warning("API key refused: rate limit prefix=%s account=%s method=%s path=%s",
+                               authority.prefix, authority.account, method, path)
+            raise HTTPException(429, "This API key is sending too many requests. Try again in a minute.",
+                                headers={"Retry-After": "60"})
+        self.key_rate.record(key_id)
+        if route_permission(request) != required:
+            raise RuntimeError("API key routes and route permissions disagree; review app.permissions.")
+        principal = self._service_principal(authority)
+        principal.require(required)
+        if admin and required in MEMBER_PERMISSIONS:
+            raise HTTPException(403, "An organization administrator must perform this action.")
+        request.state.product_identity_grant = principal.grant
+        key_logger.info("API key accepted: prefix=%s account=%s method=%s path=%s",
+                        authority.prefix, authority.account, method, path)
+        if self.service_key_touch is not None and stale_use(authority.last_used_at):
+            try:
+                await asyncio.to_thread(self.service_key_touch, key_id, authority.last_used_at, network)
+            except Exception as error:  # noqa: BLE001 - bookkeeping never fails an authenticated request.
+                key_logger.warning("API key use was not recorded: %s", type(error).__name__)
+        return principal
+
     async def authenticate(self, request: Request, *, mutation: bool = False, admin: bool = False) -> ProductPrincipal:
         from dataclasses import replace
 
         from app.cloudflare_access import AccessUnavailable
         from app.identity_kinds import INDIVIDUAL_METHODS
+        from app.service_accounts import presented
         from jwt import PyJWTError
 
+        if presented(request.headers.get("authorization")):
+            # First, and final: a key request never reaches cookie, Access or CSRF checks.
+            return await self._authenticate_service_key(request, mutation=mutation, admin=admin)
         # Ignore even prepopulated state: the assertion must be checked here.
         # This synchronous helper validates the signed cookie and CSRF only.
         # It has no canonical role store, so authorizing the requested route
@@ -555,7 +694,12 @@ class ProductIdentityAdapter:
     async def authorize_admission(
         self, db: AsyncSession, grant: ProductGrant | ProductPrincipal | None,
     ) -> ProductPrincipal:
+        from app.service_accounts import is_principal_id
+
         grant = self._grant(grant)
+        if is_principal_id(grant.user_id):
+            # Covers sessions, turns, activities, workflows and native projection.
+            raise HTTPException(403, "API keys cannot start or continue work.")
         bind = db.get_bind()
         source = self.source_engine.url
         target = bind.engine.url
@@ -611,6 +755,10 @@ class ProductIdentityAdapter:
 
     async def project_native_user(self, db: AsyncSession, principal: ProductPrincipal) -> User:
         """A native FK/profile cache, never the source of product authority."""
+        from app.service_accounts import is_principal_id
+
+        if principal.kind == "service" or is_principal_id(principal.id):
+            raise HTTPException(403, "API keys cannot start or continue work.")
         backend = db.get_bind().dialect.name
         if backend not in {"postgresql", "sqlite"}:
             raise HTTPException(503, "Unsupported native identity projection database.")

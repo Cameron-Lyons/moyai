@@ -89,6 +89,7 @@ const destinations = [
   { id: "usage", title: "Spend & usage", description: "Review recorded model usage and cost coverage.", group: "Administration", Icon: Wallet, admin: true },
   { id: "roles", title: "Roles & access", description: "Create custom roles, assign them by email and grant them to directory groups.", group: "Governance", Icon: UserCog, productOnly: true },
   { id: "provisioning", title: "Provisioning", description: "Connect your identity provider with SCIM and manage provisioning tokens.", group: "Governance", Icon: Workflow, productOnly: true },
+  { id: "service-accounts", title: "Service accounts", description: "Issue expiring, read-only API keys for audit and spend collectors.", group: "Governance", Icon: KeyRound, productOnly: true },
   { id: "security-policies", title: "Security policies", description: "Limit the apps, tools, Git access and network destinations sessions can use.", group: "Governance", Icon: ShieldCheck, productOnly: true },
   { id: "spend-limits", title: "Spend limits", description: "Cap monthly model spend for the organization, each person and each session.", group: "Governance", Icon: CircleDollarSign, productOnly: true },
   { id: "audit-log", title: "Audit log", description: "Review and export configuration and activity history: changes, sign-ins, sessions and policy denials.", group: "Governance", Icon: FileClock, productOnly: true },

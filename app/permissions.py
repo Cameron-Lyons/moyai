@@ -7,6 +7,10 @@ Tool permissions describe capability use inside an already admitted turn; they
 never authorize connection setup. Every native tool has an explicit entry, and a
 tool without one resolves to the session-scoped DEFAULT_TOOL_PERMISSION instead
 of "no check", so an empty or archived custom role never fails open.
+
+Service accounts are not people and hold no built-in role: each holds an
+explicit subset of SERVICE_PERMISSIONS, and its API keys reach only the exact
+read operations in API_KEY_ROUTES.
 """
 import re
 from urllib.parse import urlparse
@@ -40,6 +44,7 @@ PERMISSIONS = {
     'audit.read': 'Read enterprise governance audit history',
     'security.manage': 'Manage security profiles and policies',
     'scim.manage': 'View directory provisioning and revoke provisioning credentials',
+    'service_accounts.manage': 'View service accounts and revoke or disable their API keys',
 }
 
 MEMBER_PERMISSIONS = frozenset({
@@ -49,6 +54,22 @@ MEMBER_PERMISSIONS = frozenset({
     'credentials.read', 'credentials.manage', 'spend.personal',
 })
 BUILTIN_PERMISSIONS = {'admin': frozenset(PERMISSIONS), 'member': MEMBER_PERMISSIONS}
+
+# The most a service account may hold. Narrowing it here revokes immediately:
+# keys are checked against it on every request, whatever an account stores.
+SERVICE_PERMISSIONS = frozenset({'audit.read', 'spend.read'})
+# The only operations an API key may call, matched exactly: no prefixes, no
+# HEAD and no writes. Each permission equals route_permission() for its path.
+API_KEY_ROUTES = {
+    ('GET', '/api/admin/governance/audit'): 'audit.read',
+    ('GET', '/api/admin/governance/audit/export'): 'audit.read',
+    ('GET', '/api/admin/spend'): 'spend.read',
+}
+
+
+def api_key_route(method, path):
+    """The permission an API key needs for this exact (method, path), or None when keys are refused."""
+    return API_KEY_ROUTES.get((method, path))
 
 
 def route_permission(request):
@@ -61,6 +82,8 @@ def route_permission(request):
         return 'roles.manage'
     if path.startswith('/api/admin/scim'):
         return 'scim.manage'
+    if path.startswith('/api/admin/service-accounts'):
+        return 'service_accounts.manage'
     if path.startswith(('/api/security-profiles', '/api/admin/security-profiles')):
         return 'security.manage'
     if path.startswith('/api/admin/governance'):
@@ -157,6 +180,7 @@ LABELS = {
     'runtime.manage': ('View performance and runtime details', 'Operations'),
     'security.manage': ('Manage security policies', 'Security'),
     'audit.read': ('Read the audit log', 'Security'),
+    'service_accounts.manage': ('Manage service accounts', 'Security'),
 }
 
 

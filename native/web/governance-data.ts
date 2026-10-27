@@ -3,7 +3,8 @@
 // authoritative and re-validates every field.
 import type {
   AuditEntry, EffectiveSpendLimit, ExportGovernanceAuditData, GovernanceGroupRole, GovernanceRole, GovernanceRoleAssignment, GroupRoleChange, PermissionInfo, PersonalSpendStatus, PolicyCatalog, PolicyCatalogRepository,
-  PolicyView, ProfileDefaults, ProfilePolicy, RoleAssignment, RoleCreate, RoleUpdate, SaveProfile, SecurityProfileView, SpendGroupLimitView, SpendLimitChange, SpendLimitView,
+  PolicyView, ProfileDefaults, ProfilePolicy, RoleAssignment, RoleCreate, RoleUpdate, SaveProfile, SecurityProfileView, ServiceAccountCreate, ServiceAccountKey,
+  ServiceAccountUpdate, ServiceAccountView, ServiceKeyCreate, SpendGroupLimitView, SpendLimitChange, SpendLimitView,
 } from "./generated/api"
 import type { AuditExportFormat, AuditFilterQuery, AuditFilters, AuditQuery, ConnectedApp, GitAccess } from "./governance-types"
 
@@ -297,4 +298,60 @@ export function detailText(value: unknown): string {
   if (Array.isArray(value)) return value.length ? value.map(String).join(", ") : "None"
   if (typeof value === "object") return JSON.stringify(value)
   return String(value)
+}
+
+// Service accounts ------------------------------------------------------------
+
+type KeyLifetime = NonNullable<ServiceKeyCreate["expires_in_days"]>
+/** Every API key expires; these are the only lifetimes the server accepts. */
+export const EXPIRY_CHOICES: readonly KeyLifetime[] = [30, 90, 180, 365]
+export const DEFAULT_EXPIRY: KeyLifetime = 90
+/** Active keys closer than this to expiry are flagged. */
+export const EXPIRY_WARNING_DAYS = 14
+
+/** Whole days until a key expires (negative once it has), or null for an unreadable time. */
+export function daysRemaining(expiresAt: string, now = Date.now()): number | null {
+  const at = Date.parse(expiresAt)
+  return Number.isFinite(at) ? Math.floor((at - now) / DAY) : null
+}
+export type KeyState = { label: "Active" | "Expired" | "Revoked"; tone: "success" | "warning" | "danger" | "neutral"; note: string }
+/** A key's status in words, with an expiry warning; color only reinforces it. */
+export function keyState(key: ServiceAccountKey, now = Date.now()): KeyState {
+  if (key.status === "revoked") return { label: "Revoked", tone: "neutral", note: "" }
+  const days = daysRemaining(key.expires_at, now)
+  if (key.status === "expired" || days === null || days < 0) return { label: "Expired", tone: "danger", note: "" }
+  if (days < EXPIRY_WARNING_DAYS) return { label: "Active", tone: "warning", note: days === 0 ? "Expires today" : `Expires in ${days === 1 ? "1 day" : `${days} days`}` }
+  return { label: "Active", tone: "success", note: "" }
+}
+export const activeKeys = (account: ServiceAccountView) => account.keys.filter(key => key.status === "active").length
+/** maxActiveKeys is the server's limit from the listing. */
+export const canIssueKey = (account: ServiceAccountView, maxActiveKeys: number) => account.active && activeKeys(account) < maxActiveKeys
+
+export type ServiceAccountDraft = { name: string; description: string; permissions: string[] }
+/** An edit sends the displayed revision and keeps the account's state; creation sends only the account. */
+export function serviceAccountBody(draft: ServiceAccountDraft, existing: ServiceAccountView, ceiling: readonly string[]): ServiceAccountUpdate
+export function serviceAccountBody(draft: ServiceAccountDraft, existing: undefined, ceiling: readonly string[]): ServiceAccountCreate
+export function serviceAccountBody(draft: ServiceAccountDraft, existing: ServiceAccountView | undefined, ceiling: readonly string[]): ServiceAccountCreate | ServiceAccountUpdate {
+  const name = draft.name.trim(), description = draft.description.trim()
+  if (name.length < 2 || name.length > 80) throw new Error("Use a name between 2 and 80 characters.")
+  if (description.length > 500) throw new Error("Keep the description to 500 characters or fewer.")
+  const permissions = [...new Set(draft.permissions)].sort()
+  if (permissions.some(permission => !ceiling.includes(permission))) throw new Error("Service accounts can hold only the permissions listed.")
+  if (!permissions.length) throw new Error("Choose at least one permission.")
+  return existing ? { name, description, permissions, active: existing.active, revision: existing.revision } : { name, description, permissions }
+}
+/** The account at its displayed revision with only its active state changed. */
+export function serviceAccountState(account: ServiceAccountView, active: boolean): ServiceAccountUpdate {
+  return { name: account.name, description: account.description, permissions: account.permissions, active, revision: account.revision }
+}
+export function serviceKeyBody(label: string, days: number): ServiceKeyCreate {
+  const value = label.trim()
+  if (!value || value.length > 80) throw new Error("Use a label between 1 and 80 characters.")
+  const expires_in_days = EXPIRY_CHOICES.find(choice => choice === days)
+  if (expires_in_days === undefined) throw new Error("Choose an expiry of 30, 90, 180 or 365 days.")
+  return { label: value, expires_in_days }
+}
+/** A one-line collector request for the audit export; the key stays in an environment variable. */
+export function collectorCommand(origin: string): string {
+  return `curl --fail -G -H "Authorization: Bearer $MOYAI_API_KEY" -d format=ndjson "${origin.replace(/\/+$/, "")}${AUDIT_EXPORT}"`
 }

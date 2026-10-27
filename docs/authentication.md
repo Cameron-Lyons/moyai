@@ -182,3 +182,28 @@ reason (`cancelled`, `issuer`, `unavailable`, `token`, `claims`,
 `deactivated`) after a consumed sign-in attempt. Events carry no tokens, codes or
 claims; a refusal names the person only after their identity was verified, and
 an anonymous refusal is kept once per provider, client network, reason and minute.
+
+## API keys
+
+[Service accounts](enterprise-governance.md#service-accounts-and-api-keys) authenticate
+programmatic readers with `Authorization: Bearer moyai_sk_<id>.<secret>`. Keys
+work only in existing-product mode and only on the exact read operations listed
+there: the audit feed and export and the organization spend report.
+
+An `Authorization` value that mentions `moyai_sk_` is always treated as an API
+key. It is verified before, and instead of, every cookie, Cloudflare Access
+assertion and CSRF check: a malformed, unknown, revoked or expired key, or one of
+a disabled account, is a 401 even when a valid browser session cookie is sent
+with it, and the cookie is never read. On any other route such a request is a
+403. Keys are accepted only in the `Authorization` header. A key put in a query
+string is never accepted, but proxies and servers log URLs, so treat it as leaked
+and revoke it. Skipping CSRF is safe for keys: an `Authorization` header is
+not sent automatically by browsers, Moyai sets no CORS policy that would let
+another origin send one, and every key operation is a `GET`.
+
+A key's authority is not a person's. The request runs as a service principal
+(`service:<account>:<key>`) that holds only its account's permissions, has no
+email and no built-in role's permissions, cannot start or continue sessions,
+turns, workflows or approvals, and cannot change governance configuration.
+Every request and each page of an export rechecks the key's revocation and
+expiry and its account's state and permissions.

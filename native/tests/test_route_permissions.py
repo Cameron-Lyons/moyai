@@ -40,3 +40,35 @@ def test_every_api_operation_resolves_to_a_catalog_permission():
                     assert permission in PERMISSIONS, (method, path, permission)
     assert unmapped - UNGATED.keys() == set(), "Map these routes in app.permissions.route_permission"
     assert UNGATED.keys() - unmapped == set(), "These routes are mapped now; remove them from UNGATED"
+
+
+def test_api_key_routes_are_mounted_reads_whose_gate_matches_the_key_ceiling():
+    from app.permissions import API_KEY_ROUTES, SERVICE_PERMISSIONS
+
+    with schema_app() as app:
+        mounted = {(method, route.path) for route in _routes(app.routes)
+                   for method in (getattr(route, "methods", None) or set())}
+        # An Authorization header is not ambient, so skipping CSRF for keys
+        # relies on no other origin being allowed to send one.
+        assert not any("cors" in middleware.cls.__name__.lower() for middleware in app.user_middleware)
+    assert set(API_KEY_ROUTES) <= mounted
+    assert set(API_KEY_ROUTES.values()) == SERVICE_PERMISSIONS
+    for (method, path), permission in API_KEY_ROUTES.items():
+        assert method == "GET" and "{" not in path
+        assert route_permission(SimpleNamespace(scope={"path": path}, method=method)) == permission
+
+
+def test_service_account_administration_needs_its_own_permission():
+    with schema_app() as app:
+        operations = {(method, route.path) for route in _routes(app.routes)
+                      if route.path.startswith("/api/admin/service-accounts")
+                      for method in (getattr(route, "methods", None) or set())}
+    assert operations == {
+        ("GET", "/api/admin/service-accounts"), ("POST", "/api/admin/service-accounts"),
+        ("PUT", "/api/admin/service-accounts/{identity}"), ("DELETE", "/api/admin/service-accounts/{identity}"),
+        ("POST", "/api/admin/service-accounts/{identity}/keys"),
+        ("DELETE", "/api/admin/service-accounts/{identity}/keys/{key_id}"),
+    }
+    for method, path in operations:
+        concrete = re.sub(r"\{[^}]+\}", "placeholder", path)
+        assert route_permission(SimpleNamespace(scope={"path": concrete}, method=method)) == "service_accounts.manage"

@@ -88,6 +88,9 @@
 .native-settings .ns-gov .ns-table td:last-child { text-align: start; }
 .native-settings .ns-gov .ns-table table:has(td:last-child > .ns-row-actions) th:last-child { text-align: end; }
 .native-settings .ns-gov-more { margin-top: 12px; }
+.native-settings .ns-gov-account-keys { flex: 1 1 100%; min-width: 0; }
+.native-settings .ns-gov-account-keys > .ns-muted { margin: 0; }
+.native-settings .ns-gov-mono { font-family: var(--ui-font-mono); font-size: 12px; }
 .native-settings .ns-gov-count { margin-bottom: 8px; }
 @media (max-width: 1250px) {
   .native-settings .ns-gov-filters { grid-template-columns: repeat(3, minmax(0, 1fr)); }

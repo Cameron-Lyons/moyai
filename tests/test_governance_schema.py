@@ -342,6 +342,6 @@ def test_permission_catalog_keeps_builtin_roles_unchanged():
     assert permissions.BUILTIN_PERMISSIONS['member'] is permissions.MEMBER_PERMISSIONS
     assert permissions.MEMBER_PERMISSIONS < frozenset(permissions.PERMISSIONS)
     assert not permissions.MEMBER_PERMISSIONS & {'roles.manage', 'users.manage', 'scim.manage', 'security.manage',
-                                                 'audit.read', 'spend.read', 'spend.manage'}
+                                                 'audit.read', 'spend.read', 'spend.manage', 'service_accounts.manage'}
     assert [item['id'] for item in permissions.catalog()] == list(permissions.PERMISSIONS)
     assert all(item['description'] for item in permissions.catalog())

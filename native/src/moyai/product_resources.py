@@ -57,9 +57,11 @@ class ProductResources:
         from app.governance_audit import GovernanceAudit
         from app.scim import Scim
         from app.security_profiles import SecurityProfiles
+        from app.service_accounts import ServiceAccounts
         from app.spend_limits import SpendLimits
         self.profiles = SecurityProfiles(self.store_proxy, roles=self.roles.enterprise)
         self.scim = Scim(self.store_proxy, self.roles, base_url=settings.public_url.rstrip('/') + '/scim/v2')
+        self.service_accounts = ServiceAccounts(self.store_proxy, self.roles)
         self.audit = GovernanceAudit(self.store_proxy, settings.session_secret)
         self.spend_limits = SpendLimits(self.store_proxy, roles=self.roles.enterprise)
         self.security = Security(settings, self.roles)
@@ -69,6 +71,7 @@ class ProductResources:
             settings, self.engine, native_engine=self.native_engine,
             allow_shared_identities=True,
         )
+        self.identity.service_key_touch = self.service_accounts.touch
         self.history = ProductHistoryAdapter(
             self.identity, self.engine, schema=settings.moyai_database_schema,
         )

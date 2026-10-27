@@ -87,7 +87,7 @@ from .models import (
 )
 from .presentation import public_event, redact
 from .product_governance import permission_for_user
-from .product_identity import ProductAuthorityBusy
+from .product_identity import ProductAuthorityBusy, key_logger
 from .product_requester import answer_actor, can_answer
 from .pull_requests import routes as pull_request_routes
 from .runtime import Runtime
@@ -324,8 +324,26 @@ def create_app(runtime: Runtime | None = None, *, run_dispatcher: bool = True) -
 
     @app.middleware("http")
     async def security_headers(request: Request, call_next):
+        from app.permissions import api_key_route
+        from app.service_accounts import REFUSED_ROUTE, logged_prefix, presented
+
         if not hasattr(request.state, "moyai_received_at"):
             request.state.moyai_received_at = now()
+        # An API key is accepted only on its exact allowlisted operations, and
+        # only in existing-product mode. Anywhere else, including routes that
+        # authenticate without the product adapter, it is refused here and
+        # never falls back to the browser session sent alongside it.
+        authorization = request.headers.get("authorization")
+        api_key = presented(authorization)
+        if api_key and (runtime.product is None or api_key_route(request.method, request.url.path) is None):
+            # A leaked key probed elsewhere leaves a trace: its prefix only, and only from a well-formed key.
+            key_logger.warning(
+                "API key refused: route prefix=%s method=%s path=%r",
+                logged_prefix(authorization) or "malformed", request.method[:16], request.url.path[:200],
+            )
+            return JSONResponse(
+                {"detail": REFUSED_ROUTE}, status_code=403, headers={"Cache-Control": "no-store"},
+            )
         if request.method not in {"GET", "HEAD", "OPTIONS"} and not request.url.path.startswith("/hooks/"):
             origin = request.headers.get("origin")
             expected = runtime.settings.public_url.rstrip("/") or str(request.base_url).rstrip("/")
@@ -339,9 +357,11 @@ def create_app(runtime: Runtime | None = None, *, run_dispatcher: bool = True) -
 
             from .product_access import access_session
             try:
-                # Identity providers have no Access sign-in; each provisioning
-                # operation requires its own SCIM bearer credential instead.
-                access_cookie = None if scim_provisioning_route(request.url.path, request.method) else (
+                # Identity providers and collectors have no Access sign-in: each
+                # provisioning operation requires its own SCIM bearer credential,
+                # and each allowlisted key operation (the only ones left with a
+                # key) its API key. The same paths without a key keep Access.
+                access_cookie = None if scim_provisioning_route(request.url.path, request.method) or api_key else (
                     await access_session(runtime.product, request)
                 )
             except HTTPException as error:

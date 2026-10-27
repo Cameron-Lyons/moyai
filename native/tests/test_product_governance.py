@@ -917,6 +917,100 @@ async def test_scim_token_creation_returns_the_one_time_token_in_its_record(gove
         assert revoked.status_code == 200 and revoked.json()['revoked_at'] == '2026-10-21T01:00:00Z'
 
 
+SERVICE_KEY = {'id': 'b' * 32, 'account_id': 'a' * 32, 'label': 'Splunk', 'prefix': 'moyai_sk_bbbbbbbb',
+               'created_at': '2026-10-21T00:00:00+00:00', 'created_by': 'admin@example.test',
+               'expires_at': '2027-01-19T00:00:00+00:00', 'last_used_at': None, 'last_used_from': None,
+               'revoked_at': None, 'revoked_by': None, 'status': 'active'}
+SERVICE_ACCOUNT = {'id': 'a' * 32, 'name': 'SIEM collector', 'description': '', 'permissions': ['audit.read'],
+                   'revision': 1, 'active': True, 'created_at': '2026-10-21T00:00:00+00:00',
+                   'created_by': 'admin@example.test', 'updated_at': '2026-10-21T00:00:00+00:00',
+                   'updated_by': 'admin@example.test', 'keys': [SERVICE_KEY]}
+
+
+async def test_service_account_routes_return_a_new_key_once_and_need_their_permission(governed):
+    product, seen = governed, []
+    class Accounts:
+        def listing(self, actor):
+            seen.append(('listing', actor.kind))
+            return {'accounts': [SERVICE_ACCOUNT], 'permission_ceiling': ['audit.read', 'spend.read'],
+                    'key_routes': [{'method': 'GET', 'path': '/api/admin/governance/audit', 'permission': 'audit.read'}],
+                    'max_active_keys': 5, 'can_create': True, 'activity': []}
+        def create(self, body, actor):
+            seen.append(('create', body.permissions))
+            return SERVICE_ACCOUNT
+        def update(self, identity, body, actor):
+            seen.append(('update', identity, body.revision, body.active))
+            return {**SERVICE_ACCOUNT, 'revision': 2}
+        def disable(self, identity, revision, actor):
+            seen.append(('disable', identity, revision))
+            return {**SERVICE_ACCOUNT, 'active': False, 'revision': 2}
+        def create_key(self, identity, body, actor):
+            seen.append(('create_key', identity, body.label, body.expires_in_days))
+            return SERVICE_KEY, 'moyai_sk_secret'
+        def revoke_key(self, identity, key_id, actor):
+            seen.append(('revoke_key', identity, key_id))
+            return {**SERVICE_KEY, 'status': 'revoked', 'revoked_at': '2026-10-22T00:00:00+00:00',
+                    'revoked_by': 'admin@example.test'}
+    account = SERVICE_ACCOUNT['id']
+    async with governance_client(product, service_accounts=Accounts()) as client:
+        listing = await client.get('/api/admin/service-accounts')
+        assert listing.status_code == 200 and listing.json()['accounts'] == [SERVICE_ACCOUNT]
+        assert 'token' not in listing.text
+        created = await client.post('/api/admin/service-accounts', json={'name': 'SIEM collector', 'permissions': ['audit.read']})
+        assert created.status_code == 201 and created.json() == SERVICE_ACCOUNT
+        for body in ({'name': 'Wide', 'permissions': ['sessions.create']}, {'name': 'None', 'permissions': []}):
+            assert (await client.post('/api/admin/service-accounts', json=body)).status_code == 422
+        issued = await client.post(f'/api/admin/service-accounts/{account}/keys', json={'label': 'Splunk'})
+        assert issued.status_code == 201 and issued.headers['cache-control'] == 'no-store'
+        assert issued.json() == {**SERVICE_KEY, 'token': 'moyai_sk_secret'}
+        assert (await client.post(f'/api/admin/service-accounts/{account}/keys',
+                                  json={'label': 'Splunk', 'expires_in_days': 7})).status_code == 422
+        updated = await client.put(f'/api/admin/service-accounts/{account}', json={
+            'name': 'SIEM collector', 'description': '', 'permissions': ['audit.read'], 'active': True, 'revision': 1})
+        assert updated.status_code == 200 and updated.json()['revision'] == 2
+        disabled = await client.delete(f'/api/admin/service-accounts/{account}', params={'revision': 1})
+        assert disabled.status_code == 200 and disabled.json()['active'] is False
+        revoked = await client.delete(f"/api/admin/service-accounts/{account}/keys/{SERVICE_KEY['id']}")
+        assert revoked.status_code == 200 and revoked.json()['status'] == 'revoked' and 'token' not in revoked.json()
+    assert seen == [('listing', 'individual'), ('create', ['audit.read']), ('create_key', account, 'Splunk', 90),
+                    ('update', account, 1, True), ('disable', account, 1), ('revoke_key', account, SERVICE_KEY['id'])]
+    await member_role(product, ['audit.read', 'spend.read'])
+    async with governance_client(product, service_accounts=Accounts()) as client:
+        assert (await client.get('/api/admin/service-accounts')).status_code == 403
+        assert (await client.delete(f"/api/admin/service-accounts/{account}/keys/{SERVICE_KEY['id']}")).status_code == 403
+    assert len(seen) == 6
+
+
+@pytest.mark.parametrize('ending', ['revoked', 'expired', 'disabled'])
+async def test_api_key_export_stops_mid_download_when_the_key_or_its_account_ends(governed, ending):
+    """The bearer export rechecks the exact key and its account before releasing each page."""
+    from test_product_api_keys import change, issue
+    product, released, loop = governed, [], asyncio.get_running_loop()
+    def moyai(name):
+        return f'moyai.{name}'
+    key = await issue(product.source, table=moyai)
+    statement = {
+        'revoked': "UPDATE {keys} SET revoked_at='2026-10-01T00:00:00.000000+00:00' WHERE id=:id",
+        'expired': "UPDATE {keys} SET expires_at='2020-01-01T00:00:00.000000+00:00' WHERE id=:id",
+        'disabled': 'UPDATE {accounts} SET active=0 WHERE id=(SELECT account_id FROM {keys} WHERE id=:id)',
+    }[ending]
+    class TwoPages:
+        def export(self, filters, format):
+            # The first page passed its recheck; the key ends while it downloads.
+            asyncio.run_coroutine_threadsafe(change(product.source, statement, table=moyai, id=key.key), loop).result()
+            for chunk in ('{"id":"1","source":"governance"}\n', '{"id":"2","source":"governance"}\n'):
+                released.append(chunk)
+                yield chunk
+    async with governance_client(product, audit=TwoPages()) as client:
+        client.cookies.clear()
+        client.headers.update(key.header)
+        with pytest.raises(RuntimeError) as raised:
+            await client.get('/api/admin/governance/audit/export', params={'format': 'ndjson'})
+    cause = raised.value.__cause__
+    assert isinstance(cause, HTTPException) and cause.status_code == 401
+    assert released == ['{"id":"1","source":"governance"}\n']  # The second page was never pulled.
+
+
 async def test_scheduled_chat_destination_cannot_widen_the_workflow_policy(governed):
     product, governance = governed, governed.database.governance
     unrestricted = await product.database.create_session(product.actor, NewSession())

@@ -125,6 +125,9 @@ SCHEMA = (
     'CREATE TABLE spend_group_limits (group_id TEXT PRIMARY KEY, limit_usd DOUBLE PRECISION CHECK(limit_usd BETWEEN 0 AND 1000000), revision INTEGER NOT NULL CHECK(revision > 0), updated_by TEXT NOT NULL, updated_at TEXT NOT NULL)',
     "CREATE TABLE governance_audit_events (id TEXT PRIMARY KEY, action TEXT NOT NULL, actor TEXT NOT NULL, resource_type TEXT NOT NULL, resource_id TEXT NOT NULL, details TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL)",
     "CREATE TABLE governance_activity_events (id TEXT PRIMARY KEY, action TEXT NOT NULL, outcome TEXT NOT NULL CHECK(outcome IN ('success','denied','failed')), actor TEXT NOT NULL, actor_key TEXT NOT NULL, actor_id TEXT NOT NULL DEFAULT '', resource_type TEXT NOT NULL, resource_id TEXT NOT NULL, session_id TEXT NOT NULL DEFAULT '', client TEXT NOT NULL DEFAULT '', details TEXT NOT NULL DEFAULT '{}' CHECK(length(details) <= 4096), created_at TEXT NOT NULL)",
+    'CREATE TABLE service_accounts (id TEXT PRIMARY KEY, name TEXT NOT NULL, name_key TEXT NOT NULL, description TEXT NOT NULL, permissions TEXT NOT NULL, revision INTEGER NOT NULL, access_revision INTEGER NOT NULL, active INTEGER NOT NULL, created_by TEXT NOT NULL, created_at TEXT NOT NULL, updated_by TEXT NOT NULL, updated_at TEXT NOT NULL)',
+    'CREATE TABLE service_account_keys (id TEXT PRIMARY KEY, account_id TEXT NOT NULL, label TEXT NOT NULL, token_hash TEXT NOT NULL, prefix TEXT NOT NULL, created_by TEXT NOT NULL, created_at TEXT NOT NULL, expires_at TEXT NOT NULL, last_used_at TEXT NOT NULL, last_used_from TEXT NOT NULL, revoked_at TEXT NOT NULL, revoked_by TEXT NOT NULL)',
+    'CREATE UNIQUE INDEX idx_service_account_keys_hash ON service_account_keys(token_hash)',
 )
 
 

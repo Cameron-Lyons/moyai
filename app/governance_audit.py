@@ -163,6 +163,25 @@ def record_event_in(conn, action, actor, resource_type, resource_id, details=Non
     return identity
 
 
+def recent_in(conn, database, resource_types, limit=20):
+    """The newest governance events for resource_types as feed entries, for an admin page's activity list.
+
+    database is the Store's PostgreSQL database or None. PostgreSQL walks
+    idx_governance_audit_time back only in its byte order, as the feed does.
+    """
+    order = ' COLLATE "C"' if database else ''
+    marks = ','.join('?' for _ in resource_types)
+    entries = []
+    for row in conn.execute(f'''SELECT id,action,actor,resource_type,resource_id,details,created_at
+            FROM governance_audit_events WHERE resource_type IN ({marks})
+            ORDER BY created_at{order} DESC,id{order} DESC LIMIT {int(limit)}''', tuple(resource_types)):
+        action, actor, resource_type, resource_id, details = _governance_entry(row)
+        entries.append({'id': row['id'], 'source': 'governance', 'action': action, 'actor': actor,
+                        'resource_type': resource_type, 'resource_id': resource_id, 'details': details,
+                        'created_at': row['created_at']})
+    return entries
+
+
 # Feed contract. Page sizes, the 100-day window and the 24-hour cursor are API
 # limits; the export streams at most MAX_EXPORT_ROWS rows in EXPORT_PAGE batches.
 DEFAULT_LIMIT, MAX_LIMIT = 50, 200
@@ -180,8 +199,8 @@ FORMULA_PREFIXES = ('=', '+', '-', '@', '\t', '\r')
 # Governance types, then the activity audit's: automation configuration changes
 # are governance events and blocked runs are activity, so it appears once.
 GOVERNANCE_TYPES = ('role', 'role_assignment', 'group_role', 'scim_user', 'scim_group', 'scim_token',
-                    'security_profile', 'security_defaults', 'spend_limit', 'user_role', 'connection', 'credential',
-                    'ai_guardrail', 'identity_binding', 'sign_in', 'automation')
+                    'service_account', 'service_account_key', 'security_profile', 'security_defaults', 'spend_limit',
+                    'user_role', 'connection', 'credential', 'ai_guardrail', 'identity_binding', 'sign_in', 'automation')
 # Resource types only the activity table holds (session, message, policy).
 ACTIVITY_ONLY_TYPES = frozenset(ACTIVITY_RESOURCE_TYPES) - set(GOVERNANCE_TYPES)
 RESOURCE_TYPES = (*GOVERNANCE_TYPES, *(kind for kind in ACTIVITY_RESOURCE_TYPES if kind not in GOVERNANCE_TYPES))

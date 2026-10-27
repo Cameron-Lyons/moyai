@@ -136,7 +136,8 @@ export function LoadGate<T>({ resource, label, children }: { resource: GovResour
   return <div aria-busy={resource.loading}>{children(resource.data)}</div>
 }
 
-export function CopyField({ id, label, value, hint, secret = false, autoFocus = false }: { id: string; label: string; value: string; hint?: string; secret?: boolean; autoFocus?: boolean }) {
+/** secret marks a one-time credential; mono shows code, such as a command, in the monospace font. */
+export function CopyField({ id, label, value, hint, secret = false, mono = false, autoFocus = false }: { id: string; label: string; value: string; hint?: string; secret?: boolean; mono?: boolean; autoFocus?: boolean }) {
   const [status, setStatus] = useState("")
   const input = useRef<HTMLInputElement>(null), reset = useRef(0)
   useEffect(() => () => window.clearTimeout(reset.current), [])
@@ -147,7 +148,7 @@ export function CopyField({ id, label, value, hint, secret = false, autoFocus = 
   }
   return <div className="ns-field ns-gov-copy">
     <label htmlFor={id}>{label}</label>
-    <div className="ns-gov-copy-row"><Input ref={input} id={id} readOnly autoFocus={autoFocus} value={value} spellCheck={false} autoComplete="off" className={secret ? "ns-gov-secret" : undefined}
+    <div className="ns-gov-copy-row"><Input ref={input} id={id} readOnly autoFocus={autoFocus} value={value} spellCheck={false} autoComplete="off" className={secret ? "ns-gov-secret" : mono ? "ns-gov-mono" : undefined}
       aria-describedby={hint ? `${id}-hint` : undefined} onFocus={event => event.currentTarget.select()} />
       <Button type="button" variant="outline" onClick={() => void copy()}>{status.startsWith("Copied") ? <Check /> : <Copy />}Copy<span className="visually-hidden"> {label}</span></Button></div>
     {hint && <p id={`${id}-hint`} className="ns-field-hint">{hint}</p>}

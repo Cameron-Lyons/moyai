@@ -194,6 +194,49 @@ test('provisioning rows never render token secrets and state status in text',()=
   assert.match(users,/Deactivated/);assert.match(users,/dana@example.test/);
 });
 
+test('service account keys state their status in text, warn before expiry and never render secrets',()=>{
+  const now=Date.parse('2026-10-15T09:30:00Z'),day=86_400_000;
+  const key=(patch={})=>({id:'k1',account_id:'a1',label:'Splunk',prefix:'moyai_sk_ab12cd34',created_at:stamp,created_by:'admin@example.test',
+    expires_at:new Date(now+90*day).toISOString(),last_used_at:null,last_used_from:null,revoked_at:null,revoked_by:null,status:'active',...patch});
+  const keys=[key({token:'NEVER_RENDER_SECRET',token_hash:'NEVER_RENDER_HASH'}),
+    key({id:'k2',label:'Soon',expires_at:new Date(now+3*day+60_000).toISOString(),last_used_at:stamp,last_used_from:'203.0.113.7'}),
+    key({id:'k3',label:'Old',expires_at:new Date(now-day).toISOString(),status:'expired'}),
+    key({id:'k4',label:'Gone',revoked_at:stamp,revoked_by:'service_account.disabled',status:'revoked'})];
+  const html=render(gov.KeyRows,{keys,onRevoke(){},now});
+  assert.doesNotMatch(html,/NEVER_RENDER/);assert.match(html,/moyai_sk_ab12cd34…/);assert.match(html,/Never used/);
+  assert.match(html,/Expires in 3 days/);assert.match(html,/203\.0\.113\.7/);assert.match(html,/account disabled/);
+  assert.match(html,/>Active</);assert.match(html,/>Expired</);assert.match(html,/>Revoked</);
+  assert.equal((html.match(/>Revoke</g)||[]).length,3,'revoked keys cannot be revoked again');
+  assert.match(html,/aria-label="API keys"/);assert.match(html,/tabindex="0"/);
+  assert.deepEqual(gov.keyState(key({expires_at:new Date(now+20*day).toISOString()}),now),{label:'Active',tone:'success',note:''});
+  assert.deepEqual(gov.keyState(key({expires_at:new Date(now+day/2).toISOString()}),now),{label:'Active',tone:'warning',note:'Expires today'});
+  assert.equal(gov.keyState(key({expires_at:'not a time'}),now).label,'Expired','an unreadable expiry is not active');
+  assert.equal(gov.keyState(key({expires_at:new Date(now-1000).toISOString()}),now).label,'Expired','expiry is checked locally too');
+});
+
+test('service account bodies stay inside the ceiling, keep the state on edit and keys must expire',()=>{
+  const ceiling=['audit.read','spend.read'];
+  const account={id:'a1',name:'SIEM',description:'',permissions:['audit.read'],revision:4,active:false,created_at:stamp,created_by:'',updated_at:stamp,updated_by:'',keys:[]};
+  assert.deepEqual(gov.serviceAccountBody({name:' SIEM collector ',description:' Splunk ',permissions:['spend.read','audit.read','audit.read']},undefined,ceiling),
+    {name:'SIEM collector',description:'Splunk',permissions:['audit.read','spend.read']});
+  assert.deepEqual(gov.serviceAccountBody({name:'SIEM',description:'',permissions:['spend.read']},account,ceiling),
+    {name:'SIEM',description:'',permissions:['spend.read'],active:false,revision:4},'an edit never re-enables the account');
+  assert.deepEqual(gov.serviceAccountState(account,true),{name:'SIEM',description:'',permissions:['audit.read'],active:true,revision:4});
+  assert.throws(()=>gov.serviceAccountBody({name:'Wide',description:'',permissions:['sessions.create']},undefined,ceiling),/only the permissions listed/);
+  assert.throws(()=>gov.serviceAccountBody({name:'None',description:'',permissions:[]},undefined,ceiling),/at least one permission/);
+  assert.throws(()=>gov.serviceAccountBody({name:'x',description:'',permissions:['audit.read']},undefined,ceiling),/between 2 and 80/);
+  assert.deepEqual(gov.serviceKeyBody(' Splunk ',365),{label:'Splunk',expires_in_days:365});
+  for(const days of [0,7,366,Number.NaN])assert.throws(()=>gov.serviceKeyBody('Splunk',days),/30, 90, 180 or 365/);
+  assert.throws(()=>gov.serviceKeyBody('  ',90),/between 1 and 80/);
+  assert.deepEqual([...gov.EXPIRY_CHOICES],[30,90,180,365]);assert.equal(gov.DEFAULT_EXPIRY,90);
+  const five={...account,active:true,keys:Array.from({length:5},(_,i)=>({id:String(i),status:'active'}))};
+  assert.equal(gov.canIssueKey(five,5),false);assert.equal(gov.canIssueKey(five,6),true);
+  assert.equal(gov.canIssueKey({...account,active:true,keys:[{id:'x',status:'expired'}]},1),true);assert.equal(gov.canIssueKey(account,5),false);
+  const command=gov.collectorCommand('https://moyai.example.test/');
+  assert.equal(command,'curl --fail -G -H "Authorization: Bearer $MOYAI_API_KEY" -d format=ndjson "https://moyai.example.test/api/admin/governance/audit/export"');
+  assert.doesNotMatch(command,/moyai_sk_/);
+});
+
 test('the network hint follows the deployment enforcement setting',()=>{
   for(const network of ['all','listed','none'])assert.match(gov.networkHint(network,'off'),/Network enforcement is off in this deployment, so sessions with a restricted network policy are refused before they start\.$/);
   assert.equal(gov.networkHint('all','modal'),'No outbound restriction is applied.');
@@ -263,6 +306,9 @@ test('permission checks use /api/me permissions and fall back to built-in sets f
   assert.equal(permissions.canOpenPage({role:'member',permissions:['spend.read']},'usage'),true);
   assert.equal(permissions.canOpenPage({role:'member',permissions:[]},'skills'),true);
   assert.equal(permissions.canOpenPage({role:'member',permissions:[]},'audit-log'),false);
+  assert.equal(permissions.canOpenPage({role:'member',permissions:['audit.read','spend.read']},'service-accounts'),false);
+  assert.equal(permissions.canOpenPage({role:'member',permissions:['service_accounts.manage']},'service-accounts'),true);
+  assert.equal(permissions.canOpenPage({role:'admin'},'service-accounts'),true,'the built-in fallback includes the new permission');
   assert.equal(permissions.permissionKey({role:'member',permissions:['b','a']}),'a,b');
 });
 

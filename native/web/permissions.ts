@@ -6,7 +6,7 @@ export const ALL_PERMISSIONS = [
   "environments.read", "skills.read", "skills.manage", "skills.publish",
   "memory.read", "memory.manage", "credentials.read", "credentials.manage", "credentials.publish",
   "users.read", "users.manage", "roles.manage", "scim.manage", "spend.personal", "spend.read", "spend.manage",
-  "runtime.manage", "security.manage", "audit.read",
+  "runtime.manage", "security.manage", "audit.read", "service_accounts.manage",
 ] as const
 export const MEMBER_PERMISSIONS: readonly string[] = [
   "workspace.read", "sessions.read", "sessions.create", "sessions.manage", "connections.read", "connections.write",
@@ -37,6 +37,7 @@ export const PAGE_PERMISSIONS: Readonly<Record<string, readonly (readonly string
   users: [["users.read"]], performance: [["runtime.manage"], ["spend.read"]], usage: [["spend.read"]],
   roles: [["roles.manage"]], provisioning: [["scim.manage"]], "security-policies": [["security.manage"]],
   "spend-limits": [["spend.read", "spend.manage"]], "audit-log": [["audit.read"]],
+  "service-accounts": [["service_accounts.manage"]],
 }
 export function canOpenPage(subject: PermissionSubject, page: string): boolean {
   return (PAGE_PERMISSIONS[page] ?? []).every(choices => choices.some(permission => can(subject, permission)))

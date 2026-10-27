@@ -10,6 +10,7 @@ from app.governance_audit import parse_filters
 from app.permissions import BUILTIN_PERMISSIONS, catalog
 from app.scim import TokenCreate
 from app.security_profiles import PROFILE_ID_PATTERN, ProfileDefaults, SaveProfile
+from app.service_accounts import ServiceAccountCreate, ServiceAccountUpdate, ServiceKeyCreate
 from app.spend_limits import WARNING_RATIO, SpendLimitChanges, SpendLimits, group_name_in, level
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from fastapi.responses import StreamingResponse
@@ -17,6 +18,7 @@ from fastapi.responses import StreamingResponse
 from .product_governance_views import (
     AuditPage,
     CreatedScimToken,
+    CreatedServiceAccountKey,
     EffectiveSpendLimit,
     GovernanceGroupRole,
     GovernanceRole,
@@ -30,6 +32,9 @@ from .product_governance_views import (
     SecurityProfileDefaults,
     SecurityProfilesAdmin,
     SecurityProfileView,
+    ServiceAccountKey,
+    ServiceAccountsAdmin,
+    ServiceAccountView,
     SessionProfileCatalog,
     SessionSecurityPolicy,
     SpendLimitsAdmin,
@@ -98,6 +103,43 @@ def routes(runtime):
     @router.delete('/api/admin/scim/tokens/{identity}', operation_id='revokeScimToken')
     async def token_revoke(identity: str, user=Depends(principal)) -> ScimToken:
         return ScimToken.model_validate(await asyncio.to_thread(product.scim.revoke_token, identity, governed(user)))
+
+    # Browser sessions only: these paths are not in API_KEY_ROUTES, so a key never manages keys.
+    @router.get('/api/admin/service-accounts', operation_id='listServiceAccounts')
+    async def service_accounts(user=Depends(principal)) -> ServiceAccountsAdmin:
+        user.require('service_accounts.manage')
+        return ServiceAccountsAdmin.model_validate(
+            await asyncio.to_thread(product.service_accounts.listing, governed(user)))
+
+    @router.post('/api/admin/service-accounts', status_code=201, operation_id='createServiceAccount')
+    async def service_account_create(body: ServiceAccountCreate, user=Depends(principal)) -> ServiceAccountView:
+        return ServiceAccountView.model_validate(
+            await asyncio.to_thread(product.service_accounts.create, body, governed(user)))
+
+    @router.put('/api/admin/service-accounts/{identity}', operation_id='updateServiceAccount')
+    async def service_account_update(identity: str, body: ServiceAccountUpdate,
+                                     user=Depends(principal)) -> ServiceAccountView:
+        return ServiceAccountView.model_validate(
+            await asyncio.to_thread(product.service_accounts.update, identity, body, governed(user)))
+
+    @router.delete('/api/admin/service-accounts/{identity}', operation_id='disableServiceAccount')
+    async def service_account_disable(identity: str, revision: int = Query(ge=1),
+                                      user=Depends(principal)) -> ServiceAccountView:
+        return ServiceAccountView.model_validate(
+            await asyncio.to_thread(product.service_accounts.disable, identity, revision, governed(user)))
+
+    @router.post('/api/admin/service-accounts/{identity}/keys', status_code=201,
+                 operation_id='createServiceAccountKey')
+    async def service_key_create(identity: str, body: ServiceKeyCreate, response: Response,
+                                 user=Depends(principal)) -> CreatedServiceAccountKey:
+        response.headers['Cache-Control'] = 'no-store'
+        record, token = await asyncio.to_thread(product.service_accounts.create_key, identity, body, governed(user))
+        return CreatedServiceAccountKey.model_validate({**record, 'token': token})
+
+    @router.delete('/api/admin/service-accounts/{identity}/keys/{key_id}', operation_id='revokeServiceAccountKey')
+    async def service_key_revoke(identity: str, key_id: str, user=Depends(principal)) -> ServiceAccountKey:
+        return ServiceAccountKey.model_validate(
+            await asyncio.to_thread(product.service_accounts.revoke_key, identity, key_id, governed(user)))
 
     @router.get('/api/security-profiles', operation_id='listSecurityProfileOptions')
     async def profiles(user=Depends(principal)) -> SessionProfileCatalog:

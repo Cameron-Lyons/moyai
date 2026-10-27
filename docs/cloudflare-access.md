@@ -25,7 +25,9 @@ Moyai preserves an unambiguous existing account and pins the verified issuer and
 subject. Conflicting identities fail closed. Saved roles remain authoritative;
 CSRF, current authorization and session visibility checks still apply.
 
-Keep webhook exceptions exact. Existing-product Slack retains `/hooks/slack`,
+Keep webhook exceptions exact. API key reads have their own exact exception;
+see [API keys and the Access edge](#api-keys-and-the-access-edge).
+Existing-product Slack retains `/hooks/slack`,
 `/hooks/slack/events` and `/hooks/slack/interactions`; requests still require
 Slack signature verification. Automation exceptions apply only to configured
 individual webhook paths. Never bypass Access for all `/api/*` or `/hooks/*`.
@@ -44,6 +46,44 @@ runbooks are maintained in a private repository. Follow Cloudflare's
 [Access documentation](https://developers.cloudflare.com/cloudflare-one/access-controls/)
 for edge changes. Rotate connector and application service credentials separately;
 do not regenerate product encryption keys when rotating edge credentials.
+
+## API keys and the Access edge
+
+[Service account API keys](enterprise-governance.md#service-accounts-and-api-keys)
+are for collectors that cannot complete an Access sign-in. The origin exempts a
+request from its Access check only when both hold:
+
+- the method and path are exactly `GET /api/admin/governance/audit`,
+  `GET /api/admin/governance/audit/export` or `GET /api/admin/spend` (no
+  prefixes, trailing slashes or other methods), and
+- the request carries an `Authorization` header with a Moyai API key
+  (`moyai_sk_`), which must then verify.
+
+The same paths without a key keep the employee Access check, and any other
+request that carries a key is refused with 403 before Access is consulted. This is
+the same kind of application-layer exemption SCIM provisioning uses for
+`/scim/v2`.
+
+The origin exemption cannot see requests that Access blocks at the edge, so a
+collector also needs an edge policy. Add a **Service Auth** policy that admits one
+dedicated Cloudflare service token to the existing Moyai employee application,
+keeping its employee policies, and have the collector send that token's
+`CF-Access-Client-Id` and `CF-Access-Client-Secret` headers with its Moyai key.
+The service token is then a second credential, enforced at the edge.
+
+- Do not use a Bypass policy, and never exempt all of `/api/*` or `/api/admin/*`.
+- Do not put these paths in a separate Access application. Employees use the
+  audit paths from the Audit log page, and a separate application's assertions
+  carry its own audience, which the origin rejects for them.
+- The policy admits the token at the edge to the whole application, but the origin
+  accepts it only together with a valid key on the three operations above:
+  machine assertions never become employee sign-ins, and a request without a key
+  still needs a browser session.
+- The origin does not yet verify the service token's own assertion for key
+  requests; the Moyai key is the origin credential.
+
+Rotate the service token and the Moyai key independently, and revoke both when a
+collector is retired.
 
 ## Local Modal connections through WARP
 

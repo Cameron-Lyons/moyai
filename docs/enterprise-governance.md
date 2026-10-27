@@ -2,8 +2,8 @@
 
 Governance is enforced by the native Pydantic runtime in existing-product mode
 (`MOYAI_PRODUCT_MODE=existing`). Settings includes Roles & access, Provisioning,
-Security policies, Spend limits, and Audit log. The retired execution engine is
-not required.
+Service accounts, Security policies, Spend limits, and Audit log. The retired
+execution engine is not required.
 
 ## Deployment and migration
 
@@ -38,6 +38,14 @@ bindings have no selected profile, and are still subject to the current mandator
 policy. A continuation of a historical governed session intersects its saved
 policy with the new native binding; an unreadable saved policy blocks the
 continuation for review.
+
+This release adds the `service_accounts.manage` permission to the catalog.
+Built-in administrators hold every catalog permission, and the authority version
+of an administrator that governance has touched (a role assignment row, directory
+history) includes that list, so their saved execution grants and workflow
+bindings need fresh authorization after the upgrade: affected workflows are
+blocked until their owners enable them again. Drain such work in the same
+maintenance window.
 
 Repository and model limits need no schema change. A stored policy without them
 keeps the four-key document the previous release wrote, byte for byte, so
@@ -110,6 +118,7 @@ grants.
 | `users.read` / `users.manage` | User directory / built-in role assignments |
 | `roles.manage` | Custom roles, email assignments, group grants |
 | `scim.manage` | Provisioning directory and token revocation; only built-in administrators create tokens |
+| `service_accounts.manage` | Service accounts: list them, revoke keys and disable accounts; only built-in administrators create accounts, change their permissions, re-enable them and issue keys |
 | `security.manage` | Policy configuration and explicit profile selection |
 | `spend.read` / `spend.manage` | Organization spend / limit configuration |
 | `audit.read` | Audit feed and exports |
@@ -120,6 +129,104 @@ Organization accounting and usage exports honor delegated `spend.read` access;
 `spend.personal` controls personal reports. Limit managers without `spend.read`
 receive configuration changes without usage totals. Reports recheck the original
 live authority before releasing their results.
+
+## Service accounts and API keys
+
+A service account lets a tool, such as a SIEM collector, read Moyai without a
+person signing in. Create one in Settings → Service accounts, then issue it an
+API key. Service accounts are not people: they have no email, no built-in role,
+no row in the user directory, SCIM, Slack links or per-person spend, and they are
+not counted as administrators.
+
+Each account holds an explicit list of permissions, at most `audit.read` and
+`spend.read`. That ceiling is enforced when an account is saved and again on every
+request, so a stored permission outside it grants nothing. A key reaches only
+these exact operations, and only with the matching permission:
+
+| Operation | Permission |
+| --- | --- |
+| `GET /api/admin/governance/audit` | `audit.read` |
+| `GET /api/admin/governance/audit/export` | `audit.read` |
+| `GET /api/admin/spend` (without `include_activity`) | `spend.read` |
+
+Every other request that carries a key, including `HEAD`, any write, the service
+account administration routes, `/api/admin/spend-limits`, personal spend and
+websockets, is refused with 403, even when a browser session cookie is sent with
+it. A key never starts, continues or approves work, never writes governance
+configuration and never falls back to a cookie.
+
+Keys look like `moyai_sk_<id>.<secret>` and are shown once. Moyai stores only a
+SHA-256 hash (the secret has 256 bits), finds a key by its id and compares the
+hash in constant time. Each key expires after 30, 90, 180 or 365 days (90 by
+default); there is no unlimited key. An account has at most 5 active keys, and a
+workspace at most 100 active accounts; disabled accounts do not count, and
+enabling one needs a free place. The list shows each key's prefix (`moyai_sk_` and
+8 characters, a distinctive pattern for secret scanners), creator, expiry (with a
+warning in the last 14 days), and when and from which network it was last used.
+Last use is recorded at most once every 5 minutes per key and is best-effort
+bookkeeping, not an authorization input; it may be up to 5 minutes stale.
+
+Every request rechecks the key, its expiry and its account, and the audit export
+rechecks them before each page of up to 1,000 rows. Revoking a key, disabling its
+account, narrowing (or narrowing and then widening) the account's permissions,
+or expiry therefore stops even a download in progress. Disabling an account
+revokes all its keys permanently; enabling it again does not restore them. Renaming
+an account or changing its description changes no key's authority.
+
+Holders of `service_accounts.manage` can review accounts and keys, revoke keys and
+disable accounts, which only narrow access. Creating an account, changing its
+name, description or permissions, enabling it and issuing keys need a built-in
+administrator, because a key is a standing credential that outlives its issuer's
+role. Deactivating the administrator who issued a key, through SCIM or otherwise,
+does not revoke it; the key's expiry, the creator shown in the list, the audit
+events and any holder's revoke and disable actions bound that risk. Each change
+records one governance audit event: `service_account.created`, `.updated`,
+`.disabled` and `.enabled`, and `service_account_key.created` and `.revoked`.
+`.disabled` has the same details however the account was disabled: `name`,
+`revoked_keys` (the prefixes of the keys that were still usable, so at most 5)
+and `revoked_count` (every key it marked revoked, including expired keys never
+revoked before). When an edit disables or enables an account and also changes its
+permissions, the event adds `permissions` and `previous_permissions`. Keys and
+hashes are never recorded, and neither is each use of a key; accepted and refused
+key requests, including keys sent to routes that do not accept them, are logged on
+the `moyai.api_keys` logger by key prefix (only of a well-formed key), account and
+route only.
+
+Failed key attempts are limited to 30 a minute per network, and each key to 120
+requests a minute. Both limits are kept per API process. API keys require the
+existing-product deployment; standalone native mode refuses them.
+
+### Collector contract
+
+Pull the audit log as NDJSON, overlapping each window by 5 minutes and
+deduplicating on `(source, id)`, since a row can commit after a later page was
+read with an earlier `created_at`. CSV exports have no `id` column.
+
+```sh
+curl --fail -G "https://moyai.example.com/api/admin/governance/audit/export" \
+  -H "Authorization: Bearer $MOYAI_API_KEY" \
+  -H "CF-Access-Client-Id: $CF_ACCESS_CLIENT_ID" \
+  -H "CF-Access-Client-Secret: $CF_ACCESS_CLIENT_SECRET" \
+  --data-urlencode "format=ndjson" \
+  --data-urlencode "after=2026-10-26T08:55:00Z" \
+  --data-urlencode "before=2026-10-26T09:59:00Z"
+```
+
+- Set `after` to the previous call's `before` minus 5 minutes and `before` to
+  about one minute ago. A window may span at most 100 days and an export at most
+  50,000 rows; split larger ranges.
+- Each NDJSON line is one entry with `id`, `source`, `action`, `actor`,
+  `resource_type`, `resource_id`, `details` and `created_at`.
+- A 401 means the key is invalid, revoked or expired, or its account is disabled;
+  a 403 means the account lacks the permission or the route does not accept keys;
+  a 429 asks the collector to wait a minute. A download that ends early means the
+  key stopped being valid while it ran.
+- Send the `CF-Access-Client-Id` and `CF-Access-Client-Secret` headers of a
+  Cloudflare service token only when Cloudflare Access protects Moyai; the
+  operator must first admit that token at the edge, as described in
+  [API keys and the Access edge](cloudflare-access.md#api-keys-and-the-access-edge).
+- `GET /api/admin/spend?format=csv&export=daily` (or `users`, `models`,
+  `sessions`, `requests`) exports organization spend with a `spend.read` key.
 
 ## Session policies
 
@@ -488,8 +595,8 @@ refused.
 Settings → Audit log is the organization's configuration and activity history.
 It merges two metadata-only stores:
 
-- **Configuration and sign-in** (`governance_audit_events`): role, SCIM, policy,
-  spend, credential and connection changes; workflow changes
+- **Configuration and sign-in** (`governance_audit_events`): role, SCIM, service
+  account, policy, spend, credential and connection changes; workflow changes
   (`automation.created`, `updated`, `migrated`, `enabled`, `paused` and
   `retired`, with the revision, native state, profile, trigger and connection
   kinds, and whether an agent made the change); AI guardrail refusals and
@@ -571,14 +678,16 @@ purge and its cutoff in your change log.
 | `/api/admin/security-profiles`, `/api/admin/security-profiles/defaults` | Revision-checked policy configuration, with the editor's app, tool, repository and model choices and the deployment's network enforcement |
 | `/api/security-policy/new-session` | Policy and default model a new session would get; `sessions.create`, and `security.manage` to name a `profile_id` |
 | `/api/sessions/{id}/security-policy` | Accessible session's effective policy |
+| `/api/admin/service-accounts`, `/api/admin/service-accounts/{id}/keys` | Service accounts and their API keys (browser sessions only) |
 | `/api/admin/spend-limits` | Spend configuration (overrides and `group:<id>` tiers) and reported usage |
 | `/api/admin/spend-limits/effective` | The monthly limit that applies to one email, and its source |
 | `/api/spend/status` | The caller's own monthly limit and usage (`spend.personal`) |
-| `/api/admin/governance/audit`, `/api/admin/governance/audit/export` | Audit feed and export |
+| `/api/admin/spend` | Organization spend report; also accepts a `spend.read` API key |
+| `/api/admin/governance/audit`, `/api/admin/governance/audit/export` | Audit feed and export; also accept an `audit.read` API key |
 
 Configuration writes reuse canonical optimistic revisions, live writer-fenced
 permissions, CSRF protection for browser requests, and transaction-local audit
-records. A policy update must include `repositories` and `models` whenever the
+records. API keys never reach them. A policy update must include `repositories` and `models` whenever the
 saved policy limits them; an older editor or script that omits them is refused
 (409) instead of clearing the limits. Standalone native mode keeps its existing
 built-in account behavior; these enterprise settings require the canonical

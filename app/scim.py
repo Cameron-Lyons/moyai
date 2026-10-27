@@ -58,7 +58,7 @@ from .enterprise_roles import (
     GovernanceNotFound,
     narrow_group_in,
 )
-from .governance_audit import record_event_in, timestamp
+from .governance_audit import recent_in, record_event_in, timestamp
 from .schema_initializers import initialize_scim as initialize_schema
 
 log = logging.getLogger(__name__)
@@ -558,11 +558,39 @@ def _token_view(row):
             'revoked_at': row['revoked_at'] or None}
 
 
-def _stale_use(last_used_at):
+def stale_use(last_used_at):
+    """Whether a bearer credential's recorded use is missing, unreadable or older than TOKEN_USE_INTERVAL."""
     try:
         return datetime.fromisoformat(last_used_at) < datetime.now(UTC) - TOKEN_USE_INTERVAL
     except (TypeError, ValueError):
         return True
+
+
+def record_use(store, table, scope, row_id, columns=None, *, what='Credential'):
+    """Best-effort last use of a bearer credential row; False when the database skipped it.
+
+    Writes last_used_at (and columns) at most once per TOKEN_USE_INTERVAL and
+    never for a revoked row. The row is independent, so the scoped writer shares
+    the canonical lock instead of excluding other writers; lock waits stop after
+    TOKEN_USE_WAIT_MS, and a busy or failing database skips the bookkeeping
+    instead of failing a request whose result is already computed. table and
+    the column names are code constants, never request input.
+    """
+    columns = columns or {}
+    assignments = ''.join(f',{name}=?' for name in columns)
+    cutoff = (datetime.now(UTC) - TOKEN_USE_INTERVAL).isoformat(timespec='microseconds')
+    try:
+        with store.connect(write_scope=scope) as conn:
+            if store.database:
+                conn.execute(f"SET LOCAL lock_timeout = '{TOKEN_USE_WAIT_MS}ms'")
+            else:
+                conn.execute(f'PRAGMA busy_timeout = {TOKEN_USE_WAIT_MS}')
+            conn.execute(f'''UPDATE {table} SET last_used_at=?{assignments} WHERE id=? AND revoked_at=''
+                AND (last_used_at='' OR last_used_at<?)''', (timestamp(), *columns.values(), row_id, cutoff))
+    except (DatabaseError, sqlite3.Error) as error:
+        log.warning('%s use was not recorded: %s', what, type(error).__name__)
+        return False
+    return True
 
 
 class Scim:
@@ -596,7 +624,7 @@ class Scim:
     def authenticate_in(self, conn, header, *, write=False):
         """The token for this request. In a write transaction a stale use time is refreshed there."""
         token = self._token_in(conn, header)
-        if write and _stale_use(token['last_used_at']):
+        if write and stale_use(token['last_used_at']):
             conn.execute('UPDATE scim_tokens SET last_used_at=? WHERE id=?', (timestamp(), token['id']))
             token['last_used_at'] = None
         return token
@@ -619,21 +647,8 @@ class Scim:
         failing database skips the bookkeeping instead of failing a request
         whose result is already computed.
         """
-        if not _stale_use(token['last_used_at']):
-            return
-        stamp = timestamp()
-        cutoff = (datetime.now(UTC) - TOKEN_USE_INTERVAL).isoformat(timespec='microseconds')
-        try:
-            # An independent row: scoped writers share the canonical lock instead of excluding them.
-            with self.store.connect(write_scope='scim-token-use') as conn:
-                if self.store.database:
-                    conn.execute(f"SET LOCAL lock_timeout = '{TOKEN_USE_WAIT_MS}ms'")
-                else:
-                    conn.execute(f'PRAGMA busy_timeout = {TOKEN_USE_WAIT_MS}')
-                conn.execute('''UPDATE scim_tokens SET last_used_at=? WHERE id=? AND revoked_at=''
-                    AND (last_used_at='' OR last_used_at<?)''', (stamp, token['id'], cutoff))
-        except (DatabaseError, sqlite3.Error) as error:
-            log.warning('Provisioning token use was not recorded: %s', type(error).__name__)
+        if stale_use(token['last_used_at']):
+            record_use(self.store, 'scim_tokens', 'scim-token-use', token['id'], what='Provisioning token')
 
     def authenticate(self, header):
         _credential(header)
@@ -1050,14 +1065,7 @@ class Scim:
                               ORDER BY g.display_key,g.id''')]
                 tokens = [_token_view(row) for row in conn.execute('''SELECT id,label,prefix,created_at,created_by,
                     last_used_at,revoked_at FROM scim_tokens ORDER BY created_at DESC,id DESC''')]
-                # PostgreSQL walks idx_governance_audit_time back only in its byte order, as the audit feed does.
-                order = ' COLLATE "C"' if self.store.database else ''
-                activity = [{'id': row['id'], 'source': 'governance', 'action': row['action'], 'actor': row['actor'],
-                             'resource_type': row['resource_type'], 'resource_id': row['resource_id'],
-                             'details': json.loads(row['details']), 'created_at': row['created_at']}
-                            for row in conn.execute(f'''SELECT * FROM governance_audit_events
-                                WHERE resource_type IN ('scim_user','scim_group','scim_token')
-                                ORDER BY created_at{order} DESC,id{order} DESC LIMIT 20''')]
+                activity = recent_in(conn, self.store.database, ('scim_user', 'scim_group', 'scim_token'))
         items = []
         for row in rows[:limit]:
             profile = json.loads(row['profile'])

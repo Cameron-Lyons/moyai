@@ -1393,6 +1393,24 @@ export type AnalyticsUserAggregate = {
 };
 
 /**
+ * ApiKeyRoute
+ */
+export type ApiKeyRoute = {
+    /**
+     * Method
+     */
+    method: 'GET';
+    /**
+     * Path
+     */
+    path: string;
+    /**
+     * Permission
+     */
+    permission: string;
+};
+
+/**
  * ApprovalReply
  */
 export type ApprovalReply = {
@@ -3253,6 +3271,64 @@ export type CreatedScimToken = {
      * Revoked At
      */
     revoked_at: string | null;
+    /**
+     * Token
+     */
+    token: string;
+};
+
+/**
+ * CreatedServiceAccountKey
+ */
+export type CreatedServiceAccountKey = {
+    /**
+     * Account Id
+     */
+    account_id: string;
+    /**
+     * Created At
+     */
+    created_at: string;
+    /**
+     * Created By
+     */
+    created_by: string;
+    /**
+     * Expires At
+     */
+    expires_at: string;
+    /**
+     * Id
+     */
+    id: string;
+    /**
+     * Label
+     */
+    label: string;
+    /**
+     * Last Used At
+     */
+    last_used_at: string | null;
+    /**
+     * Last Used From
+     */
+    last_used_from: string | null;
+    /**
+     * Prefix
+     */
+    prefix: string;
+    /**
+     * Revoked At
+     */
+    revoked_at: string | null;
+    /**
+     * Revoked By
+     */
+    revoked_by: string | null;
+    /**
+     * Status
+     */
+    status: 'active' | 'expired' | 'revoked';
     /**
      * Token
      */
@@ -9249,6 +9325,200 @@ export type SelfManagementOutput = {
 };
 
 /**
+ * ServiceAccountCreate
+ */
+export type ServiceAccountCreate = {
+    /**
+     * Description
+     */
+    description?: string;
+    /**
+     * Name
+     */
+    name: string;
+    /**
+     * Permissions
+     */
+    permissions: Array<string>;
+};
+
+/**
+ * ServiceAccountKey
+ */
+export type ServiceAccountKey = {
+    /**
+     * Account Id
+     */
+    account_id: string;
+    /**
+     * Created At
+     */
+    created_at: string;
+    /**
+     * Created By
+     */
+    created_by: string;
+    /**
+     * Expires At
+     */
+    expires_at: string;
+    /**
+     * Id
+     */
+    id: string;
+    /**
+     * Label
+     */
+    label: string;
+    /**
+     * Last Used At
+     */
+    last_used_at: string | null;
+    /**
+     * Last Used From
+     */
+    last_used_from: string | null;
+    /**
+     * Prefix
+     */
+    prefix: string;
+    /**
+     * Revoked At
+     */
+    revoked_at: string | null;
+    /**
+     * Revoked By
+     */
+    revoked_by: string | null;
+    /**
+     * Status
+     */
+    status: 'active' | 'expired' | 'revoked';
+};
+
+/**
+ * ServiceAccountUpdate
+ *
+ * The complete account at the revision the editor showed; active false disables it.
+ */
+export type ServiceAccountUpdate = {
+    /**
+     * Active
+     */
+    active: boolean;
+    /**
+     * Description
+     */
+    description?: string;
+    /**
+     * Name
+     */
+    name: string;
+    /**
+     * Permissions
+     */
+    permissions: Array<string>;
+    /**
+     * Revision
+     */
+    revision: number;
+};
+
+/**
+ * ServiceAccountView
+ */
+export type ServiceAccountView = {
+    /**
+     * Active
+     */
+    active: boolean;
+    /**
+     * Created At
+     */
+    created_at: string;
+    /**
+     * Created By
+     */
+    created_by: string;
+    /**
+     * Description
+     */
+    description: string;
+    /**
+     * Id
+     */
+    id: string;
+    /**
+     * Keys
+     */
+    keys: Array<ServiceAccountKey>;
+    /**
+     * Name
+     */
+    name: string;
+    /**
+     * Permissions
+     */
+    permissions: Array<string>;
+    /**
+     * Revision
+     */
+    revision: number;
+    /**
+     * Updated At
+     */
+    updated_at: string;
+    /**
+     * Updated By
+     */
+    updated_by: string;
+};
+
+/**
+ * ServiceAccountsAdmin
+ */
+export type ServiceAccountsAdmin = {
+    /**
+     * Accounts
+     */
+    accounts: Array<ServiceAccountView>;
+    /**
+     * Activity
+     */
+    activity: Array<AuditEntry>;
+    /**
+     * Can Create
+     */
+    can_create: boolean;
+    /**
+     * Key Routes
+     */
+    key_routes: Array<ApiKeyRoute>;
+    /**
+     * Max Active Keys
+     */
+    max_active_keys: number;
+    /**
+     * Permission Ceiling
+     */
+    permission_ceiling: Array<string>;
+};
+
+/**
+ * ServiceKeyCreate
+ */
+export type ServiceKeyCreate = {
+    /**
+     * Expires In Days
+     */
+    expires_in_days?: 30 | 90 | 180 | 365;
+    /**
+     * Label
+     */
+    label: string;
+};
+
+/**
  * SessionDeleteResult
  */
 export type SessionDeleteResult = {
@@ -12930,6 +13200,176 @@ export type UpdateSecurityProfileResponses = {
 };
 
 export type UpdateSecurityProfileResponse = UpdateSecurityProfileResponses[keyof UpdateSecurityProfileResponses];
+
+export type ListServiceAccountsData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/api/admin/service-accounts';
+};
+
+export type ListServiceAccountsResponses = {
+    /**
+     * Successful Response
+     */
+    200: ServiceAccountsAdmin;
+};
+
+export type ListServiceAccountsResponse = ListServiceAccountsResponses[keyof ListServiceAccountsResponses];
+
+export type CreateServiceAccountData = {
+    body: ServiceAccountCreate;
+    path?: never;
+    query?: never;
+    url: '/api/admin/service-accounts';
+};
+
+export type CreateServiceAccountErrors = {
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+};
+
+export type CreateServiceAccountError = CreateServiceAccountErrors[keyof CreateServiceAccountErrors];
+
+export type CreateServiceAccountResponses = {
+    /**
+     * Successful Response
+     */
+    201: ServiceAccountView;
+};
+
+export type CreateServiceAccountResponse = CreateServiceAccountResponses[keyof CreateServiceAccountResponses];
+
+export type DisableServiceAccountData = {
+    body?: never;
+    path: {
+        /**
+         * Identity
+         */
+        identity: string;
+    };
+    query: {
+        /**
+         * Revision
+         */
+        revision: number;
+    };
+    url: '/api/admin/service-accounts/{identity}';
+};
+
+export type DisableServiceAccountErrors = {
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+};
+
+export type DisableServiceAccountError = DisableServiceAccountErrors[keyof DisableServiceAccountErrors];
+
+export type DisableServiceAccountResponses = {
+    /**
+     * Successful Response
+     */
+    200: ServiceAccountView;
+};
+
+export type DisableServiceAccountResponse = DisableServiceAccountResponses[keyof DisableServiceAccountResponses];
+
+export type UpdateServiceAccountData = {
+    body: ServiceAccountUpdate;
+    path: {
+        /**
+         * Identity
+         */
+        identity: string;
+    };
+    query?: never;
+    url: '/api/admin/service-accounts/{identity}';
+};
+
+export type UpdateServiceAccountErrors = {
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+};
+
+export type UpdateServiceAccountError = UpdateServiceAccountErrors[keyof UpdateServiceAccountErrors];
+
+export type UpdateServiceAccountResponses = {
+    /**
+     * Successful Response
+     */
+    200: ServiceAccountView;
+};
+
+export type UpdateServiceAccountResponse = UpdateServiceAccountResponses[keyof UpdateServiceAccountResponses];
+
+export type CreateServiceAccountKeyData = {
+    body: ServiceKeyCreate;
+    path: {
+        /**
+         * Identity
+         */
+        identity: string;
+    };
+    query?: never;
+    url: '/api/admin/service-accounts/{identity}/keys';
+};
+
+export type CreateServiceAccountKeyErrors = {
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+};
+
+export type CreateServiceAccountKeyError = CreateServiceAccountKeyErrors[keyof CreateServiceAccountKeyErrors];
+
+export type CreateServiceAccountKeyResponses = {
+    /**
+     * Successful Response
+     */
+    201: CreatedServiceAccountKey;
+};
+
+export type CreateServiceAccountKeyResponse = CreateServiceAccountKeyResponses[keyof CreateServiceAccountKeyResponses];
+
+export type RevokeServiceAccountKeyData = {
+    body?: never;
+    path: {
+        /**
+         * Identity
+         */
+        identity: string;
+        /**
+         * Key Id
+         */
+        key_id: string;
+    };
+    query?: never;
+    url: '/api/admin/service-accounts/{identity}/keys/{key_id}';
+};
+
+export type RevokeServiceAccountKeyErrors = {
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+};
+
+export type RevokeServiceAccountKeyError = RevokeServiceAccountKeyErrors[keyof RevokeServiceAccountKeyErrors];
+
+export type RevokeServiceAccountKeyResponses = {
+    /**
+     * Successful Response
+     */
+    200: ServiceAccountKey;
+};
+
+export type RevokeServiceAccountKeyResponse = RevokeServiceAccountKeyResponses[keyof RevokeServiceAccountKeyResponses];
 
 export type GetAdminSpendReportData = {
     body?: never;
