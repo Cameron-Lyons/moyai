@@ -10313,6 +10313,20 @@
             "title": "Connected Apps",
             "type": "array"
           },
+          "models": {
+            "items": {
+              "$ref": "#/components/schemas/PolicyCatalogModel"
+            },
+            "title": "Models",
+            "type": "array"
+          },
+          "repositories": {
+            "items": {
+              "$ref": "#/components/schemas/PolicyCatalogRepository"
+            },
+            "title": "Repositories",
+            "type": "array"
+          },
           "tools": {
             "items": {
               "$ref": "#/components/schemas/PolicyCatalogTool"
@@ -10323,7 +10337,9 @@
         },
         "required": [
           "connected_apps",
-          "tools"
+          "tools",
+          "repositories",
+          "models"
         ],
         "title": "PolicyCatalog",
         "type": "object"
@@ -10350,6 +10366,42 @@
           "label"
         ],
         "title": "PolicyCatalogApp",
+        "type": "object"
+      },
+      "PolicyCatalogModel": {
+        "properties": {
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "label": {
+            "title": "Label",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "label"
+        ],
+        "title": "PolicyCatalogModel",
+        "type": "object"
+      },
+      "PolicyCatalogRepository": {
+        "properties": {
+          "id": {
+            "title": "Id",
+            "type": "integer"
+          },
+          "label": {
+            "title": "Label",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "label"
+        ],
+        "title": "PolicyCatalogRepository",
         "type": "object"
       },
       "PolicyCatalogTool": {
@@ -10426,6 +10478,20 @@
             "title": "Git Access",
             "type": "string"
           },
+          "models": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Models"
+          },
           "network_domains": {
             "anyOf": [
               {
@@ -10439,6 +10505,20 @@
               }
             ],
             "title": "Network Domains"
+          },
+          "repositories": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "integer"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Repositories"
           },
           "tools": {
             "anyOf": [
@@ -10459,7 +10539,9 @@
           "connected_apps",
           "tools",
           "git_access",
-          "network_domains"
+          "network_domains",
+          "repositories",
+          "models"
         ],
         "title": "PolicyView",
         "type": "object"
@@ -13503,6 +13585,21 @@
             "title": "Git Access",
             "type": "string"
           },
+          "models": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "maxItems": 64,
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Models"
+          },
           "network_domains": {
             "anyOf": [
               {
@@ -13517,6 +13614,23 @@
               }
             ],
             "title": "Network Domains"
+          },
+          "repositories": {
+            "anyOf": [
+              {
+                "items": {
+                  "exclusiveMinimum": 0.0,
+                  "maximum": 9007199254740991.0,
+                  "type": "integer"
+                },
+                "maxItems": 1000,
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Repositories"
           },
           "tools": {
             "anyOf": [

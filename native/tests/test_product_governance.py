@@ -503,12 +503,14 @@ def governance_client(product, **services):
 
     from moyai.product_governance_routes import routes
     database = services.pop('database', product.database)
+    connections = services.pop('product_connections', None)
     resources = product.database.governance.product
     resources.scim = SimpleNamespace(router=lambda: APIRouter())
     for name, service in services.items():
         setattr(resources, name, service)
     app = FastAPI()
-    app.include_router(routes(SimpleNamespace(product=resources, database=database)))
+    app.include_router(routes(SimpleNamespace(product=resources, database=database, settings=product.database.settings,
+                                              product_connections=connections)))
     cookie, csrf = google_cookie(product.adapter, sub=product.subject)
     client = httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://127.0.0.1:8787',
                                headers={'origin': 'http://127.0.0.1:8787', 'x-csrf-token': csrf})
@@ -545,6 +547,39 @@ async def test_spend_management_without_read_permission_does_not_return_usage(go
         assert response.status_code == 200 and response.json() == configuration
         await source_write(product, "UPDATE moyai.enterprise_roles SET permissions='[\"workspace.read\"]' WHERE id='restricted'")
         assert (await client.get('/api/admin/spend-limits')).status_code == 403
+
+
+async def test_policy_editor_offers_installation_repositories_and_workspace_models(governed, monkeypatch):
+    """The editor catalog comes from canonical repository metadata and the enabled models; saves may add only those."""
+    from app.security_profiles import policy_catalog
+    product, seen = governed, {}
+    monkeypatch.setattr(product.database.settings, 'model_catalog', 'openai/gpt-6-astra')
+    view = {'id': 'a' * 32, 'name': 'Limited', 'enabled': True, 'revision': 1, 'updated_at': 'now', 'updated_by': 'owner',
+            'policy': ProfilePolicy(repositories=[7], models=['openai/gpt-6-astra']).model_dump(mode='json')}
+    class Profiles:
+        def admin_listing(self, repositories, models):
+            return {'profiles': [view], 'catalog': policy_catalog(repositories, models), 'defaults': {
+                'default_profile_id': '', 'mandatory_profile_id': '', 'revision': 0, 'updated_at': None, 'updated_by': ''}}
+        def save(self, body, actor, *, profile_id='', known_repositories=None, known_models=None):
+            seen[profile_id] = (body.policy.model_fields_set >= {'repositories', 'models'}, known_repositories, known_models)
+            return view
+    class Repositories:
+        def repository_options(self):
+            return [{'id': 7, 'full_name': 'acme/app'}]
+    connections = SimpleNamespace(connectors=SimpleNamespace(github=Repositories()))
+    async with governance_client(product, profiles=Profiles(), product_connections=connections) as client:
+        listing = (await client.get('/api/admin/security-profiles')).json()
+        assert listing['catalog']['repositories'] == [{'id': 7, 'label': 'acme/app'}]
+        assert listing['catalog']['models'] == [{'id': 'test', 'label': 'test'},
+                                                {'id': 'openai/gpt-6-astra', 'label': 'GPT-6 Astra'}]
+        assert listing['profiles'][0]['policy']['repositories'] == [7]
+        body = {'name': 'Limited', 'policy': {'repositories': [7], 'models': ['openai/gpt-6-astra']}}
+        assert (await client.post('/api/admin/security-profiles', json=body)).status_code == 201
+        assert (await client.put(f"/api/admin/security-profiles/{'a' * 32}", json={**body, 'revision': 1})).status_code == 200
+        for invalid in ({'repositories': [True]}, {'repositories': ['7']}, {'models': ['a b']}):
+            response = await client.post('/api/admin/security-profiles', json={'name': 'Invalid', 'policy': invalid})
+            assert response.status_code == 422
+    assert seen == {key: (True, [7], ['test', 'openai/gpt-6-astra']) for key in ('', 'a' * 32)}
 
 
 async def test_scim_token_creation_returns_the_one_time_token_in_its_record(governed):

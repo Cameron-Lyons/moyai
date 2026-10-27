@@ -27,7 +27,7 @@ const catalogRows=[
 const ALL=catalogRows.map(row=>row[0]);
 const MEMBER=['workspace.read','sessions.read','sessions.create','sessions.manage','connections.read','connections.write','automations.read','automations.manage','environments.read','skills.read','skills.manage','memory.read','memory.manage','credentials.read','credentials.manage','spend.personal'];
 const entry=(id,action,resource_type,resource_id,details={},actor='admin@example.test',source='governance',created_at=stamp)=>({id,source,action,actor,resource_type,resource_id,details,created_at});
-const profile=(id,name,policy,patch={})=>({id,name,enabled:true,revision:2,policy:{connected_apps:null,tools:null,git_access:'write',network_domains:null,...policy},updated_at:stamp,updated_by:'admin@example.test',...patch});
+const profile=(id,name,policy,patch={})=>({id,name,enabled:true,revision:2,policy:{connected_apps:null,tools:null,git_access:'write',network_domains:null,repositories:null,models:null,...policy},updated_at:stamp,updated_by:'admin@example.test',...patch});
 function reset(overrides={}) {
   state={mode:'existing',role:'admin',permissions:[...ALL],accessRole:null,requests:[],conflict:false,forbidRoles:false,
     roles:[
@@ -41,7 +41,7 @@ function reset(overrides={}) {
     tokens:[{id:'tok-1',label:'Okta production',prefix:'moyai_scim_ab12',created_at:stamp,created_by:'admin@example.test',last_used_at:stamp,revoked_at:null},
       {id:'tok-0',label:'Old connector',prefix:'moyai_scim_99zz',created_at:'2026-01-02T10:00:00+00:00',created_by:'admin@example.test',last_used_at:null,revoked_at:'2026-02-01T10:00:00+00:00'}],
     profiles:[profile(P1,'Standard engineering',{network_domains:['github.com','registry.npmjs.org','*.githubusercontent.com']}),
-      profile(P2,'Restricted review',{connected_apps:['github'],tools:['read_file','search_files'],git_access:'read',network_domains:[]},{revision:5}),
+      profile(P2,'Restricted review',{connected_apps:['github'],tools:['read_file','search_files'],git_access:'read',network_domains:[],repositories:[101,9001],models:['openai/gpt-6-astra']},{revision:5}),
       profile(P3,'Retired policy',{git_access:'none'},{enabled:false,revision:1})],
     defaults:{default_profile_id:P1,mandatory_profile_id:'',revision:2,updated_at:stamp,updated_by:'admin@example.test'},
     limits:[
@@ -133,7 +133,9 @@ async function handle(req,res,next) {
     if(p==='/api/admin/security-profiles'&&method==='GET')return json({profiles:state.profiles,defaults:state.defaults,catalog:{
       connected_apps:[{id:'github',label:'GitHub'},{id:'linear',label:'Linear'},{id:'slack',label:'Slack'},{id:'notion',label:'Notion'}],
       tools:[{id:'read_file',label:'Read files',group:'Workspace'},{id:'write_file',label:'Write files',group:'Workspace'},{id:'search_files',label:'Search files',group:'Workspace'},{id:'run_shell',label:'Run shell commands',group:'Workspace'},
-        {id:'create_pull_request',label:'Create pull request',group:'GitHub'},{id:'update_pull_request',label:'Update pull request',group:'GitHub'},{id:'browser_navigate',label:'Browse the web',group:'Browser'},{id:'memory_save',label:'Save memory',group:'Memory'}]}});
+        {id:'create_pull_request',label:'Create pull request',group:'GitHub'},{id:'update_pull_request',label:'Update pull request',group:'GitHub'},{id:'browser_navigate',label:'Browse the web',group:'Browser'},{id:'memory_save',label:'Save memory',group:'Memory'}],
+      repositories:[{id:101,label:'synthetic-org/api'},{id:102,label:'synthetic-org/web'},{id:103,label:'synthetic-org/infra'}],
+      models:[{id:'openai/gpt-6-astra',label:'GPT-6 Astra'},{id:'openai/gpt-6-astra-ultrafast',label:'GPT-6 Astra Ultrafast'},{id:'anthropic/claude-opus-5-5',label:'Claude Opus 5.5'}]}});
     if(p==='/api/admin/security-profiles/defaults'&&method==='PUT'){if(data.revision!==state.defaults.revision)return json({detail:STALE},409);state.defaults={...data,revision:data.revision+1,updated_at:stamp,updated_by:'admin@example.test'};return json(state.defaults);}
     if(p==='/api/admin/security-profiles'&&method==='POST'){const row={...profile('abcdefabcdefabcdefabcdefabcdefab',data.name,data.policy),enabled:data.enabled,revision:1};state.profiles.push(row);return json(row,201);}
     const match=p.match(/^\/api\/admin\/security-profiles\/([0-9a-f]{32})$/);
@@ -356,6 +358,11 @@ test('security policies: explicit null-versus-empty choices, validation, default
   await page.getByRole('heading',{name:'Restricted review'}).waitFor();
   const restricted=page.locator('article').filter({hasText:'Restricted review'});
   await restricted.getByText('No outbound network').waitFor();await restricted.getByText('Read only').waitFor();await restricted.getByText('GitHub',{exact:true}).waitFor();
+  await restricted.getByText('synthetic-org/api, Repository 9001').waitFor();await restricted.getByText('GPT-6 Astra',{exact:true}).waitFor();
+  await page.locator('article').filter({hasText:'Standard engineering'}).getByText('All repositories').waitFor();
+  await page.getByRole('searchbox',{name:'Search policies'}).fill('synthetic-org/api');
+  assert.deepEqual(await page.locator('article h3').allTextContents(),['Restricted review'],'repository names are searchable');
+  await page.getByRole('searchbox',{name:'Search policies'}).fill('');
   await page.getByRole('button',{name:'New policy'}).click();const dialog=page.getByRole('dialog',{name:'New security policy'});
   await dialog.getByRole('textbox',{name:'Policy name'}).fill('Contractor sandbox');
   await choose(dialog,page,'Connected apps','No connected apps');
@@ -364,6 +371,14 @@ test('security policies: explicit null-versus-empty choices, validation, default
   await dialog.getByRole('searchbox',{name:'Filter tools'}).fill('files');assert.equal(await dialog.getByRole('checkbox',{name:'Run shell commands'}).count(),0);
   await dialog.getByRole('checkbox',{name:'Read files'}).click();await dialog.getByRole('checkbox',{name:'Search files'}).click();
   await choose(dialog,page,'Git access','No Git access');
+  await choose(dialog,page,'Repositories','Only selected repositories');
+  await dialog.getByRole('group',{name:'Allowed repositories, 0 selected'}).waitFor();
+  await dialog.getByRole('searchbox',{name:'Filter repositories'}).fill('web');assert.equal(await dialog.getByRole('checkbox',{name:'synthetic-org/api'}).count(),0);
+  await dialog.getByRole('checkbox',{name:'synthetic-org/web'}).click();await dialog.getByRole('group',{name:'Allowed repositories, 1 selected'}).waitFor();
+  await dialog.getByRole('searchbox',{name:'Filter repositories'}).fill('');await dialog.getByRole('checkbox',{name:'synthetic-org/api'}).click();
+  await dialog.getByText(/Every other repository is refused, including public ones/).waitFor();
+  await choose(dialog,page,'Models','Only selected models');
+  await dialog.getByRole('checkbox',{name:'GPT-6 Astra Ultrafast'}).click();
   await choose(dialog,page,'Network access','Only listed domains');
   await dialog.getByRole('textbox',{name:'Allowed domains'}).fill('https://evil.test/path');
   await dialog.getByRole('button',{name:'Create policy'}).click();
@@ -372,11 +387,21 @@ test('security policies: explicit null-versus-empty choices, validation, default
   await dialog.getByRole('textbox',{name:'Allowed domains'}).fill('Registry.npmjs.org\n*.example.com, pypi.org');
   await dialog.getByRole('button',{name:'Create policy'}).click();await dialog.waitFor({state:'hidden'});
   assert.deepEqual(last('/api/admin/security-profiles','POST').body,{name:'Contractor sandbox',enabled:true,revision:0,
-    policy:{connected_apps:[],tools:['read_file','search_files'],git_access:'none',network_domains:['*.example.com','pypi.org','registry.npmjs.org']}});
+    policy:{connected_apps:[],tools:['read_file','search_files'],git_access:'none',network_domains:['*.example.com','pypi.org','registry.npmjs.org'],
+      repositories:[101,102],models:['openai/gpt-6-astra-ultrafast']}});
+  // Saved entries outside the current catalog stay listed and selected, so an edit never drops them.
+  await page.getByRole('button',{name:'Edit Restricted review'}).click();const review=page.getByRole('dialog',{name:'Edit Restricted review'});
+  const repositories=review.getByRole('group',{name:'Allowed repositories, 2 selected'});
+  await repositories.getByRole('group',{name:'Saved, not in the current catalog'}).getByRole('checkbox',{name:'Repository 9001'}).waitFor();
+  assert.equal(await repositories.getByRole('checkbox',{name:'Repository 9001'}).isChecked(),true);
+  await choose(review,page,'Models','No models');await review.getByText(/cannot start or continue/).waitFor();
+  await review.getByRole('button',{name:'Save policy'}).click();await review.waitFor({state:'hidden'});
+  assert.deepEqual(last(`/api/admin/security-profiles/${P2}`,'PUT').body.policy,{connected_apps:['github'],tools:['read_file','search_files'],git_access:'read',network_domains:[],
+    repositories:[101,9001],models:[]});
   await page.getByRole('button',{name:'Edit Standard engineering'}).click();const edit=page.getByRole('dialog',{name:'Edit Standard engineering'});
   assert.equal(await edit.getByRole('checkbox',{name:'Available for new sessions'}).isDisabled(),true,'the default stays enabled');
   await choose(edit,page,'Network access','Unrestricted');await edit.getByRole('button',{name:'Save policy'}).click();await edit.waitFor({state:'hidden'});
-  assert.deepEqual(last(`/api/admin/security-profiles/${P1}`,'PUT').body.policy,{connected_apps:null,tools:null,git_access:'write',network_domains:null});
+  assert.deepEqual(last(`/api/admin/security-profiles/${P1}`,'PUT').body.policy,{connected_apps:null,tools:null,git_access:'write',network_domains:null,repositories:null,models:null});
   await choose(page,page,'Mandatory policy','Restricted review');await page.getByText('Unsaved changes.').waitFor();
   await page.getByRole('button',{name:'Save defaults'}).click();await page.getByText('Defaults saved.').waitFor();
   assert.deepEqual(last('/api/admin/security-profiles/defaults','PUT').body,{default_profile_id:P1,mandatory_profile_id:P2,revision:2});

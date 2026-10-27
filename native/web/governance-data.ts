@@ -2,8 +2,8 @@
 // function validates locally with plain-language errors; the server remains
 // authoritative and re-validates every field.
 import type {
-  ExportGovernanceAuditData, GovernanceGroupRole, GovernanceRole, GovernanceRoleAssignment, GroupRoleChange, PermissionInfo, PolicyView,
-  ProfileDefaults, ProfilePolicy, RoleAssignment, RoleCreate, RoleUpdate, SaveProfile, SecurityProfileView, SpendLimitChange, SpendLimitView,
+  ExportGovernanceAuditData, GovernanceGroupRole, GovernanceRole, GovernanceRoleAssignment, GroupRoleChange, PermissionInfo, PolicyCatalogRepository,
+  PolicyView, ProfileDefaults, ProfilePolicy, RoleAssignment, RoleCreate, RoleUpdate, SaveProfile, SecurityProfileView, SpendLimitChange, SpendLimitView,
 } from "./generated/api"
 import type { AuditExportFormat, AuditFilterQuery, AuditFilters, AuditQuery, ConnectedApp, GitAccess } from "./governance-types"
 
@@ -78,17 +78,24 @@ export type PolicyDraft = {
   name: string; enabled: boolean; git_access: GitAccess
   apps: ScopeMode; app_ids: ConnectedApp[]; tools: ScopeMode; tool_ids: string[]
   network: "all" | "listed" | "none"; domains: string
+  repositories: ScopeMode; repository_ids: number[]; models: ScopeMode; model_ids: string[]
 }
-const modeOf = (value: readonly string[] | null): ScopeMode => value === null ? "all" : value.length ? "selected" : "none"
+const modeOf = (value: readonly unknown[] | null): ScopeMode => value === null ? "all" : value.length ? "selected" : "none"
 export function policyDraft(profile?: SecurityProfileView): PolicyDraft {
-  const policy: PolicyView = profile?.policy ?? { connected_apps: null, tools: null, git_access: "write", network_domains: null }
+  const policy: PolicyView = profile?.policy ?? { connected_apps: null, tools: null, git_access: "write", network_domains: null, repositories: null, models: null }
   return {
     name: profile?.name ?? "", enabled: profile?.enabled ?? true, git_access: policy.git_access,
     apps: modeOf(policy.connected_apps), app_ids: policy.connected_apps ?? [],
     tools: modeOf(policy.tools), tool_ids: policy.tools ?? [],
     network: policy.network_domains === null ? "all" : policy.network_domains.length ? "listed" : "none",
     domains: (policy.network_domains ?? []).join("\n"),
+    repositories: modeOf(policy.repositories), repository_ids: policy.repositories ?? [],
+    models: modeOf(policy.models), model_ids: policy.models ?? [],
   }
+}
+/** A saved repository keeps its ID as its label once it leaves the catalog. */
+export function repositoryLabel(repositories: readonly PolicyCatalogRepository[], id: number): string {
+  return repositories.find(repository => repository.id === id)?.label ?? `Repository ${id}`
 }
 
 const HOST_LABEL = /^[a-z0-9¡-￿](?:[a-z0-9¡-￿-]{0,61}[a-z0-9¡-￿])?$/
@@ -111,10 +118,10 @@ export function policyBody(draft: PolicyDraft, existing: SecurityProfileView | u
   const name = draft.name.trim()
   if (!name || name.length > 80) throw new Error("Use a policy name between 1 and 80 characters.")
   if (!["write", "read", "none"].includes(draft.git_access)) throw new Error("Choose a Git access level.")
-  const scoped = <T extends string>(mode: ScopeMode, ids: readonly T[], noun: string, none: string): T[] | null => {
+  const scoped = <T extends string | number>(mode: ScopeMode, ids: readonly T[], noun: string, none: string): T[] | null => {
     if (mode === "all") return null
     if (mode === "none") return []
-    const selected = [...new Set(ids)].sort()
+    const selected = [...new Set(ids)].sort((a, b) => a < b ? -1 : a > b ? 1 : 0)
     if (!selected.length) throw new Error(`Select at least one ${noun}, or choose “${none}”.`)
     return selected
   }
@@ -127,11 +134,14 @@ export function policyBody(draft: PolicyDraft, existing: SecurityProfileView | u
     if (parsed.domains.length > 200) throw new Error("List at most 200 domains.")
     network_domains = parsed.domains
   }
-  const policy: ProfilePolicy = {
+  // Every field is sent: the server refuses an update that omits saved repository or model limits.
+  const policy = {
     connected_apps: scoped(draft.apps, draft.app_ids, "app", "No connected apps"),
     tools: scoped(draft.tools, draft.tool_ids, "tool", "No tools"),
     git_access: draft.git_access, network_domains,
-  }
+    repositories: scoped(draft.repositories, draft.repository_ids, "repository", "No repositories"),
+    models: scoped(draft.models, draft.model_ids, "model", "No models"),
+  } satisfies Required<ProfilePolicy>
   return { name, enabled: draft.enabled, policy, revision: existing?.revision ?? 0 }
 }
 
@@ -142,14 +152,18 @@ export function defaultsBody(defaultId: string, mandatoryId: string, revision: n
 }
 
 const gitLabels: Record<GitAccess, string> = { write: "Read and write", read: "Read only", none: "No Git access" }
-export function policySummary(policy: PolicyView, appLabel: (id: ConnectedApp) => string = id => id) {
-  const list = <T extends string>(value: T[] | null, all: string, none: string, many: (count: number) => string, names?: (ids: T[]) => string) =>
+export type SummaryLabels = { app?: (id: ConnectedApp) => string; repository?: (id: number) => string; model?: (id: string) => string }
+export function policySummary(policy: PolicyView, labels: SummaryLabels = {}) {
+  const { app = id => id, repository = id => `Repository ${id}`, model = id => id } = labels
+  const list = <T,>(value: T[] | null, all: string, none: string, many: (count: number) => string, names?: (ids: T[]) => string) =>
     value === null ? all : !value.length ? none : names && value.length <= 3 ? names(value) : many(value.length)
   return {
-    apps: list(policy.connected_apps, "All connected apps", "No connected apps", count => `${count} apps`, ids => ids.map(appLabel).join(", ")),
+    apps: list(policy.connected_apps, "All connected apps", "No connected apps", count => `${count} apps`, ids => ids.map(app).join(", ")),
     tools: list(policy.tools, "All tools", "No tools", count => `${count} tools`, ids => ids.join(", ")),
     git: gitLabels[policy.git_access] ?? policy.git_access,
     network: list(policy.network_domains, "Unrestricted network", "No outbound network", count => `${count} domains`, ids => ids.join(", ")),
+    repositories: list(policy.repositories, "All repositories", "No repositories", count => `${count} repositories`, ids => ids.map(repository).join(", ")),
+    models: list(policy.models, "All models", "No models", count => `${count} models`, ids => ids.map(model).join(", ")),
   }
 }
 

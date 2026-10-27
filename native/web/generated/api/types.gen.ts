@@ -5818,6 +5818,14 @@ export type PolicyCatalog = {
      */
     connected_apps: Array<PolicyCatalogApp>;
     /**
+     * Models
+     */
+    models: Array<PolicyCatalogModel>;
+    /**
+     * Repositories
+     */
+    repositories: Array<PolicyCatalogRepository>;
+    /**
      * Tools
      */
     tools: Array<PolicyCatalogTool>;
@@ -5831,6 +5839,34 @@ export type PolicyCatalogApp = {
      * Id
      */
     id: 'github' | 'linear' | 'slack' | 'notion';
+    /**
+     * Label
+     */
+    label: string;
+};
+
+/**
+ * PolicyCatalogModel
+ */
+export type PolicyCatalogModel = {
+    /**
+     * Id
+     */
+    id: string;
+    /**
+     * Label
+     */
+    label: string;
+};
+
+/**
+ * PolicyCatalogRepository
+ */
+export type PolicyCatalogRepository = {
+    /**
+     * Id
+     */
+    id: number;
     /**
      * Label
      */
@@ -5884,9 +5920,17 @@ export type PolicyView = {
      */
     git_access: 'write' | 'read' | 'none';
     /**
+     * Models
+     */
+    models: Array<string> | null;
+    /**
      * Network Domains
      */
     network_domains: Array<string> | null;
+    /**
+     * Repositories
+     */
+    repositories: Array<number> | null;
     /**
      * Tools
      */
@@ -7758,9 +7802,17 @@ export type ProfilePolicy = {
      */
     git_access?: 'write' | 'read' | 'none';
     /**
+     * Models
+     */
+    models?: Array<string> | null;
+    /**
      * Network Domains
      */
     network_domains?: Array<string> | null;
+    /**
+     * Repositories
+     */
+    repositories?: Array<number> | null;
     /**
      * Tools
      */

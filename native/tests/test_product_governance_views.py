@@ -87,16 +87,20 @@ def test_role_and_directory_responses_keep_every_service_key(services):
 
 
 def test_policy_spend_and_audit_responses_keep_every_service_key(services):
-    policy = {'connected_apps': ['github'], 'tools': ['read_file'], 'git_access': 'read', 'network_domains': None}
+    policy = {'connected_apps': ['github'], 'tools': ['read_file'], 'git_access': 'read', 'network_domains': None,
+              'repositories': [7], 'models': ['openai/gpt-6-astra']}
     profile = services.profiles.save(SaveProfile(name='Restricted', enabled=True, policy=policy, revision=0), OWNER)
+    assert profile['policy']['repositories'] == [7] and profile['policy']['models'] == ['openai/gpt-6-astra']
     same(SecurityProfileView, profile)
     same(SecurityProfileDefaults, services.profiles.save_defaults(ProfileDefaults(
         default_profile_id=profile['id'], mandatory_profile_id='', revision=0), OWNER))
     catalog = services.profiles.catalog()
     assert catalog['profiles'] and catalog['default_profile_id'] == profile['id']
     same(SessionProfileCatalog, catalog)
-    admin = services.profiles.admin_listing()
+    admin = services.profiles.admin_listing([{'id': 7, 'label': 'acme/app'}],
+                                            [{'id': 'openai/gpt-6-astra', 'label': 'GPT-6 Astra'}])
     assert admin['catalog']['connected_apps'] and admin['catalog']['tools']
+    assert admin['catalog']['repositories'] and admin['catalog']['models']
     same(SecurityProfilesAdmin, admin)
     spare = services.profiles.save(SaveProfile(name='Spare', enabled=True, policy=policy, revision=0), OWNER)
     same(SecurityProfileView, services.profiles.disable(spare['id'], spare['revision'], OWNER))

@@ -166,6 +166,10 @@ class PolicyView(GovernanceView):
     tools: list[str] | None
     git_access: Literal["write", "read", "none"]
     network_domains: list[str] | None
+    # Permanent GitHub repository IDs.
+    repositories: list[int] | None
+    # Model choice IDs, matched exactly.
+    models: list[str] | None
 
 
 class SecurityProfileView(GovernanceView):
@@ -198,9 +202,23 @@ class PolicyCatalogTool(GovernanceView):
     group: str
 
 
+class PolicyCatalogRepository(GovernanceView):
+    id: int
+    # The repository's full name when it was last seen.
+    label: str
+
+
+class PolicyCatalogModel(GovernanceView):
+    id: str
+    label: str
+
+
 class PolicyCatalog(GovernanceView):
     connected_apps: list[PolicyCatalogApp]
     tools: list[PolicyCatalogTool]
+    # The GitHub App installation's repositories and the workspace's models.
+    repositories: list[PolicyCatalogRepository]
+    models: list[PolicyCatalogModel]
 
 
 class SecurityProfilesAdmin(GovernanceView):

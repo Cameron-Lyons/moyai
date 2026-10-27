@@ -17,6 +17,7 @@ from app.security_profiles import (
     DefaultsUnavailable,
     InvalidPolicy,
     OrganizationPolicyUnavailable,
+    PolicyFieldsOmitted,
     ProfileInUse,
     ProfileNotFound,
     ProfilePolicy,
@@ -24,6 +25,7 @@ from app.security_profiles import (
     SaveProfile,
     SecurityProfiles,
     StaleRevision,
+    UnknownPolicyEntry,
     dump_policy,
     effective,
     intersect,
@@ -190,12 +192,16 @@ def test_tools_apps_and_git_access_are_canonical_and_closed():
     assert policy.tools == ('a' * 128, 'read_file', 'write_file')
     assert policy.connected_apps == ('github', 'slack')
     assert ProfilePolicy(tools=[], connected_apps=[]).model_dump() == {
-        'connected_apps': (), 'tools': (), 'git_access': 'write', 'network_domains': None}
+        'connected_apps': (), 'tools': (), 'git_access': 'write', 'network_domains': None,
+        'repositories': None, 'models': None}
     for invalid in ({'connected_apps': ['jira']}, {'git_access': 'admin'}, {'git_access': None},
                     {'tools': 'read_file'}, {'network_domains': 'example.com'}, {'unknown': True},
                     {'connected_apps': ['github'] * 17}, {'tools': [1]}):
         with pytest.raises(ValidationError):
             ProfilePolicy.model_validate(invalid)
+
+
+LEGACY = '"connected_apps":null,"git_access":"write","network_domains":null,"tools":null'
 
 
 @pytest.mark.parametrize('text', [
@@ -204,6 +210,14 @@ def test_tools_apps_and_git_access_are_canonical_and_closed():
     '{"connected_apps":null,"tools":null,"git_access":"write","network_domains":null,"extra":1}',
     '{"connected_apps":null,"tools":null,"git_access":"root","network_domains":null}',
     '{"connected_apps":null,"tools":null,"git_access":"write","network_domains":["127.0.0.1"]}',
+    # A dropped key never reads as unrestricted: five keys are refused.
+    '{' + LEGACY + ',"repositories":[1]}', '{' + LEGACY + ',"models":["a"]}',
+    '{' + LEGACY + ',"repositories":null}', '{' + LEGACY + ',"models":null}',
+    '{' + LEGACY + ',"repositories":null,"models":null,"extra":1}',
+    '{"connected_apps":null,"tools":null,"git_access":"write","repositories":[1],"models":null}',
+    *('{' + LEGACY + f',"repositories":[{value}],"models":null}}' for value in ('0', '-1', 'true', '1.5', '"1"', 2**53)),
+    *('{' + LEGACY + f',"repositories":null,"models":[{json.dumps(value)}]}}'
+      for value in ('', 'a b', 'a\x00', 'mo\ndel', 'a' * 121)),
 ])
 def test_stored_policies_must_be_complete_valid_objects(text):
     with pytest.raises(InvalidPolicy):
@@ -217,6 +231,46 @@ def test_policy_json_round_trips_canonically():
                     '"tools":["x"]}')
     assert load_policy(text) == policy and hash(load_policy(text)) == hash(policy)
     assert dump_policy({'tools': ['x', 'x']}) == '{"connected_apps":null,"git_access":"write","network_domains":null,"tools":["x"]}'
+
+
+def test_repository_and_model_limits_write_six_keys_and_legacy_documents_load_unchanged():
+    # Earlier releases' four-key documents (stored profiles, immutable native
+    # bindings, historical runs) load without limits and dump byte-identically.
+    legacy = '{' + LEGACY + '}'
+    assert load_policy(legacy) == ProfilePolicy() and dump_policy(load_policy(legacy)) == legacy
+    for policy, text in (
+        (ProfilePolicy(repositories=[9, 3, 3]), '{"connected_apps":null,"git_access":"write","models":null,'
+                                                '"network_domains":null,"repositories":[3,9],"tools":null}'),
+        (ProfilePolicy(models=['openai/gpt-6-astra-ultrafast', 'openai/gpt-6-astra']),
+         '{"connected_apps":null,"git_access":"write","models":["openai/gpt-6-astra","openai/gpt-6-astra-ultrafast"],'
+         '"network_domains":null,"repositories":null,"tools":null}'),
+        (ProfilePolicy(repositories=[], models=[]), '{"connected_apps":null,"git_access":"write","models":[],'
+                                                    '"network_domains":null,"repositories":[],"tools":null}'),
+    ):
+        assert dump_policy(policy) == text and load_policy(text) == policy
+    # A hand-written six-key document without limits is equivalent; the next dump normalizes it.
+    explicit = '{' + LEGACY + ',"repositories":null,"models":null}'
+    assert load_policy(explicit) == ProfilePolicy() and dump_policy(load_policy(explicit)) == legacy
+
+
+def test_repository_ids_and_model_ids_are_strict_canonical_and_bounded():
+    policy = ProfilePolicy(repositories=[42, 7, 42, 2**53 - 1], models=['b/model', 'a:model@1', 'b/model'])
+    assert policy.repositories == (7, 42, 2**53 - 1) and policy.models == ('a:model@1', 'b/model')
+    for invalid in (0, -1, True, 1.5, '1', 2**53):
+        with pytest.raises(ValidationError):
+            ProfilePolicy(repositories=[invalid])
+    for invalid in ('', 'a b', 'tab\tmodel', 'nul\x00', '-leading', 'a' * 121, 1):
+        with pytest.raises(ValidationError) as caught:
+            ProfilePolicy(models=[invalid])
+        assert 'leading' not in str(caught.value.errors(include_input=False))  # Never echoes the input.
+    assert ProfilePolicy(models=['a' * 120]).models == ('a' * 120,)
+    # Counts are bounded before deduplication, as for tools.
+    assert ProfilePolicy(repositories=[1] * 1000).repositories == (1,)
+    assert ProfilePolicy(models=['m'] * 64).models == ('m',)
+    with pytest.raises(ValidationError):
+        ProfilePolicy(repositories=[1] * 1001)
+    with pytest.raises(ValidationError):
+        ProfilePolicy(models=['m'] * 65)
 
 
 # Intersection
@@ -247,6 +301,11 @@ def test_lists_narrow_git_takes_the_minimum_and_null_is_identity():
     assert intersect({'tools': []}, {'tools': ['a']}).tools == ()
     assert effective({'tools': ['a', 'b']}, {'tools': ['b']}).tools == ('b',)
     assert effective(None, None) == ProfilePolicy()
+    # Regression guard: model_construct would silently leave an omitted field unrestricted.
+    narrowed = intersect({'repositories': [1, 2], 'models': ['a', 'b']}, {'repositories': [2, 3]}, {'models': ['b']})
+    assert (narrowed.repositories, narrowed.models) == ((2,), ('b',))
+    assert intersect({'repositories': [1]}, {'tools': ['x']}).repositories == (1,)
+    assert intersect({'models': []}, None).models == ()
 
 
 @pytest.mark.parametrize('value', ['null', '[]', 0, False, '', ['tools'], 1.5])
@@ -260,6 +319,8 @@ BASES = ('a.com', 'x.a.com', 'y.x.a.com', 'b.a.com', 'b.com', 'a.org', 'xn--bche
 ENTRIES = BASES + tuple('*.' + base for base in BASES)
 HOSTS = BASES + tuple('z.' + base for base in BASES) + ('evila.com', 'q.y.x.a.com', 'com', 'a.net', 'a.com.org')
 TOOLS = ('read_file', 'write_file', 'shell', 'create_pull_request', 'browser_open')
+REPOSITORIES = (1, 2, 3, 42, 2**53 - 1)
+MODELS = ('openai/gpt-6-astra', 'openai/gpt-6-astra-ultrafast', 'anthropic/claude-opus-5-5', 'fireworks_ai/glm-5p3')
 
 
 def random_policy(rng):
@@ -267,7 +328,8 @@ def random_policy(rng):
         return None if rng.random() < 0.3 else rng.sample(values, rng.randint(0, len(values)))
     return ProfilePolicy(network_domains=subset(ENTRIES), tools=subset(TOOLS),
                          connected_apps=subset(['github', 'linear', 'slack', 'notion']),
-                         git_access=rng.choice(['write', 'read', 'none']))
+                         git_access=rng.choice(['write', 'read', 'none']),
+                         repositories=subset(REPOSITORIES), models=subset(MODELS))
 
 
 def allows(policy, field, value):
@@ -293,6 +355,11 @@ def test_intersection_laws(seed):
     for app in ('github', 'linear', 'slack', 'notion'):
         assert allows(both, 'connected_apps', app) is (
             allows(first, 'connected_apps', app) and allows(second, 'connected_apps', app))
+    for repository in REPOSITORIES + (99,):
+        assert allows(both, 'repositories', repository) is (
+            allows(first, 'repositories', repository) and allows(second, 'repositories', repository))
+    for model in MODELS + ('openai/other',):
+        assert allows(both, 'models', model) is (allows(first, 'models', model) and allows(second, 'models', model))
     levels = security_profiles.GIT_LEVELS
     assert levels[both.git_access] == min(levels[first.git_access], levels[second.git_access])
 
@@ -305,7 +372,7 @@ def test_create_update_and_revisions_record_metadata_only_audit_events(store, pr
     assert created['revision'] == 1 and created['enabled'] is True and created['updated_by'] == 'admin@example.com'
     assert security_profiles.PROFILE_ID.fullmatch(created['id'])
     assert created['policy'] == {'connected_apps': None, 'tools': ['read_file'], 'git_access': 'write',
-                                 'network_domains': ['secret-host.example']}
+                                 'network_domains': ['secret-host.example'], 'repositories': None, 'models': None}
     assert stored(profiles, created['id']) == created
     updated = profiles.save(body('Locked', revision=1, git_access='none'), ADMIN, profile_id=created['id'])
     assert updated['revision'] == 2 and updated['name'] == 'Locked' and updated['policy']['git_access'] == 'none'
@@ -338,6 +405,63 @@ def test_stale_unknown_and_unchanged_saves_write_nothing(store, profiles):
     assert same == created
     assert len(events(store)) == 1
     assert store.rows('SELECT COUNT(*) AS total FROM security_profile_revisions')[0]['total'] == 1
+
+
+def test_updates_that_omit_saved_repository_or_model_limits_are_refused(store, profiles):
+    """Regression guard: an editor or script that predates these fields would clear the limits."""
+    created = profiles.save(body(repositories=[7], models=['openai/gpt-6-astra']), ADMIN)
+    writes = (len(events(store)), store.rows('SELECT COUNT(*) AS total FROM security_profile_revisions')[0]['total'])
+    for policy in ({}, {'git_access': 'read'}, {'repositories': [7]}, {'models': ['openai/gpt-6-astra']}):
+        with pytest.raises(PolicyFieldsOmitted) as caught:
+            profiles.save(body(revision=1, **policy), ADMIN, profile_id=created['id'])
+        assert caught.value.status_code == 409
+    with pytest.raises(PolicyFieldsOmitted):
+        profiles.save({'name': 'Restricted', 'revision': 1}, ADMIN, profile_id=created['id'])
+    assert writes == (len(events(store)),
+                      store.rows('SELECT COUNT(*) AS total FROM security_profile_revisions')[0]['total'])
+    assert stored(profiles, created['id'])['policy']['repositories'] == [7]
+    # Sending both fields, even as null, is an explicit choice.
+    cleared = profiles.save(body(revision=1, repositories=None, models=None), ADMIN, profile_id=created['id'])
+    assert (cleared['revision'], cleared['policy']['repositories'], cleared['policy']['models']) == (2, None, None)
+    assert json.loads(store.rows('SELECT policy FROM security_profiles WHERE id=?', (created['id'],))[0]['policy']
+                      ).keys() == security_profiles.LEGACY_POLICY_FIELDS
+    # Without saved limits, an older body (four fields) still saves.
+    renamed = profiles.save(body('Renamed', revision=2), ADMIN, profile_id=created['id'])
+    assert renamed['revision'] == 3
+
+
+def test_legacy_profiles_save_unchanged_with_explicit_nulls(store, profiles):
+    created = profiles.save(body(tools=['read_file']), ADMIN)
+    assert store.rows('SELECT policy FROM security_profiles')[0]['policy'] == (
+        '{"connected_apps":null,"git_access":"write","network_domains":null,"tools":["read_file"]}')
+    same = profiles.save(body(revision=1, tools=['read_file'], repositories=None, models=None), ADMIN,
+                         profile_id=created['id'])
+    assert same == created and len(events(store)) == 1
+    assert store.rows('SELECT COUNT(*) AS total FROM security_profile_revisions')[0]['total'] == 1
+
+
+def test_only_newly_added_repositories_and_models_must_be_in_the_catalog(store, profiles):
+    known = {'known_repositories': [1, 2], 'known_models': ['openai/gpt-6-astra']}
+    for policy in ({'repositories': [3]}, {'models': ['retired/model']}, {'repositories': [1, 3]}):
+        with pytest.raises(UnknownPolicyEntry) as caught:
+            profiles.save(body(**policy), ADMIN, **known)
+        assert (caught.value.status_code, caught.value.detail) == (
+            422, 'Choose repositories and models available to this workspace.')
+    assert not events(store)
+    created = profiles.save(body(repositories=[1, 2], models=['openai/gpt-6-astra']), ADMIN, **known)
+    # Saved entries stay valid after they leave the catalog.
+    shrunk = {'known_repositories': [], 'known_models': []}
+    kept = profiles.save(body('Renamed', revision=1, repositories=[1, 2], models=['openai/gpt-6-astra']), ADMIN,
+                         profile_id=created['id'], **shrunk)
+    assert kept['policy']['repositories'] == [1, 2]
+    narrowed = profiles.save(body('Renamed', revision=2, repositories=[2], models=['openai/gpt-6-astra']), ADMIN,
+                             profile_id=created['id'], **shrunk)
+    assert narrowed['policy']['repositories'] == [2]
+    with pytest.raises(UnknownPolicyEntry):
+        profiles.save(body('Renamed', revision=3, repositories=[1, 2], models=['openai/gpt-6-astra']), ADMIN,
+                      profile_id=created['id'], **shrunk)
+    # Library callers without catalogs are not checked.
+    assert profiles.save(body('Other', repositories=[99]), ADMIN)['policy']['repositories'] == [99]
 
 
 def test_profile_count_is_bounded(store, profiles, monkeypatch):
@@ -424,6 +548,12 @@ def test_catalogs_show_enabled_profiles_and_admin_listing_shows_all(store, profi
     assert listing['profiles'][1]['enabled'] is False and listing['defaults']['revision'] == 1
     catalog = listing['catalog']
     assert catalog == policy_catalog()
+    assert catalog['repositories'] == catalog['models'] == []
+    choices = ([{'id': 7, 'label': 'acme/app', 'full_name': 'ignored'}],
+               [{'id': 'openai/gpt-6-astra', 'label': 'GPT-6 Astra'}])
+    assert profiles.admin_listing(*choices)['catalog'] == policy_catalog(*choices)
+    assert policy_catalog(*choices)['repositories'] == [{'id': 7, 'label': 'acme/app'}]
+    assert policy_catalog(*choices)['models'] == [{'id': 'openai/gpt-6-astra', 'label': 'GPT-6 Astra'}]
     assert catalog['connected_apps'] == [{'id': 'github', 'label': 'GitHub'}, {'id': 'linear', 'label': 'Linear'},
                                          {'id': 'slack', 'label': 'Slack'}, {'id': 'notion', 'label': 'Notion'}]
     # Every tool a role can grant, grouped for the editor.
@@ -460,8 +590,18 @@ def test_new_sessions_bind_the_selection_narrowed_by_the_mandatory_profile(store
         network_domains=['api.example.com', 'other.org'])
     floor = read(store, profiles.mandatory_in)
     assert floor == (mandatory['id'], 1, load_policy(dump_policy(ProfilePolicy.model_validate(mandatory['policy']))))
+    # Repository and model limits narrow the binding like every other list.
+    limited = profiles.save(body('Floor', revision=1, tools=['read_file'], connected_apps=['github'],
+                                 network_domains=['api.example.com', 'other.org'], repositories=[5, 6],
+                                 models=['openai/gpt-6-astra']), ADMIN, profile_id=mandatory['id'])
+    profiles.save(body('Chosen', revision=1, git_access='read', repositories=[6, 7]), ADMIN, profile_id=chosen['id'])
+    limited_binding = resolve(store, profiles, chosen['id'])
+    assert (limited_binding.policy.repositories, limited_binding.policy.models) == ((6,), ('openai/gpt-6-astra',))
+    profiles.save(body('Chosen', revision=2, git_access='read', repositories=None, models=None), ADMIN,
+                  profile_id=chosen['id'])
     # Loosening the mandatory profile later never widens a pinned binding.
-    loosened = profiles.save(body('Floor', revision=1), ADMIN, profile_id=mandatory['id'])
+    loosened = profiles.save(body('Floor', revision=limited['revision'], repositories=None, models=None), ADMIN,
+                             profile_id=mandatory['id'])
     assert read(store, profiles.mandatory_in) == (mandatory['id'], loosened['revision'], ProfilePolicy())
     assert effective(chosen_binding.policy, read(store, profiles.mandatory_in).policy) == chosen_binding.policy
 

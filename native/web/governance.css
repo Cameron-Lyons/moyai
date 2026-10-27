@@ -17,7 +17,7 @@
 .native-settings .ns-gov-builtins dl { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 8px 16px; margin: 8px 0 0; padding: 16px; border: 1px solid var(--ui-border); border-radius: 8px; background: var(--ui-subtle); font-size: 13px; }
 .native-settings .ns-gov-builtins dt { font-weight: 500; }
 .native-settings .ns-gov-builtins dd { margin: 0; color: var(--ui-muted); overflow-wrap: anywhere; }
-.native-settings .ns-gov-summary { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px 24px; margin: 10px 0 4px; font-size: 13px; }
+.native-settings .ns-gov-summary { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px 24px; margin: 10px 0 4px; font-size: 13px; }
 .native-settings .ns-gov-summary dt { color: var(--ui-muted); font-size: 12px; }
 .native-settings .ns-gov-summary dd { margin: 0; overflow-wrap: anywhere; }
 .native-settings .ns-gov-defaults { display: grid; gap: 16px; }

@@ -34,7 +34,7 @@ const catalog=[
   {id:'roles.manage',label:'Manage custom roles and grants',description:'Manage roles.',group:'People'},
 ];
 const role=(patch={})=>({id:'auditor',name:'Auditor',description:'Compliance <b>review</b>',permissions:['audit.read','sessions.read'],revision:3,archived:false,updated_at:stamp,updated_by:'admin@example.test',...patch});
-const profile=(patch={})=>({id:'0123456789abcdef'.repeat(2),name:'Restricted',enabled:true,revision:2,policy:{connected_apps:['github'],tools:[],git_access:'read',network_domains:null},updated_at:stamp,updated_by:'admin@example.test',...patch});
+const profile=(patch={})=>({id:'0123456789abcdef'.repeat(2),name:'Restricted',enabled:true,revision:2,policy:{connected_apps:['github'],tools:[],git_access:'read',network_domains:null,repositories:[7,42],models:null},updated_at:stamp,updated_by:'admin@example.test',...patch});
 const limit=(patch={})=>({id:'organization',kind:'organization',subject:'',limit_usd:5000,revision:3,updated_at:stamp,updated_by:'admin@example.test',used_usd:1234.5,...patch});
 const limits=()=>[limit(),limit({id:'user-default',kind:'user-default',limit_usd:null,revision:0,used_usd:null}),limit({id:'session-default',kind:'session-default',limit_usd:20,revision:1,used_usd:null})];
 
@@ -70,9 +70,14 @@ test('assignments carry both revisions, never grant admin, and group grants clea
 test('security policy drafts keep unrestricted, nothing and listed values distinct',()=>{
   const draft=gov.policyDraft(profile());
   assert.equal(draft.apps,'selected');assert.equal(draft.tools,'none');assert.equal(draft.network,'all');
-  assert.deepEqual(gov.policyBody(draft,profile()).policy,profile().policy,'an unchanged draft round-trips exactly');
+  assert.equal(draft.repositories,'selected');assert.equal(draft.models,'all');
+  assert.deepEqual(gov.policyBody(draft,profile()).policy,profile().policy,'an unchanged draft round-trips exactly, IDs in numeric order');
   const body=gov.policyBody({...gov.policyDraft(),name:' Sandbox ',apps:'none',tools:'all',network:'listed',domains:'Registry.npmjs.org.\n*.Example.com, pypi.org pypi.org'},undefined);
-  assert.deepEqual(body,{name:'Sandbox',enabled:true,revision:0,policy:{connected_apps:[],tools:null,git_access:'write',network_domains:['*.example.com','pypi.org','registry.npmjs.org']}});
+  assert.deepEqual(body,{name:'Sandbox',enabled:true,revision:0,policy:{connected_apps:[],tools:null,git_access:'write',network_domains:['*.example.com','pypi.org','registry.npmjs.org'],repositories:null,models:null}},'every field is sent, so saved limits are never omitted');
+  const limited=gov.policyBody({...gov.policyDraft(),name:'Limited',repositories:'selected',repository_ids:[100,9,9],models:'none',model_ids:['ignored']},undefined).policy;
+  assert.deepEqual([limited.repositories,limited.models],[[9,100],[]]);
+  assert.throws(()=>gov.policyBody({...gov.policyDraft(),name:'Repos',repositories:'selected',repository_ids:[]},undefined),/No repositories/);
+  assert.throws(()=>gov.policyBody({...gov.policyDraft(),name:'Models',models:'selected',model_ids:[]},undefined),/No models/);
   assert.deepEqual(gov.policyBody({...gov.policyDraft(),name:'Offline',network:'none',domains:'ignored.example'},undefined).policy.network_domains,[],'blocking sends an empty list');
   assert.throws(()=>gov.policyBody({...gov.policyDraft(),name:'Empty',network:'listed',domains:'  '},undefined),/Block all outbound network access/);
   assert.throws(()=>gov.policyBody({...gov.policyDraft(),name:'Apps',apps:'selected',app_ids:[]},undefined),/No connected apps/);
@@ -82,7 +87,10 @@ test('security policy drafts keep unrestricted, nothing and listed values distin
   assert.deepEqual(gov.parseDomains('*.githubusercontent.com\ngithub.com').domains,['*.githubusercontent.com','github.com']);
   assert.throws(()=>gov.defaultsBody('disabled','',2,[profile({id:'disabled',enabled:false})]),/enabled security policy/);
   assert.deepEqual(gov.defaultsBody('',profile().id,2,[profile()]),{default_profile_id:'',mandatory_profile_id:profile().id,revision:2});
-  assert.deepEqual(gov.policySummary(profile().policy,id=>id==='github'?'GitHub':id),{apps:'GitHub',tools:'No tools',git:'Read only',network:'Unrestricted network'});
+  assert.deepEqual(gov.policySummary(profile().policy,{app:id=>id==='github'?'GitHub':id,repository:id=>id===7?'acme/app':`Repository ${id}`}),
+    {apps:'GitHub',tools:'No tools',git:'Read only',network:'Unrestricted network',repositories:'acme/app, Repository 42',models:'All models'});
+  assert.deepEqual(gov.policySummary({...profile().policy,repositories:[],models:['a','b','c','d']}),{apps:'github',tools:'No tools',git:'Read only',network:'Unrestricted network',repositories:'No repositories',models:'4 models'});
+  assert.equal(gov.repositoryLabel([{id:7,label:'acme/app'}],7),'acme/app');assert.equal(gov.repositoryLabel([],9),'Repository 9','a repository that left the catalog keeps its ID');
 });
 
 test('spend amounts: blank is no limit, zero blocks, and only changed rows are sent with their revisions',()=>{
@@ -153,9 +161,10 @@ test('provisioning rows never render token secrets and state status in text',()=
 
 test('policy rows mark defaults, keep defaults enabled and summarize empty lists as nothing allowed',()=>{
   const defaults={default_profile_id:profile().id,mandatory_profile_id:'',revision:1,updated_at:stamp,updated_by:''};
-  const other=profile({id:'f'.repeat(32),name:'Open',policy:{connected_apps:null,tools:null,git_access:'write',network_domains:[]}});
-  const html=render(gov.ProfileRows,{profiles:[profile(),other,profile({id:'e'.repeat(32),name:'Retired',enabled:false})],defaults,catalog:{connected_apps:[{id:'github',label:'GitHub'}],tools:[]},onEdit(){},onDisable(){},onEnable(){}});
+  const other=profile({id:'f'.repeat(32),name:'Open',policy:{connected_apps:null,tools:null,git_access:'write',network_domains:[],repositories:null,models:null}});
+  const html=render(gov.ProfileRows,{profiles:[profile(),other,profile({id:'e'.repeat(32),name:'Retired',enabled:false})],defaults,catalog:{connected_apps:[{id:'github',label:'GitHub'}],tools:[],repositories:[{id:7,label:'acme/app'}],models:[]},onEdit(){},onDisable(){},onEnable(){}});
   assert.match(html,/Default/);assert.match(html,/No tools/);assert.match(html,/No outbound network/);assert.match(html,/All connected apps/);
+  assert.match(html,/<dt>Repositories<\/dt><dd>acme\/app, Repository 42<\/dd>/);assert.match(html,/<dt>Models<\/dt><dd>All models<\/dd>/);
   assert.equal((html.match(/>Disable</g)||[]).length,1,'the default policy cannot be disabled');assert.equal((html.match(/>Enable</g)||[]).length,1);
 });
 

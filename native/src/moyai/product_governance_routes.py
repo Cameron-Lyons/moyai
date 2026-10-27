@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 from typing import Literal
 
+from app.config import MODEL_CATALOG
 from app.enterprise_roles import GovernanceActor, GroupRoleChange, RoleAssignment, RoleCreate, RoleUpdate
 from app.governance_audit import parse_filters
 from app.permissions import BUILTIN_PERMISSIONS, catalog
@@ -100,14 +101,31 @@ def routes(runtime):
         user.require('security.manage')
         return SessionProfileCatalog.model_validate(await asyncio.to_thread(product.profiles.catalog))
 
+    def policy_choices():
+        """The policy editor's repositories and models, from canonical metadata only (no provider I/O)."""
+        connections = runtime.product_connections
+        repositories = connections.connectors.github.repository_options() if connections is not None else []
+        return ([{'id': row['id'], 'label': row['full_name']} for row in repositories],
+                [{'id': model, 'label': MODEL_CATALOG.get(model, model)} for model in runtime.settings.models])
+
+    async def save_profile(body, user, profile_id='') -> SecurityProfileView:
+        def save():
+            # Only entries the editor could offer may be added; saved ones stay.
+            repositories, models = policy_choices()
+            return product.profiles.save(body, governed(user), profile_id=profile_id,
+                                         known_repositories=[row['id'] for row in repositories],
+                                         known_models=[row['id'] for row in models])
+        return SecurityProfileView.model_validate(await asyncio.to_thread(save))
+
     @router.get('/api/admin/security-profiles', operation_id='listSecurityProfiles')
     async def profiles_admin(user=Depends(principal)) -> SecurityProfilesAdmin:
         user.require('security.manage')
-        return SecurityProfilesAdmin.model_validate(await asyncio.to_thread(product.profiles.admin_listing))
+        return SecurityProfilesAdmin.model_validate(
+            await asyncio.to_thread(lambda: product.profiles.admin_listing(*policy_choices())))
 
     @router.post('/api/admin/security-profiles', status_code=201, operation_id='createSecurityProfile')
     async def profile_create(body: SaveProfile, user=Depends(principal)) -> SecurityProfileView:
-        return SecurityProfileView.model_validate(await asyncio.to_thread(product.profiles.save, body, governed(user)))
+        return await save_profile(body, user)
 
     @router.put('/api/admin/security-profiles/defaults', operation_id='updateSecurityProfileDefaults')
     async def defaults(body: ProfileDefaults, user=Depends(principal)) -> SecurityProfileDefaults:
@@ -116,8 +134,7 @@ def routes(runtime):
 
     @router.put('/api/admin/security-profiles/{identity}', operation_id='updateSecurityProfile')
     async def profile_update(identity: str, body: SaveProfile, user=Depends(principal)) -> SecurityProfileView:
-        return SecurityProfileView.model_validate(
-            await asyncio.to_thread(product.profiles.save, body, governed(user), profile_id=identity))
+        return await save_profile(body, user, profile_id=identity)
 
     @router.delete('/api/admin/security-profiles/{identity}', operation_id='disableSecurityProfile')
     async def profile_disable(identity: str, revision: int = Query(ge=1),

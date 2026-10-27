@@ -1,10 +1,18 @@
 """Session security profiles and the organization default and mandatory profile.
 
 A policy narrows what a session may use: connected_apps (managed connectors),
-tools (tool names offered to the agent), git_access and network_domains (a
-hostname allowlist). For each list, null is unrestricted, [] allows nothing and
-a list allows only its entries. intersect() never widens: lists meet by
-intersection, git access takes the minimum and null is the identity.
+tools (tool names offered to the agent), git_access, network_domains (a
+hostname allowlist), repositories (permanent GitHub repository IDs) and models
+(the workspace's model choice IDs, matched exactly). For each list, null is
+unrestricted, [] allows nothing and a list allows only its entries. intersect()
+never widens: lists meet by intersection, git access takes the minimum and null
+is the identity.
+
+Repository limits name permanent IDs, never owner/name text, and apply to public
+repositories too. Stored documents have two shapes: a policy without repository
+or model limits keeps the four-key document earlier releases wrote and read,
+byte for byte, and any such limit writes all six keys. Earlier releases therefore
+refuse (fail closed on) exactly the documents that use the new limits.
 
 network_domains is validated, stored and intersected, but no installed provider
 enforces egress, so ProductGovernance.require_provider refuses every non-null
@@ -56,12 +64,18 @@ from .schema_initializers import initialize_security_profiles as initialize_sche
 
 CONNECTED_APPS = {'github': 'GitHub', 'linear': 'Linear', 'slack': 'Slack', 'notion': 'Notion'}
 GIT_LEVELS = {'none': 0, 'read': 1, 'write': 2}
-POLICY_FIELDS = frozenset({'connected_apps', 'tools', 'git_access', 'network_domains'})
+LEGACY_POLICY_FIELDS = frozenset({'connected_apps', 'tools', 'git_access', 'network_domains'})
+SCOPE_FIELDS = frozenset({'repositories', 'models'})
+POLICY_FIELDS = LEGACY_POLICY_FIELDS | SCOPE_FIELDS
 PROFILE_ID = re.compile(r'[0-9a-f]{32}')
 PROFILE_ID_PATTERN = r'^([0-9a-f]{32})?$'
 TOOL_NAME = re.compile(r'[a-z][a-z0-9_]{0,127}')
+# The 120-character limit matches the automation definition's model field.
+MODEL_ID = re.compile(r'[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,119}')
 MAX_DOMAINS = 200
 MAX_TOOLS = 500
+MAX_REPOSITORIES = 1000
+MAX_MODELS = 64
 MAX_PROFILES = 500
 
 _LABEL = re.compile(r'[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?')
@@ -111,6 +125,14 @@ class ProfileLimit(ProfileError):
 
 class CorruptPolicy(ProfileError):
     message = 'A saved security policy is invalid. Restore it from a backup.'
+
+
+class PolicyFieldsOmitted(ProfileError):
+    message = 'This policy has repository or model limits this editor did not send. Reload and try again.'
+
+
+class UnknownPolicyEntry(ProfileError):
+    status, message = 422, 'Choose repositories and models available to this workspace.'
 
 
 class InvalidPolicy(ValueError):
@@ -233,6 +255,8 @@ def _no_controls(value: str) -> str:
 
 
 AppName = Literal['github', 'linear', 'slack', 'notion']
+# Strict: a bool, float or numeric string is not a repository ID.
+RepositoryId = Annotated[int, Field(gt=0, le=2**53 - 1, strict=True)]
 
 
 class ProfilePolicy(BaseModel):
@@ -246,10 +270,12 @@ class ProfilePolicy(BaseModel):
     tools: Annotated[tuple[str, ...], Field(max_length=MAX_TOOLS)] | None = None
     git_access: Literal['write', 'read', 'none'] = 'write'
     network_domains: Annotated[tuple[str, ...], Field(max_length=MAX_DOMAINS)] | None = None
+    repositories: Annotated[tuple[RepositoryId, ...], Field(max_length=MAX_REPOSITORIES)] | None = None
+    models: Annotated[tuple[str, ...], Field(max_length=MAX_MODELS)] | None = None
 
-    @field_validator('connected_apps')
+    @field_validator('connected_apps', 'repositories')
     @classmethod
-    def _apps(cls, values):
+    def _sorted(cls, values):
         return None if values is None else tuple(sorted(set(values)))
 
     @field_validator('tools')
@@ -265,6 +291,15 @@ class ProfilePolicy(BaseModel):
     @classmethod
     def _domains(cls, values):
         return None if values is None else reduce_domains(normalize_domain(value) for value in values)
+
+    @field_validator('models')
+    @classmethod
+    def _models(cls, values):
+        if values is None:
+            return None
+        if not all(MODEL_ID.fullmatch(value) for value in values):
+            raise PydanticCustomError('model_id', 'Use model IDs from the workspace model list.')
+        return tuple(sorted(set(values)))
 
 
 def _policy(value):
@@ -282,22 +317,33 @@ def intersect(*policies: ProfilePolicy | Mapping | None) -> ProfilePolicy:
     mappings take unrestricted defaults); other values raise TypeError, so a
     corrupt falsy document can never pass as an unrestricted policy.
     """
-    apps = tools = domains = None
+    apps = tools = domains = repositories = models = None
     git = 'write'
+
+    def meet(current, values):
+        return values if current is None else tuple(sorted(set(current) & set(values)))
+
     for value in policies:
         if value is None:
             continue
         policy = _policy(value)
         if policy.connected_apps is not None:
-            apps = policy.connected_apps if apps is None else tuple(sorted(set(apps) & set(policy.connected_apps)))
+            apps = meet(apps, policy.connected_apps)
         if policy.tools is not None:
-            tools = policy.tools if tools is None else tuple(sorted(set(tools) & set(policy.tools)))
+            tools = meet(tools, policy.tools)
         if policy.network_domains is not None:
             domains = policy.network_domains if domains is None else intersect_domains(domains, policy.network_domains)
+        if policy.repositories is not None:
+            repositories = meet(repositories, policy.repositories)
+        if policy.models is not None:
+            models = meet(models, policy.models)
         if GIT_LEVELS[policy.git_access] < GIT_LEVELS[git]:
             git = policy.git_access
     # Every component is already canonical, so skip re-normalizing domains.
-    return ProfilePolicy.model_construct(connected_apps=apps, tools=tools, git_access=git, network_domains=domains)
+    # model_construct defaults an omitted field to None (unrestricted), so every
+    # field is passed explicitly.
+    return ProfilePolicy.model_construct(connected_apps=apps, tools=tools, git_access=git, network_domains=domains,
+                                         repositories=repositories, models=models)
 
 
 def effective(session_policy: ProfilePolicy | Mapping | None,
@@ -307,22 +353,30 @@ def effective(session_policy: ProfilePolicy | Mapping | None,
 
 
 def dump_policy(policy: ProfilePolicy | Mapping) -> str:
-    """Canonical compact JSON for storage, bindings and comparisons."""
-    return json.dumps(_policy(policy).model_dump(mode='json'), sort_keys=True, separators=(',', ':'))
+    """Canonical compact JSON for storage, bindings and comparisons.
+
+    Without repository or model limits this is the four-key document earlier
+    releases wrote; either limit writes all six keys.
+    """
+    document = _policy(policy).model_dump(mode='json')
+    if document['repositories'] is None and document['models'] is None:
+        del document['repositories'], document['models']
+    return json.dumps(document, sort_keys=True, separators=(',', ':'))
 
 
 def load_policy(text: str) -> ProfilePolicy:
-    """Parse stored policy JSON. It must be an object holding exactly the four fields.
+    """Parse stored policy JSON: an object holding exactly the four legacy fields or all six.
 
-    Raises InvalidPolicy otherwise, including for 'null', '[]', '{}' and partial
-    objects, so a truncated or foreign document never reads as unrestricted.
+    A four-key document has no repository or model limits. Raises InvalidPolicy
+    otherwise, including for 'null', '[]', '{}' and partial objects, so a
+    truncated or foreign document never reads as unrestricted.
     """
     try:
         document = json.loads(text)
     except (TypeError, ValueError):
         raise InvalidPolicy('The security policy is not valid JSON.') from None
-    if not isinstance(document, dict) or document.keys() != POLICY_FIELDS:
-        raise InvalidPolicy('The security policy must hold exactly its four fields.')
+    if not isinstance(document, dict) or frozenset(document) not in (LEGACY_POLICY_FIELDS, POLICY_FIELDS):
+        raise InvalidPolicy('The security policy must hold exactly its four original fields or all six.')
     try:
         return ProfilePolicy.model_validate(document)
     except ValidationError:
@@ -383,15 +437,18 @@ def _tool_group(name):
     return next((group for prefix, group in _TOOL_GROUPS if name.startswith(prefix)), 'Workspace')
 
 
-def policy_catalog() -> dict:
-    """Choices for the policy editor: connected apps and the app.permissions.TOOL_PERMISSIONS names.
+def policy_catalog(repositories: Iterable[Mapping] = (), models: Iterable[Mapping] = ()) -> dict:
+    """Choices for the policy editor: connected apps, the app.permissions.TOOL_PERMISSIONS names,
+    and the caller's repository and model choices ({'id', 'label'} each, in display order).
 
     Names a policy cannot hold are skipped. Tools are ordered by group, then id.
     """
     entries = [{'id': name, 'label': _tool_label(name), 'group': _tool_group(name)}
                for name in TOOL_PERMISSIONS if TOOL_NAME.fullmatch(name)]
     return {'connected_apps': [{'id': key, 'label': label} for key, label in CONNECTED_APPS.items()],
-            'tools': sorted(entries, key=lambda entry: (entry['group'], entry['id']))}
+            'tools': sorted(entries, key=lambda entry: (entry['group'], entry['id'])),
+            'repositories': [{'id': entry['id'], 'label': entry['label']} for entry in repositories],
+            'models': [{'id': entry['id'], 'label': entry['label']} for entry in models]}
 
 
 _COLUMNS = 'id,name,enabled,revision,policy,updated_by,updated_at'
@@ -460,14 +517,14 @@ class SecurityProfiles:
                 'default_profile_id': defaults['default_profile_id'],
                 'mandatory': {'id': mandatory['id'], 'name': mandatory['name']} if mandatory else None}
 
-    def admin_listing(self) -> dict:
-        """Every profile including disabled ones, the defaults and the editor catalog."""
+    def admin_listing(self, repositories: Iterable[Mapping] = (), models: Iterable[Mapping] = ()) -> dict:
+        """Every profile including disabled ones, the defaults and the editor catalog (see policy_catalog)."""
         with self.store.connect() as conn:
             conn.begin_read()
             defaults = self.defaults_in(conn)
             rows = [dict(row) for row in conn.execute(f'SELECT {_COLUMNS} FROM security_profiles')]
         return {'profiles': [_view(row) for row in _ordered(rows)], 'defaults': defaults,
-                'catalog': policy_catalog()}
+                'catalog': policy_catalog(repositories, models)}
 
     @staticmethod
     def _revise_in(conn, row, *, name, enabled, policy, label, action):
@@ -483,11 +540,27 @@ class SecurityProfiles:
         return {'id': row['id'], 'name': name, 'enabled': enabled, 'revision': revision,
                 'policy': policy.model_dump(mode='json'), 'updated_at': stamp, 'updated_by': label}
 
-    def save(self, body: SaveProfile | Mapping, actor, *, profile_id: str = '') -> dict:
+    @staticmethod
+    def _require_known(policy, current, known_repositories, known_models):
+        """Refuse newly added repositories or models outside the supplied choices (None skips the check).
+
+        Entries the profile already holds stay valid after they leave a catalog.
+        """
+        for name, known in (('repositories', known_repositories), ('models', known_models)):
+            added = set(getattr(policy, name) or ()) - set(getattr(current, name) or ())
+            if known is not None and not added <= set(known):
+                raise UnknownPolicyEntry()
+
+    def save(self, body: SaveProfile | Mapping, actor, *, profile_id: str = '',
+             known_repositories: Iterable[int] | None = None, known_models: Iterable[str] | None = None) -> dict:
         """Create (no profile_id; revision 0) or update a profile at its current revision.
 
         An unchanged save returns the profile without a new revision or event.
         A profile selected as the default or mandatory profile cannot be disabled.
+        An update must send repositories and models whenever the stored policy
+        limits them; an editor or script that predates them would otherwise
+        clear the limits. Newly added repositories and models must belong to
+        known_repositories and known_models when those are given.
         """
         body, label = validated(SaveProfile, body), actor_label(actor)
         with self.store.connect() as conn:
@@ -502,12 +575,16 @@ class SecurityProfiles:
                 if not body.enabled and profile_id in self._selected_in(conn):
                     raise ProfileInUse()
                 current = _stored(row['policy'])
+                if any(getattr(current, name) is not None for name in SCOPE_FIELDS - body.policy.model_fields_set):
+                    raise PolicyFieldsOmitted()
+                self._require_known(body.policy, current, known_repositories, known_models)
                 if (row['name'], bool(row['enabled']), current) == (body.name, body.enabled, body.policy):
                     return _view(row, current)
                 return self._revise_in(conn, row, name=body.name, enabled=body.enabled, policy=body.policy,
                                        label=label, action='security_profile.updated')
             if body.revision != 0:
                 raise StaleRevision()
+            self._require_known(body.policy, ProfilePolicy(), known_repositories, known_models)
             if conn.execute('SELECT COUNT(*) AS total FROM security_profiles').fetchone()['total'] >= MAX_PROFILES:
                 raise ProfileLimit()
             identity, stamp, text = uuid4().hex, timestamp(), dump_policy(body.policy)

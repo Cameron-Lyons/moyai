@@ -5,7 +5,7 @@ import { Input } from "@/components/ui/input"
 import { Textarea } from "@/components/ui/textarea"
 import { Checkbox } from "@/components/ui/checkbox"
 import { Choice, Empty, Toolbar, contains, dateTime } from "./settings"
-import { defaultsBody, policyBody, policyDraft, policySummary, type PolicyDraft, type ScopeMode } from "./governance-data"
+import { defaultsBody, policyBody, policyDraft, policySummary, repositoryLabel, type PolicyDraft, type ScopeMode } from "./governance-data"
 import { DialogActions, GovConfirm, GovDialog, LoadGate, MutationError, PageActions, Section, StatusBadge, dataOf, useGovMutation, useGovResource } from "./governance-shared"
 import {
   createSecurityProfile, disableSecurityProfile, listSecurityProfiles, updateSecurityProfile, updateSecurityProfileDefaults,
@@ -20,9 +20,13 @@ export function ProfileRows({ profiles, defaults, catalog, onEdit, onDisable, on
   profiles: SecurityProfile[]; defaults: ProfileDefaults; catalog: Catalog
   onEdit: (profile: SecurityProfile) => void; onDisable: (profile: SecurityProfile) => void; onEnable: (profile: SecurityProfile) => void
 }) {
-  const appLabel = (id: string) => catalog.connected_apps.find(app => app.id === id)?.label || id
+  const labels = {
+    app: (id: string) => catalog.connected_apps.find(app => app.id === id)?.label || id,
+    repository: (id: number) => repositoryLabel(catalog.repositories, id),
+    model: (id: string) => catalog.models.find(model => model.id === id)?.label || id,
+  }
   return <div className="ns-records">{profiles.map(profile => {
-    const summary = policySummary(profile.policy, appLabel)
+    const summary = policySummary(profile.policy, labels)
     const isDefault = defaults.default_profile_id === profile.id, mandatory = defaults.mandatory_profile_id === profile.id
     return <article className="ns-record" key={profile.id}><div className="ns-record-copy">
       <div className="ns-record-title"><h3>{profile.name}</h3>
@@ -31,6 +35,7 @@ export function ProfileRows({ profiles, defaults, catalog, onEdit, onDisable, on
       <dl className="ns-gov-summary">
         <div><dt>Connected apps</dt><dd>{summary.apps}</dd></div><div><dt>Tools</dt><dd>{summary.tools}</dd></div>
         <div><dt>Git access</dt><dd>{summary.git}</dd></div><div><dt>Network</dt><dd>{summary.network}</dd></div>
+        <div><dt>Repositories</dt><dd>{summary.repositories}</dd></div><div><dt>Models</dt><dd>{summary.models}</dd></div>
       </dl>
       <small>Revision {profile.revision} · Updated {dateTime(profile.updated_at)}{profile.updated_by ? ` by ${profile.updated_by}` : ""}</small>
       {profile.enabled && (isDefault || mandatory) && <small>Change the organization defaults before disabling this policy.</small>}
@@ -48,7 +53,8 @@ export function SecurityPoliciesPage() {
   const [editor, setEditor] = useState<SecurityProfile | "new" | null>(null), [disable, setDisable] = useState<SecurityProfile | null>(null)
   const toggle = useGovMutation()
   return <LoadGate resource={resource} label="security policies">{data => {
-    const rows = data.profiles.filter(profile => contains(search, profile.name, ...(profile.policy.network_domains ?? []), ...(profile.policy.tools ?? []))
+    const rows = data.profiles.filter(profile => contains(search, profile.name, ...(profile.policy.network_domains ?? []), ...(profile.policy.tools ?? []),
+      ...(profile.policy.repositories ?? []).map(id => repositoryLabel(data.catalog.repositories, id)), ...(profile.policy.models ?? []))
       && (status === "all" || (status === "enabled") === profile.enabled))
     return <>
       <div className="ns-gov-intro"><p className="ns-notice">Each setting allows everything, allows only what you list, or allows nothing. A session uses the policy chosen when it starts; the mandatory policy then applies on top, and the stricter setting wins.</p>
@@ -108,20 +114,47 @@ function ScopeChoice({ id, label, value, onChange, disabled, all, selected, none
     options={[{ value: "all", label: all }, { value: "selected", label: selected }, { value: "none", label: none }]} />
 }
 
+const SAVED_ONLY = "Saved, not in the current catalog"
+type PickItem<T> = { id: T; label: string; group: string }
+/** A filterable, grouped checkbox list; each item shows its ID under its label. */
+function PickList<T extends string | number>({ id, noun, items, selected, disabled, onPick }: {
+  id: string; noun: string; items: readonly PickItem<T>[]; selected: readonly T[]; disabled: boolean; onPick: (value: T, checked: boolean) => void
+}) {
+  const [filter, setFilter] = useState("")
+  const visible = items.filter(item => contains(filter, String(item.id), item.label, item.group))
+  const groups = [...new Set(visible.map(item => item.group || "Other"))]
+  return <>
+    <div className="ns-field"><label htmlFor={`${id}-filter`}>Filter {noun}</label><Input id={`${id}-filter`} type="search" value={filter} onChange={event => setFilter(event.target.value)} /></div>
+    <div className="ns-gov-tool-list" role="group" aria-label={`Allowed ${noun}, ${selected.length} selected`} tabIndex={0}>
+      {groups.map(group => <fieldset key={group}><legend>{group}</legend>{visible.filter(item => (item.group || "Other") === group).map(item => <div className="ns-gov-check" key={item.id}>
+        <Checkbox id={`${id}-${item.id}`} checked={selected.includes(item.id)} disabled={disabled} aria-describedby={`${id}-${item.id}-name`} onCheckedChange={checked => onPick(item.id, checked === true)} />
+        <div><label htmlFor={`${id}-${item.id}`}>{item.label}</label><small id={`${id}-${item.id}-name`}><code>{item.id}</code></small></div></div>)}</fieldset>)}
+      {!visible.length && <p className="ns-muted">No {noun} match this filter.</p>}
+    </div>
+    <p className="ns-field-hint">{selected.length} selected.</p>
+  </>
+}
+/** Catalog entries, then saved entries the catalog no longer offers. */
+function withSaved<T extends string | number>(catalog: readonly PickItem<T>[], saved: readonly T[], label: (id: T) => string): PickItem<T>[] {
+  const known = new Set(catalog.map(item => item.id))
+  return [...catalog, ...saved.filter(value => !known.has(value)).map(value => ({ id: value, label: label(value), group: SAVED_ONLY }))]
+}
+
 export function PolicyEditor({ profile, catalog, defaults, onClose, onSaved }: {
   profile?: SecurityProfile; catalog: Catalog; defaults: ProfileDefaults; onClose: () => void; onSaved: () => void
 }) {
   const mutation = useGovMutation(), id = useId()
   const [draft, setDraft] = useState<PolicyDraft>(() => policyDraft(profile))
-  const [toolFilter, setToolFilter] = useState("")
   const change = (patch: Partial<PolicyDraft>) => setDraft(previous => ({ ...previous, ...patch }))
   const pickApp = (app: ConnectedApp, checked: boolean) => setDraft(previous => ({ ...previous, app_ids: toggled(previous.app_ids, app, checked) }))
   const pickTool = (tool: string, checked: boolean) => setDraft(previous => ({ ...previous, tool_ids: toggled(previous.tool_ids, tool, checked) }))
+  const pickRepository = (repository: number, checked: boolean) => setDraft(previous => ({ ...previous, repository_ids: toggled(previous.repository_ids, repository, checked) }))
+  const pickModel = (model: string, checked: boolean) => setDraft(previous => ({ ...previous, model_ids: toggled(previous.model_ids, model, checked) }))
   const inUse = Boolean(profile && (defaults.default_profile_id === profile.id || defaults.mandatory_profile_id === profile.id))
-  const known = new Set(catalog.tools.map(tool => tool.id))
-  const tools = [...catalog.tools, ...draft.tool_ids.filter(tool => !known.has(tool)).map(tool => ({ id: tool, label: tool, group: "Saved, not in the current catalog" }))]
-  const visibleTools = tools.filter(tool => contains(toolFilter, tool.id, tool.label, tool.group))
-  const toolGroups = [...new Set(visibleTools.map(tool => tool.group || "Other"))]
+  const tools = withSaved(catalog.tools, draft.tool_ids, tool => tool)
+  // Saved entries remain listed so editing never silently drops them.
+  const repositories = withSaved(catalog.repositories.map(repository => ({ ...repository, group: "GitHub repositories" })), draft.repository_ids, repository => repositoryLabel(catalog.repositories, repository))
+  const models = withSaved(catalog.models.map(model => ({ ...model, group: "Workspace models" })), draft.model_ids, model => model)
   return <GovDialog wide title={profile ? `Edit ${profile.name}` : "New security policy"} busy={mutation.busy} onClose={onClose}
     description="Saving creates a new revision. Sessions that already started keep the revision they started with.">
     <form className="ns-fields" onSubmit={event => { event.preventDefault(); void mutation.run(async () => {
@@ -145,16 +178,7 @@ export function PolicyEditor({ profile, catalog, defaults, onClose, onSaved }: {
         <div className="ns-field"><label htmlFor={`${id}-tools`}>Which tools can the agent call?</label>
           <ScopeChoice id={`${id}-tools`} label="Agent tools" value={draft.tools} disabled={mutation.busy} onChange={tools => change({ tools })} all="All tools" selected="Only selected tools" none="No tools" />
           <p className="ns-field-hint">{draft.tools === "all" ? "Every tool the person’s role allows stays available." : draft.tools === "none" ? "No tools are offered to the agent, including commands, file edits and app actions. It can only reply in chat." : "Only the checked tools are offered to the agent. Role permissions still apply."}</p></div>
-        {draft.tools === "selected" && <>
-          <div className="ns-field"><label htmlFor={`${id}-tool-filter`}>Filter tools</label><Input id={`${id}-tool-filter`} type="search" value={toolFilter} onChange={event => setToolFilter(event.target.value)} /></div>
-          <div className="ns-gov-tool-list" role="group" aria-label={`Allowed tools, ${draft.tool_ids.length} selected`} tabIndex={0}>
-            {toolGroups.map(group => <fieldset key={group}><legend>{group}</legend>{visibleTools.filter(tool => (tool.group || "Other") === group).map(tool => <div className="ns-gov-check" key={tool.id}>
-              <Checkbox id={`${id}-tool-${tool.id}`} checked={draft.tool_ids.includes(tool.id)} disabled={mutation.busy} aria-describedby={`${id}-tool-${tool.id}-name`} onCheckedChange={checked => pickTool(tool.id, checked === true)} />
-              <div><label htmlFor={`${id}-tool-${tool.id}`}>{tool.label}</label><small id={`${id}-tool-${tool.id}-name`}><code>{tool.id}</code></small></div></div>)}</fieldset>)}
-            {!visibleTools.length && <p className="ns-muted">No tools match this filter.</p>}
-          </div>
-          <p className="ns-field-hint">{draft.tool_ids.length} selected.</p>
-        </>}
+        {draft.tools === "selected" && <PickList id={`${id}-tool`} noun="tools" items={tools} selected={draft.tool_ids} disabled={mutation.busy} onPick={pickTool} />}
       </fieldset>
 
       <fieldset className="ns-gov-policy-block"><legend>Git access</legend>
@@ -162,6 +186,20 @@ export function PolicyEditor({ profile, catalog, defaults, onClose, onSaved }: {
           <Choice id={`${id}-git`} label="Git access" value={draft.git_access} disabled={mutation.busy} onChange={git_access => change({ git_access: git_access as GitAccess })}
             options={[{ value: "write", label: "Read and write" }, { value: "read", label: "Read only" }, { value: "none", label: "No Git access" }]} />
           <p className="ns-field-hint">{draft.git_access === "write" ? "Sessions can open and update pull requests when the person is allowed to." : draft.git_access === "read" ? "Sessions can read repositories but cannot push, publish or open pull requests." : "GitHub tools are removed from sessions."}</p></div>
+      </fieldset>
+
+      <fieldset className="ns-gov-policy-block"><legend>Repositories</legend>
+        <div className="ns-field"><label htmlFor={`${id}-repositories`}>Which GitHub repositories can sessions use?</label>
+          <ScopeChoice id={`${id}-repositories`} label="Repositories" value={draft.repositories} disabled={mutation.busy} onChange={repositories => change({ repositories })} all="All repositories" selected="Only selected repositories" none="No repositories" />
+          <p className="ns-field-hint">{draft.repositories === "all" ? "Sessions can use any repository the GitHub connection and Git access allow." : draft.repositories === "none" ? "Sessions cannot use any GitHub repository, including public ones." : "Sessions can use only the checked repositories. Every other repository is refused, including public ones and environments built from them."}</p></div>
+        {draft.repositories === "selected" && <PickList id={`${id}-repository`} noun="repositories" items={repositories} selected={draft.repository_ids} disabled={mutation.busy} onPick={pickRepository} />}
+      </fieldset>
+
+      <fieldset className="ns-gov-policy-block"><legend>Models</legend>
+        <div className="ns-field"><label htmlFor={`${id}-models`}>Which models can sessions use?</label>
+          <ScopeChoice id={`${id}-models`} label="Models" value={draft.models} disabled={mutation.busy} onChange={models => change({ models })} all="All models" selected="Only selected models" none="No models" />
+          <p className="ns-field-hint">{draft.models === "all" ? "Sessions can use every model enabled for this workspace." : draft.models === "none" ? "No model is allowed, so sessions under this policy cannot start or continue." : "Sessions and workflows can use only the checked models. New sessions start on the first allowed model when the default is not checked."}</p></div>
+        {draft.models === "selected" && <PickList id={`${id}-model`} noun="models" items={models} selected={draft.model_ids} disabled={mutation.busy} onPick={pickModel} />}
       </fieldset>
 
       <fieldset className="ns-gov-policy-block"><legend>Network access</legend>
