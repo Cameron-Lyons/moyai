@@ -213,9 +213,10 @@ curl --fail -G "https://moyai.example.com/api/admin/governance/audit/export" \
   --data-urlencode "before=2026-10-26T09:59:00Z"
 ```
 
-- Set `after` to the previous call's `before` minus 5 minutes and `before` to
-  about one minute ago. A window may span at most 100 days and an export at most
-  50,000 rows, newest first.
+- Set `after` to the previous window's original `before` (the one first
+  requested for that window, not a `next_before` used to finish it after a
+  truncation) minus 5 minutes, and `before` to about one minute ago. A window
+  may span at most 100 days and an export at most 50,000 rows, newest first.
 - Each NDJSON line is one entry with `id`, `source`, `action`, `actor`,
   `resource_type`, `resource_id`, `details` and `created_at`.
 - When a window holds more than 50,000 rows, the export stops at the cap and its
@@ -223,10 +224,10 @@ curl --fail -G "https://moyai.example.com/api/admin/governance/audit/export" \
   `export`, action `export.truncated`, and `details` with `rows` (the rows sent)
   and `next_before`. Do not store it. Request the same `after` again with
   `before` set to `next_before`, and repeat until an export ends without the
-  record; only then move `after` forward. Because `before` is exclusive,
-  `next_before` is one microsecond after the last instant the export reached:
-  rows sharing that instant are sent again rather than skipped, and
-  deduplication drops them.
+  record; only then move to the next window, from the window's original
+  `before`. Because `before` is exclusive, `next_before` is one microsecond
+  after the last instant the export reached: rows sharing that instant are sent
+  again rather than skipped, and deduplication drops them.
 - A 401 means the key is invalid, revoked or expired, or its account is disabled;
   a 403 means the account lacks the permission or the route does not accept keys;
   a 429 asks the collector to wait a minute. A download that ends early means the
@@ -284,9 +285,12 @@ review reports `repository_not_allowed_by_security_policy` or
 `model_not_allowed_by_security_policy` when that profile no longer allows the
 saved repository, a GitHub trigger repository, or the model; a save the
 policy refuses keeps the editor open with the reason. A workflow that runs in
-an existing chat submits its model under that chat's policy, so the review also
-reports `model_not_allowed_by_security_policy`, and a save is refused, when the
-chat does not allow the workflow's model. Someone without
+an existing chat submits its model under that chat's policy, and its event
+admission checks its GitHub trigger repositories against that policy, so the
+review also reports `model_not_allowed_by_security_policy` or
+`repository_not_allowed_by_security_policy`, and a save is refused, when the
+chat does not allow the workflow's model or a GitHub trigger repository (such a
+run never uses the workflow's saved repository). Someone without
 `security.manage` editing a workflow that keeps another profile sees every
 choice; saving still checks it.
 
@@ -311,13 +315,14 @@ transaction. A workflow created or updated by an agent cannot exceed the
 creating session's effective policy. Both scheduled and event-triggered
 admissions bind that workflow's profile before admitting work. An
 event-triggered admission first checks the delivered GitHub repository, the
-GitHub trigger repositories and the saved repository against the policy the run
-will bind (the workflow's profile with the current mandatory policy and, for a
-run in an existing chat, that chat's policy), so a limit narrowed after the
-workflow was enabled refuses the run before the event's content reaches a
-prompt (`policy.workflow_denied` with reason `repository_policy`). A run refused
-by that profile, the effective policy or the owner's role is recorded as blocked,
-and the workflow stays blocked until its owner enables it again.
+GitHub trigger repositories and the saved repository against the workflow's
+profile with the current mandatory policy and, for a run in an existing chat,
+the delivered and trigger GitHub repositories against that chat's policy, so a
+limit narrowed after the workflow was enabled refuses the run before the event's
+content reaches a prompt (`policy.workflow_denied` with reason
+`repository_policy`). A run refused by that profile, the effective policy or the
+owner's role is recorded as blocked, and the workflow stays blocked until its
+owner enables it again.
 
 Native tool catalogs omit disallowed operations. Tool execution checks the policy
 again, including every Temporal activity attempt. Managed connection credential

@@ -395,6 +395,15 @@ class ProductGovernance:
         if (definition.repo_url or definition.github_repository_id) and not ProductGovernance.admits_repository(
                 policy, definition.github_repository_id):
             return 'The workflow repository exceeds its security policy.'
+        return ProductGovernance.trigger_repository_denial(policy, definition)
+
+    @staticmethod
+    def trigger_repository_denial(policy, definition):
+        """Why this policy refuses a workflow's GitHub trigger repository, or None.
+
+        A run in an existing chat never uses the workflow's saved repository, so
+        the chat's policy is checked against the trigger repositories alone.
+        """
         if not all(ProductGovernance.admits_repository(policy, trigger.event.repository_id)
                    for trigger in definition.triggers if trigger.event is not None and trigger.event.provider == 'github'):
             return 'A workflow trigger repository exceeds its security policy.'
@@ -679,12 +688,15 @@ class ProductGovernance:
         current = await self.policy(db, session_id)
         return intersect(current, policy) != current
 
-    async def continuation(self, db, session_id, requested='', *, actor_id='', automation_id='', model=None):
+    async def continuation(self, db, session_id, requested='', *, actor_id='', automation_id='', model=None,
+                           definition=None):
         """Admit a run in an existing chat only while the chat is no wider than its workflow.
 
         A chat's binding is immutable, so it cannot adopt the workflow's profile.
-        With model (the workflow's resolved model), also refuse a model the
-        chat's policy does not allow, which would otherwise refuse every run.
+        With model (the workflow's resolved model) and definition, also refuse a
+        model or GitHub trigger repository the chat's policy does not allow,
+        which would otherwise refuse every run (event admission checks the
+        trigger repositories against the chat).
         """
         from app.governance_activity import model_fields
         denial = Denial('policy.continuation_denied', actor_id, session_id, subject=automation_id)
@@ -693,7 +705,13 @@ class ProductGovernance:
                 denial, 'continuation_wider', 'This chat allows more than the workflow security policy. '
                                               'Choose a chat started under that policy, or a new chat for each run.',
                 automation_id=automation_id or None)
-        if model is not None and not self.admits_model(await self.policy(db, session_id), model):
+        chat = await self.policy(db, session_id)
+        if definition is not None and self.trigger_repository_denial(chat, definition):
+            raise await self._refuse(
+                denial, 'repository_policy', "The chat's security policy does not allow a workflow trigger "
+                                             'repository. Choose a chat that allows it, or a new chat for each run.',
+                automation_id=automation_id or None)
+        if model is not None and not self.admits_model(chat, model):
             raise await self._refuse(
                 denial, 'model_policy', "The chat's security policy does not allow the workflow model. "
                                         'Choose a model it allows, or a new chat for each run.',

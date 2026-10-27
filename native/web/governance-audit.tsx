@@ -73,11 +73,12 @@ export function AuditLogPage() {
       <div className="ns-gov-filter-actions"><Button type="submit">Apply filters</Button>{(filtered(draft) || filtered(applied)) && <Button type="button" variant="outline" onClick={clear}>Clear filters</Button>}</div>
       {formError && <p className="ns-error" role="alert">{formError}</p>}
     </form>
-    <div className="ns-gov-export" role="group" aria-label="Export the filtered audit log">
-      <span className="ns-muted">Export {filtered(applied) ? "the filtered" : "the full"} history, up to 50,000 entries:</span>
+    <div className="ns-gov-export" role="group" aria-label="Export the filtered audit log" aria-describedby={`${id}-export-hint`}>
+      <span className="ns-muted">Export {filtered(applied) ? "the filtered" : "the full"} history, newest first:</span>
       <Button variant="outline" size="sm" disabled={exporter.busy} onClick={() => download("csv")}><Download />{exporter.busy && format === "csv" ? "Exporting…" : "Export CSV"}</Button>
       <Button variant="outline" size="sm" disabled={exporter.busy} onClick={() => download("ndjson")}><Download />{exporter.busy && format === "ndjson" ? "Exporting…" : "Export NDJSON"}</Button>
       <PageActions resource={resource} />
+      <p id={`${id}-export-hint`} className="ns-field-hint ns-gov-export-hint">An export stops at 50,000 entries. A capped file ends with an <code>export.truncated</code> row instead of the older entries, and its <code>next_before</code> shows where it stopped: set To (UTC) to that date, or narrow the dates, to export the rest.</p>
     </div>
     <MutationError mutation={exporter} />
     <LoadGate resource={resource} label="the audit log">{data => {

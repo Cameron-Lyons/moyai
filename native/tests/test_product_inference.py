@@ -895,20 +895,33 @@ async def test_guardrail_refusal_is_audited_once_with_its_zero_spend_outcome(inf
 
 async def test_guardrail_refusal_names_an_oidc_enrolled_person_by_email(inference, monkeypatch):
     """Regression: only Google and Access accounts were named by email, so OIDC people appeared as their opaque id."""
-    ctx = inference
-    audit = ctx.service._audit_guardrail
+    from dataclasses import replace
 
-    async def enrolled_by_oidc(db, capture):
-        # Admission already authorized this Google account (OIDC sign-in needs a
-        # configured provider); the audit then reads the row an organization
-        # OpenID Connect enrollment (app.oidc_sso) creates, of kind 'oidc'.
-        await db.execute(text("UPDATE moyai.users SET kind='oidc' WHERE id=:id"),
-                         {"id": ctx.scope.product_grant.user_id})
+    from moyai.product_identity import ProductGrant
+    ctx = inference
+    audit, captured = ctx.service._audit_guardrail, []
+
+    async def capturing(db, capture):
+        captured.append(capture)
         await audit(db, capture)
-    monkeypatch.setattr(ctx.service, "_audit_guardrail", enrolled_by_oidc)
+    monkeypatch.setattr(ctx.service, "_audit_guardrail", capturing)
     assert (await perform(ctx, handler=guardrail_refusal)).status_code == 400
-    event, = await guardrail_events(ctx)
-    assert (event["action"], event["actor"]) == ("ai_guardrail.violation", "admin@example.test")
+    capture, = captured
+    # The row an organization OpenID Connect enrollment (app.oidc_sso) creates.
+    # Signing in through OIDC needs a configured provider, so the person is
+    # seeded and the same refusal is audited under their grant.
+    person = "oidc:" + hashlib.sha256(b"https://issuer.example.test\0synthetic-subject").hexdigest()
+    activity = capture.activity
+    capture.activity = replace(activity, logical_identity=f"{activity.logical_identity}:oidc", scope=replace(
+        activity.scope, product_grant=ProductGrant(person, ctx.scope.product_grant.authority_version)))
+    async with ctx.product.database.sessions.begin() as db:
+        await db.execute(text(
+            "INSERT INTO moyai.users(id,kind,email,name,created_at,updated_at) "
+            "VALUES (:id,'oidc','oidc.person@example.test','Synthetic OIDC person','c','u')"
+        ), {"id": person})
+        await audit(db, capture)
+    assert [(event["action"], event["actor"]) for event in await guardrail_events(ctx)] == [
+        ("ai_guardrail.violation", "admin@example.test"), ("ai_guardrail.violation", "oidc.person@example.test")]
 
 
 async def test_ordinary_gateway_error_is_not_audited_or_relayed_as_a_guardrail(inference):

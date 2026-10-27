@@ -364,7 +364,8 @@ class ProductAutomationService:
                         # A probe: blockers are reported, not recorded as refusals.
                         wider = await governance.continuation_wider(
                             db, definition.session_id, definition.security_profile_id, policy=policy)
-                        # Each run submits the workflow's model under the chat's own policy.
+                        # Each run submits the workflow's model under the chat's own policy,
+                        # and event admission checks its GitHub trigger repositories against it.
                         chat = await governance.policy(db, definition.session_id)
                     except HTTPException:
                         wider = True
@@ -422,11 +423,18 @@ class ProductAutomationService:
             result.append("model_not_enabled")
         if policy is not None:  # governance.workflow() refuses an unavailable profile.
             result.extend(self._policy_blockers(governance, policy, definition, model))
-        if (
-            governance is not None and chat is not None and model is not None
-            and not governance.admits_model(chat, model) and "model_not_allowed_by_security_policy" not in result
-        ):
-            result.append("model_not_allowed_by_security_policy")
+        if governance is not None and chat is not None:
+            # The chat's own limits, with continuation(); a chat run never uses the saved repository.
+            if (
+                governance.trigger_repository_denial(chat, definition)
+                and "repository_not_allowed_by_security_policy" not in result
+            ):
+                result.append("repository_not_allowed_by_security_policy")
+            if (
+                model is not None and not governance.admits_model(chat, model)
+                and "model_not_allowed_by_security_policy" not in result
+            ):
+                result.append("model_not_allowed_by_security_policy")
         if await self._old_active(db, row["id"]):
             result.append("legacy_occurrences_must_finish")
         for trigger in definition.triggers:
@@ -1078,7 +1086,8 @@ class ProductAutomationService:
                     await self.database.automation_session(db, principal.id, definition.session_id)
                     if governance is not None:
                         await governance.continuation(db, definition.session_id, definition.security_profile_id,
-                                                      actor_id=principal.id, automation_id=identity, model=model)
+                                                      actor_id=principal.id, automation_id=identity, model=model,
+                                                      definition=definition)
                 revision = row["revision"] + (action != "create")
                 if action != "create":
                     await db.execute(text(

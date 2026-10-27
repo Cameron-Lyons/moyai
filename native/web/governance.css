@@ -82,6 +82,7 @@
 .native-settings .ns-gov-filter-actions { grid-column: 1 / -1; display: flex; flex-wrap: wrap; gap: 8px; }
 .native-settings .ns-gov-export { display: flex; align-items: center; flex-wrap: wrap; gap: 8px 12px; margin-block: 16px; }
 .native-settings .ns-gov-export > .ns-gov-page-actions { margin-inline-start: auto; }
+.native-settings .ns-gov-export > .ns-gov-export-hint { flex-basis: 100%; margin: 0; overflow-wrap: anywhere; }
 .native-settings .ns-gov .ns-table :is(th, td) { overflow-wrap: break-word; }
 .native-settings .ns-gov .ns-table th { white-space: nowrap; }
 .native-settings .ns-gov .ns-table td :is(small, code) { overflow-wrap: anywhere; }

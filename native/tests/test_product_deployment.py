@@ -94,6 +94,9 @@ def test_required_guardrails_reach_native_settings_and_the_shared_role_contract(
     unset = configured(environment)
     # Roles that disagree on the required guardrails are not admitted together.
     assert candidate_role_fingerprint(unset) != candidate_role_fingerprint(required)
+    # A guardrail named 'off' is a requirement too, not an inert default.
+    environment["MOYAI_REQUIRED_GUARDRAILS"] = "off"
+    assert candidate_role_fingerprint(configured(environment)) != candidate_role_fingerprint(unset)
     # Left empty, the setting keeps the contract of releases that predate it.
     source = unset.legacy_settings()
     assert runtime_settings(source) == {name: getattr(source, name) for name in RUNTIME_SETTINGS}

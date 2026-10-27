@@ -1278,24 +1278,27 @@ async def test_scheduled_governance_refusal_blocks_the_workflow_instead_of_retry
     assert details == [GOVERNANCE_BLOCKED] * 2
 
 
-@pytest.mark.parametrize('narrowed', ['mandatory', 'chat'])
+GITHUB_TRIGGER = {'id': 'comment', 'event': {'provider': 'github', 'event': 'issue_comment', 'repository_id': 111}}
+
+
+@pytest.mark.parametrize('narrowed', ['mandatory', 'chat', 'chat_saved_before_its_check'])
 async def test_event_admission_rechecks_github_repositories_before_the_prompt(events, narrowed):
     """Regression: after a repository limit narrowed, a GitHub event's issue and comment still reached a new run."""
     from test_product_activity_audit import activity, audited
 
     from moyai.models import Turn
     from moyai.product_automation_models import ProductAutomationBinding as Binding
-    from moyai.product_automations import GOVERNANCE_BLOCKED, Migration
+    from moyai.product_automations import GOVERNANCE_BLOCKED, Migration, _definition, definition_digest
     ctx = events
     product = ctx.product
     audited(product)
     chat = None
-    if narrowed == 'chat':  # A run in an existing chat is bound by that chat, which may be narrower.
+    if narrowed == 'chat':  # A run in an existing chat, whose policy the mandatory limit narrows as well.
         chat = (await product.database.create_session(product.actor, NewSession(
-            visibility='shared', security_profile_id=await profile(product, {'repositories': []})))).id
+            visibility='shared', security_profile_id=await profile(product, {'repositories': [111]})))).id
     row = await automation_fixtures.create(
         ctx, security_profile_id=await profile(product, {'repositories': [111]}), session_id=chat,
-        triggers=[{'id': 'comment', 'event': {'provider': 'github', 'event': 'issue_comment', 'repository_id': 111}}])
+        triggers=[GITHUB_TRIGGER])
     secret = 'synthetic-github-signing-secret'
     async with product.source.begin() as db:
         await db.execute(text("INSERT INTO moyai.automation_webhooks VALUES (:id,'github',:encrypted)"),
@@ -1303,8 +1306,18 @@ async def test_event_admission_rechecks_github_repositories_before_the_prompt(ev
     await ctx.service.mutate(ctx.grant, 'migrate', row['id'], Migration(
         revision=row['revision'], request_key='migrate-' + uuid4().hex, activate=True))
     await ctx.service.reconcile(row['id'])
-    if narrowed == 'mandatory':
+    if narrowed in {'mandatory', 'chat'}:
         await defaults(product, mandatory=await profile(product, {'repositories': [222]}))
+    else:  # An enabled workflow saved into a chat that excludes its trigger repository, which save now refuses.
+        chat = (await product.database.create_session(product.actor, NewSession(
+            visibility='shared', security_profile_id=await profile(product, {'repositories': []})))).id
+        async with product.source.begin() as db:
+            saved = await db.scalar(text('SELECT definition FROM moyai.automations WHERE id=:id'), {'id': row['id']})
+            saved = json.dumps({**json.loads(saved), 'session_id': chat})
+            await db.execute(text('UPDATE moyai.automations SET definition=:definition WHERE id=:id'),
+                             {'id': row['id'], 'definition': saved})
+        async with product.database.sessions.begin() as db:
+            (await db.get(Binding, row['id'])).definition_digest = definition_digest(_definition({'definition': saved}))
     delivery = {'action': 'created', 'repository': {'id': 111, 'full_name': 'acme/excluded'}, 'sender': {'type': 'User'},
                 'issue': {'number': 7, 'title': 'Excluded issue'}, 'comment': {'body': 'Excluded comment'}}
     signature = 'sha256=' + hmac.new(secret.encode(), json.dumps(delivery).encode(), hashlib.sha256).hexdigest()
@@ -1361,6 +1374,60 @@ async def test_scheduled_chat_workflow_model_is_checked_against_the_chat_policy(
     allowed = (await product.database.create_session(product.actor, NewSession(
         visibility='shared', security_profile_id=await profile(product, {'models': ['other', 'test']})))).id
     await automation_fixtures.create(ctx, session_id=allowed)
+
+
+async def test_scheduled_chat_workflow_trigger_repositories_are_checked_against_the_chat_policy(events):
+    """Regression: a chat excluding a GitHub trigger repository passed review and save, then blocked every event."""
+    from test_product_activity_audit import activity, audited
+
+    from moyai.product_automations import Migration
+    ctx = events
+    product = ctx.product
+    audited(product)
+    workflow = await profile(product, {'repositories': [111]})
+    chat = (await product.database.create_session(product.actor, NewSession(
+        visibility='shared', security_profile_id=await profile(product, {'repositories': []})))).id
+    with pytest.raises(HTTPException) as refused:
+        await automation_fixtures.create(ctx, security_profile_id=workflow, session_id=chat, triggers=[GITHUB_TRIGGER])
+    assert refused.value.status_code == 403 and 'does not allow a workflow trigger repository' in refused.value.detail
+    [denied] = await activity(product, 'policy.continuation_denied')
+    assert (denied['resource_id'], denied['details']['reason']) == (chat, 'repository_policy')
+    # A workflow saved before that check is reported by the readiness review and cannot be enabled.
+    row = await automation_fixtures.create(ctx, security_profile_id=workflow, triggers=[GITHUB_TRIGGER])
+    async with product.source.begin() as db:
+        saved = json.loads(await db.scalar(text('SELECT definition FROM moyai.automations WHERE id=:id'), {'id': row['id']}))
+        await db.execute(text('UPDATE moyai.automations SET definition=:definition WHERE id=:id'),
+                         {'id': row['id'], 'definition': json.dumps({**saved, 'session_id': chat})})
+    blockers = (await ctx.service.preview(ctx.grant, row['id']))['blockers']
+    assert 'repository_not_allowed_by_security_policy' in blockers
+    assert 'scheduled_chat_exceeds_security_policy' not in blockers
+    with pytest.raises(HTTPException) as blocked:
+        await ctx.service.mutate(ctx.grant, 'migrate', row['id'], Migration(
+            revision=row['revision'], request_key='migrate-' + uuid4().hex, activate=True))
+    assert blocked.value.status_code == 409
+    assert 'repository_not_allowed_by_security_policy' in blocked.value.detail['blockers']
+    # A chat that allows the trigger repository serves the workflow.
+    allowed = (await product.database.create_session(product.actor, NewSession(
+        visibility='shared', security_profile_id=await profile(product, {'repositories': [111]})))).id
+    await automation_fixtures.create(ctx, security_profile_id=workflow, session_id=allowed, triggers=[GITHUB_TRIGGER])
+
+
+async def test_chat_event_admission_ignores_the_saved_repository_a_chat_run_never_uses(events):
+    """Regression: a stale saved repository the chat excludes blocked every event although review passed."""
+    from test_product_activity_audit import activity, audited
+    ctx = events
+    product = ctx.product
+    audited(product)
+    chat = (await product.database.create_session(product.actor, NewSession(
+        visibility='shared', security_profile_id=await profile(product, {'repositories': [222]})))).id
+    row = await event_fixtures.event_automation(
+        ctx, session_id=chat, repo_url='https://github.com/acme/hidden', github_repository_id=111)
+    assert (await ctx.service.preview(ctx.grant, row['id']))['blockers'] == []
+    assert (await event_fixtures.deliver(ctx, row))['status'] == 'accepted'
+    [inbox] = await event_fixtures.pending(ctx)
+    admitted = await ctx.events.admit(inbox['occurrence'])
+    assert (admitted['status'], admitted['session_id']) == ('admitted', chat)
+    assert await activity(product, 'policy.workflow_denied') == []
 
 
 @pytest_asyncio.fixture

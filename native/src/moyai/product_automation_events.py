@@ -683,21 +683,25 @@ class ProductAutomationEvents:
     ) -> bool:
         """Whether a policy this run binds now refuses its repositories; records the refusal.
 
-        Saving and enabling check the GitHub trigger and saved repositories. A
-        profile, mandatory or chat policy narrowed since then refuses the run
-        here, before the delivered event's content reaches a prompt. A run in
-        an existing chat is bound by that chat's policy as well.
+        Saving and enabling check the GitHub trigger and saved repositories
+        against the workflow profile, and the trigger repositories against the
+        chat a run continues. A profile, mandatory or chat policy narrowed since
+        then refuses the run here, before the delivered event's content reaches
+        a prompt. A run in an existing chat never uses the saved repository, so
+        the chat's policy is checked against the GitHub repositories only.
         """
         from .product_governance import Denial
         try:
-            policies = [await governance.profile_policy(db, definition.security_profile_id)]
+            policies = [(await governance.profile_policy(db, definition.security_profile_id),
+                         governance.workflow_repository_denial)]
             if definition.session_id:
-                policies.append(await governance.policy(db, definition.session_id))
+                policies.append((await governance.policy(db, definition.session_id),
+                                 governance.trigger_repository_denial))
         except HTTPException:
             return False  # Admission refuses an unavailable profile itself.
         github = context.get("provider") == "github"
-        for policy in policies:
-            message = governance.workflow_repository_denial(policy, definition) or (
+        for policy, denial in policies:
+            message = denial(policy, definition) or (
                 "A workflow trigger repository exceeds its security policy."
                 if github and not governance.admits_repository(policy, context.get("repository_id")) else None)
             if message:
