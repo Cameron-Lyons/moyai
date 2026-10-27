@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Any, cast
 from agentchat.models import UploadFile
 
 from .debug_trace import debug_trace
+from .failure_diagnostics import guardrail_refused
 from .models import Turn, User
 
 if TYPE_CHECKING:
@@ -16,7 +17,7 @@ if TYPE_CHECKING:
 @dataclass(frozen=True)
 class FailureReport:
     text: str
-    debug_log: UploadFile
+    debug_log: UploadFile | None
 
     @classmethod
     async def for_turn(cls, runtime: Runtime, turn: Turn) -> FailureReport:
@@ -24,6 +25,13 @@ class FailureReport:
             f"This task stopped before it completed: {turn.error}"
             if turn.error else "This task stopped before it completed."
         )
+        try:
+            refused = await guardrail_refused(runtime.database, turn)
+        except Exception:  # noqa: BLE001  # [BLE001] An unreadable failure record fails closed.
+            refused = True
+        if refused:
+            # The trace would repost the refused prompt and tool output to Slack.
+            return cls(text=text, debug_log=None)
         try:
             async with runtime.database.sessions() as db:
                 actor = await db.get(User, turn.actor_id)

@@ -223,7 +223,7 @@ async def stage_deliveries(runtime: Runtime) -> None:
                     destination=destination,
                     content=runtime.security.seal(content),
                 ))
-                if failure_report is not None:
+                if failure_report is not None and failure_report.debug_log is not None:
                     db.add(Delivery(
                         id=new_id(), identity=f"slack-answer:{turn.id}:debug",
                         session_id=turn.session_id, turn_id=turn.id,

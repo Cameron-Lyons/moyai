@@ -13,6 +13,7 @@ from pydantic_ai.usage import RunUsage
 from moyai.context.session import SessionContext
 from moyai.context.slack import SlackThread, make_slack_thread_reader
 from moyai.contracts import RunScope
+from moyai.inference_guardrails import MESSAGES
 
 bridge = slack_tests.bridge
 slack = slack_tests.slack
@@ -217,6 +218,30 @@ async def test_triggering_message_is_not_duplicated(ingress, monkeypatch):
     rendered = await render_source(ingress, turn.id)
 
     assert "do we support this?" not in rendered
+    assert DEEPSEEK_URL in rendered
+
+
+async def test_guardrail_refused_messages_are_not_reread_by_later_turns(ingress, monkeypatch):
+    refused = {**mention_message(), "text": "<@UBOT00001> flagged-private-input"}
+    later = {**mention_message(), "ts": "1792255900.001", "text": "<@UBOT00001> and now?"}
+
+    async def request(method, url, **kwargs):
+        if url == ACK_URL:
+            return {"ok": True}
+        return {"ok": True, "messages": [root_message(), refused, later], "has_more": False}
+
+    monkeypatch.setattr(ingress.service.connectors, "request", request)
+    await ingress.service.receive_payload(envelope(refused))
+    first = await ingress.runtime.database.claim_next()
+    assert first is not None
+    await ingress.runtime.database.fail(first.id, MESSAGES["blocked"])
+    await ingress.service.receive_payload(envelope(later))
+    turn = await ingress.runtime.database.claim_next()
+    assert turn is not None and turn.id != first.id
+    rendered = await render_source(ingress, turn.id)
+
+    # Rereading the refused message would only be refused again, for this requester.
+    assert "flagged-private-input" not in rendered and "and now?" not in rendered
     assert DEEPSEEK_URL in rendered
 
 

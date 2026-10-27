@@ -21,6 +21,7 @@ async def test_failure_report_falls_back_when_trace_export_fails(runtime, active
     report = await FailureReport.for_turn(runtime, turn)
 
     assert report.text == f"This task stopped before it completed: {error}"
+    assert report.debug_log is not None
     assert report.debug_log.filename == f"moyai-debug-{turn.id}.json"
     assert report.debug_log.title == "Moyai debug log"
     assert json.loads(report.debug_log.content) == {
@@ -29,3 +30,21 @@ async def test_failure_report_falls_back_when_trace_export_fails(runtime, active
         "error": error,
         "trace_export_error": "trace store unavailable",
     }
+
+
+async def test_failure_report_omits_the_trace_when_the_failure_record_is_unreadable(runtime, active, monkeypatch):
+    _, turn, _ = active
+    turn.status, turn.error = "failed", "Your organization's AI guardrail blocked this request."
+
+    async def unreadable(*_args):
+        raise ValueError("sealed failure record cannot be read")
+
+    async def export(*_args):
+        raise AssertionError("A possibly refused turn's trace must not be exported.")
+
+    monkeypatch.setattr("moyai.failure_report.guardrail_refused", unreadable)
+    monkeypatch.setattr("moyai.failure_report.debug_trace", export)
+    report = await FailureReport.for_turn(runtime, turn)
+    # Fail closed: the notice is still posted, without the trace.
+    assert report.text == f"This task stopped before it completed: {turn.error}"
+    assert report.debug_log is None

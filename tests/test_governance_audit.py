@@ -27,6 +27,7 @@ from app.governance_audit import (
     RESOURCE_TYPES,
     AuditFilters,
     GovernanceAudit,
+    event_values,
     parse_filters,
     record_event_in,
 )
@@ -583,6 +584,19 @@ def test_recorded_actions_name_their_resource_type(store, audit):
         older = record_event_in(conn, 'role.updated', 'owner@example.com', 'CustomRole', 'auditor')
     assert pages(audit, parse_filters(resource_type='security_profile')) == [('governance', kept)]
     assert pages(audit, parse_filters(resource_type='CustomRole')) == [('governance', older)]
+
+
+def test_runtime_events_validate_like_governance_changes(store, audit):
+    """Native AI guardrail refusals insert event_values rows from their own transaction."""
+    with pytest.raises(ValueError, match=r'^Name governance actions <resource_type>\.<verb>\.$'):
+        event_values('guardrail.violation', 'owner@example.com', 'ai_guardrail', 'phi-presidio')
+    action, actor, resource_type, resource_id, details = event_values(
+        'ai_guardrail.violation', 'owner@example.com', 'ai_guardrail', 'phi-presidio',
+        {'session_id': 'session', 'model': 'route-alias', 'guardrails': ['phi-presidio']})
+    kept = governance_row(store, BASE, action=action, actor=actor, resource_type=resource_type,
+                          resource_id=resource_id, details=json.loads(details))
+    assert pages(audit, parse_filters(resource_type='ai_guardrail')) == [('governance', kept)]
+    assert 'ai_guardrail' in audit.listing()['facets']['resource_types']
 
 
 def test_exports_release_one_chunk_per_page(store, audit, monkeypatch):

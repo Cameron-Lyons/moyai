@@ -545,7 +545,7 @@ class ProductSlack:
                 )
                 for artifact in artifacts
             )
-            if failure_report is not None:
+            if failure_report is not None and failure_report.debug_log is not None:
                 parts.append(("failed:debug", SlackFileDelivery.content(
                     failure_report.debug_log,
                     after=f"product-slack:{turn.id}:failed:0",

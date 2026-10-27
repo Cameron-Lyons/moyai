@@ -15,16 +15,24 @@ from fastapi import FastAPI
 from pydantic_ai.messages import ModelResponse, TextPart
 from pydantic_ai.models.function import FunctionModel
 from sqlalchemy import select, text, update
+from temporalio.exceptions import ApplicationError
+from temporalio.worker import ExecuteActivityInput
 from test_inference_usage import WireStream, payload
 from test_product_memory_store import memory_execution
 
-from moyai.inference_usage import InferenceActivity, UsageCapture
+from moyai.inference_guardrails import MESSAGES
+from moyai.inference_usage import InferenceActivity, InferenceUsageTransport, UsageCapture
 from moyai.models import Session, Turn
 from moyai.product_drain_models import ProductDrainState
 from moyai.product_inference import InferenceAdmissionError, ProductInferenceRequest
 from moyai.product_inference_routes import broker_request, product_inference_routes
 from moyai.product_memory import ProductMemoryService
-from moyai.product_memory_review import WORKFLOW_PREFIX, ProductMemoryReviewService
+from moyai.product_memory_review import (
+    AGENT_NAME,
+    WORKFLOW_PREFIX,
+    ProductMemoryReviewService,
+    ReviewActivity,
+)
 
 pytestmark = pytest.mark.skipif(not os.getenv("MOYAI_TEST_POSTGRES"), reason="Set a disposable local PostgreSQL URL.")
 product_database = inference_fixtures.product_database
@@ -204,6 +212,81 @@ async def test_remote_review_keeps_reclaimable_slot_through_response_body(mainte
         rows = list(await db.scalars(select(ProductInferenceRequest)))
         assert next(row for row in rows if row.turn_id == ctx.review_turn.id).status == "unknown"
         assert next(row for row in rows if row.turn_id == ctx.turn.id).status == "completed"
+    assert ctx.service.slots.active == 0
+
+
+async def test_review_broker_forwards_only_its_own_guardrail_outcomes(maintenance, monkeypatch):
+    ctx = maintenance
+    responses = {
+        "blocked": inference_fixtures.guardrail_refusal,
+        "ordinary": lambda _request: httpx2.Response(
+            429, stream=WireStream(b'{"error":{"message":"synthetic limit"}}'),
+            headers={"content-type": "application/json", "x-moyai-guardrail": "blocked"},
+        ),
+        "unattested": lambda _request: httpx2.Response(
+            200, stream=WireStream(json.dumps(payload(cost="0.07")).encode()), headers={
+                "content-type": "application/json", "x-litellm-applied-guardrails": "prompt-injection",
+            },
+        ),
+    }
+    outcome = "blocked"
+
+    async def upstream(request):
+        response = responses[outcome](request)
+        return await response if asyncio.iscoroutine(response) else response
+
+    monkeypatch.setattr(ctx.product.database.settings, "required_guardrails", "phi-presidio")
+    await inference_fixtures.install_broker_upstream(ctx, upstream)
+    app = FastAPI()
+    app.include_router(product_inference_routes(ctx.service))
+    async with httpx2.AsyncClient(transport=httpx2.ASGITransport(app=app)) as client:
+        for outcome in responses:
+            signed = signed_review(SimpleNamespace(**{**vars(ctx), "logical_review": f"{ctx.logical_review}-{outcome}"}))
+            response = await client.post(str(signed.url), headers=signed.headers, content=signed.content)
+            if outcome == "blocked":
+                # A complete refusal keeps its status and body.
+                assert response.status_code == 400 and response.content == inference_fixtures.GUARDRAIL_REFUSAL
+            elif outcome == "unattested":
+                # The broker refused the answer itself: a fixed outcome, no body.
+                assert response.status_code == 502 and response.content == b""
+            else:
+                assert response.status_code == 429
+            assert response.headers.get("x-moyai-guardrail") == (None if outcome == "ordinary" else outcome)
+    events = await inference_fixtures.guardrail_events(ctx)
+    assert sorted(event["action"] for event in events) == ["ai_guardrail.unattested", "ai_guardrail.violation"]
+    assert ctx.service.slots.active == 0
+
+
+async def test_refused_review_activity_settles_once_without_gateway_text(maintenance, monkeypatch):
+    ctx = maintenance
+    info = SimpleNamespace(
+        activity_type=f"agent__{AGENT_NAME}__model_request", workflow_namespace=ctx.product.settings.temporal_namespace,
+        workflow_id=WORKFLOW_PREFIX + ctx.review_turn.id, workflow_run_id="run", activity_id="model-0", attempt=1,
+    )
+    monkeypatch.setattr("moyai.product_memory_review.activity.info", lambda: info)
+
+    class Next:
+        async def execute_activity(self, _input):
+            async with httpx2.AsyncClient(transport=InferenceUsageTransport(
+                httpx2.MockTransport(inference_fixtures.guardrail_refusal), require_admission=True,
+            )) as client:
+                response = await client.post(
+                    "https://gateway.invalid/v1/responses",
+                    headers={"authorization": "Bearer synthetic-inference-key"},
+                    json={"model": "test", "input": "private review input"},
+                )
+            response.raise_for_status()
+
+    interceptor = ReviewActivity(Next(), ctx.review)
+    value = ExecuteActivityInput(fn=lambda: None, args=[ctx.review_scope], executor=None, headers={})
+    with pytest.raises(ApplicationError) as denied:
+        await interceptor.execute_activity(value)
+    assert denied.value.non_retryable and denied.value.type == "MoyaiGuardrailBlocked"
+    assert denied.value.message == MESSAGES["blocked"]
+    assert denied.value.__cause__ is None and denied.value.__suppress_context__
+    event, = await inference_fixtures.guardrail_events(ctx)
+    assert event["action"] == "ai_guardrail.violation" and event["resource_id"] == "bedrock-input"
+    assert json.loads(event["details"])["session_id"] == ctx.review_scope.session_id
     assert ctx.service.slots.active == 0
 
 

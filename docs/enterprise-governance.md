@@ -266,16 +266,117 @@ Native Slack intake does not transcribe audio, since gateway transcription is
 neither admitted against these limits nor recorded in the ledger. The original
 file remains available to the agent.
 
+## AI guardrails
+
+Moyai has no prompt classifier of its own. Configure guardrails in the LiteLLM
+gateway: every native model request (web, Slack, workflows, delegated and team
+tasks, and memory review) passes through it, including the tool output the agent
+sends back to the model. Moyai selects no guardrails per request, so make each one
+`default_on` or attach it to Moyai's virtual key or team, and do not set
+`disable_global_guardrails` or `opted_out_global_guardrails` in that key's or
+team's metadata. For PHI, use a self-hosted or BAA-covered backend, such as
+Presidio, AWS Bedrock Guardrails or Azure Prompt Shields; a third-party guardrail
+service receives every screened prompt and tool output.
+
+```yaml
+guardrails:
+  - guardrail_name: phi-presidio
+    litellm_params:
+      guardrail: presidio
+      mode: pre_call
+      default_on: true
+      presidio_analyzer_api_base: https://presidio-analyzer.internal
+      presidio_anonymizer_api_base: https://presidio-anonymizer.internal
+      pii_entities_config:
+        US_SSN: BLOCK
+        MEDICAL_LICENSE: BLOCK
+```
+
+Moyai recognizes a refusal from a `pre_call` or `during_call` guardrail, which
+LiteLLM returns before any model output as an OpenAI error with status 400, 403
+or 422, the statuses LiteLLM itself counts as a guardrail block. The error must
+name its guardrail in one of two ways that LiteLLM 1.106.4 uses:
+
+- `error.provider_specific_fields.guardrail_name`, which LiteLLM adds when a
+  guardrail raises an HTTP error with structured detail, as Bedrock, Lakera v2,
+  Aporia, Azure and the LiteLLM content filter do.
+- LiteLLM's own wrapper in `error.message`, "Guardrail raised an exception,
+  Guardrail: <name>, ..." or Presidio's "... by Guardrail: <name>. ...", with a
+  name that `x-litellm-applied-guardrails` also lists.
+
+Guardrails that raise their own unwrapped message are not recognized: the
+generic guardrail API, whose message is the backend's `blocked_reason` or
+"Content violates policy", Akto and Alice, for example. Other statuses are never
+refusals. A guardrail backend that is unavailable, throttled or answers
+unexpectedly (a 5xx, 408 or 429, such as Bedrock's "throttle retries exhausted"
+or the generic guardrail API's "Generic Guardrail API failed") fails the turn
+with the generic failure and records no event. LiteLLM does not report whether a
+wrapped guardrail exception judged the content, so a guardrail that fails closed
+with that wrapper and status 400 when its backend is unreachable (LLM Shield
+Proxy, for example) still counts as a refusal. Check the gateway logs before
+treating such an event as the requester's violation. The
+`x-litellm-applied-guardrails` header alone is not proof of a refusal, because
+LiteLLM also sends it on ordinary provider errors after guardrails pass. A
+`MASK` action rewrites the request instead of refusing it, and Bedrock's
+`disable_exception_on_block` returns the guardrail's message as a successful
+answer; neither is a refusal to Moyai. A `post_call` guardrail that fails a
+streamed answer mid-stream looks like an ordinary stream error.
+
+A recognized refusal fails the turn with the non-retryable `MoyaiGuardrailBlocked`
+denial, so Temporal never sends the refused input again. The web failure banner
+and the Slack thread show "Your organization's AI guardrail blocked this
+request."; the Slack report omits its debug log, which would repost the refused
+prompt and tool output, and so does a Slack report whose failure record cannot be
+read. The turn's conversation is not saved as the next turn's context, so its
+files are not checkpointed either. The submitted message stays in the
+transcript, but later turns leave it out of the context they rebuild from
+earlier messages when the requester, model or connections change, and out of the
+Slack thread they read, so another participant's turn does not send it again. A
+refused memory review is settled once, without retries.
+
+Each refusal records one `ai_guardrail.violation` audit event, in the same
+transaction as its zero-spend ledger outcome, with the requester as the actor.
+The resource is the refusing guardrail's name, or `gateway` when the name LiteLLM
+reported is not a valid guardrail name. Details hold only the session ID, model,
+guardrail mode, and the names in `x-litellm-applied-guardrails`; never prompts,
+tool output, or the guardrail's response. Retried attempts of one model activity
+share one event. Filter the audit log by the `ai_guardrail` resource type, or
+export it, to list violations. A refusal Moyai does not recognize is still
+blocked by the gateway, but the turn shows the generic failure and records no
+event.
+
+Without gateway guardrails, nothing is screened. To fail closed instead, set
+`MOYAI_REQUIRED_GUARDRAILS` to at most ten comma-separated guardrail names
+(letters, digits, `_`, `.`, `:` and `-`); order and repeats do not matter. Like
+the other shared runtime settings, every role needs the same names: change them
+by restarting the coordinator first, since other roles with different names are
+refused. While it is empty, the setting leaves the role contracts unchanged. Each
+successful answer must then list every name in `x-litellm-applied-guardrails`,
+which LiteLLM sends with the response headers before any streamed content.
+Otherwise the broker (or, without a separate broker, the process that dispatches
+the request) closes the answer before the agent reads any of it, records
+`ai_guardrail.unattested` with the missing names, and fails the turn with the
+non-retryable `MoyaiGuardrailUnattested` denial ("The model gateway did not
+confirm your organization's required AI guardrails, so this request was
+stopped."). The gateway has already processed that request; its cost settles
+like an interrupted stream. LiteLLM 1.106.4 lists a passing guardrail only when
+the guardrail records itself: Presidio, Bedrock, the LiteLLM content filter, the
+generic guardrail API and Lakera v2 do, while Azure Prompt Shields does not. Send
+a test request and check the header before setting this, or every request is
+refused.
+
 ## Audit and API
 
 The audit feed combines metadata-only role, SCIM, policy, spend, credential, and
-connection changes. Filters and signed cursors bound each page. Only the first page
+connection changes with AI guardrail refusals and attestation failures. Filters
+and signed cursors bound each page. Only the first page
 (no cursor) carries the filter facets, as only the provisioning directory's first
 page carries its groups, tokens and activity. CSV/NDJSON exports stream pages of up
 to 1,000 rows and recheck live permission before releasing each page. Tokens,
 credential contents, prompts, and policy domain, tool, repository and model
 payloads are excluded from governance events.
-This records configuration history, not a transcript of every agent action.
+Apart from AI guardrail refusals and attestation failures, this records
+configuration history, not a transcript of every agent action.
 
 | Endpoint | Purpose |
 | --- | --- |

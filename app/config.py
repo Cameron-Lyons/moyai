@@ -19,6 +19,9 @@ MODEL_CATALOG: dict[str, str] = {
     'anthropic/claude-opus-5-5': 'Claude Opus 5.5',
     'fireworks_ai/glm-5p3': 'GLM-5.3',
 }
+# At most ten comma-separated LiteLLM guardrail names; native settings build the
+# same pattern from moyai.inference_guardrails, and a test keeps the two equal.
+GUARDRAIL_NAMES = r'^(?:[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}(?: *, *[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}){0,9})?$'
 
 
 class Settings(BaseSettings):
@@ -185,6 +188,9 @@ class Settings(BaseSettings):
     litellm_api_base: str = ""
     litellm_api_key: str = ""
     litellm_spend_recovery_enabled: bool = True
+    # LiteLLM guardrails every successful native gateway answer must attest
+    # (comma-separated, at most ten); carried to every role's native settings.
+    moyai_required_guardrails: str = Field(default='', pattern=GUARDRAIL_NAMES)
     model_context_limits: dict[str, ModelContextLimits] = Field(default_factory=dict)
     session_titles_enabled: bool = True
     session_title_model: str = Field(default="openai/gpt-4.1-nano", min_length=1, max_length=200)
@@ -359,6 +365,12 @@ class Settings(BaseSettings):
         if len(items) > 100 or any(not re.fullmatch(r'[A-Za-z0-9-]{1,100}', item) for item in items):
             raise ValueError('Use at most 100 comma-separated Modal object IDs.')
         return ','.join(items)
+
+    @field_validator('moyai_required_guardrails')
+    @classmethod
+    def required_guardrails(cls, value):
+        # Roles listing the same names in another order share one contract.
+        return ','.join(sorted({name.strip() for name in value.split(',') if name.strip()}))
 
     @field_validator('moyai_build_sha')
     @classmethod

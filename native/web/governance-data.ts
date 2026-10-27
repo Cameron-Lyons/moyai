@@ -249,7 +249,7 @@ export function auditExportPath(filters: AuditFilters, format: AuditExportFormat
   return `${AUDIT_EXPORT.slice("/api".length)}?${params}`
 }
 /** "role_assignment.updated" → "Role assignment updated". */
-const ACRONYMS: Record<string, string> = { scim: "SCIM", usd: "USD", id: "ID", sso: "SSO", aws: "AWS" }
+const ACRONYMS: Record<string, string> = { scim: "SCIM", usd: "USD", id: "ID", sso: "SSO", aws: "AWS", ai: "AI" }
 export function actionLabel(action: string): string {
   const text = action.replace(/[._-]+/g, " ").trim().split(/\s+/).map(word => ACRONYMS[word.toLowerCase()] ?? word).join(" ")
   return text ? text[0].toUpperCase() + text.slice(1) : "Change recorded"

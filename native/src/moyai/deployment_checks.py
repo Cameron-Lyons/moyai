@@ -41,6 +41,7 @@ def settings(values: Mapping[str, str]) -> Settings:
         workspace_password=SecretStr(values["WORKSPACE_PASSWORD"]),
         gateway_url=values["LITELLM_API_BASE"],
         gateway_key=SecretStr(values["LITELLM_API_KEY"]),
+        required_guardrails=values.get("MOYAI_REQUIRED_GUARDRAILS", ""),
         default_model=values["AGENT_MODEL"],
         temporal_address=values["TEMPORAL_ADDRESS"],
         temporal_namespace=values["TEMPORAL_NAMESPACE"],

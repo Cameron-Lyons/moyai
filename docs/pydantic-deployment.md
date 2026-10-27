@@ -60,6 +60,10 @@ schema, queue, key and object formats. Normal coordinator activation publishes
 these contracts. Incompatible schema, framework or protocol changes require a
 coordinated maintenance window with all previous runtime owners retired.
 Compatible replacements must preserve the activated contracts and schema receipts.
+`MOYAI_REQUIRED_GUARDRAILS` joins the shared role contract only when set, so
+leaving it empty keeps existing contracts. Setting or changing it is a shared
+configuration change: restart the coordinator first (see
+[AI guardrails](enterprise-governance.md#ai-guardrails)).
 
 Native execution protocol 2 records split activity queues, bundled skill startup,
 and on-demand workspace acquisition. It retains the `pydantic-v1` core identity

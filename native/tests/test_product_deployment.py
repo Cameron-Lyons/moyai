@@ -80,6 +80,27 @@ def test_worker_versions_share_a_contract_but_require_explicit_adoption(environm
     assert core_contract(configured(environment).legacy_settings()) != blue_contract
 
 
+def test_required_guardrails_reach_native_settings_and_the_shared_role_contract(environment):
+    from app.database import RUNTIME_SETTINGS, runtime_settings
+
+    environment["MOYAI_REQUIRED_GUARDRAILS"] = "prompt-injection, phi-presidio,prompt-injection"
+    required = configured(environment)
+    assert Settings(_env_file=None, **required.native_overrides()).guardrails == ("phi-presidio", "prompt-injection")
+    environment["MOYAI_REQUIRED_GUARDRAILS"] = "phi-presidio,prompt-injection"
+    # The same names in another spelling are one shared configuration.
+    assert candidate_role_fingerprint(configured(environment)) == candidate_role_fingerprint(required)
+    environment["MOYAI_REQUIRED_GUARDRAILS"] = ""
+    unset = configured(environment)
+    # Roles that disagree on the required guardrails are not admitted together.
+    assert candidate_role_fingerprint(unset) != candidate_role_fingerprint(required)
+    # Left empty, the setting keeps the contract of releases that predate it.
+    source = unset.legacy_settings()
+    assert runtime_settings(source) == {name: getattr(source, name) for name in RUNTIME_SETTINGS}
+    environment["MOYAI_REQUIRED_GUARDRAILS"] = "phi presidio"
+    with pytest.raises(ProductConfigurationError):
+        configured(environment)
+
+
 def test_pydantic_default_and_standalone_remain_usable_without_product_sources(tmp_path):
     assert select_core({}) == "pydantic"
     with pytest.raises(ProductConfigurationError):

@@ -50,10 +50,12 @@ with workflow.unsafe.imports_passed_through():
     from .contracts import CompletedTurn, PreparedTurn, RunScope, SteeringInput
     from .deployment_handoff import VERSION as DEPLOYMENT_HANDOFF_VERSION
     from .deployment_handoff import DeploymentHandoff
-    from .failure_diagnostics import FAILURE_VERSION, capture_failure
+    from .failure_diagnostics import FAILURE_VERSION, capture_failure, guardrail_outcome
     from .history_handoff import VERSION as HISTORY_VERSION
     from .history_handoff import AgentCheckpoint, CheckpointSave, HistoryHandoff, HistoryLimits
     from .images import prompt_content
+    from .inference_guardrails import MESSAGES as GUARDRAIL_MESSAGES
+    from .inference_guardrails import VERSION as GUARDRAIL_VERSION
     from .input_identity import identified_prompt
     from .live_events import public_event_sink
     from .maintenance_workspace import VERSION as MAINTENANCE_WORKSPACE_VERSION
@@ -655,7 +657,15 @@ class TurnWorkflow(PydanticAIWorkflow):
             )
             if (prepared is None or preserve_maintenance) and workflow.patched("moyai-public-preparation-errors-v1"):
                 message = public_preparation_message(error) or message
-            if prepared is not None and workflow.patched("moyai-failure-workspace-checkpoint-v1"):
+            failure = capture_failure(error)
+            guardrail = guardrail_outcome(failure)
+            if guardrail is not None and workflow.patched(GUARDRAIL_VERSION):
+                # Publish only the fixed notice, and never save the refused
+                # prompt or tool output as the next turn's context.
+                message = GUARDRAIL_MESSAGES[guardrail]
+            else:
+                guardrail = None
+            if prepared is not None and guardrail is None and workflow.patched("moyai-failure-workspace-checkpoint-v1"):
                 # Capture before failure settlement clears active ownership. A
                 # capture failure must never prevent the original error settling.
                 with suppress(ActivityError):
@@ -668,7 +678,7 @@ class TurnWorkflow(PydanticAIWorkflow):
                     )
             await workflow.execute_activity(
                 "moyai_fail_turn_v1",
-                args=[turn_id, message, capture_failure(error)] if workflow.patched(FAILURE_VERSION)
+                args=[turn_id, message, failure] if workflow.patched(FAILURE_VERSION)
                 else [turn_id, message],
                 **CONTROL,
             )

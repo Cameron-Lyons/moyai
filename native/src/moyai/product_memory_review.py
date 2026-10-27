@@ -51,6 +51,7 @@ from temporalio.service import RPCError
 from temporalio.worker import ActivityInboundInterceptor, ExecuteActivityInput, Interceptor
 
 from .contracts import PreparedTurn, RunScope
+from .inference_guardrails import denial
 from .inference_usage import INFERENCE_ACTIVITY, InferenceActivity, UsageCapture
 from .models import Message, Session, Turn, User, now
 from .product_automation_models import ProductAutomationTurn
@@ -631,6 +632,9 @@ class ReviewActivity(ActivityInboundInterceptor):
                 await usage.result(result)
                 return result
             except Exception as error:
+                if usage.guardrail is not None:
+                    # Settle the review once; never resend the refused input.
+                    raise denial(usage.guardrail) from None
                 if usage.admission_error is not None:
                     raise ApplicationError(
                         "Product admission refused this memory review.", non_retryable=True,

@@ -19,6 +19,7 @@ import test_product_authority as authority
 from app.model_slots import PostgresModelSlots
 from fastapi import FastAPI
 from openai import AsyncOpenAI
+from pydantic_ai.exceptions import ModelHTTPError
 from pydantic_ai.messages import BinaryContent, ModelRequest, UserPromptPart
 from pydantic_ai.models import ModelRequestParameters
 from pydantic_ai.models.openai import OpenAIResponsesModel
@@ -835,3 +836,198 @@ async def test_admitted_native_billing_joins_canonical_actor_and_exact_source_re
     assert str(charge.amount) == row.cost_usd
     assert len(charge.observations) == 2
     assert {item.source.engine for item in charge.observations} == {"legacy", "native"}
+
+
+GUARDRAIL_REFUSAL = json.dumps({"error": {
+    "message": "Violated guardrail policy", "type": "invalid_request_error", "param": None, "code": "400",
+    "provider_specific_fields": {
+        "error": "Violated guardrail policy", "bedrock_guardrail_response": "private prompt must not persist",
+        "guardrail_name": "bedrock-input", "guardrail_mode": "pre_call",
+    },
+}}).encode()
+
+
+async def guardrail_refusal(_request):
+    return httpx2.Response(400, stream=WireStream(GUARDRAIL_REFUSAL), headers={
+        "content-type": "application/json", "x-litellm-applied-guardrails": "presidio-pii,bedrock-input",
+        # Only the broker may assert a guardrail outcome to a worker.
+        "x-moyai-guardrail": "blocked",
+    })
+
+
+async def guardrail_events(ctx):
+    async with ctx.product.database.sessions() as db:
+        return list((await db.execute(text(
+            "SELECT * FROM moyai.governance_audit_events ORDER BY created_at",
+        ))).mappings().all())
+
+
+async def test_guardrail_refusal_is_audited_once_with_its_zero_spend_outcome(inference):
+    from moyai.product_governance import record_runtime_event
+
+    ctx = inference
+    response = await perform(ctx, handler=guardrail_refusal)
+    assert response.status_code == 400 and response.content == GUARDRAIL_REFUSAL
+    with pytest.raises(InferenceAdmissionError, match="already dispatched"):
+        await perform(ctx, attempt=2, handler=guardrail_refusal)
+    row, = await requests(ctx)
+    assert row.status == "failed" and row.cost_usd is None
+    event, = await guardrail_events(ctx)
+    assert (event["action"], event["actor"], event["resource_type"], event["resource_id"]) == (
+        "ai_guardrail.violation", "admin@example.test", "ai_guardrail", "bedrock-input",
+    )
+    assert json.loads(event["details"]) == {
+        "session_id": ctx.session.id, "model": "test", "mode": "pre_call",
+        "guardrails": ["presidio-pii", "bedrock-input"],
+    }
+    assert "private prompt" not in repr(dict(event)) and "Violated" not in repr(dict(event))
+    # Every attempt of one logical activity shares the event identity.
+    async with ctx.product.database.sessions.begin() as db:
+        await record_runtime_event(
+            db, ctx.product.adapter, "logical-one", "ai_guardrail.violation", "other@example.test",
+            "ai_guardrail", "bedrock-input",
+        )
+    assert [item["id"] for item in await guardrail_events(ctx)] == [event["id"]]
+    async with ctx.product.database.sessions() as db:
+        usage = await db.get(InferenceUsage, row.request_key)
+        assert usage.coverage_error == "gateway_error" and usage.cost_usd is None
+
+
+async def test_ordinary_gateway_error_is_not_audited_or_relayed_as_a_guardrail(inference):
+    async def rejected(_):
+        return httpx2.Response(429, stream=WireStream(b'{"error":{"message":"synthetic limit"}}'), headers={
+            "content-type": "application/json", "x-litellm-applied-guardrails": "presidio-pii",
+        })
+    activity = InferenceActivity(inference.product.database, inference.scope, "plain/1", logical_identity="plain")
+    token = INFERENCE_ACTIVITY.set(activity)
+    try:
+        async with httpx2.AsyncClient(transport=InferenceUsageTransport(
+            httpx2.MockTransport(rejected), require_admission=True,
+        )) as client:
+            response = await client.post(
+                "https://gateway.invalid/v1/responses",
+                headers={"authorization": "Bearer synthetic-inference-key"}, json={"model": "test"},
+            )
+    finally:
+        INFERENCE_ACTIVITY.reset(token)
+    assert response.status_code == 429 and activity.guardrail is None
+    assert not await guardrail_events(inference)
+
+
+async def test_broker_relays_only_its_own_guardrail_outcome(inference):
+    ctx = inference
+    ctx.service.settings = ctx.service.settings.model_copy(update={"public_url": "https://workspace.invalid"})
+    refused = True
+
+    async def upstream(request):
+        if refused:
+            return await guardrail_refusal(request)
+        return httpx2.Response(429, stream=WireStream(b'{"error":{"message":"synthetic limit"}}'), headers={
+            "content-type": "application/json", "x-moyai-guardrail": "blocked",
+        })
+    await install_broker_upstream(ctx, upstream)
+    app = FastAPI()
+    app.include_router(product_inference_routes(ctx.service))
+    worker_database = SimpleNamespace(settings=ctx.product.settings, product_identity=ctx.product.adapter)
+    worker = ProductInferenceService(worker_database, ctx.service.settings.model_copy(update={
+        "moyai_separate_broker": True, "moyai_runtime_role": "worker", "litellm_api_key": "",
+    }), None)
+    worker_database.product_inference = worker
+    await worker.start()
+    try:
+        for logical in ("refused", "limited"):
+            refused = logical == "refused"
+            activity = InferenceActivity(worker_database, ctx.scope, f"{logical}/1", logical_identity=logical)
+            token = INFERENCE_ACTIVITY.set(activity)
+            try:
+                async with httpx2.AsyncClient(transport=InferenceUsageTransport(
+                    httpx2.ASGITransport(app=app), require_admission=True,
+                )) as client:
+                    sdk = AsyncOpenAI(
+                        base_url="https://gateway.invalid/v1", api_key="not-configured",
+                        max_retries=0, http_client=client,
+                    )
+                    model = OpenAIResponsesModel("test", provider=LiteLLMProvider(openai_client=sdk))
+                    with pytest.raises(ModelHTTPError) as failed:
+                        await model.request(
+                            [ModelRequest(parts=[UserPromptPart("private input")])], None, ModelRequestParameters(),
+                        )
+            finally:
+                INFERENCE_ACTIVITY.reset(token)
+            assert failed.value.status_code == (400 if refused else 429)
+            assert activity.guardrail == ("blocked" if refused else None)
+            assert (failed.value.headers or {}).get("x-moyai-guardrail") == ("blocked" if refused else None)
+            if refused:
+                assert failed.value.body == json.loads(GUARDRAIL_REFUSAL)["error"]
+        event, = await guardrail_events(ctx)
+        assert event["action"] == "ai_guardrail.violation" and event["resource_id"] == "bedrock-input"
+        assert [row.status for row in await requests(ctx)] == ["failed", "failed"]
+        assert not ctx.service.active and ctx.service.slots.active == 0
+    finally:
+        await worker.close()
+
+
+async def test_broker_refuses_an_unattested_answer_before_the_worker_reads_it(inference, monkeypatch):
+    ctx = inference
+    ctx.service.settings = ctx.service.settings.model_copy(update={"public_url": "https://workspace.invalid"})
+    monkeypatch.setattr(ctx.product.database.settings, "required_guardrails", "phi-presidio")
+    applied = "prompt-injection"
+    upstream_streams = []
+
+    async def upstream(_request):
+        stream = WireStream(json.dumps(payload(cost="0.31")).encode())
+        upstream_streams.append(stream)
+        return httpx2.Response(200, stream=stream, headers={
+            "content-type": "application/json", "x-litellm-applied-guardrails": applied,
+        })
+    await install_broker_upstream(ctx, upstream)
+    app = FastAPI()
+    app.include_router(product_inference_routes(ctx.service))
+    # The worker's own settings never decide; the broker enforces the shared value.
+    worker_database = SimpleNamespace(
+        settings=ctx.product.settings.model_copy(update={"required_guardrails": ""}),
+        product_identity=ctx.product.adapter,
+    )
+    worker = ProductInferenceService(worker_database, ctx.service.settings.model_copy(update={
+        "moyai_separate_broker": True, "moyai_runtime_role": "worker", "litellm_api_key": "",
+    }), None)
+    worker_database.product_inference = worker
+    await worker.start()
+    try:
+        for logical in ("unattested", "attested"):
+            applied = "prompt-injection" if logical == "unattested" else "phi-presidio,prompt-injection"
+            activity = InferenceActivity(worker_database, ctx.scope, f"{logical}/1", logical_identity=logical)
+            token = INFERENCE_ACTIVITY.set(activity)
+            try:
+                async with httpx2.AsyncClient(transport=InferenceUsageTransport(
+                    httpx2.ASGITransport(app=app), require_admission=True,
+                )) as client:
+                    response = await client.post(
+                        "https://gateway.invalid/v1/responses",
+                        headers={"authorization": "Bearer not-configured"},
+                        json={"model": "test", "input": "private input"},
+                    )
+            finally:
+                INFERENCE_ACTIVITY.reset(token)
+            if logical == "unattested":
+                assert response.status_code == 502 and response.content == b""
+                assert response.headers["x-moyai-guardrail"] == activity.guardrail == "unattested"
+            else:
+                assert response.status_code == 200 and activity.guardrail is None
+                assert response.json()["usage"]["x_litellm_response_cost"] == "0.31"
+        assert all(stream.closed for stream in upstream_streams)
+        event, = await guardrail_events(ctx)
+        assert (event["action"], event["resource_type"], event["resource_id"]) == (
+            "ai_guardrail.unattested", "ai_guardrail", "gateway",
+        )
+        assert json.loads(event["details"]) == {
+            "session_id": ctx.session.id, "model": "test",
+            "guardrails": ["prompt-injection"], "missing": ["phi-presidio"],
+        }
+        refused, accepted = await requests(ctx)
+        # The refused answer was paid for; receipt recovery may still price it.
+        assert (refused.status, refused.cost_usd) == ("unknown", None)
+        assert (accepted.status, accepted.cost_usd) == ("completed", "0.31")
+        assert not ctx.service.active and ctx.service.slots.active == 0
+    finally:
+        await worker.close()

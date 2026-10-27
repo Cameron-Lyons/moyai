@@ -1,6 +1,7 @@
 """Live canonical governance on the native admission and execution transactions."""
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from contextlib import asynccontextmanager
@@ -76,6 +77,23 @@ class CanonicalRead:
             raise ValueError('Governance query bindings changed.')
         sql = pieces[0] + ''.join(f':p{index}' + part for index, part in enumerate(pieces[1:]))
         return self.session.execute(text(sql), {f'p{index}': value for index, value in enumerate(values)}).mappings()
+
+
+async def record_runtime_event(db, identity, key, action, actor, resource_type, resource_id, details=None):
+    """Insert one canonical governance audit event in a native transaction, once per key.
+
+    The event commits or rolls back with the native outcome it records, as
+    product_skill_tools' canonical skill_audit rows do. Its id derives from the
+    action and key, so a retried activity reaching the same outcome adds nothing.
+    """
+    from app.governance_audit import event_values, timestamp
+    values = dict(zip(('action', 'actor', 'resource_type', 'resource_id', 'details'),
+                      event_values(action, actor, resource_type, resource_id, details)))
+    await db.execute(text(
+        f"INSERT INTO {identity._table('governance_audit_events')} "
+        '(id,action,actor,resource_type,resource_id,details,created_at) '
+        'VALUES (:id,:action,:actor,:resource_type,:resource_id,:details,:created_at) ON CONFLICT (id) DO NOTHING'
+    ), {**values, 'id': hashlib.sha256(f'{action}/{key}'.encode()).hexdigest()[:32], 'created_at': timestamp()})
 
 
 class ProductGovernance:

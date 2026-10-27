@@ -14,8 +14,11 @@ import httpx
 import pytest
 from pydantic import SecretStr
 from sqlalchemy import event, func, select
+from temporalio.exceptions import ApplicationError
 
 from moyai.api import create_app
+from moyai.failure_diagnostics import capture_failure
+from moyai.inference_guardrails import MESSAGES
 from moyai.models import Delivery, Session, SlackInbox, SlackThread, Turn, User, new_id
 from moyai.slack import admit_one, deliver_one, reconcile_one, stage_deliveries
 
@@ -231,6 +234,22 @@ async def test_failed_turn_posts_error_then_uploads_debug_file(runtime, active, 
     assert receipt["files"] == [{
         "id": "FDEBUG001", "permalink": "https://slack.test/files/FDEBUG001",
     }]
+
+
+async def test_guardrail_failed_turn_posts_only_its_notice(runtime, active):
+    session, turn, _ = active
+    refused = ApplicationError(MESSAGES["blocked"], type="MoyaiGuardrailBlocked", non_retryable=True)
+    await runtime.database.fail(turn.id, MESSAGES["blocked"], diagnostics=capture_failure(refused))
+    async with runtime.database.sessions.begin() as db:
+        db.add(SlackThread(
+            id=new_id(), team_id="TTEST", channel_id="CTEST", thread_ts="123.456", session_id=session.id,
+        ))
+    await stage_deliveries(runtime)
+    async with runtime.database.sessions() as db:
+        message, = await db.scalars(select(Delivery).where(Delivery.turn_id == turn.id))
+    # The debug trace would repost the refused prompt and tool output.
+    assert message.identity == f"slack-answer:{turn.id}"
+    assert MESSAGES["blocked"] in json.loads(runtime.security.unseal(message.content))["text"]
 
 
 async def test_lost_send_ack_is_reconciled_without_reposting(runtime, active):

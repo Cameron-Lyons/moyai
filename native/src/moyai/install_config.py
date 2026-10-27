@@ -35,6 +35,7 @@ DEFAULTS = {
     "MOYAI_NATIVE_OBJECT_PREFIX": "",
     "LITELLM_API_BASE": "",
     "AGENT_MODEL": "",
+    "MOYAI_REQUIRED_GUARDRAILS": "",
     "MODAL_APP_NAME": "",
     "MOYAI_MODAL_RUNTIME": "vm",
     "SANDBOX_PROVIDER": "modal",

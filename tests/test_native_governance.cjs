@@ -124,7 +124,7 @@ test('audit filters use whole UTC days, a 100-day window, normalized actors and 
   assert.equal(exported.pathname,'/admin/governance/audit/export');
   assert.deepEqual(Object.fromEntries(exported.searchParams),{action:'role.created',actor:'admin@example.test',resource_type:'role',after:'2026-07-08T00:00:00Z',before:'2026-10-16T00:00:00Z',format:'ndjson'},'the export uses the same filters');
   assert.equal(gov.auditExportPath(gov.emptyAuditFilters,'csv'),'/admin/governance/audit/export?format=csv');
-  assert.equal(gov.actionLabel('scim_token.revoked'),'SCIM token revoked');assert.equal(gov.actionLabel(''),'Change recorded');
+  assert.equal(gov.actionLabel('scim_token.revoked'),'SCIM token revoked');assert.equal(gov.actionLabel('ai_guardrail.violation'),'AI guardrail violation');assert.equal(gov.actionLabel(''),'Change recorded');
   assert.equal(gov.detailText(['a','b']),'a, b');assert.equal(gov.detailText(null),'None');
 });
 

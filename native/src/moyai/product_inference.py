@@ -20,7 +20,7 @@ from uuid import uuid4
 
 import anyio
 import httpx2 as httpx
-from sqlalchemy import Integer, String, func, select
+from sqlalchemy import Integer, String, func, select, text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from .inference_usage import InferenceUsage
@@ -405,6 +405,30 @@ class ProductInferenceService:
                 row.finished_at = values["finished_at"]
                 if admission.unsent:
                     row.next_attempt_at = None
+            if capture.finished and capture.guardrail is not None:
+                await self._audit_guardrail(db, capture)
+
+    async def _audit_guardrail(self, db: Any, capture: UsageCapture) -> None:
+        """Record the refusal with its ledger outcome: names and identifiers, never content."""
+        from app.enterprise_roles import GovernanceActor, actor_label
+
+        from .inference_guardrails import ACTIONS
+        from .product_governance import record_runtime_event
+
+        guardrail, activity = capture.guardrail, capture.activity
+        identity, grant = self.database.product_identity, activity.scope.product_grant
+        assert guardrail is not None and identity is not None and grant is not None and activity.logical_identity
+        user = (await db.execute(text(
+            f"SELECT kind,email FROM {identity._table('users')} WHERE id=:id"
+        ), {"id": grant.user_id})).first()
+        # Like actor_label for a principal, only an individual's email names the actor.
+        email = user.email if user is not None and user.kind in {"google", "cloudflare"} else ""
+        await record_runtime_event(
+            db, identity, activity.logical_identity, ACTIONS[guardrail.outcome],
+            actor_label(GovernanceActor(id=grant.user_id, email=email or "")),
+            "ai_guardrail", guardrail.name or "gateway",
+            guardrail.details(activity.scope.session_id, capture.values["model"]),
+        )
 
     async def recover_once(self) -> int:
         if self.recovery is None:

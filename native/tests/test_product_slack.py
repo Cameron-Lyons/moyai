@@ -21,9 +21,12 @@ import pytest
 import pytest_asyncio
 from fastapi import FastAPI, HTTPException
 from sqlalchemy import func, select
+from temporalio.exceptions import ApplicationError
 from test_product_connections import bridge as canonical_connections
 
-from moyai.models import Delivery, ProductTurnAuthority, SlackThread, Turn, new_id
+from moyai.failure_diagnostics import FAILURE_KIND, capture_failure
+from moyai.inference_guardrails import MESSAGES
+from moyai.models import Delivery, Event, ProductTurnAuthority, SlackThread, Turn, new_id
 from moyai.product_identity import ProductGrant, ProductPrincipal
 from moyai.product_slack import ProductSlack
 from moyai.product_slack_models import ProductSlackBinding
@@ -153,13 +156,18 @@ async def queued(slack, active):
         return await db.scalar(select(Delivery))
 
 
-async def stage_failed_turn(slack, active, error):
+async def stage_failed_turn(slack, active, error, diagnostics=None):
     thread = await bind(slack, active)
     async with slack.runtime.database.sessions.begin() as db:
         turn = await db.get(Turn, active[1].id)
         turn.status = "failed"
         turn.error = error
         turn.finished_at = datetime.now(UTC).isoformat()
+        if diagnostics is not None:
+            db.add(Event(
+                session_id=turn.session_id, turn_id=turn.id, kind=FAILURE_KIND,
+                identity=f"failure-diagnostics:{turn.id}", content=slack.runtime.security.seal(diagnostics),
+            ))
         binding = await db.get(ProductSlackBinding, turn.session_id)
         binding.delivery_after = "2020-01-01T00:00:00+00:00"
     await slack.service.stage()
@@ -517,6 +525,14 @@ async def test_failed_turn_stages_error_and_requester_debug_trace(slack, active)
     assert upload["title"] == "Moyai debug log"
     assert trace["schema_version"] == "ATIF-v1.8"
     assert any(step["source"] == "system" and step["message"] == error for step in trace["steps"])
+
+
+async def test_guardrail_failed_turn_stages_only_its_notice(slack, active):
+    refused = ApplicationError(MESSAGES["blocked"], type="MoyaiGuardrailBlocked", non_retryable=True)
+    _, deliveries = await stage_failed_turn(slack, active, MESSAGES["blocked"], capture_failure(refused))
+    # The debug trace would repost the refused prompt and tool output.
+    assert set(deliveries) == {"0"}
+    assert MESSAGES["blocked"] in json.loads(slack.runtime.security.unseal(deliveries["0"].content))["text"]
 
 
 async def test_failed_debug_upload_waits_for_message_then_uses_slack_file_helper(slack, active, monkeypatch):

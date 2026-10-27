@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import logging
 from collections import OrderedDict
-from collections.abc import Mapping
+from collections.abc import Collection, Mapping
 from typing import TYPE_CHECKING, Any, ClassVar, Protocol
 
 from agentchat.channels.slack.host import SlackHost
@@ -14,6 +14,7 @@ from fastapi import HTTPException
 from sqlalchemy import select
 
 from ..contracts import Grant, RunScope
+from ..inference_guardrails import MESSAGES as GUARDRAIL_MESSAGES
 from ..models import MessageSource, Turn
 from ..models import SlackThread as SlackThreadRecord
 from ..product_slack_models import ProductSlackBinding, SlackTurnSource
@@ -55,6 +56,14 @@ def make_slack_thread_reader(slack: ProductSlack) -> SlackThreadReader:
                         source = SlackTurnSource(turn_id=scope.turn_id, **{key: origin[key] for key in keys})
             turn = await db.get(Turn, scope.turn_id)
             binding = await db.get(ProductSlackBinding, scope.session_id)
+            # A gateway guardrail refused these messages; rereading them would
+            # only be refused again, for this turn's requester.
+            refused = set(await db.scalars(select(SlackTurnSource.message_ts).join(
+                Turn, Turn.id == SlackTurnSource.turn_id,
+            ).where(
+                Turn.session_id == scope.session_id, Turn.status == "failed",
+                Turn.error.in_(list(GUARDRAIL_MESSAGES.values())),
+            )))
         if (
             thread is None or source is None or turn is None or binding is None
             or turn.session_id != scope.session_id or turn.actor_id != scope.actor_id
@@ -78,7 +87,7 @@ def make_slack_thread_reader(slack: ProductSlack) -> SlackThreadReader:
         }
         context = await slack.connections.execution.call(
             lambda bound: _read(
-                bound, host, origin, source.message_ts, as_bot=True,
+                bound, host, origin, {source.message_ts, *refused}, as_bot=True,
             ),
             authorize=lambda: _authorize(slack, scope, binding, installed, None),
             recheck=True,
@@ -100,7 +109,7 @@ def make_slack_thread_reader(slack: ProductSlack) -> SlackThreadReader:
             else:
                 context = await slack.connections.execution.call(
                     lambda bound: _read(
-                        bound, host, origin, source.message_ts, as_bot=False,
+                        bound, host, origin, {source.message_ts, *refused}, as_bot=False,
                     ),
                     authorize=lambda: _authorize(slack, scope, binding, installed, grant),
                     recheck=True,
@@ -155,7 +164,7 @@ async def _authorize(
 
 async def _read(
     bound: Any, host: SlackHost, origin: Mapping[str, str],
-    message_ts: str, *, as_bot: bool,
+    excluded: Collection[str], *, as_bot: bool,
 ) -> dict[str, Any]:
     async def request_page(params: Mapping[str, Any]) -> dict[str, Any]:
         try:
@@ -173,7 +182,7 @@ async def _read(
                         **response,
                         "messages": [
                             item for item in messages
-                            if not isinstance(item, dict) or item.get("ts") != message_ts
+                            if not isinstance(item, dict) or item.get("ts") not in excluded
                         ],
                     }
             return response

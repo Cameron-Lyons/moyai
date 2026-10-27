@@ -72,6 +72,7 @@ Each installation needs its own ID and Compose project.
 | `OBJECT_STORAGE_ACCESS_KEY_ID`, `OBJECT_STORAGE_SECRET_ACCESS_KEY` | Credentials, or leave empty to use the AWS workload credential chain. |
 | `MOYAI_PUBLIC_URL` | The HTTPS origin your browser and workers can reach. |
 | `LITELLM_API_BASE`, `LITELLM_API_KEY`, `AGENT_MODEL` | Gateway URL, key, and an enabled model that supports Responses. |
+| `MOYAI_REQUIRED_GUARDRAILS` | Optional comma-separated LiteLLM guardrail names every model answer must attest; see [AI guardrails](../../docs/enterprise-governance.md#ai-guardrails). |
 | `MODAL_TOKEN_ID`, `MODAL_TOKEN_SECRET` | A token pair for your Modal workspace. |
 | `MODAL_APP_NAME` | A dedicated Modal application name for this installation. |
 | `MOYAI_MODAL_RUNTIME` | `vm` (default) for a full Linux kernel, or explicit `gvisor`. Use the same value in every service; see [runtime selection](../../docs/modal-runtime.md). |

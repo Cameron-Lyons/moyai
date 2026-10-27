@@ -12,8 +12,13 @@ from pathlib import Path
 from typing import Literal
 from urllib.parse import urlsplit
 
-from pydantic import AliasChoices, Field, SecretStr, model_validator
+from pydantic import AliasChoices, Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from .inference_guardrails import MAX_AUDIT_NAMES, NAME
+
+# Comma-separated LiteLLM guardrail names; each event lists every missing one.
+GUARDRAIL_NAMES = rf"^(?:{NAME.pattern}(?: *, *{NAME.pattern}){{0,{MAX_AUDIT_NAMES - 1}}})?$"
 
 
 class Settings(BaseSettings):
@@ -43,6 +48,10 @@ class Settings(BaseSettings):
         default="openai/gpt-6-astra", validation_alias=AliasChoices("MOYAI_MODEL", "AGENT_MODEL")
     )
     model_catalog: str = Field(default="", validation_alias="MOYAI_MODELS")
+    # Every successful gateway answer must attest these, or the request fails closed.
+    required_guardrails: str = Field(
+        default="", pattern=GUARDRAIL_NAMES, validation_alias="MOYAI_REQUIRED_GUARDRAILS",
+    )
     temporal_address: str = Field(default="127.0.0.1:7233", validation_alias="TEMPORAL_ADDRESS")
     temporal_namespace: str = Field(default="default", validation_alias="TEMPORAL_NAMESPACE")
     temporal_queue: str = Field(default="moyai-pydantic-v1", validation_alias="TEMPORAL_TASK_QUEUE")
@@ -142,12 +151,22 @@ class Settings(BaseSettings):
             raise ValueError("Worker adoption bridging requires an existing product and an explicit worker version.")
         return self
 
+    @field_validator("required_guardrails")
+    @classmethod
+    def canonical_guardrails(cls, value: str) -> str:
+        # The product's shared runtime setting has the same canonical spelling.
+        return ",".join(sorted({name.strip() for name in value.split(",") if name.strip()}))
+
     @property
     def models(self) -> list[str]:
         return list(dict.fromkeys([
             self.default_model,
             *(value.strip() for value in self.model_catalog.split(",") if value.strip()),
         ]))
+
+    @property
+    def guardrails(self) -> tuple[str, ...]:
+        return tuple(dict.fromkeys(name.strip() for name in self.required_guardrails.split(",") if name.strip()))
 
     @property
     def sqlalchemy_url(self) -> str:

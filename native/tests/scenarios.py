@@ -18,6 +18,13 @@ from pydantic_ai.models.function import DeltaToolCall, FunctionModel
 
 def integration_model(scenario: str, *, gates: tuple[asyncio.Event, asyncio.Event] | None = None) -> FunctionModel:
     def response(messages, info):
+        if scenario == "guardrail":
+            # The gateway refused the request; its error quotes the flagged input.
+            from moyai.inference_usage import INFERENCE_ACTIVITY
+            activity = INFERENCE_ACTIVITY.get()
+            assert activity is not None
+            activity.guardrail = "blocked"
+            raise RuntimeError("Violated guardrail policy: flagged-private-input")
         if scenario == "image":
             images = [
                 value for message in messages for part in message.parts

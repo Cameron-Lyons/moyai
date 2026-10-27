@@ -29,6 +29,17 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Mapped, mapped_column
 
 from .contracts import RunScope
+from .inference_guardrails import (
+    APPLIED,
+    ERROR_TYPES,
+    HEADER,
+    MAX_ERROR_BYTES,
+    UNATTESTED,
+    Guardrail,
+    GuardrailUnattested,
+    blocked,
+    unattested,
+)
 from .models import Base, now
 from .usage_projection import ProjectionError, UsageProjection
 
@@ -129,6 +140,8 @@ class InferenceActivity:
     admission_error: Exception | None = None
     foreground: bool = False
     broker_received_at: str | None = None
+    # A gateway guardrail outcome; the activity fails with its typed denial.
+    guardrail: str | None = None
 
     def capture(self, request: httpx.Request) -> UsageCapture:
         self.requests += 1
@@ -195,6 +208,10 @@ class UsageCapture:
         self.decoder = None
         self.admission: Admission | None = None
         self.gateway_call_id: str | None = None
+        self.error: bytearray | None = None
+        self.error_status = 0
+        self.applied: str | None = None
+        self.guardrail: Guardrail | None = None
 
     def headers(self, response: httpx.Response) -> None:
         self.streaming = (
@@ -202,6 +219,10 @@ class UsageCapture:
             or "text/event-stream" in response.headers.get("content-type", "").lower()
         )
         self.values["status"] = "pending" if response.is_success else "failed"
+        if response.is_success and (required := self.activity.database.settings.guardrails):
+            self.guardrail = unattested(response.headers.get(APPLIED), required)
+            if self.guardrail is not None:
+                self.activity.guardrail = self.guardrail.outcome
         self.gateway_call_id = _identity(response.headers.get("x-litellm-call-id"))
         identifier = self.gateway_call_id or _identity(response.headers.get("x-request-id"))
         self.values["provider_request_id"] = identifier
@@ -225,6 +246,10 @@ class UsageCapture:
             # zero spend. Spend limits therefore never wait for its receipt.
             self.disabled = True
             self.values["coverage_error"] = "gateway_error"
+            if encoding == "identity":
+                # Kept only until finish() classifies a guardrail refusal.
+                self.error, self.error_status = bytearray(), response.status_code
+                self.applied = response.headers.get(APPLIED)
 
     def consume(self, value: object, *, final: bool) -> None:
         if not isinstance(value, dict):
@@ -352,6 +377,8 @@ class UsageCapture:
                 self._end_line()
 
     def feed(self, chunk: bytes) -> None:
+        if self.error is not None:
+            self.error += chunk[:MAX_ERROR_BYTES - len(self.error)]
         if self.disabled:
             return
         try:
@@ -407,6 +434,11 @@ class UsageCapture:
         self.finished = True
         self.exhausted = exhausted
         self.feed(b"")
+        if self.error is not None:
+            self.guardrail = blocked(self.error_status, self.applied, bytes(self.error))
+            self.error = None
+            if self.guardrail is not None:
+                self.activity.guardrail = self.guardrail.outcome
         if not self.disabled:
             if self.streaming:
                 self._end_line()
@@ -569,6 +601,8 @@ class InferenceUsageTransport(httpx.AsyncBaseTransport):
                 if response.headers.get("x-moyai-inference-denied") == "1":
                     from .product_inference import InferenceAdmissionError
                     context.admission_error = InferenceAdmissionError("Product broker admission refused.")
+                if response.headers.get(HEADER) in ERROR_TYPES:
+                    context.guardrail = response.headers[HEADER]
                 return response
             try:
                 await service.admit(request, capture)
@@ -611,6 +645,11 @@ class InferenceUsageTransport(httpx.AsyncBaseTransport):
         capture.headers(response)
         assert isinstance(response.stream, httpx.AsyncByteStream)
         response.stream = ObservedStream(response.stream, capture)
+        if capture.guardrail is not None and capture.guardrail.outcome == UNATTESTED:
+            # Fail closed before the SDK reads a byte. The paid answer is
+            # already spent; closing records its ledger outcome and audit.
+            await response.aclose()
+            raise GuardrailUnattested("The model gateway did not attest the required guardrails.")
         return response
 
     async def aclose(self) -> None:

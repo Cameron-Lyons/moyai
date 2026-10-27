@@ -65,7 +65,8 @@ const scimUsers=[
 const auditPages=[
   [entry('a1','role.created','role','auditor',{permissions:['audit.read','sessions.read']}),entry('a2','scim_token.revoked','scim_token','tok-0',{label:'Old connector'}),
    entry('a3','role.changed','user_role','bob@example.test',{previous:'member',replacement:'admin'},'admin@example.test','user_roles')],
-  [entry('a4','spend_limit.updated','spend_limit','organization',{limit_usd:5000,previous_usd:null})],
+  [entry('a4','spend_limit.updated','spend_limit','organization',{limit_usd:5000,previous_usd:null}),
+   entry('a5','ai_guardrail.violation','ai_guardrail','phi-presidio',{session_id:'s1',model:'openai/gpt-6-astra',mode:'pre_call',guardrails:['phi-presidio','prompt-injection']},'bob@example.test')],
 ];
 const rolesView=()=>({roles:state.roles,assignments:state.assignments,group_roles:state.groupRoles,groups:state.groups,grantable:state.role==='admin'?null:state.permissions,builtin_admin:state.role==='admin'});
 // Like the server, spend.manage alone can read the listing, and both GET and writes return
@@ -175,7 +176,7 @@ async function handle(req,res,next) {
     const page=url.searchParams.get('cursor')==='audit-2'?1:0;
     let entries=page&&state.emptyNextPage?[]:auditPages[page];
     if(url.searchParams.get('action'))entries=entries.filter(row=>row.action===url.searchParams.get('action'));
-    return json({entries,next_cursor:page||url.searchParams.get('action')?null:'audit-2',facets:{actions:['role.created','role.changed','scim_token.revoked','spend_limit.updated'],resource_types:['role','user_role','scim_token','spend_limit']}});
+    return json({entries,next_cursor:page||url.searchParams.get('action')?null:'audit-2',facets:{actions:['ai_guardrail.violation','role.created','role.changed','scim_token.revoked','spend_limit.updated'],resource_types:['role','user_role','scim_token','spend_limit','ai_guardrail']}});
   }
   // Users directory (existing route, governance fields)
   if(p==='/api/settings/users')return has('users.read')?json({source:'product',note:'Organization sign-in manages accounts.',capabilities:{roles:has('users.manage'),create:false,update:false,delete:false},
@@ -478,7 +479,10 @@ test('audit log: filters, date validation, cursor paging and exports',async t=>{
   reset();const page=await pageFor(t,'#settings/audit-log');
   const table=page.getByRole('region',{name:'Audit log entries'});await table.getByText('Role created',{exact:true}).waitFor();
   await page.getByText('3 entries shown; more are available.').waitFor();
-  await page.getByRole('button',{name:'Load more'}).click();await table.getByText('Spend limit updated',{exact:true}).waitFor();await page.getByText('4 entries shown.').waitFor();
+  await page.getByRole('button',{name:'Load more'}).click();await table.getByText('Spend limit updated',{exact:true}).waitFor();await page.getByText('5 entries shown.').waitFor();
+  const refusal=table.getByRole('row').filter({hasText:'AI guardrail violation'}),refusalText=await refusal.textContent();
+  assert.ok(['ai_guardrail.violation','bob@example.test','ai_guardrail','phi-presidio'].every(text=>refusalText.includes(text)));
+  await refusal.locator('details summary').click();await refusal.getByText('phi-presidio, prompt-injection').waitFor();
   await table.locator('details summary').first().click();await table.getByText('audit.read, sessions.read').waitFor();
   await page.getByLabel('From (UTC)').fill('2026-10-10');await page.getByLabel('To (UTC)').fill('2026-01-01');await page.getByRole('button',{name:'Apply filters'}).click();
   await page.getByRole('alert').getByText('Choose a start date on or before the end date.').waitFor();

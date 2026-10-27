@@ -11,6 +11,7 @@ from temporalio.worker import ActivityInboundInterceptor, ExecuteActivityInput, 
 
 from .contracts import GuidanceChanged, RunScope
 from .database import Database
+from .inference_guardrails import denial
 from .inference_usage import INFERENCE_ACTIVITY, InferenceActivity
 from .performance import computer_timing
 
@@ -95,6 +96,8 @@ class AuthorizedActivity(ActivityInboundInterceptor):
                 await usage.result(result)
                 return result
             except Exception as error:
+                if usage.guardrail is not None:
+                    raise denial(usage.guardrail) from None
                 if usage.admission_error is not None:
                     raise ApplicationError(
                         "Product inference admission refused; no new model request was dispatched.",

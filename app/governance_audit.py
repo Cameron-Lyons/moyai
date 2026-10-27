@@ -2,10 +2,13 @@
 
 Every successful governance change records exactly one event through
 record_event_in on the same canonical connection, after its writer lock is held,
-so a rolled-back change leaves no event. Events carry identifiers, actions,
-authenticated actors and bounded metadata; never tokens, secrets, policy bodies
-or user content. Schema lives in the canonical initializers; keep the import
-alias below instead of defining initialize_schema here.
+so a rolled-back change leaves no event. Native runtime outcomes, such as a
+gateway AI guardrail refusal, insert event_values rows in the native transaction
+that records the outcome instead; they change no configuration and take no writer
+lock. Events carry identifiers, actions, authenticated actors and bounded
+metadata; never tokens, secrets, policy bodies or user content. Schema lives in
+the canonical initializers; keep the import alias below instead of defining
+initialize_schema here.
 
 GovernanceAudit merges governance_audit_events with the existing user_role_audit,
 connection_audit and credential_audit tables into one feed ordered by
@@ -103,15 +106,14 @@ def _in_write_transaction(conn):
     return getattr(conn, 'write_locked', False) is True
 
 
-def record_event_in(conn, action, actor, resource_type, resource_id, details=None):
-    """Insert one event in the caller's open write transaction and return its id.
+def event_values(action, actor, resource_type, resource_id, details=None):
+    """(action, actor, resource_type, resource_id, details JSON) for one event.
 
     Validation happens before any SQL and never echoes values. TypeError: a
     field is not text or details are not a JSON object. ValueError: a field is
     empty, has NUL or exceeds its bound (action/resource_type 64 characters,
     actor/resource_id 512), details exceed 4096 UTF-8 bytes or hold NaN, or a
     resource type in RESOURCE_TYPES has an action outside '<resource_type>.'.
-    RuntimeError: the connection holds no write transaction.
     """
     values = (_text(action, 'action', MAX_ACTION), _text(actor, 'actor', MAX_IDENTIFIER),
               _text(resource_type, 'resource type', MAX_RESOURCE_TYPE),
@@ -119,6 +121,16 @@ def record_event_in(conn, action, actor, resource_type, resource_id, details=Non
     # The feed's resource_type filter reads these rows through their actions.
     if values[2] in RESOURCE_TYPES and not values[0].startswith(values[2] + '.'):
         raise ValueError('Name governance actions <resource_type>.<verb>.')
+    return values
+
+
+def record_event_in(conn, action, actor, resource_type, resource_id, details=None):
+    """Insert one event in the caller's open write transaction and return its id.
+
+    Raises event_values' TypeError and ValueError before any SQL. RuntimeError:
+    the connection holds no write transaction.
+    """
+    values = event_values(action, actor, resource_type, resource_id, details)
     if not _in_write_transaction(conn):
         raise RuntimeError('Record governance audit events inside the mutation’s write transaction.')
     identity = uuid4().hex
@@ -142,7 +154,8 @@ EXPORT_COLUMNS = ('created_at', 'source', 'action', 'actor', 'resource_type', 'r
 # Spreadsheets evaluate cells starting with these; the quote keeps them literal text.
 FORMULA_PREFIXES = ('=', '+', '-', '@', '\t', '\r')
 RESOURCE_TYPES = ('role', 'role_assignment', 'group_role', 'scim_user', 'scim_group', 'scim_token',
-                  'security_profile', 'security_defaults', 'spend_limit', 'user_role', 'connection', 'credential')
+                  'security_profile', 'security_defaults', 'spend_limit', 'user_role', 'connection', 'credential',
+                  'ai_guardrail')
 
 # Legacy free text maps to fixed actions; first match wins. Prefix rules cover
 # texts that interpolate labels, repository ids or reasons, none of which leave.

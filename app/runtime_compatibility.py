@@ -8,7 +8,7 @@ See docs/pydantic-deployment.md for the review and cross-release rehearsal requi
 import hashlib
 import json
 
-from .database import RUNTIME_SETTINGS
+from .database import runtime_settings
 from .native_contract import core_contract
 from .schema_migrations import SCHEMA_COMPATIBILITY_REVISION
 
@@ -42,7 +42,7 @@ def api_fingerprint(settings):
     values = {
         'protocol': API_PROTOCOL_REVISION,
         'schema': SCHEMA_COMPATIBILITY_REVISION,
-        'settings': {name: getattr(settings, name) for name in RUNTIME_SETTINGS if name != 'moyai_build_sha'},
+        'settings': runtime_settings(settings, exclude=('moyai_build_sha',)),
     }
     native = core_contract(settings)
     if native is not None:
@@ -67,7 +67,7 @@ def background_fingerprint(settings, role):
         'coordinator_protocol': COORDINATOR_PROTOCOL_REVISION,
         'api_protocol': API_PROTOCOL_REVISION,
         'schema': SCHEMA_COMPATIBILITY_REVISION,
-        'settings': {name: getattr(settings, name) for name in RUNTIME_SETTINGS if name != 'moyai_build_sha'},
+        'settings': runtime_settings(settings, exclude=('moyai_build_sha',)),
     }
     native = core_contract(settings)
     if native is not None:

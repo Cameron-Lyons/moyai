@@ -43,6 +43,7 @@ from .failed_action_attempts import settle_failed_action_attempts
 from .goal_models import Goal
 from .goals import Goals
 from .goals import dispatchable as goal_dispatchable
+from .inference_guardrails import MESSAGES as GUARDRAIL_MESSAGES
 from .models import (
     Base,
     ComputerOperation,
@@ -1030,6 +1031,12 @@ class Database:
                 public = list(await db.scalars(select(Message).where(
                     Message.session_id == session.id, Message.turn_id != turn.id,
                     Message.created_at < turn.created_at,
+                    # A gateway guardrail refused these turns; replaying their
+                    # messages would only be refused again, for this requester.
+                    Message.turn_id.not_in(select(Turn.id).where(
+                        Turn.session_id == session.id, Turn.status == "failed",
+                        Turn.error.in_(list(GUARDRAIL_MESSAGES.values())),
+                    )),
                 ).order_by(Message.id)))
                 projected = await public_messages(self, db, public)
                 history = []

@@ -20,6 +20,7 @@ from pydantic import TypeAdapter, ValidationError
 from starlette.responses import Response, StreamingResponse
 
 from .contracts import RunScope
+from .inference_guardrails import HEADER as GUARDRAIL_HEADER
 from .inference_usage import INFERENCE_ACTIVITY, InferenceActivity
 from .models import now
 from .product_inference import InferenceAdmissionError, drain
@@ -29,9 +30,40 @@ if TYPE_CHECKING:
     from .product_inference import ProductInferenceService
 
 MAX_MEMORY_REVIEW_RESPONSE_BYTES = 8 * 1024 * 1024
+MAX_ERROR_RESPONSE_BYTES = 1024 * 1024
 MAX_ENVELOPE_BYTES = 64 * 1024
 ROUTES = {"responses", "responses/compact", "chat/completions"}
 SCOPE = TypeAdapter(RunScope)
+
+
+def _forwarded(upstream: httpx2.Response, activity: InferenceActivity) -> dict[str, str]:
+    # Preserve provider bytes and encoding, but forward no keys or unneeded
+    # provider headers. The broker already owns the authoritative receipt.
+    headers = {name: upstream.headers[name] for name in (
+        "content-type", "content-encoding", "x-litellm-call-id", "x-request-id",
+    ) if name in upstream.headers}
+    if activity.guardrail is not None:
+        headers[GUARDRAIL_HEADER] = activity.guardrail
+    return headers
+
+
+async def _read(upstream: httpx2.Response, limit: int) -> bytes | None:
+    """The whole raw answer, or None once it exceeds limit."""
+    body = bytearray()
+    async for chunk in upstream.aiter_raw():
+        if len(body) + len(chunk) > limit:
+            return None
+        body.extend(chunk)
+    return bytes(body)
+
+
+def _failed(activity: InferenceActivity) -> Response:
+    # Upstream errors can contain credentials; only fixed outcomes cross.
+    if activity.admission_error is not None:
+        return Response(status_code=409, headers={"x-moyai-inference-denied": "1"})
+    if activity.guardrail is not None:
+        return Response(status_code=502, headers={GUARDRAIL_HEADER: activity.guardrail})
+    return Response(status_code=502)
 
 
 def _signer(service: ProductInferenceService) -> URLSafeTimedSerializer:
@@ -127,21 +159,14 @@ async def _maintenance_response(
                     "Content-Type": "application/json", "Accept-Encoding": "identity",
                 },
             ), stream=True)
-            body = bytearray()
-            async for chunk in upstream.aiter_raw():
-                if len(body) + len(chunk) > MAX_MEMORY_REVIEW_RESPONSE_BYTES:
-                    raise InferenceAdmissionError("The memory-review response exceeds its bound.")
-                body.extend(chunk)
-            headers = {name: upstream.headers[name] for name in (
-                "content-type", "content-encoding", "x-litellm-call-id", "x-request-id",
-            ) if name in upstream.headers}
-            return Response(bytes(body), status_code=upstream.status_code, headers=headers)
+            body = await _read(upstream, MAX_MEMORY_REVIEW_RESPONSE_BYTES)
+            if body is None:
+                raise InferenceAdmissionError("The memory-review response exceeds its bound.")
+            return Response(body, status_code=upstream.status_code, headers=_forwarded(upstream, activity))
         except asyncio.CancelledError:
             raise
         except Exception:  # noqa: BLE001 - provider errors may contain private inputs or credentials
-            if activity.admission_error is not None:
-                return Response(status_code=409, headers={"x-moyai-inference-denied": "1"})
-            return Response(status_code=502)
+            return _failed(activity)
         finally:
             async def close() -> None:
                 try:
@@ -225,29 +250,38 @@ def product_inference_routes(service: ProductInferenceService) -> APIRouter:
             raise
         except Exception:  # noqa: BLE001 - upstream errors can contain credentials; fixed safe response only
             await client.aclose()
-            if activity.admission_error is not None:
-                return Response(status_code=409, headers={"x-moyai-inference-denied": "1"})
-            return Response(status_code=502)
+            return _failed(activity)
         finally:
             INFERENCE_ACTIVITY.reset(token)
+
+        async def close():
+            try:
+                await upstream.aclose()
+            finally:
+                await client.aclose()
+
+        if not upstream.is_success:
+            # A refusal is small, and its guardrail outcome must reach the
+            # worker in headers, so the broker reads the whole answer first.
+            try:
+                error = await _read(upstream, MAX_ERROR_RESPONSE_BYTES)
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - upstream errors can contain credentials; fixed safe response only
+                error = None
+            finally:
+                await drain(asyncio.create_task(close()))
+            if error is None:
+                return Response(status_code=502)
+            return Response(error, status_code=upstream.status_code, headers=_forwarded(upstream, activity))
 
         async def stream():
             try:
                 async for chunk in upstream.aiter_raw():
                     yield chunk
             finally:
-                async def close():
-                    try:
-                        await upstream.aclose()
-                    finally:
-                        await client.aclose()
                 await drain(asyncio.create_task(close()))
 
-        # Preserve provider bytes and encoding, but forward no keys or unneeded
-        # provider headers. The broker already owns the authoritative receipt.
-        headers = {name: upstream.headers[name] for name in (
-            "content-type", "content-encoding", "x-litellm-call-id", "x-request-id",
-        ) if name in upstream.headers}
-        return StreamingResponse(stream(), status_code=upstream.status_code, headers=headers)
+        return StreamingResponse(stream(), status_code=upstream.status_code, headers=_forwarded(upstream, activity))
 
     return router

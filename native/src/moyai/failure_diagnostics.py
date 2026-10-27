@@ -11,6 +11,7 @@ from sqlalchemy import select
 from temporalio.exceptions import ActivityError, ApplicationError
 
 from .history_handoff import is_turn_run, latest_turn_snapshot
+from .inference_guardrails import ERROR_TYPES as GUARDRAIL_ERRORS
 from .models import Event, Turn
 from .presentation import private_tool, redact
 from .progress import progress_secrets
@@ -64,12 +65,16 @@ def capture_failure(error: BaseException) -> dict[str, Any] | None:
     return safe_failure_metadata({"exception_chain": chain})
 
 
-async def failure_summary(database: Database, db: AsyncSession, turn: Turn) -> str:
-    """Only whitelisted runtime identifiers cross into parent context and cards."""
+async def recorded_failure(database: Database, db: AsyncSession, turn: Turn) -> dict[str, Any] | None:
     recorded = await db.scalar(select(Event).where(
         Event.turn_id == turn.id, Event.kind == FAILURE_KIND,
     ).order_by(Event.id).limit(1))
-    metadata = safe_failure_metadata(json.loads(database.security.unseal(recorded.content))) if recorded else None
+    return safe_failure_metadata(json.loads(database.security.unseal(recorded.content))) if recorded else None
+
+
+async def failure_summary(database: Database, db: AsyncSession, turn: Turn) -> str:
+    """Only whitelisted runtime identifiers cross into parent context and cards."""
+    metadata = await recorded_failure(database, db, turn)
     if not metadata:
         return "The subagent failed before completing its assignment. Open its conversation for failure details."
     chain = metadata["exception_chain"]
@@ -78,13 +83,25 @@ async def failure_summary(database: Database, db: AsyncSession, turn: Turn) -> s
     return f"Subagent failed: {cause}" + (f" during {activity}" if activity else "") + ". Open its conversation for failure details."
 
 
+def guardrail_outcome(metadata: dict[str, Any] | None) -> str | None:
+    """The gateway guardrail outcome whose typed denial is in this failure chain."""
+    outcomes = {kind: outcome for outcome, kind in GUARDRAIL_ERRORS.items()}
+    return next((
+        outcomes[item["application_type"]] for item in (metadata or {}).get("exception_chain", ())
+        if item.get("application_type") in outcomes
+    ), None)
+
+
+async def guardrail_refused(database: Database, turn: Turn) -> bool:
+    """Whether a gateway guardrail's typed denial failed this turn."""
+    async with database.sessions() as db:
+        return guardrail_outcome(await recorded_failure(database, db, turn)) is not None
+
+
 async def failure_details(runtime: Runtime, turn: Turn) -> dict[str, Any]:
     secrets = progress_secrets(runtime, turn)
     async with runtime.database.sessions() as db:
-        recorded = await db.scalar(select(Event).where(
-            Event.turn_id == turn.id, Event.kind == FAILURE_KIND,
-        ).order_by(Event.id).limit(1))
-    metadata = safe_failure_metadata(json.loads(runtime.security.unseal(recorded.content))) if recorded else None
+        metadata = await recorded_failure(runtime.database, db, turn)
     notes = [] if metadata else ["Runtime exception details were not captured for this turn."]
     calls: dict[tuple[str, str], dict[str, Any]] = {}
     last_action = None
