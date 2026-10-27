@@ -347,7 +347,7 @@ class ProductAutomationService:
         governance = getattr(self.database, "governance", None)
         # Read the workflow's profile once. When it is unavailable, policy stays
         # None and each check below reads it again, so it reports the refusal.
-        policy = None
+        policy = chat = None
         if governance is not None:
             try:
                 policy = await governance.profile_policy(db, definition.security_profile_id)
@@ -364,6 +364,8 @@ class ProductAutomationService:
                         # A probe: blockers are reported, not recorded as refusals.
                         wider = await governance.continuation_wider(
                             db, definition.session_id, definition.security_profile_id, policy=policy)
+                        # Each run submits the workflow's model under the chat's own policy.
+                        chat = await governance.policy(db, definition.session_id)
                     except HTTPException:
                         wider = True
                     if wider:
@@ -420,6 +422,11 @@ class ProductAutomationService:
             result.append("model_not_enabled")
         if policy is not None:  # governance.workflow() refuses an unavailable profile.
             result.extend(self._policy_blockers(governance, policy, definition, model))
+        if (
+            governance is not None and chat is not None and model is not None
+            and not governance.admits_model(chat, model) and "model_not_allowed_by_security_policy" not in result
+        ):
+            result.append("model_not_allowed_by_security_policy")
         if await self._old_active(db, row["id"]):
             result.append("legacy_occurrences_must_finish")
         for trigger in definition.triggers:
@@ -1039,11 +1046,11 @@ class ProductAutomationService:
                     if self.events is not None:
                         await self.events.remove_receivers(db, identity, definition)
                 governance = getattr(self.database, 'governance', None)
+                try:
+                    model = self.settings.resolve_model(definition.model or None)
+                except ValueError:
+                    model = definition.model  # Reported by blockers when nothing refuses it first.
                 if governance is not None and action in {'create', 'update', 'enable', 'migrate'}:
-                    try:
-                        model = self.settings.resolve_model(definition.model or None)
-                    except ValueError:
-                        model = definition.model  # Reported by blockers when nothing refuses it first.
                     await governance.workflow(db, principal, definition,
                                               previous='' if action == 'create' else _definition(row).security_profile_id,
                                               scope=scope, model=model, automation_id=identity)
@@ -1071,7 +1078,7 @@ class ProductAutomationService:
                     await self.database.automation_session(db, principal.id, definition.session_id)
                     if governance is not None:
                         await governance.continuation(db, definition.session_id, definition.security_profile_id,
-                                                      actor_id=principal.id, automation_id=identity)
+                                                      actor_id=principal.id, automation_id=identity, model=model)
                 revision = row["revision"] + (action != "create")
                 if action != "create":
                     await db.execute(text(
@@ -1364,14 +1371,22 @@ class ProductAutomationService:
         except HTTPException as error:
             if error.status_code not in {403, 409}:
                 raise
+        await self._block(db, binding, occurrence=occurrence, occurrence_kind=occurrence_kind,
+                          session_id=admission.get("session_id") or "")
+        return None
+
+    async def _block(
+        self, db: AsyncSession, binding: Binding, *, occurrence: str, occurrence_kind: Literal["schedule", "event"],
+        session_id: str = "",
+    ) -> None:
+        """Block the binding after a governance refusal until its owner enables it again."""
         binding.sync_state, binding.last_error = "blocked", GOVERNANCE_BLOCKED
         governance = getattr(self.database, "governance", None)
         if governance is not None:
             await governance.record(
                 db, "automation.blocked", actor_id=binding.owner_id, resource_id=binding.id,
-                session_id=admission.get("session_id") or "", key=(occurrence,),
+                session_id=session_id, key=(occurrence,),
                 details={"occurrence_kind": occurrence_kind, "reason": "governance"})
-        return None
 
     async def admit(
         self, identity: str, generation: int, revision: int, trigger_id: str,

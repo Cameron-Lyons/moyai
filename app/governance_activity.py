@@ -120,8 +120,10 @@ class WorkflowDenied(_Details):
 
 
 class ContinuationDenied(_Details):
-    reason: Literal['continuation_wider']
+    reason: Literal['continuation_wider', 'model_policy']
     automation_id: Identifier | None = None
+    model: Identifier | None = None
+    model_digest: Digest | None = None
 
 
 class AutomationBlocked(_Details):

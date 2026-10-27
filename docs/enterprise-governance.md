@@ -273,7 +273,10 @@ admission. The workflow editor checks its workflow's profile, and its readiness
 review reports `repository_not_allowed_by_security_policy` or
 `model_not_allowed_by_security_policy` when that profile no longer allows the
 saved repository, a GitHub trigger repository, or the model; a save the
-policy refuses keeps the editor open with the reason. Someone without
+policy refuses keeps the editor open with the reason. A workflow that runs in
+an existing chat submits its model under that chat's policy, so the review also
+reports `model_not_allowed_by_security_policy`, and a save is refused, when the
+chat does not allow the workflow's model. Someone without
 `security.manage` editing a workflow that keeps another profile sees every
 choice; saving still checks it.
 
@@ -296,8 +299,14 @@ permission. Workflow edits recheck selection and the connected-app, repository
 (including GitHub trigger repositories) and model limits inside the writer
 transaction. A workflow created or updated by an agent cannot exceed the
 creating session's effective policy. Both scheduled and event-triggered
-admissions bind that workflow's profile before admitting work. A run refused by
-that profile, the effective policy or the owner's role is recorded as blocked,
+admissions bind that workflow's profile before admitting work. An
+event-triggered admission first checks the delivered GitHub repository, the
+GitHub trigger repositories and the saved repository against the policy the run
+will bind (the workflow's profile with the current mandatory policy and, for a
+run in an existing chat, that chat's policy), so a limit narrowed after the
+workflow was enabled refuses the run before the event's content reaches a
+prompt (`policy.workflow_denied` with reason `repository_policy`). A run refused
+by that profile, the effective policy or the owner's role is recorded as blocked,
 and the workflow stays blocked until its owner enables it again.
 
 Native tool catalogs omit disallowed operations. Tool execution checks the policy

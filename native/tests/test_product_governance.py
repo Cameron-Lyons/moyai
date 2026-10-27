@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac
 import json
 import os
 from dataclasses import replace
@@ -13,6 +15,7 @@ import httpx2
 import pytest
 import pytest_asyncio
 import test_product_authority as authority
+import test_product_automation_events as event_fixtures
 import test_product_automations as automation_fixtures
 import test_product_inference as inference_fixtures
 import test_product_skill_tools as skill_fixtures
@@ -42,6 +45,7 @@ pytestmark = pytest.mark.skipif(not os.getenv('MOYAI_TEST_POSTGRES'), reason='Di
 product_database = authority.product_database
 admitted_product = authority.admitted_product
 automations = automation_fixtures.automations
+events = event_fixtures.events
 skills = skill_fixtures.skills
 inference = inference_fixtures.inference
 
@@ -1272,6 +1276,91 @@ async def test_scheduled_governance_refusal_blocks_the_workflow_instead_of_retry
     async with product.source.connect() as db:
         details = (await db.execute(text('SELECT detail FROM moyai.automation_runs'))).scalars().all()
     assert details == [GOVERNANCE_BLOCKED] * 2
+
+
+@pytest.mark.parametrize('narrowed', ['mandatory', 'chat'])
+async def test_event_admission_rechecks_github_repositories_before_the_prompt(events, narrowed):
+    """Regression: after a repository limit narrowed, a GitHub event's issue and comment still reached a new run."""
+    from test_product_activity_audit import activity, audited
+
+    from moyai.models import Turn
+    from moyai.product_automation_models import ProductAutomationBinding as Binding
+    from moyai.product_automations import GOVERNANCE_BLOCKED, Migration
+    ctx = events
+    product = ctx.product
+    audited(product)
+    chat = None
+    if narrowed == 'chat':  # A run in an existing chat is bound by that chat, which may be narrower.
+        chat = (await product.database.create_session(product.actor, NewSession(
+            visibility='shared', security_profile_id=await profile(product, {'repositories': []})))).id
+    row = await automation_fixtures.create(
+        ctx, security_profile_id=await profile(product, {'repositories': [111]}), session_id=chat,
+        triggers=[{'id': 'comment', 'event': {'provider': 'github', 'event': 'issue_comment', 'repository_id': 111}}])
+    secret = 'synthetic-github-signing-secret'
+    async with product.source.begin() as db:
+        await db.execute(text("INSERT INTO moyai.automation_webhooks VALUES (:id,'github',:encrypted)"),
+                         {'id': row['id'], 'encrypted': product.adapter.legacy_security.encrypt(secret)})
+    await ctx.service.mutate(ctx.grant, 'migrate', row['id'], Migration(
+        revision=row['revision'], request_key='migrate-' + uuid4().hex, activate=True))
+    await ctx.service.reconcile(row['id'])
+    if narrowed == 'mandatory':
+        await defaults(product, mandatory=await profile(product, {'repositories': [222]}))
+    delivery = {'action': 'created', 'repository': {'id': 111, 'full_name': 'acme/excluded'}, 'sender': {'type': 'User'},
+                'issue': {'number': 7, 'title': 'Excluded issue'}, 'comment': {'body': 'Excluded comment'}}
+    signature = 'sha256=' + hmac.new(secret.encode(), json.dumps(delivery).encode(), hashlib.sha256).hexdigest()
+    assert (await ctx.events.receive(row['id'], 'github', event_fixtures.request(delivery, headers={
+        'x-hub-signature-256': signature, 'x-github-event': 'issue_comment'})))['status'] == 'accepted'
+    async with product.database.sessions() as db:
+        sessions = await db.scalar(select(func.count()).select_from(Session))
+    [inbox] = await event_fixtures.pending(ctx)
+    assert (await ctx.events.admit(inbox['occurrence']))['status'] == 'blocked'
+    async with product.database.sessions() as db:
+        assert await db.scalar(select(func.count()).select_from(Session)) == sessions
+        assert await db.scalar(select(func.count()).select_from(Turn)) == 0
+        current = await db.get(Binding, row['id'])
+        assert (current.sync_state, current.last_error) == ('blocked', GOVERNANCE_BLOCKED)
+    [denied] = await activity(product, 'policy.workflow_denied')
+    assert (denied['resource_id'], denied['details']) == (
+        row['id'], {'reason': 'repository_policy', 'automation_id': row['id']})
+    [blocked] = await activity(product, 'automation.blocked')
+    assert (blocked['resource_id'], blocked['details']) == (row['id'], {'occurrence_kind': 'event', 'reason': 'governance'})
+    assert (await event_fixtures.pending(ctx))[0]['context'] == '{}'
+
+
+async def test_scheduled_chat_workflow_model_is_checked_against_the_chat_policy(automations, monkeypatch):
+    """Regression: review and save checked only the workflow profile, so every run in a narrower chat was refused."""
+    from test_product_activity_audit import activity, audited
+
+    from moyai.product_automations import Migration
+    ctx = automations
+    product = ctx.product
+    audited(product)
+    monkeypatch.setattr(product.database.settings, 'model_catalog', 'other')
+    chat = (await product.database.create_session(product.actor, NewSession(
+        visibility='shared', security_profile_id=await profile(product, {'models': ['other']})))).id
+    # The workflow's default model 'test' under an unrestricted profile.
+    with pytest.raises(HTTPException) as refused:
+        await automation_fixtures.create(ctx, session_id=chat)
+    assert refused.value.status_code == 403 and 'does not allow the workflow model' in refused.value.detail
+    [denied] = await activity(product, 'policy.continuation_denied')
+    assert (denied['resource_id'], denied['details']['reason'], denied['details']['model']) == (chat, 'model_policy', 'test')
+    # A workflow saved before that check is reported by the readiness review and cannot be enabled.
+    row = await automation_fixtures.create(ctx)
+    async with product.source.begin() as db:
+        saved = json.loads(await db.scalar(text('SELECT definition FROM moyai.automations WHERE id=:id'), {'id': row['id']}))
+        await db.execute(text('UPDATE moyai.automations SET definition=:definition WHERE id=:id'),
+                         {'id': row['id'], 'definition': json.dumps({**saved, 'session_id': chat})})
+    blockers = (await ctx.service.preview(ctx.grant, row['id']))['blockers']
+    assert 'model_not_allowed_by_security_policy' in blockers
+    assert 'scheduled_chat_exceeds_security_policy' not in blockers
+    with pytest.raises(HTTPException) as blocked:
+        await ctx.service.mutate(ctx.grant, 'migrate', row['id'], Migration(
+            revision=row['revision'], request_key='migrate-' + uuid4().hex, activate=True))
+    assert blocked.value.status_code == 409 and 'model_not_allowed_by_security_policy' in blocked.value.detail['blockers']
+    # A chat that allows the model serves the workflow.
+    allowed = (await product.database.create_session(product.actor, NewSession(
+        visibility='shared', security_profile_id=await profile(product, {'models': ['other', 'test']})))).id
+    await automation_fixtures.create(ctx, session_id=allowed)
 
 
 @pytest_asyncio.fixture

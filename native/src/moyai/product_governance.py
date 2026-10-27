@@ -679,17 +679,25 @@ class ProductGovernance:
         current = await self.policy(db, session_id)
         return intersect(current, policy) != current
 
-    async def continuation(self, db, session_id, requested='', *, actor_id='', automation_id=''):
+    async def continuation(self, db, session_id, requested='', *, actor_id='', automation_id='', model=None):
         """Admit a run in an existing chat only while the chat is no wider than its workflow.
 
         A chat's binding is immutable, so it cannot adopt the workflow's profile.
+        With model (the workflow's resolved model), also refuse a model the
+        chat's policy does not allow, which would otherwise refuse every run.
         """
+        from app.governance_activity import model_fields
+        denial = Denial('policy.continuation_denied', actor_id, session_id, subject=automation_id)
         if await self.continuation_wider(db, session_id, requested):
             raise await self._refuse(
-                Denial('policy.continuation_denied', actor_id, session_id, subject=automation_id),
-                'continuation_wider', 'This chat allows more than the workflow security policy. '
-                                      'Choose a chat started under that policy, or a new chat for each run.',
+                denial, 'continuation_wider', 'This chat allows more than the workflow security policy. '
+                                              'Choose a chat started under that policy, or a new chat for each run.',
                 automation_id=automation_id or None)
+        if model is not None and not self.admits_model(await self.policy(db, session_id), model):
+            raise await self._refuse(
+                denial, 'model_policy', "The chat's security policy does not allow the workflow model. "
+                                        'Choose a model it allows, or a new chat for each run.',
+                automation_id=automation_id or None, **model_fields(model))
 
 
 def permission_for_user(user, permission):
