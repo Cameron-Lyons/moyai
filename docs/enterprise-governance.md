@@ -227,7 +227,9 @@ curl --fail -G "https://moyai.example.com/api/admin/governance/audit/export" \
   record; only then move to the next window, from the window's original
   `before`. Because `before` is exclusive, `next_before` is one microsecond
   after the last instant the export reached: rows sharing that instant are sent
-  again rather than skipped, and deduplication drops them.
+  again rather than skipped, and deduplication drops them. If more than 50,000
+  entries share one microsecond, `next_before` cannot advance; narrow that
+  request with an action or resource type filter.
 - A 401 means the key is invalid, revoked or expired, or its account is disabled;
   a 403 means the account lacks the permission or the route does not accept keys;
   a 429 asks the collector to wait a minute. A download that ends early means the
@@ -289,8 +291,9 @@ an existing chat submits its model under that chat's policy, and its event
 admission checks its GitHub trigger repositories against that policy, so the
 review also reports `model_not_allowed_by_security_policy` or
 `repository_not_allowed_by_security_policy`, and a save is refused, when the
-chat does not allow the workflow's model or a GitHub trigger repository (such a
-run never uses the workflow's saved repository). Someone without
+chat does not allow the workflow's model or a GitHub trigger repository. Such a
+run never uses the workflow's saved repository, so only the workflow's profile
+checks it. Someone without
 `security.manage` editing a workflow that keeps another profile sees every
 choice; saving still checks it.
 

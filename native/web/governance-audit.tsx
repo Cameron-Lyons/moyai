@@ -78,7 +78,7 @@ export function AuditLogPage() {
       <Button variant="outline" size="sm" disabled={exporter.busy} onClick={() => download("csv")}><Download />{exporter.busy && format === "csv" ? "Exporting…" : "Export CSV"}</Button>
       <Button variant="outline" size="sm" disabled={exporter.busy} onClick={() => download("ndjson")}><Download />{exporter.busy && format === "ndjson" ? "Exporting…" : "Export NDJSON"}</Button>
       <PageActions resource={resource} />
-      <p id={`${id}-export-hint`} className="ns-field-hint ns-gov-export-hint">An export stops at 50,000 entries. A capped file ends with an <code>export.truncated</code> row instead of the older entries, and its <code>next_before</code> shows where it stopped: set To (UTC) to that date, or narrow the dates, to export the rest.</p>
+      <p id={`${id}-export-hint`} className="ns-field-hint ns-gov-export-hint">An export stops at 50,000 entries. A capped file ends with an <code>export.truncated</code> row instead of the older entries, and its <code>next_before</code> shows where it stopped: set To (UTC) to the day before that date to export older days. The rest of that day needs the audit export API with <code>before</code> set to <code>next_before</code>.</p>
     </div>
     <MutationError mutation={exporter} />
     <LoadGate resource={resource} label="the audit log">{data => {
