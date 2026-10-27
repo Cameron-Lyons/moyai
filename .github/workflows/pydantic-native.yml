@@ -119,6 +119,7 @@ jobs:
         tests/test_enterprise_roles.py tests/test_scim.py tests/test_security_profiles.py
         tests/test_spend_limits.py tests/test_governance_audit.py tests/test_governance_schema.py
         tests/test_governance_foundation.py tests/test_user_roles_governance.py tests/test_oidc_sso.py
+        tests/test_service_accounts.py tests/test_governance_activity.py tests/test_permissions_github_tools.py
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.88.0
