@@ -106,12 +106,12 @@ def test_candidate_plans_require_contiguous_reviewed_source_digests(monkeypatch)
 
 
 def test_shipped_registry_has_no_online_path_below_the_compatibility_floor():
-    """Compatibility 24 retired the historical 20 -> 21 step; earlier schemas need maintenance."""
+    """No step reaches compatibility 25; every earlier schema, including revision 24, needs maintenance."""
     assert online._manifest() == {'protocol': 1, 'steps': []}
-    for revision in (20, 22, 23):
+    for revision in (20, 22, 23, 24):
         with pytest.raises(DatabaseError, match='No compatible online migration path'):
             online.plan(revision)
-    assert online.plan(24) == seal({'from_revision': 24, 'to_revision': 24, 'compatibility': 24, 'steps': []})
+    assert online.plan(25) == seal({'from_revision': 25, 'to_revision': 25, 'compatibility': 25, 'steps': []})
 
 
 @pytest.mark.parametrize('mutation', ['drop','default','not_null','index_existing','sql_type',

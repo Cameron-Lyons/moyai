@@ -18,6 +18,7 @@ import tempfile
 
 from .storage_maintenance import MaintenanceError, source_database
 from .database_schema import (REVOKE_TRIGGER, REVOKE_FUNCTION, REVOKE_POSTGRES,
+                              ACTIVITY_TRIGGER, ACTIVITY_FUNCTION, ACTIVITY_POSTGRES,
                               SQLITE_OCCUPIED_INDEX, POSTGRES_OCCUPIED_INDEX)
 
 
@@ -26,13 +27,30 @@ SCHEMA_PATTERN = r'moyai_[a-z][a-z0-9_]{0,49}'
 # Schema SQL is executable input. Accept only the constructs used by Moyai;
 # new functions, generated columns, triggers, etc. need an explicit port.
 DDL_NODES = frozenset('''Create Index Identifier Table IndexParameters Ordered
-    Column Where EQ GT Literal NEQ And Is Null Between Schema ColumnDef PrimaryKey
+    Column Where EQ GT LTE Literal NEQ And Is Null Between Length Schema ColumnDef PrimaryKey
     UniqueColumnConstraint DataType ColumnConstraint NotNullColumnConstraint
     Reference PrimaryKeyColumnConstraint DefaultColumnConstraint
     AutoIncrementColumnConstraint CheckColumnConstraint In ForeignKey
     Select From With CTE Union TableAlias Join Alias'''.split())
 TYPES = {'INTEGER': ('BIGINT', int), 'TEXT': ('TEXT', str),
          'REAL': ('DOUBLE', float), 'BLOB': ('BYTEA', bytes)}
+# The PostgreSQL initializers index audit feed keys COLLATE "C" (the byte order
+# SQLite's BINARY collation already gives) in PostgreSQL's default NULL order, as
+# the feed queries sort. SQLite DDL carries neither, and a later migrate() keeps
+# an existing index, so the copy ports these definitions and refuses drift.
+_TEXT_FEED, _INTEGER_FEED = 'created_at COLLATE "C",id COLLATE "C"', 'created_at COLLATE "C",id'
+FEED_INDEXES = {name: f'CREATE INDEX {name} ON {table}({keys}){where}' for name, table, keys, where in (
+    ('idx_governance_audit_time', 'governance_audit_events', _TEXT_FEED, ''),
+    ('idx_governance_audit_action', 'governance_audit_events', 'action,' + _TEXT_FEED, ''),
+    ('idx_credential_audit_time', 'credential_audit', _INTEGER_FEED, ''),
+    ('idx_user_role_audit_time', 'user_role_audit', _INTEGER_FEED, ''),
+    ('idx_connection_audit_time', 'connection_audit', _INTEGER_FEED, ''),
+    ('idx_activity_audit_time', 'governance_activity_events', _TEXT_FEED, ''),
+    ('idx_activity_audit_action', 'governance_activity_events', 'action,' + _TEXT_FEED, ''),
+    ('idx_activity_audit_actor', 'governance_activity_events', 'actor_key,' + _TEXT_FEED, ''),
+    ('idx_activity_audit_resource', 'governance_activity_events', 'resource_type,' + _TEXT_FEED, ''),
+    ('idx_activity_audit_session', 'governance_activity_events', 'session_id,' + _TEXT_FEED, " WHERE session_id<>''"),
+)}
 
 
 
@@ -139,6 +157,11 @@ def inspect_schema(source: sqlite3.Connection) -> Schema:
                     triggers.append(SESSION_EVENT_FUNCTION)
                 triggers.append(postgres)
                 continue
+            if name == 'governance_activity_immutable':
+                if ' '.join(ddl.split()) != ' '.join(ACTIVITY_TRIGGER.split()):
+                    raise MaintenanceError('Changed activity audit trigger; port its behavior before copying.')
+                triggers.extend([ACTIVITY_FUNCTION, ACTIVITY_POSTGRES])
+                continue
             if ' '.join(ddl.split()) != ' '.join(REVOKE_TRIGGER.split()):
                 raise MaintenanceError('Unknown or changed SQLite trigger; port its behavior before copying.')
             triggers.extend([REVOKE_FUNCTION, REVOKE_POSTGRES])
@@ -147,6 +170,11 @@ def inspect_schema(source: sqlite3.Connection) -> Schema:
             if ' '.join(ddl.split()) != ' '.join(SQLITE_OCCUPIED_INDEX.split()):
                 raise MaintenanceError('Changed durable admission index; port its predicate before copying.')
             indexes.append(POSTGRES_OCCUPIED_INDEX)
+            continue
+        if kind == 'index' and name in FEED_INDEXES:
+            if ' '.join(ddl.split()) != ' '.join(FEED_INDEXES[name].replace(' COLLATE "C"', '').split()):
+                raise MaintenanceError('Changed audit feed index; port its collation before copying.')
+            indexes.append(FEED_INDEXES[name])
             continue
         tree = postgres_ddl(ddl)
         if kind == 'index':

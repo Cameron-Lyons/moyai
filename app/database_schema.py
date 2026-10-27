@@ -51,6 +51,24 @@ PRIVATE_POSTGRES = '''CREATE OR REPLACE TRIGGER immutable_session_privacy
     FOR EACH ROW EXECUTE FUNCTION enforce_session_privacy()'''
 
 
+# Activity audit rows reject UPDATE, including ON CONFLICT DO UPDATE, on both
+# databases. DELETE (kept for retention), TRUNCATE and SQLite REPLACE are not
+# rejected, so writers use only INSERT ... ON CONFLICT(id) DO NOTHING. Like the
+# privacy trigger, both backends raise an integrity error (PostgreSQL 23514).
+ACTIVITY_TRIGGER = '''CREATE TRIGGER governance_activity_immutable
+    BEFORE UPDATE ON governance_activity_events
+    BEGIN SELECT RAISE(ABORT, 'Activity audit events are immutable'); END'''
+ACTIVITY_FUNCTION = '''CREATE OR REPLACE FUNCTION governance_activity_immutable() RETURNS trigger
+    LANGUAGE plpgsql SET search_path FROM CURRENT AS $moyai$
+    BEGIN
+        RAISE EXCEPTION 'Activity audit events are immutable' USING ERRCODE = '23514';
+    END
+    $moyai$'''
+ACTIVITY_POSTGRES = '''CREATE OR REPLACE TRIGGER governance_activity_immutable
+    BEFORE UPDATE ON governance_activity_events
+    FOR EACH ROW EXECUTE FUNCTION governance_activity_immutable()'''
+
+
 SQLITE_OCCUPIED_SESSION = """(json_extract(state, '$.phase')
     NOT IN ('idle', 'waiting_children', 'waiting_credential', 'waiting_environment')
     OR json_type(state, '$.phase') = 'null')

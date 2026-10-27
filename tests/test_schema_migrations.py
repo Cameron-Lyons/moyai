@@ -13,7 +13,7 @@ import pytest
 from app import schema_migrations as migration
 from canonical_fixture import open_services
 from app.config import Settings
-from app.database import DatabaseError, PostgresConnection
+from app.database import INTEGRITY_ERRORS, DatabaseError, PostgresConnection
 from app.db import Store
 from app.schema_initializers import TABLES
 from postgres_fixture import target  # noqa: F401
@@ -336,6 +336,50 @@ def test_upgrade_adds_skill_learning_without_changing_saved_work(split_settings,
         assert {name: api.state.store.rows('SELECT * FROM ' + name) for name in tables} == saved
         for name in ('skill_suggestions', 'skill_learning_jobs', 'skill_learning_preferences'):
             assert api.state.store.rows('SELECT * FROM ' + name) == []
+    finally:
+        api.state.store.close()
+
+
+def test_revision_twenty_four_upgrade_adds_governance_tables_without_changing_saved_rows(split_settings):
+    settings = ready(split_settings)
+    added = ('service_accounts', 'service_account_keys', 'spend_group_limits', 'governance_activity_events')
+    preserved = ('runs', 'spend_limits', 'scim_groups', 'enterprise_group_roles', 'governance_audit_events')
+    api = open_services(settings)
+    try:
+        store = api.state.store
+        store.create_run('Existing revision-24 session', '', 'modal', [])
+        store.execute("INSERT INTO spend_limits VALUES('user-default','user-default','',25,3,'owner','2026-10-21')")
+        store.execute("INSERT INTO scim_groups VALUES('group','','Engineering','engineering','','2026-10-21','2026-10-21',1)")
+        store.execute("INSERT INTO enterprise_group_roles VALUES('group','reader',1,'owner','2026-10-21')")
+        store.execute('''INSERT INTO governance_audit_events VALUES('event','spend_limit.updated','owner',
+            'spend_limit','user-default','{}','2026-10-21')''')
+        saved = {name: store.rows(f'SELECT * FROM {name} ORDER BY 1') for name in preserved}
+    finally:
+        api.state.store.close()
+    with psycopg.connect(settings.moyai_database_url) as conn:
+        conn.execute(f'SET search_path TO "{settings.moyai_database_schema}"')
+        for name in added:
+            conn.execute('DROP TABLE ' + name)
+        conn.execute('DROP FUNCTION governance_activity_immutable()')
+        conn.execute('UPDATE schema_state SET revision=24')
+    # Verified startup refuses the revision-24 schema until the offline migration runs.
+    with pytest.raises(DatabaseError, match='offline migration'):
+        open_services(settings)
+    ready(split_settings)
+    assert execute(settings, 'SELECT revision,dirty FROM schema_state') == [(migration.SCHEMA_REVISION, 0)]
+    assert execute(settings, """SELECT tgname FROM pg_trigger
+        WHERE tgrelid='governance_activity_events'::regclass AND NOT tgisinternal""") == [('governance_activity_immutable',)]
+    api = open_services(settings)
+    try:
+        store = api.state.store
+        assert {name: store.rows(f'SELECT * FROM {name} ORDER BY 1') for name in preserved} == saved
+        for name in added:
+            assert store.rows('SELECT * FROM ' + name) == []
+        store.execute('''INSERT INTO governance_activity_events
+            (id,action,outcome,actor,actor_key,resource_type,resource_id,created_at)
+            VALUES('event','sign_in.succeeded','success','Person','person','sign_in','person','2026-10-26')''')
+        with pytest.raises(INTEGRITY_ERRORS):
+            store.execute("UPDATE governance_activity_events SET outcome='denied'")
     finally:
         api.state.store.close()
 

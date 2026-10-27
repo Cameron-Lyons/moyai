@@ -1,14 +1,23 @@
 # Explicit PostgreSQL schema migrations
 
-This branch's canonical schema requires revision **24**, with compatibility floor
-**24**. It retains the governance tables and organization pin alongside upstream
+This branch's canonical schema requires revision **25**, with compatibility floor
+**25**. It retains the governance tables and organization pin alongside upstream
 revision 22. Upstream and the earlier governance branch used revision 22 for
 different changes; neither layout is admitted as the combined schema. Revision 23
 was the first combined layout; revision 24 adds `enterprise_roles.permissions_revision`
 (backfilled from each role's revision), which revision 23 binaries do not write.
+Revision 25 adds four empty tables: `service_accounts` and `service_account_keys`
+for programmatic access, `governance_activity_events` for the activity audit log,
+and `spend_group_limits` for spend-limit group tiers. It changes no existing table
+or row. A revision 24 binary would ignore group tiers and give a restrictive tier's
+members the default limit, so revision 25 also raises the compatibility floor.
+The activity log and group tiers also use DDL outside online protocol 1 (checks,
+defaults, `COLLATE "C"` and partial indexes, and an immutability trigger), so the
+online registry declares no 24 to 25 step.
 Use the offline migration for any of these sources. Native application migrations
-have their own version receipts. Pair canonical revision 24 with native governance
-v24; both must verify before native execution starts.
+have their own version receipts. Revision 25 needs no native migration. Pair
+canonical revision 25 with native governance v24; both must verify before native
+execution starts.
 The Pydantic application and Harness have separate receipts; see the
 [deployment contract](pydantic-deployment.md). Coordinate a maintenance window
 for current native upgrades. The retained online migration engine and its ledger
@@ -44,7 +53,7 @@ is insufficient.
    python -m app.schema_migrations --apply
    ```
 
-   It prints `{"schema_revision": 24, "status": "ready"}` on success. An empty
+   It prints `{"schema_revision": 25, "status": "ready"}` on success. An empty
    schema must already exist, and requires `MOYAI_DATABASE_INITIALIZE=true`.
    Existing schemas do not need that flag. No credentials are printed.
 4. Set `MOYAI_SCHEMA_MODE=verify` on every role, including the dedicated API.
@@ -57,9 +66,9 @@ Complete this coordinated maintenance transition before enabling concurrent
 replacements of compatible runtime versions. A normal pre-deploy hook that runs while the old
 app is live will be rejected. Once this activation is complete, deploy the bridge
 at the same schema revision to all four roles before using online expansions.
-An installation still on an earlier revision, such as revision 14, 22 or 23, first
-needs the one-time maintenance adoption of revision 24; the canonical online
-registry declares no steps at compatibility 24.
+An installation still on an earlier revision, such as revision 14, 22, 23 or 24,
+first needs the one-time maintenance adoption of revision 25; the canonical online
+registry declares no steps at compatibility 25.
 
 ## Private-session upgrade
 
@@ -71,7 +80,7 @@ Use the coordinated maintenance steps above for an existing revision-18 deployme
 back up the database, drain work, stop **all four roles** (including the dedicated
 API), run `python -m app.schema_migrations --apply` from the target release, and
 start every role at that release with `MOYAI_SCHEMA_MODE=verify`. Confirm the
-migration prints the current revision 24, health checks pass, and an ordinary saved session
+migration prints the current revision 25, health checks pass, and an ordinary saved session
 opens before reopening ingress. Verify that a private test session returns 404
 for a second individual account.
 

@@ -890,6 +890,38 @@ def initialize_scim(store):
         conn.execute("UPDATE scim_users SET access_epoch=1 WHERE access_epoch=0 AND (active=0 OR deleted_at<>'')")
 
 
+def initialize_service_accounts(store):
+    """Service principals for programmatic access. Keys are stored only as SHA-256 hashes.
+
+    Account names are unique by their casefolded name_key, and permissions are
+    a sorted JSON list. access_revision advances whenever an account's
+    permissions change or it is disabled or enabled, so authority versions that
+    include it never return to an earlier value. Every key has an expiry; ''
+    means never used or not revoked. Writers validate every value, so the tables
+    have no defaults, checks or foreign keys. Revoked keys and disabled accounts
+    are retained.
+    """
+    with store.connect() as conn:
+        conn.executescript('''
+            CREATE TABLE IF NOT EXISTS service_accounts (
+                id TEXT PRIMARY KEY, name TEXT NOT NULL, name_key TEXT NOT NULL,
+                description TEXT NOT NULL, permissions TEXT NOT NULL, revision INTEGER NOT NULL,
+                access_revision INTEGER NOT NULL, active INTEGER NOT NULL,
+                created_by TEXT NOT NULL, created_at TEXT NOT NULL,
+                updated_by TEXT NOT NULL, updated_at TEXT NOT NULL);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_service_accounts_name ON service_accounts(name_key);
+            CREATE TABLE IF NOT EXISTS service_account_keys (
+                id TEXT PRIMARY KEY, account_id TEXT NOT NULL, label TEXT NOT NULL,
+                token_hash TEXT NOT NULL, prefix TEXT NOT NULL,
+                created_by TEXT NOT NULL, created_at TEXT NOT NULL, expires_at TEXT NOT NULL,
+                last_used_at TEXT NOT NULL, last_used_from TEXT NOT NULL,
+                revoked_at TEXT NOT NULL, revoked_by TEXT NOT NULL);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_service_account_keys_hash ON service_account_keys(token_hash);
+            CREATE INDEX IF NOT EXISTS idx_service_account_keys_account
+                ON service_account_keys(account_id,created_at);
+        ''')
+
+
 def initialize_governance_audit(store):
     """Metadata-only governance events, written in each mutation's transaction.
 
@@ -918,6 +950,43 @@ def initialize_governance_audit(store):
                 ('idx_connection_audit_time', 'connection_audit', f'created_at{collate},id')):
             if table in tables:
                 conn.execute(f'CREATE INDEX IF NOT EXISTS {index} ON {table}({keys})')
+
+
+def initialize_governance_activity(store):
+    """Metadata-only activity events (sign-in, sessions, messages and refusals).
+
+    Configuration changes stay in governance_audit_events. On both databases a
+    trigger rejects UPDATE, including ON CONFLICT DO UPDATE, with an integrity
+    error. DELETE (for an opt-in retention purge), TRUNCATE and SQLite REPLACE
+    are not rejected, so writers insert only with ON CONFLICT(id) DO NOTHING.
+    Feed keys are byte-ordered text as in the configuration audit, so PostgreSQL
+    indexes them COLLATE "C". Only session events carry a session_id, so its
+    index is partial.
+    """
+    from .database_schema import ACTIVITY_TRIGGER, ACTIVITY_FUNCTION, ACTIVITY_POSTGRES
+    collate = ' COLLATE "C"' if store.database else ''
+    keys = f'created_at{collate},id{collate}'
+    with store.connect() as conn:
+        conn.execute('''CREATE TABLE IF NOT EXISTS governance_activity_events (
+            id TEXT PRIMARY KEY, action TEXT NOT NULL,
+            outcome TEXT NOT NULL CHECK(outcome IN ('success','denied','failed')),
+            actor TEXT NOT NULL, actor_key TEXT NOT NULL, actor_id TEXT NOT NULL DEFAULT '',
+            resource_type TEXT NOT NULL, resource_id TEXT NOT NULL,
+            session_id TEXT NOT NULL DEFAULT '', client TEXT NOT NULL DEFAULT '',
+            details TEXT NOT NULL DEFAULT '{}' CHECK(length(details) <= 4096),
+            created_at TEXT NOT NULL)''')
+        for index, columns, where in (
+                ('idx_activity_audit_time', keys, ''),
+                ('idx_activity_audit_action', 'action,' + keys, ''),
+                ('idx_activity_audit_actor', 'actor_key,' + keys, ''),
+                ('idx_activity_audit_resource', 'resource_type,' + keys, ''),
+                ('idx_activity_audit_session', 'session_id,' + keys, " WHERE session_id<>''")):
+            conn.execute(f'CREATE INDEX IF NOT EXISTS {index} ON governance_activity_events({columns}){where}')
+        if store.database:
+            conn.execute(ACTIVITY_FUNCTION)
+            conn.execute(ACTIVITY_POSTGRES)
+        else:
+            conn.execute(ACTIVITY_TRIGGER.replace('CREATE TRIGGER ', 'CREATE TRIGGER IF NOT EXISTS ', 1))
 
 
 def initialize_security_profiles(store):
@@ -952,10 +1021,19 @@ def initialize_spend_limits(store):
     """Monthly USD limits. Ids: organization, user-default, session-default, user:<email>.
 
     A NULL limit is unlimited and zero blocks model requests. Usage comes from
-    the native inference ledger, so this table stores configuration only.
+    the native inference ledger, so these tables store configuration only.
+    spend_group_limits holds one tier per SCIM group id. It has no foreign key:
+    group tombstones are retained and writers check that the group is live, as
+    enterprise_group_roles does. Its range check admits NULL (unlimited) and
+    rejects infinities, and PostgreSQL rejects NaN, but SQLite stores NaN as
+    NULL, so writers must reject non-finite limits themselves.
     """
     store.execute('''CREATE TABLE IF NOT EXISTS spend_limits (
         id TEXT PRIMARY KEY,
         kind TEXT NOT NULL CHECK(kind IN ('organization','user-default','session-default','user')),
         subject TEXT NOT NULL DEFAULT '', limit_usd REAL, revision INTEGER NOT NULL,
+        updated_by TEXT NOT NULL, updated_at TEXT NOT NULL)''')
+    store.execute('''CREATE TABLE IF NOT EXISTS spend_group_limits (
+        group_id TEXT PRIMARY KEY, limit_usd REAL CHECK(limit_usd BETWEEN 0 AND 1000000),
+        revision INTEGER NOT NULL CHECK(revision > 0),
         updated_by TEXT NOT NULL, updated_at TEXT NOT NULL)''')

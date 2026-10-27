@@ -7,34 +7,41 @@ not required.
 
 ## Deployment and migration
 
-Apply canonical schema revision **24** and native application migration
+Apply canonical schema revision **25** and native application migration
 **2026-10-21-product-governance-v24** during the coordinated maintenance window
-in [the deployment contract](pydantic-deployment.md). Canonical revision 24 combines
+in [the deployment contract](pydantic-deployment.md). Canonical revision 25 combines
 upstream revision 22 with the governance branch's older revision 22, plus the
-role permissions revision added after the first combined revision 23; none of the
-older layouts is admitted as the combined release. The native migration follows upstream
-v23 (automation chats), adds an immutable session-policy table and preserves the
-previous 23 migration receipts. It is also a registered
+role permissions revision added after the first combined revision 23 (revision 24)
+and the service account, activity audit and spend tier tables (revision 25); none
+of the older layouts is admitted as the combined release. Revision 25 raises the
+compatibility floor, so revision 24 services must not overlap it: they would
+ignore spend tiers. Rolling back to them needs the reviewed database restore
+procedure. Revision 25 needs no native migration of its own. The v24 native
+migration follows upstream v23 (automation chats), adds an immutable
+session-policy table and preserves the previous 23 migration receipts. It is also a registered
 [online expansion](native-online-schema.md), so the native table can be prepared
 while v23 services run; the canonical revision still needs the maintenance
 window. Normal startup verifies both schemas; it does not run migrations.
 
 The canonical upgrade retains existing governance configuration and audit events,
 copies the older `floor_profile_id` into the mandatory policy, and adds SCIM
-revocation epochs. Previously inactive directory users remain revoked. Existing
-native sessions without policy bindings have no selected profile, and are still
-subject to the current mandatory policy. A continuation of a historical governed
-session intersects its saved policy with the new native binding; an unreadable
-saved policy blocks the continuation for review.
+revocation epochs. Previously inactive directory users remain revoked. Revision 25
+only adds empty tables: `service_accounts` and `service_account_keys`,
+`governance_activity_events` (whose rows reject updates on both databases but can
+be deleted), and `spend_group_limits`. Existing native sessions without policy
+bindings have no selected profile, and are still subject to the current mandatory
+policy. A continuation of a historical governed session intersects its saved
+policy with the new native binding; an unreadable saved policy blocks the
+continuation for review.
 
 Repository and model limits need no schema change. A stored policy without them
-keeps the four-key document v24 wrote, byte for byte, so existing profiles,
-revisions and immutable session bindings load unchanged. A policy that uses
-either limit is stored with all six keys, which a v24 binary refuses as invalid
-(it fails closed). Configure these limits only after every service runs this
-release. Before rolling back to a v24 binary, clear them from every profile:
-otherwise v24 blocks admissions under a default or mandatory profile that uses
-them, and sessions already bound with them stay unreadable to v24.
+keeps the four-key document the previous release wrote, byte for byte, so
+existing profiles, revisions and immutable session bindings load unchanged. A
+policy that uses either limit is stored with all six keys, which the previous
+release refuses as invalid (it fails closed). Because this release raises the
+compatibility floor, rolling back to the previous (revision 24) release means
+restoring the pre-upgrade database backup, which has no repository or model
+limits; clearing them from profiles is not a rollback step.
 
 Use `MOYAI_ORGANIZATION_ID` for one organization per deployment and database.
 The immutable database pin rejects a different organization at startup. An existing

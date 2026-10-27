@@ -10,10 +10,10 @@ import json
 
 from .database import DatabaseError, identifier
 
-SCHEMA_REVISION = 24
+SCHEMA_REVISION = 25
 # Physical additive expansions can keep this contract after a reviewed online
 # manifest step. Incompatible changes advance it and require maintenance.
-SCHEMA_COMPATIBILITY_REVISION = 24
+SCHEMA_COMPATIBILITY_REVISION = 25
 # Dependency order; optional features are prepared even when disabled at runtime.
 COMPONENTS = (
     'organization_scope', 'session_privacy', 'personal_slack', 'user_roles', 'sandbox_settings', 'github_repositories', 'github_write_access',
@@ -26,7 +26,8 @@ COMPONENTS = (
     'broker_ownership', 'performance',
     'session_journal', 'goals', 'slack_sources', 'published_artifacts', 'computer_operations', 'broker_payloads',
     'session_events', 'slack_notifications',
-    'enterprise_roles', 'scim', 'security_profiles', 'spend_limits', 'governance_audit',
+    'enterprise_roles', 'scim', 'service_accounts', 'security_profiles', 'spend_limits', 'governance_audit',
+    'governance_activity',
 )
 
 

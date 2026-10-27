@@ -13,6 +13,8 @@ pytest.importorskip('sqlglot')
 
 from app import postgres_migration as migration
 from app.config import Settings
+from app.db import Store
+from app.schema_migrations import initialize_components
 from canonical_fixture import open_services as create_app
 
 
@@ -61,7 +63,8 @@ def test_plan_is_read_only_and_requires_no_destination(source, monkeypatch):
     report = migration.plan(store.path.parent)
     assert report['objects']['table'] >= 81
     from app.database_schema import SESSION_EVENT_TRIGGERS, PRIVATE_TRIGGERS
-    assert report['objects']['view'] == 2 and report['objects']['trigger'] == 1 + len(SESSION_EVENT_TRIGGERS) + len(PRIVATE_TRIGGERS)
+    # The GitHub revocation and activity-audit immutability triggers, plus the trigger families.
+    assert report['objects']['view'] == 2 and report['objects']['trigger'] == 2 + len(SESSION_EVENT_TRIGGERS) + len(PRIVATE_TRIGGERS)
     assert report['tables']['connections']['rows'] == 1
     assert report['source_preserved'] and not report['runtime_cutover']
     assert hashlib.sha256(store.path.read_bytes()).hexdigest() == before
@@ -123,6 +126,59 @@ def test_private_ownership_and_derivation_guards_survive_migration(source, targe
             conn.execute('UPDATE runs SET parent_run_id=%s WHERE id=%s', (run['id'], source.state.test_run_id))
         with pytest.raises(psycopg.errors.CheckViolation):
             conn.execute('UPDATE runs SET side_chat_of=%s WHERE id=%s', (source.state.test_run_id, run['id']))
+
+
+def test_revision_25_governance_constraints_survive_migration(source, target):
+    store, (url, name) = source.state.store, target
+    store.execute('''INSERT INTO governance_activity_events
+        (id,action,outcome,actor,actor_key,resource_type,resource_id,created_at)
+        VALUES('event','sign_in.succeeded','success','Person','person@example.com','sign_in','person','2026-10-26')''')
+    store.execute("INSERT INTO spend_group_limits VALUES('group',NULL,1,'owner','2026-10-26')")
+    migration.transfer(store.path.parent, url, name)
+    with psycopg.connect(url, autocommit=True) as conn:
+        conn.execute(f'SET search_path TO {migration.identifier(name)}, pg_catalog')
+        with pytest.raises(psycopg.errors.CheckViolation, match='immutable'):
+            conn.execute("UPDATE governance_activity_events SET outcome='denied'")
+        with pytest.raises(psycopg.errors.CheckViolation):
+            conn.execute('''INSERT INTO governance_activity_events
+                (id,action,outcome,actor,actor_key,resource_type,resource_id,details,created_at)
+                VALUES('large','sign_in.failed','failed','Person','person','sign_in','person',%s,'2026-10-26')''',
+                         ('x' * 4097,))
+        with pytest.raises(psycopg.errors.CheckViolation):
+            conn.execute("UPDATE spend_group_limits SET limit_usd=-1")
+        conn.execute('DELETE FROM governance_activity_events')
+        assert conn.execute('SELECT limit_usd,revision FROM spend_group_limits').fetchall() == [(None, 1)]
+
+
+def test_audit_feed_indexes_match_the_postgres_initializers(source, target, tmp_path):
+    """A later migrate() keeps a copied index, so the copy must already match its collation and NULL order."""
+    store, (url, name) = source.state.store, target
+    migration.transfer(store.path.parent, url, name)
+    reference = 'moyai_test_' + uuid4().hex
+    with psycopg.connect(url, autocommit=True) as conn:
+        conn.execute(f'CREATE SCHEMA {migration.identifier(reference)}')
+    try:
+        initialized = Store(tmp_path / 'reference', database_url=url, database_schema=reference,
+                            database_initialize=True)
+        try:
+            initialize_components(initialized)
+        finally:
+            initialized.close()
+        with psycopg.connect(url) as conn:
+            def collated(schema):
+                return {index: definition.replace(schema + '.', '') for index, definition in conn.execute(
+                    "SELECT indexname,indexdef FROM pg_indexes WHERE schemaname=%s AND indexdef LIKE '%%COLLATE%%'",
+                    (schema,))}
+            expected = collated(reference)
+            assert set(expected) == set(migration.FEED_INDEXES)
+            assert collated(name) == expected
+    finally:
+        with psycopg.connect(url, autocommit=True) as conn:
+            conn.execute(f'DROP SCHEMA IF EXISTS {migration.identifier(reference)} CASCADE')
+    store.execute('DROP INDEX idx_activity_audit_time')
+    store.execute('CREATE INDEX idx_activity_audit_time ON governance_activity_events(created_at)')
+    with pytest.raises(migration.MaintenanceError, match='feed index'):
+        migration.plan(store.path.parent)
 
 
 def test_failed_readback_rolls_back_everything_and_retry_succeeds(source, target, monkeypatch):

@@ -1,15 +1,22 @@
-"""Revision-23 governance storage and audit-event contract on SQLite or --postgres-backend."""
+"""Governance storage (revisions 23 to 25) and audit-event contract on SQLite or --postgres-backend."""
 import json
+import os
 import re
+import sqlite3
 
 import pytest
 from app import permissions
 from app.database import INTEGRITY_ERRORS
 from app.db import Store
 from app.governance_audit import MAX_DETAILS_BYTES, record_event_in
-from app.schema_migrations import COMPONENTS, initialize_components
+from app.online_migrations import _versions
+from app.schema_migrations import COMPONENTS, SCHEMA_COMPATIBILITY_REVISION, initialize_components
 
-GOVERNANCE = ('enterprise_roles', 'scim', 'security_profiles', 'spend_limits', 'governance_audit')
+GOVERNANCE = ('enterprise_roles', 'scim', 'service_accounts', 'security_profiles', 'spend_limits',
+              'governance_audit', 'governance_activity')
+# Revision 25's additions, in creation order; revision 24 has none of them.
+REVISION_25 = ('service_accounts', 'service_account_keys', 'spend_group_limits', 'governance_activity_events')
+STAMP = '2026-10-26T00:00:00.000000+00:00'
 
 
 @pytest.fixture
@@ -34,19 +41,211 @@ def test_governance_components_are_appended_and_idempotent(store):
     initialize_components(store)
     assert {'enterprise_roles', 'enterprise_role_assignments', 'enterprise_group_roles', 'scim_tokens',
             'scim_users', 'scim_groups', 'scim_group_members', 'security_profiles', 'security_profile_revisions',
-            'security_profile_defaults', 'spend_limits', 'governance_audit_events'} <= store.table_names()
+            'security_profile_defaults', 'spend_limits', 'governance_audit_events', *REVISION_25} <= store.table_names()
 
 
 def test_governance_module_initializers_need_only_the_core_store(tmp_path):
     from app import enterprise_roles, governance_audit, scim, security_profiles, spend_limits
+    from app.schema_initializers import initialize_governance_activity, initialize_service_accounts
     store = Store(tmp_path / 'core-only')
     try:
         # Service constructors may initialize before other components in auto mode.
         for module in (governance_audit, spend_limits, security_profiles, scim, enterprise_roles):
             module.initialize_schema(store)
-        assert 'governance_audit_events' in store.table_names()
+        initialize_service_accounts(store)
+        initialize_governance_activity(store)
+        assert {'governance_audit_events', *REVISION_25} <= store.table_names()
     finally:
         store.close()
+
+
+def test_revision_25_is_appended_as_a_maintenance_revision():
+    """Earlier digests are never rewritten, and revision-24 binaries cannot overlap revision 25.
+
+    A revision-24 binary would ignore spend tiers and give a restrictive tier's
+    members the default limit, so the compatibility floor advances with it.
+    """
+    versions = _versions()
+    assert versions['23'] == '9447c4af35e4ff67061853a7ca863649981332b9936a80645439fd4edf85625c'
+    assert versions['24'] == '23405097eea19ab2cac34e6484d7e9a32a9ca0b2a48cc9af6d45b53cfa2d8b1d'
+    assert '25' in versions and SCHEMA_COMPATIBILITY_REVISION >= 25
+
+
+def indexes(store, table):
+    """{name: definition without whitespace} for the table's named indexes."""
+    if store.database:
+        rows = store.rows("""SELECT indexname AS name,indexdef AS sql FROM pg_indexes
+            WHERE schemaname=current_schema() AND tablename=? AND indexname LIKE 'idx%'""", (table,))
+    else:
+        rows = store.rows("SELECT name,sql FROM sqlite_master WHERE type='index' AND tbl_name=? AND sql IS NOT NULL",
+                          (table,))
+    return {row['name']: ''.join(row['sql'].split()) for row in rows}
+
+
+def triggers(store, table):
+    if store.database:
+        return {row['tgname'] for row in store.rows(
+            'SELECT tgname FROM pg_trigger WHERE tgrelid=CAST(? AS regclass) AND NOT tgisinternal', (table,))}
+    return {row['name'] for row in store.rows(
+        "SELECT name FROM sqlite_master WHERE type='trigger' AND tbl_name=?", (table,))}
+
+
+def test_revision_25_indexes_and_triggers(store):
+    initialize_components(store)  # Rerunning the migration keeps one copy of each object.
+    collate = 'COLLATE"C"' if store.database else ''
+    feed = f'created_at{collate},id{collate}'
+    activity_indexes = indexes(store, 'governance_activity_events')
+    assert {name: re.search(r'\(([^()]*)\)(?:WHERE|$)', sql).group(1) for name, sql in activity_indexes.items()} == {
+        'idx_activity_audit_time': feed, 'idx_activity_audit_action': 'action,' + feed,
+        'idx_activity_audit_actor': 'actor_key,' + feed, 'idx_activity_audit_resource': 'resource_type,' + feed,
+        'idx_activity_audit_session': 'session_id,' + feed}
+    assert [name for name, sql in activity_indexes.items() if 'WHERE' in sql] == ['idx_activity_audit_session']
+    assert "session_id<>''" in activity_indexes['idx_activity_audit_session']
+    assert not any('UNIQUE' in sql for sql in activity_indexes.values())
+    accounts, keys = indexes(store, 'service_accounts'), indexes(store, 'service_account_keys')
+    assert set(accounts) == {'idx_service_accounts_name'} and 'UNIQUE' in accounts['idx_service_accounts_name']
+    assert '(name_key)' in accounts['idx_service_accounts_name']
+    assert set(keys) == {'idx_service_account_keys_hash', 'idx_service_account_keys_account'}
+    assert 'UNIQUE' in keys['idx_service_account_keys_hash'] and '(token_hash)' in keys['idx_service_account_keys_hash']
+    assert 'UNIQUE' not in keys['idx_service_account_keys_account']
+    assert '(account_id,created_at)' in keys['idx_service_account_keys_account']
+    assert indexes(store, 'spend_group_limits') == {}
+    assert triggers(store, 'governance_activity_events') == {'governance_activity_immutable'}
+    assert not triggers(store, 'governance_audit_events') | triggers(store, 'spend_group_limits')
+    if store.database:
+        assert store.rows("""SELECT proname FROM pg_proc WHERE pronamespace=CAST(current_schema() AS regnamespace)
+            AND proname='governance_activity_immutable'""") == [{'proname': 'governance_activity_immutable'}]
+
+
+def activity(**change):
+    values = {'id': 'a' * 32, 'action': 'sign_in.succeeded', 'outcome': 'success', 'actor': 'Person',
+              'actor_key': 'person@example.com', 'resource_type': 'sign_in', 'resource_id': 'person@example.com',
+              'created_at': STAMP, **change}
+    return (f'INSERT INTO governance_activity_events({",".join(values)}) VALUES({",".join("?" * len(values))})',
+            tuple(values.values()))
+
+
+def assert_update_refused(store, statement):
+    """Both backends refuse with an integrity error, as the privacy trigger does."""
+    with pytest.raises(INTEGRITY_ERRORS) as refused:
+        store.execute(statement)
+    if not store.database:
+        assert isinstance(refused.value, sqlite3.IntegrityError)
+        assert 'Activity audit events are immutable' in str(refused.value)
+        return
+    # The adapter hides PostgreSQL's message; read the trigger's own error directly.
+    import psycopg
+    with psycopg.connect(os.environ['MOYAI_TEST_POSTGRES_URL']) as conn:
+        conn.execute(f'SET search_path TO "{store.database.schema}"')
+        with pytest.raises(psycopg.errors.CheckViolation, match='Activity audit events are immutable'):
+            conn.execute(statement)
+
+
+def test_activity_rows_are_immutable_but_can_be_purged(store):
+    store.execute(*activity())
+    store.execute(*activity(id='b' * 32, action='session.created', resource_type='session', session_id='c' * 32,
+                            details='{"origin":"web"}'))
+    saved = store.rows('SELECT * FROM governance_activity_events ORDER BY id')
+    assert saved[0] == {
+        'id': 'a' * 32, 'action': 'sign_in.succeeded', 'outcome': 'success', 'actor': 'Person',
+        'actor_key': 'person@example.com', 'actor_id': '', 'resource_type': 'sign_in',
+        'resource_id': 'person@example.com', 'session_id': '', 'client': '', 'details': '{}', 'created_at': STAMP}
+    upsert = f"""INSERT INTO governance_activity_events(id,action,outcome,actor,actor_key,resource_type,resource_id,
+        created_at) VALUES('{'a' * 32}','sign_in.succeeded','failed','Person','person','sign_in','person','{STAMP}')
+        ON CONFLICT(id) DO UPDATE SET outcome=excluded.outcome"""
+    for statement in ("UPDATE governance_activity_events SET outcome='denied'",
+                      "UPDATE governance_activity_events SET details='{}' WHERE session_id<>''",
+                      'UPDATE governance_activity_events SET id=id', upsert):
+        assert_update_refused(store, statement)
+    # Deterministic ids collapse retried writes without firing the trigger.
+    statement, params = activity(outcome='failed')
+    assert store.execute(statement + ' ON CONFLICT(id) DO NOTHING', params) == 0
+    assert store.rows('SELECT * FROM governance_activity_events ORDER BY id') == saved
+    with pytest.raises(INTEGRITY_ERRORS):
+        store.execute(*activity())
+    # An opt-in retention purge can still delete rows.
+    assert store.execute('DELETE FROM governance_activity_events WHERE created_at<=?', (STAMP,)) == 2
+    assert store.rows('SELECT * FROM governance_activity_events') == []
+
+
+@pytest.mark.parametrize('change', [
+    {'outcome': 'succeeded'}, {'outcome': ''}, {'outcome': None}, {'details': 'x' * 4097}, {'details': None},
+    {'session_id': None}, {'actor_key': None},
+])
+def test_activity_rows_are_checked(store, change):
+    with pytest.raises(INTEGRITY_ERRORS):
+        store.execute(*activity(**change))
+    store.execute(*activity(details='x' * 4096))
+    assert store.rows('SELECT length(details) AS size FROM governance_activity_events') == [{'size': 4096}]
+
+
+def test_spend_group_limits_bound_each_tier(store):
+    insert = 'INSERT INTO spend_group_limits VALUES(?,?,?,?,?)'
+    for group, limit in (('unlimited', None), ('blocked', 0), ('ceiling', 1_000_000), ('cents', 12.34)):
+        store.execute(insert, (group, limit, 1, 'owner@example.com', STAMP))
+    for limit, revision in ((-0.01, 1), (1_000_000.01, 1), (5, 0), (5, None)):
+        with pytest.raises(INTEGRITY_ERRORS):
+            store.execute(insert, ('rejected', limit, revision, 'owner@example.com', STAMP))
+    with pytest.raises(INTEGRITY_ERRORS):  # One tier per group.
+        store.execute(insert, ('cents', 5, 2, 'owner@example.com', STAMP))
+    assert store.rows('SELECT group_id,limit_usd FROM spend_group_limits ORDER BY group_id') == [
+        {'group_id': 'blocked', 'limit_usd': 0}, {'group_id': 'ceiling', 'limit_usd': 1_000_000},
+        {'group_id': 'cents', 'limit_usd': 12.34}, {'group_id': 'unlimited', 'limit_usd': None}]
+    for limit in (float('inf'), float('-inf')):
+        with pytest.raises(INTEGRITY_ERRORS):
+            store.execute(insert, ('infinite', limit, 1, 'owner@example.com', STAMP))
+    if store.database:
+        with pytest.raises(INTEGRITY_ERRORS):
+            store.execute(insert, ('nan', float('nan'), 1, 'owner@example.com', STAMP))
+        assert not store.rows("SELECT 1 FROM spend_group_limits WHERE group_id='nan'")
+    else:
+        # SQLite stores NaN as NULL (unlimited), so writers must reject non-finite limits themselves.
+        store.execute(insert, ('nan', float('nan'), 1, 'owner@example.com', STAMP))
+        assert store.rows("SELECT limit_usd FROM spend_group_limits WHERE group_id='nan'") == [{'limit_usd': None}]
+
+
+def test_service_account_names_and_key_hashes_are_unique(store):
+    account = 'INSERT INTO service_accounts VALUES(?,?,?,?,?,1,1,1,?,?,?,?)'
+    key = "INSERT INTO service_account_keys VALUES(?,?,'SIEM',?,'moyai_sk_0123abcd','owner',?,?,'','','','')"
+    expires = '2027-01-24T00:00:00.000000+00:00'
+    store.execute(account, ('a' * 32, 'SIEM', 'siem', '', '["audit.read"]', 'owner', STAMP, 'owner', STAMP))
+    with pytest.raises(INTEGRITY_ERRORS):  # Writers casefold name_key.
+        store.execute(account, ('b' * 32, 'siem', 'siem', '', '[]', 'owner', STAMP, 'owner', STAMP))
+    store.execute(key, ('c' * 32, 'a' * 32, 'f' * 64, STAMP, expires))
+    with pytest.raises(INTEGRITY_ERRORS):
+        store.execute(key, ('d' * 32, 'a' * 32, 'f' * 64, STAMP, expires))
+    with pytest.raises(INTEGRITY_ERRORS):  # Expiry, last use and revocation have no defaults.
+        store.execute("""INSERT INTO service_account_keys(id,account_id,label,token_hash,prefix,created_by,created_at)
+            VALUES('e','a','SIEM','e','moyai_sk_','owner',?)""", (STAMP,))
+    assert store.rows('SELECT account_id,expires_at,last_used_at,revoked_at FROM service_account_keys') == [
+        {'account_id': 'a' * 32, 'expires_at': expires, 'last_used_at': '', 'revoked_at': ''}]
+
+
+def test_revision_24_rows_survive_the_revision_25_upgrade(store):
+    store.execute("INSERT INTO spend_limits VALUES('user-default','user-default','',25,3,'owner@example.com',?)",
+                  (STAMP,))
+    store.execute("INSERT INTO spend_limits VALUES('user:a@example.com','user','a@example.com',NULL,1,'owner',?)",
+                  (STAMP,))
+    store.execute("INSERT INTO scim_groups VALUES('group','entra-group','Engineering','engineering','',?,?,2)",
+                  (STAMP, STAMP))
+    store.execute("INSERT INTO enterprise_group_roles VALUES('group','reader',1,'owner',?)", (STAMP,))
+    with store.connect() as conn:
+        conn.begin_write()
+        event(conn, action='spend_limit.updated', resource_type='spend_limit', resource_id='user-default')
+    preserved = ('spend_limits', 'scim_groups', 'enterprise_group_roles', 'governance_audit_events')
+    saved = {table: store.rows(f'SELECT * FROM {table} ORDER BY 1') for table in preserved}
+    with store.connect() as conn:  # Reproduce revision 24's schema.
+        for table in REVISION_25:
+            conn.execute(f'DROP TABLE {table}')
+        if store.database:
+            conn.execute('DROP FUNCTION governance_activity_immutable()')
+    assert not set(REVISION_25) & store.table_names()
+    initialize_components(store)
+    assert {table: store.rows(f'SELECT * FROM {table} ORDER BY 1') for table in preserved} == saved
+    assert all(store.rows(f'SELECT * FROM {table}') == [] for table in REVISION_25)
+    assert triggers(store, 'governance_activity_events') == {'governance_activity_immutable'}
+    store.execute(*activity())
+    assert_update_refused(store, "UPDATE governance_activity_events SET actor='someone else'")
 
 
 def test_upgraded_roles_start_their_permissions_revision_at_the_revision(tmp_path):

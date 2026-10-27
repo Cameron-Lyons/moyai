@@ -16,10 +16,14 @@ inside a private temporary directory. It does not copy or print credentials.
 
 The importer creates a **new schema** in PostgreSQL and copies every application
 table in one transaction. It preserves primary and foreign keys, unique and check
-constraints, explicit indexes, views, defaults, and the GitHub write-access
-revocation trigger. SQLite integers become 64-bit Postgres integers, REAL values
-remain double precision, and BLOBs become BYTEA. Generated IDs resume above both
-the largest retained ID and SQLite's saved sequence, including deleted IDs.
+constraints, explicit indexes, views, defaults, the GitHub write-access
+revocation trigger and the activity audit immutability trigger. SQLite integers
+become 64-bit Postgres integers, REAL values remain double precision, and BLOBs
+become BYTEA. Generated IDs resume above both the largest retained ID and
+SQLite's saved sequence, including deleted IDs. The audit feed indexes are
+created as the PostgreSQL initializers define them, with byte-ordered
+`COLLATE "C"` keys, because a later `app.schema_migrations --apply` keeps an
+existing index rather than replacing it; a changed SQLite feed index stops the copy.
 
 Before committing, it checks the table inventory, column types, row counts, and
 a SHA-256 digest of every row's typed contents in primary-key order. This covers
