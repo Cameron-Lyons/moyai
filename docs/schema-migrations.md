@@ -9,13 +9,12 @@ was the first combined layout; revision 24 adds `enterprise_roles.permissions_re
 Revision 25 adds four empty tables: `service_accounts` and `service_account_keys`
 for programmatic access, `governance_activity_events` for the activity audit log,
 and `spend_group_limits` for spend-limit group tiers. It changes no existing table
-or row. A revision 24 binary would ignore group tiers and give a restrictive tier's
-members the default limit, so revision 25 also raises the compatibility floor.
-The floor cannot tell revision 25 builds apart, so tier admission ships in the
-same release as revision 25: a revision 25 build without it (an intermediate
-build of this branch) must never run against a store where tiers have been
-written, nor alongside services that write them. A feature that changes how an
-existing revision's rows are enforced needs its own revision and floor.
+or row, but raises the compatibility floor because a revision 24 binary would
+ignore group tiers and give a restrictive tier's members the default limit. The
+floor cannot tell revision 25 builds apart, so tier admission ships with revision
+25 itself: an intermediate build without it must never use a store where tiers
+were written, nor run alongside services that write them. A feature that changes
+how an existing revision's rows are enforced needs its own revision and floor.
 The activity log and group tiers also use DDL outside online protocol 1 (checks,
 defaults, `COLLATE "C"` and partial indexes, and an immutability trigger), so the
 online registry declares no 24 to 25 step.

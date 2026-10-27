@@ -11,39 +11,33 @@ Apply canonical schema revision **25** and native application migration
 **2026-10-21-product-governance-v24** during the coordinated maintenance window
 in [the deployment contract](pydantic-deployment.md). Canonical revision 25
 combines upstream revision 22 with the governance branch's older revision 22,
-plus the role permissions revision added after the first combined revision 23
-(revision 24) and the service account, activity audit and spend tier tables
-(revision 25); none of the older layouts is admitted as the combined release.
-Revision 25 raises the compatibility floor, so revision 24 services must not
-overlap it: they would ignore spend tiers. Rolling back to them needs the
-reviewed database restore procedure. The floor cannot tell revision 25 builds
-apart, so tier admission ships in the same release as revision 25: a revision 25
-build without it would accept the schema and ignore tiers, and must never run
-against a store where tiers have been written. If tiers had shipped later, they
-would have needed their own revision and floor. Revision 25 needs no native
-migration of its own. The v24 native migration follows upstream v23 (automation
-chats), adds an immutable session-policy table and preserves the previous 23
-migration receipts. It is also a registered
-[online expansion](native-online-schema.md), so the native table can be prepared
-while v23 services run; the canonical revision still needs the maintenance window.
-Normal startup verifies both schemas; it does not run migrations.
+the role permissions revision (24) and the service account, activity audit and
+spend tier tables (25); none of the older layouts is admitted as the combined
+release. Revision 25 raises the compatibility floor because revision 24 services
+would ignore spend tiers: they must not overlap it, and rolling back to them
+means restoring the pre-upgrade database backup.
+[Schema migrations](schema-migrations.md) explains why tier admission ships with
+revision 25. Revision 25 needs no native migration of its own. The v24 native
+migration follows upstream v23 (automation chats), adds an immutable
+session-policy table and preserves the previous 23 migration receipts. It is
+also a registered [online expansion](native-online-schema.md), so the native
+table can be prepared while v23 services run; the canonical revision still needs
+the maintenance window. Normal startup verifies both schemas; it does not run
+migrations.
 
 The canonical upgrade retains existing governance configuration and audit events,
 copies the older `floor_profile_id` into the mandatory policy, and adds SCIM
-revocation epochs. Previously inactive directory users remain revoked. Revision 25
-only adds empty tables: `service_accounts` and `service_account_keys`,
-`governance_activity_events` (whose rows reject updates on both databases but can
-be deleted), and `spend_group_limits`. Existing native sessions without policy
-bindings have no selected profile, and are still subject to the current mandatory
-policy. A continuation of a historical governed session intersects its saved
-policy with the new native binding; an unreadable saved policy blocks the
-continuation for review.
+revocation epochs. Previously inactive directory users remain revoked. Revision
+25's new tables start empty. Existing native sessions without policy bindings
+have no selected profile, and are still subject to the current mandatory policy.
+A continuation of a historical governed session intersects its saved policy with
+the new native binding; an unreadable saved policy blocks the continuation for
+review.
 
-This release adds the `service_accounts.manage` permission to the catalog.
-Built-in administrators hold every catalog permission, and the authority version
+This release adds the `service_accounts.manage` permission. The authority version
 of an administrator that governance has touched (a role assignment row, directory
-history) includes that list, so their saved execution grants and workflow
-bindings need fresh authorization after the upgrade: affected workflows are
+history) includes the full catalog, so their saved execution grants and workflow
+bindings need fresh authorization after the upgrade: affected workflows stay
 blocked until their owners enable them again. Drain such work in the same
 maintenance window.
 
@@ -51,10 +45,8 @@ Repository and model limits need no schema change. A stored policy without them
 keeps the four-key document the previous release wrote, byte for byte, so
 existing profiles, revisions and immutable session bindings load unchanged. A
 policy that uses either limit is stored with all six keys, which the previous
-release refuses as invalid (it fails closed). Because this release raises the
-compatibility floor, rolling back to the previous (revision 24) release means
-restoring the pre-upgrade database backup, which has no repository or model
-limits; clearing them from profiles is not a rollback step.
+release refuses as invalid (it fails closed); clearing the limits from profiles
+is not a rollback step.
 
 Use `MOYAI_ORGANIZATION_ID` for one organization per deployment and database.
 The immutable database pin rejects a different organization at startup. An existing
@@ -73,12 +65,11 @@ A custom role replaces an internal user's default permissions; active SCIM group
 grants add permissions by union. Assignments do not change sign-in eligibility or
 make shared conversations private. Built-in roles cannot be edited or archived.
 
-In existing-product mode, Slack senders need a verified in-domain Slack profile.
-That requires `SLACK_IDENTITY_LINKING_ENABLED` (the default) and the `users:read`
-and `users:read.email` Slack scopes. A verified sender never exceeds member access.
-Senders who are unverified, or linked only manually, hold no permissions and are
-refused; upstream admitted them as members. Deployments that disable identity
-linking cannot verify new senders, so those senders are refused.
+In existing-product mode, Slack senders need a verified in-domain Slack profile,
+which requires `SLACK_IDENTITY_LINKING_ENABLED` (the default; disabling it refuses
+new senders) and the `users:read` and `users:read.email` Slack scopes. A verified
+sender never exceeds member access. Senders who are unverified, or linked only
+manually, hold no permissions and are refused; upstream admitted them as members.
 
 The server checks permissions independently of navigation visibility. Native
 session and turn admission, tool catalogs, actual tool attempts and retries,
@@ -108,10 +99,8 @@ replacements off-peak.
 
 People can also sign in through an organization OpenID Connect provider (Okta,
 Microsoft Entra ID); see [sign-in](authentication.md#organization-openid-connect-okta-microsoft-entra-id).
-Sign-in and every later request recheck SCIM state: a deactivated person is
-refused, and a provider with `require_scim_user` accepts only active provisioned
-people. Its group claims grant nothing; SCIM groups remain the source of group
-grants.
+SCIM deactivation and `require_scim_user` apply at sign-in and on every later
+request; provider group claims grant nothing.
 
 | Permission | Governance access |
 | --- | --- |
@@ -163,8 +152,8 @@ workspace at most 100 active accounts; disabled accounts do not count, and
 enabling one needs a free place. The list shows each key's prefix (`moyai_sk_` and
 8 characters, a distinctive pattern for secret scanners), creator, expiry (with a
 warning in the last 14 days), and when and from which network it was last used.
-Last use is recorded at most once every 5 minutes per key and is best-effort
-bookkeeping, not an authorization input; it may be up to 5 minutes stale.
+Last use is best-effort bookkeeping, recorded at most every 5 minutes per key,
+and never an authorization input.
 
 Every request rechecks the key, its expiry and its account, and the audit export
 rechecks them before each page of up to 1,000 rows. Revoking a key, disabling its
@@ -173,28 +162,26 @@ or expiry therefore stops even a download in progress. Disabling an account
 revokes all its keys permanently; enabling it again does not restore them. Renaming
 an account or changing its description changes no key's authority.
 
-Holders of `service_accounts.manage` can review accounts and keys, revoke keys and
-disable accounts, which only narrow access. Creating an account, changing its
-name, description or permissions, enabling it and issuing keys need a built-in
-administrator, because a key is a standing credential that outlives its issuer's
-role. Deactivating the administrator who issued a key, through SCIM or otherwise,
-does not revoke it; the key's expiry, the creator shown in the list, the audit
-events and any holder's revoke and disable actions bound that risk. Each change
-records one governance audit event: `service_account.created`, `.updated`,
-`.disabled` and `.enabled`, and `service_account_key.created` and `.revoked`.
-`.disabled` has the same details however the account was disabled: `name`,
-`revoked_keys` (the prefixes of the keys that were still usable, so at most 5)
-and `revoked_count` (every key it marked revoked, including expired keys never
-revoked before). When an edit disables or enables an account and also changes its
-permissions, the event adds `permissions` and `previous_permissions`. Keys and
-hashes are never recorded, and neither is each use of a key; accepted and refused
-key requests, including keys sent to routes that do not accept them, are logged on
-the `moyai.api_keys` logger by key prefix (only of a well-formed key), account and
+Holders of `service_accounts.manage` can review accounts and keys, revoke keys
+and disable accounts; everything else needs a built-in administrator, because a
+key is a standing credential that outlives its issuer's role. Deactivating the
+administrator who issued a key, through SCIM or otherwise, does not revoke it;
+the key's expiry, the creator shown in the list, the audit events and any
+holder's revoke and disable actions bound that risk. Each change records one
+governance audit event: `service_account.created`, `.updated`, `.disabled` and
+`.enabled`, and `service_account_key.created` and `.revoked`. `.disabled` has
+the same details however the account was disabled: `name`, `revoked_keys` (the
+prefixes of the keys that were still usable, so at most 5) and `revoked_count`
+(every key it marked revoked, including expired keys never revoked before). When
+an edit disables or enables an account and also changes its permissions, the
+event adds `permissions` and `previous_permissions`. Keys and hashes are never
+recorded, and neither is each use of a key; accepted and refused key requests,
+including keys sent to routes that do not accept them, are logged on the
+`moyai.api_keys` logger by key prefix (only of a well-formed key), account and
 route only.
 
 Failed key attempts are limited to 30 a minute per network, and each key to 120
-requests a minute. Both limits are kept per API process. API keys require the
-existing-product deployment; standalone native mode refuses them.
+requests a minute. Both limits are kept per API process.
 
 ### Collector contract
 
@@ -213,23 +200,22 @@ curl --fail -G "https://moyai.example.com/api/admin/governance/audit/export" \
   --data-urlencode "before=2026-10-26T09:59:00Z"
 ```
 
-- Set `after` to the previous window's original `before` (the one first
-  requested for that window, not a `next_before` used to finish it after a
-  truncation) minus 5 minutes, and `before` to about one minute ago. A window
-  may span at most 100 days and an export at most 50,000 rows, newest first.
+- Set `after` to the previous window's original `before` minus 5 minutes (see
+  truncation below), and `before` to about one minute ago. A window may span at
+  most 100 days and an export at most 50,000 rows, newest first.
 - Each NDJSON line is one entry with `id`, `source`, `action`, `actor`,
   `resource_type`, `resource_id`, `details` and `created_at`.
 - When a window holds more than 50,000 rows, the export stops at the cap and its
   last line (the last CSV row) is a truncation record, not an audit entry: source
   `export`, action `export.truncated`, and `details` with `rows` (the rows sent)
-  and `next_before`. Do not store it. Request the same `after` again with
-  `before` set to `next_before`, and repeat until an export ends without the
-  record; only then move to the next window, from the window's original
-  `before`. Because `before` is exclusive, `next_before` is one microsecond
-  after the last instant the export reached: rows sharing that instant are sent
-  again rather than skipped, and deduplication drops them. If more than 50,000
-  entries share one microsecond, `next_before` cannot advance; narrow that
-  request with an action or resource type filter.
+  and `next_before`. Do not store it. Request the same `after` with `before`
+  set to `next_before` until an export ends without the record; only then move
+  to the next window, from the window's original `before`. Because `before` is
+  exclusive, `next_before` is one microsecond after the last instant the export
+  reached: rows sharing that instant are sent again rather than skipped, and
+  deduplication drops them. If more than 50,000 entries share one microsecond,
+  `next_before` cannot advance; narrow that request with an action or resource
+  type filter.
 - A 401 means the key is invalid, revoked or expired, or its account is disabled;
   a 403 means the account lacks the permission or the route does not accept keys;
   a 429 asks the collector to wait a minute. A download that ends early means the
@@ -274,28 +260,19 @@ model; an explicitly requested model must be allowed. A policy that allows no
 model stops all sessions under it.
 
 Model and connection pickers follow the effective policy, but admission still
-decides. Home reads the policy a new session would bind (with the chosen profile
-and the mandatory policy) and offers only its models and the connections it
-allows, starting on the model that session would get (a new side chat leaves
-the model to that default as well); the conversation composer
-does the same with its session's policy, so a narrower mandatory limit moves it
-to an allowed model. Both wait for that read before sending, and Home reads the
-policy again after a refused send. Continuing a historical conversation offers the
-organization default's choices, which its saved policy can narrow further at
-admission. The workflow editor checks its workflow's profile, and its readiness
-review reports `repository_not_allowed_by_security_policy` or
-`model_not_allowed_by_security_policy` when that profile no longer allows the
-saved repository, a GitHub trigger repository, or the model; a save the
-policy refuses keeps the editor open with the reason. A workflow that runs in
-an existing chat submits its model under that chat's policy, and its event
-admission checks its GitHub trigger repositories against that policy, so the
-review also reports `model_not_allowed_by_security_policy` or
-`repository_not_allowed_by_security_policy`, and a save is refused, when the
-chat does not allow the workflow's model or a GitHub trigger repository. Such a
-run never uses the workflow's saved repository, so only the workflow's profile
-checks it. Someone without
-`security.manage` editing a workflow that keeps another profile sees every
-choice; saving still checks it.
+decides. Home offers only the models and connections allowed by the policy a new
+session would bind (the chosen profile with the mandatory policy) and starts on
+the model that session would get; the conversation composer does the same with
+its session's policy, so a narrower mandatory limit moves it to an allowed model.
+Continuing a historical conversation offers the organization default's choices,
+which its saved policy can narrow further at admission. The workflow editor's
+readiness review reports `repository_not_allowed_by_security_policy` or
+`model_not_allowed_by_security_policy`, and a save is refused with the reason,
+when the workflow's profile no longer allows its saved repository, a GitHub
+trigger repository or its model, or when the existing chat it runs in does not
+allow its model or a GitHub trigger repository (such a run never uses the saved
+repository). Someone without `security.manage` editing a workflow that keeps
+another profile sees every choice; saving still checks it.
 
 These limits govern Moyai-managed access only. They do not stop a session's shell
 from cloning a public repository, using credentials a person supplies, or calling
@@ -317,15 +294,14 @@ permission. Workflow edits recheck selection and the connected-app, repository
 transaction. A workflow created or updated by an agent cannot exceed the
 creating session's effective policy. Both scheduled and event-triggered
 admissions bind that workflow's profile before admitting work. An
-event-triggered admission first checks the delivered GitHub repository, the
-GitHub trigger repositories and the saved repository against the workflow's
-profile with the current mandatory policy and, for a run in an existing chat,
-the delivered and trigger GitHub repositories against that chat's policy, so a
-limit narrowed after the workflow was enabled refuses the run before the event's
-content reaches a prompt (`policy.workflow_denied` with reason
-`repository_policy`). A run refused by that profile, the effective policy or the
-owner's role is recorded as blocked, and the workflow stays blocked until its
-owner enables it again.
+event-triggered admission first checks the delivered, trigger and saved GitHub
+repositories against that profile and the current mandatory policy (and, for a
+run in an existing chat, the delivered and trigger repositories against the
+chat's policy), so a limit narrowed after the workflow was enabled refuses the
+run before the event's content reaches a prompt (`policy.workflow_denied`,
+reason `repository_policy`). A run refused by that profile, the effective policy
+or the owner's role is recorded as blocked, and the workflow stays blocked until
+its owner enables it again.
 
 Native tool catalogs omit disallowed operations. Tool execution checks the policy
 again, including every Temporal activity attempt. Managed connection credential
@@ -349,16 +325,14 @@ an existing Lambda computer.
 With enforcement on, the session's effective domains (its binding intersected
 with the live mandatory policy) are passed to Modal when its computer is created:
 on the agent's first workspace use, in continuation preparation, and when a
-checkpoint is restored. An empty list creates an allowlist with no entries, not
-Modal's `block_network`. An unrestricted session's computer is created exactly as
-before. A restricted computer records a digest of its creation-time allowlist in
-an immutable Modal sandbox tag. Every agent workspace or tool activity, human
-desktop or browser action, desktop stream, and preparation that reuses a computer
-compares that tag with the session's current effective policy, and refuses a
-computer created under a wider policy before anything runs in it. The tag holds
-only a digest, so a computer created under any other restricted list, even a
-narrower one, is refused as well. Computers created before this release have no
-tag and count as unrestricted.
+checkpoint is restored. An empty list allows no destination. A restricted
+computer records a digest of its creation-time allowlist in an immutable Modal
+sandbox tag. Every agent workspace or tool activity, human desktop or browser
+action, desktop stream, and preparation that reuses a computer compares that tag
+with the session's current effective policy: a restricted session refuses any
+computer whose tag does not match, even one created under a narrower list,
+before anything runs in it. Computers created before this release have no tag
+and count as unrestricted.
 
 A narrowed mandatory policy therefore stops further work in running computers;
 processes already running in one keep its creation-time policy until it stops.
@@ -368,10 +342,7 @@ computer stops: the next turn restores the saved files into a computer created
 under the current policy. Removing a session's network restriction needs no
 action; any other change to its allowlist needs a new computer. The setting
 decides admission only; workers always create computers under the session's
-policy. Use the same value in every API, worker, broker and coordinator: once it
-is not `off` it joins the shared role contract, so roles that disagree are not
-admitted together, and setting or changing it is a shared configuration change
-(restart the coordinator first).
+policy.
 
 Modal matches outbound TLS on port 443 by SNI hostname; `*.example.com` covers the
 apex and every subdomain. Plain HTTP (including Debian `apt` mirrors), SSH,
@@ -389,9 +360,12 @@ the deployment cannot enforce it is audited as a policy denial with the reason
 `network_unenforceable`.
 
 Keep the setting `off` until every API, worker, broker and coordinator runs this
-release, use the same value in every service, and first run the
+release, and first run the
 [operator egress probe](modal-runtime.md#outbound-network-allowlists) against your
-Modal workspace under the deployed runtime. Modal documents the domain allowlist
+Modal workspace under the deployed runtime. It is a
+[shared role setting](pydantic-deployment.md#configuration-contract): roles with
+a different value are refused, so use the same value in every service and
+restart the coordinator first to change it. Modal documents the domain allowlist
 as beta. An older worker creates untagged computers, which restricted sessions
 refuse, so a mixed rollout fails closed.
 
@@ -419,8 +393,7 @@ A tier replaces the default, so it can be lower or higher. The organization and
 session limits still apply on top. Only live groups count, and only for live,
 active SCIM users whose userName is the person's email, the same membership rule
 as group grants. Tiers also apply to built-in administrators: a budget is not a
-permission. People who were never provisioned by SCIM use their override or the
-default. A stored tier that is not a valid amount blocks its members, whatever
+permission. A stored tier that is not a valid amount blocks its members, whatever
 their other tiers allow.
 
 Most permissive means adding a membership never lowers a budget, so a low tier on
@@ -468,17 +441,16 @@ cost, since waiting would not help. In split deployments the broker passes only
 this reason to the worker, in its own `x-moyai-inference-denied-reason` header;
 an older or unknown value keeps the generic admission failure, and the request
 is refused either way. Workflows remain enabled: a monthly budget resets by
-itself. Turns that failed before this release keep the generic message.
+itself.
 
 Home and the conversation composer show people with `spend.personal` a notice
 from `/api/spend/status`, computed live as admission counts spend: once they
 have used two-thirds of their monthly limit, when it is reached, while an
 earlier request's cost is still being recorded, and when the organization's
 monthly limit refuses requests because it is reached or awaits such a cost (the
-status says only which, never its amounts). The notice loads with the page, on
-window focus at most every five minutes, and after a turn fails. It is advisory:
-admission enforces limits whether or not it shows. Durable alerts, Slack or
-email messages, and requests for more budget are not implemented.
+status says only which, never its amounts). The notice is advisory: admission
+enforces limits whether or not it shows. Durable alerts, Slack or email
+messages, and requests for more budget are not implemented.
 
 ### Admission
 
@@ -561,33 +533,30 @@ name its guardrail in one of two ways that LiteLLM 1.106.4 uses:
 
 Guardrails that raise their own unwrapped message are not recognized: the
 generic guardrail API, whose message is the backend's `blocked_reason` or
-"Content violates policy", Akto and Alice, for example. Other statuses are never
-refusals. A guardrail backend that is unavailable, throttled or answers
-unexpectedly (a 5xx, 408 or 429, such as Bedrock's "throttle retries exhausted"
-or the generic guardrail API's "Generic Guardrail API failed") fails the turn
-with the generic failure and records no event. LiteLLM does not report whether a
-wrapped guardrail exception judged the content, so a guardrail that fails closed
-with that wrapper and status 400 when its backend is unreachable (LLM Shield
-Proxy, for example) still counts as a refusal. Check the gateway logs before
-treating such an event as the requester's violation. The
-`x-litellm-applied-guardrails` header alone is not proof of a refusal, because
-LiteLLM also sends it on ordinary provider errors after guardrails pass. A
-`MASK` action rewrites the request instead of refusing it, and Bedrock's
-`disable_exception_on_block` returns the guardrail's message as a successful
-answer; neither is a refusal to Moyai. A `post_call` guardrail that fails a
-streamed answer mid-stream looks like an ordinary stream error.
+"Content violates policy", Akto and Alice, for example. The gateway still blocks
+a refusal Moyai does not recognize, but the turn shows the generic failure and
+records no event. Other statuses are never refusals. A guardrail backend that is
+unavailable, throttled or answers unexpectedly (a 5xx, 408 or 429, such as
+Bedrock's "throttle retries exhausted" or the generic guardrail API's "Generic
+Guardrail API failed") likewise fails the turn with the generic failure and
+records no event. LiteLLM does not report whether a wrapped guardrail exception
+judged the content, so a guardrail that fails closed with that wrapper and
+status 400 when its backend is unreachable (LLM Shield Proxy, for example) still
+counts as a refusal. Check the gateway logs before treating such an event as the
+requester's violation. A `MASK` action rewrites the request instead of refusing
+it, and Bedrock's `disable_exception_on_block` returns the guardrail's message
+as a successful answer; neither is a refusal to Moyai. A `post_call` guardrail
+that fails a streamed answer mid-stream looks like an ordinary stream error.
 
 A recognized refusal fails the turn with the non-retryable `MoyaiGuardrailBlocked`
 denial, so Temporal never sends the refused input again. The web failure banner
 and the Slack thread show "Your organization's AI guardrail blocked this
-request."; the Slack report omits its debug log, which would repost the refused
-prompt and tool output, and so does a Slack report whose failure record cannot be
-read. The turn's conversation is not saved as the next turn's context, so its
-files are not checkpointed either. The submitted message stays in the
-transcript, but later turns leave it out of the context they rebuild from
-earlier messages when the requester, model or connections change, and out of the
-Slack thread they read, so another participant's turn does not send it again. A
-refused memory review is settled once, without retries.
+request."; the Slack report, even one whose failure record cannot be read, omits
+its debug log, which would repost the refused prompt and tool output. The turn's
+conversation is not saved as later turns' context, and its files are not
+checkpointed. Its submitted message stays in the transcript but is left out of
+the context later turns rebuild and the Slack thread they read, so no later turn
+sends it again. A refused memory review is settled once, without retries.
 
 Each refusal records one `ai_guardrail.violation` audit event, in the same
 transaction as its zero-spend ledger outcome, with the requester as the actor.
@@ -596,29 +565,26 @@ reported is not a valid guardrail name. Details hold only the session ID, model,
 guardrail mode, and the names in `x-litellm-applied-guardrails`; never prompts,
 tool output, or the guardrail's response. Retried attempts of one model activity
 share one event. Filter the audit log by the `ai_guardrail` resource type, or
-export it, to list violations. A refusal Moyai does not recognize is still
-blocked by the gateway, but the turn shows the generic failure and records no
-event.
+export it, to list violations.
 
 Without gateway guardrails, nothing is screened. To fail closed instead, set
 `MOYAI_REQUIRED_GUARDRAILS` to at most ten comma-separated guardrail names
-(letters, digits, `_`, `.`, `:` and `-`); order and repeats do not matter. Like
-the other shared runtime settings, every role needs the same names: change them
-by restarting the coordinator first, since other roles with different names are
-refused. While it is empty, the setting leaves the role contracts unchanged. Each
-successful answer must then list every name in `x-litellm-applied-guardrails`,
-which LiteLLM sends with the response headers before any streamed content.
-Otherwise the broker (or, without a separate broker, the process that dispatches
-the request) closes the answer before the agent reads any of it, records
-`ai_guardrail.unattested` with the missing names, and fails the turn with the
-non-retryable `MoyaiGuardrailUnattested` denial ("The model gateway did not
-confirm your organization's required AI guardrails, so this request was
-stopped."). The gateway has already processed that request; its cost settles
-like an interrupted stream. LiteLLM 1.106.4 lists a passing guardrail only when
-the guardrail records itself: Presidio, Bedrock, the LiteLLM content filter, the
-generic guardrail API and Lakera v2 do, while Azure Prompt Shields does not. Send
-a test request and check the header before setting this, or every request is
-refused.
+(letters, digits, `_`, `.`, `:` and `-`); order and repeats do not matter. Every
+role needs the same names, since roles with different names are refused; it is a
+[shared role setting](pydantic-deployment.md#configuration-contract), so restart
+the coordinator first to change it. Each successful answer must then list every
+name in `x-litellm-applied-guardrails`, which LiteLLM sends with the response
+headers before any streamed content. Otherwise the broker (or, without a
+separate broker, the process that dispatches the request) closes the answer
+before the agent reads any of it, records `ai_guardrail.unattested` with the
+missing names, and fails the turn with the non-retryable
+`MoyaiGuardrailUnattested` denial ("The model gateway did not confirm your
+organization's required AI guardrails, so this request was stopped."). The
+gateway has already processed that request; its cost settles like an interrupted
+stream. LiteLLM 1.106.4 lists a passing guardrail only when the guardrail
+records itself: Presidio, Bedrock, the LiteLLM content filter, the generic
+guardrail API and Lakera v2 do, while Azure Prompt Shields does not. Send a test
+request and check the header before setting this, or every request is refused.
 
 ## Audit and API
 
@@ -655,19 +621,16 @@ kinds and actors, though never their content; grant it to compliance roles only.
 
 Session and message activity commits in the same transaction as the change it
 describes, so it cannot be lost or recorded for a change that rolled back.
-Refusals are counted, not transcribed: a refusal within a turn is recorded once
-per session, turn, refused tool, model, connection or workflow and reason, which
-collapses the policy check and activity-interceptor check of one call, Temporal
-retries and workflow resets. An agent that keeps calling a refused tool in one
-turn is recorded once. Refusals outside a turn (starting a session, sending a
-message, saving a workflow) are recorded once per person, session (if any),
-refused tool, model, connection or workflow, reason and minute, and a blocked
-run once per occurrence. A refusal's resource is its session; outside one it is
-the refused connection kind or workflow, else `workspace` (a tool name or model
-ID is kept only in the details). A refusal is still enforced, with its
-original status and message, when its event cannot be written: the write uses
-its own short transaction on the canonical pool, gives up after two seconds and
-is logged.
+Refusals are counted, not transcribed. Within a turn a refusal is recorded once
+per session, turn, refused tool, model, connection or workflow and reason, however
+often the agent, Temporal retries or workflow resets repeat it. Outside a turn
+(starting a session, sending a message, saving a workflow) it is recorded once
+per person, session (if any), refused item, reason and minute, and a blocked run
+once per occurrence. A refusal's resource is its session; outside one it is the
+refused connection kind or workflow, else `workspace` (a tool name or model ID is
+kept only in the details). A refusal is still enforced, with its original status
+and message, when its event cannot be written: the write uses its own short
+transaction on the canonical pool, gives up after two seconds and is logged.
 
 Not recorded: refusals' own failures to record (logged instead), invalid or
 forged Access assertions, Google callbacks with an unknown or expired state,
@@ -675,28 +638,23 @@ tools a catalog never offered, connections Slack leaves out of its automatic
 selection, route-level 403s outside the session policy checks, revocations of a
 running execution's authority (401), messages a team coordinator generates for
 its members, SCIM token use, approvals and goal changes, and anything in
-standalone native mode. A refused session start names no session, because none
-was created.
+standalone native mode.
 
-Filters and signed cursors bound each page. The actor filter is
-case-insensitive; on the activity store it uses the folded-actor (`actor_key`)
-index, while on the configuration store and the legacy role, connection and
-credential audits no index covers it, so it is checked within the time and
-keyset bounds. Only the first page (no cursor) carries the filter
-facets, as only the provisioning directory's first page carries its groups,
+Filters and signed cursors bound each page; the actor filter is case-insensitive
+(indexed only on the activity store). Only the first page (no cursor) carries the
+filter facets, as only the provisioning directory's first page carries its groups,
 tokens and activity. CSV/NDJSON exports stream pages of up to 1,000 rows,
 recheck live permission before releasing each page and stop at 50,000 rows with
-a truncation record when older rows remain, so a SIEM collector should pull
-hourly `after`/`before` windows and re-request any window that ends with that
-record, as the [collector contract](#collector-contract) describes. Activity
-grows by roughly 1 KB per event (about 15 GB a year for 3,000 people sending
-50,000 messages a day); configuration events are small and rare. Activity rows
-cannot be updated (a trigger rejects `UPDATE`), and there is no retention job
-yet, so plan storage accordingly. Until there is one, the supported purge is a
-database owner deleting old activity rows only, after exporting any that must
+a truncation record, as the [collector contract](#collector-contract) describes.
+
+Activity grows by roughly 1 KB per event (about 15 GB a year for 3,000 people
+sending 50,000 messages a day); configuration events are small and rare. Activity
+rows cannot be updated (a trigger rejects `UPDATE`), and there is no retention
+job yet, so plan storage accordingly. Until there is one, the supported purge is
+a database owner deleting old activity rows only, after exporting any that must
 be kept: `DELETE FROM governance_activity_events WHERE created_at < '2026-01-01'`
-with a UTC date (on PostgreSQL, qualify the table with the canonical schema).
-The trigger allows `DELETE`, and issued cursors stay valid. Never delete from
+with a UTC date (on PostgreSQL, qualify the table with the canonical schema). The
+trigger allows `DELETE`, and issued cursors stay valid. Never delete from
 `governance_audit_events`: configuration and sign-in history has no retention
 limit. Deleting audit evidence is a compliance decision, so record who ran the
 purge and its cutoff in your change log.
@@ -719,7 +677,7 @@ purge and its cutoff in your change log.
 
 Configuration writes reuse canonical optimistic revisions, live writer-fenced
 permissions, CSRF protection for browser requests, and transaction-local audit
-records. API keys never reach them. A policy update must include `repositories` and `models` whenever the
+records. A policy update must include `repositories` and `models` whenever the
 saved policy limits them; an older editor or script that omits them is refused
 (409) instead of clearing the limits. Standalone native mode keeps its existing
 built-in account behavior; these enterprise settings require the canonical

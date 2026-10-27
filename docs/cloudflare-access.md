@@ -25,13 +25,12 @@ Moyai preserves an unambiguous existing account and pins the verified issuer and
 subject. Conflicting identities fail closed. Saved roles remain authoritative;
 CSRF, current authorization and session visibility checks still apply.
 
-Keep webhook exceptions exact. API key reads have their own exact exception;
-see [API keys and the Access edge](#api-keys-and-the-access-edge).
-Existing-product Slack retains `/hooks/slack`,
+Keep webhook exceptions exact. Existing-product Slack retains `/hooks/slack`,
 `/hooks/slack/events` and `/hooks/slack/interactions`; requests still require
 Slack signature verification. Automation exceptions apply only to configured
 individual webhook paths. Never bypass Access for all `/api/*` or `/hooks/*`.
 Provider OAuth callbacks and all new paths need their actual deployed policies.
+API key reads have [their own exact exception](#api-keys-and-the-access-edge).
 
 During the maintenance release, preserve both source and candidate routing.
 After activation verify an approved employee reaches the same account, a missing
@@ -75,10 +74,9 @@ The service token is then a second credential, enforced at the edge.
 - Do not put these paths in a separate Access application. Employees use the
   audit paths from the Audit log page, and a separate application's assertions
   carry its own audience, which the origin rejects for them.
-- The policy admits the token at the edge to the whole application, but the origin
-  accepts it only together with a valid key on the three operations above:
-  machine assertions never become employee sign-ins, and a request without a key
-  still needs a browser session.
+- The policy admits the token to the whole application at the edge, but the
+  origin accepts it only with a valid key on the three operations above; machine
+  assertions never become employee sign-ins.
 - The origin does not yet verify the service token's own assertion for key
   requests; the Moyai key is the origin credential.
 

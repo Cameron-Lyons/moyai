@@ -53,11 +53,10 @@ role trusting `lambda.amazonaws.com` with `sts:AssumeRole` and `sts:TagSession`.
 That role needs artifact reads and its image's CloudWatch build-log writes.
 The default network connectors are the region's `ALL_INGRESS` and
 `INTERNET_EGRESS`. Guest HTTP must remain behind AWS authenticated ingress.
-`LAMBDA_EGRESS_CONNECTOR` applies to every MicroVM of the deployment; Lambda has no
-per-session egress policy. Sessions under a security policy with network
-restrictions are therefore refused on Lambda computers, before any MicroVM is
-created or attached, whatever `MOYAI_NETWORK_POLICY_ENFORCEMENT` says. See
-[network allowlists](enterprise-governance.md#network-allowlists).
+`LAMBDA_EGRESS_CONNECTOR` applies to every MicroVM of the deployment, so sessions
+with [network restrictions](enterprise-governance.md#network-allowlists) are
+refused on Lambda computers before any MicroVM is created or attached, whatever
+`MOYAI_NETWORK_POLICY_ENFORCEMENT` says.
 Checkpoints currently use SSE-S3 (`AES256`); SSE-KMS buckets are not supported.
 
 ## Image baseline and checkpoints

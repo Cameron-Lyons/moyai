@@ -73,11 +73,10 @@ compatibility requirement.
 
 ## Outbound network allowlists
 
-Security policies with network restrictions are enforced per computer, not
-through a deployment-wide SDK setting like the runtime: Moyai passes each
-session's allowlist to `Sandbox.create` with that computer, because Modal fixes a
-computer's network policy type when it is created. Modal documents that its
-network access controls apply to both runtimes. Before setting
+Network restrictions are enforced per computer, unlike the deployment-wide
+runtime: Moyai passes each session's allowlist to `Sandbox.create`, because
+Modal fixes a computer's network policy type when it is created. Modal documents
+that its network access controls apply to both runtimes. Before setting
 `MOYAI_NETWORK_POLICY_ENFORCEMENT=modal` (see
 [enterprise governance](enterprise-governance.md#network-allowlists)), run the
 manual egress probe against the deployment's Modal workspace under each runtime

@@ -31,29 +31,27 @@ password login with `PASSWORD_LOGIN_ENABLED=false`. Preserve `SESSION_SECRET`,
 `ENCRYPTION_KEY` and existing data; do not rotate them as part of consolidation.
 Shared passwords do not identify an individual for personal data access.
 
-Every existing-product sign-in method records the same governance audit events as
-organization OpenID Connect below: `sign_in.succeeded` (with `enrolled` on a
-first sign-in), `sign_in.refused` with a fixed reason, and `sign_in.signed_out`.
-The resource is the method (`google`, `cloudflare`, `password`) or the OpenID
-Connect provider. Google records `cancelled`, `token`, `deactivated`,
+Every existing-product sign-in method records governance audit events:
+`sign_in.succeeded` (with `enrolled` on a first sign-in), `sign_in.refused` with
+a fixed reason, and `sign_in.signed_out`. The resource is the method (`google`,
+`cloudflare`, `password`) or the OpenID Connect provider; events carry no tokens,
+codes or claims. Google records `cancelled`, `token`, `deactivated`,
 `mapping_review` or `unavailable` after a consumed sign-in attempt, and nothing
 for an unknown or expired one. A refusal names the person once the provider has
 verified them; before that its actor is `anonymous`, and Google and OpenID
-Connect keep an anonymous refusal once per client network, reason and minute.
-A wrong shared password records `invalid_password` with the actor `anonymous`
-(sign-in rate limits bound these); a password sign-in's actor is the shared
-account (`Shared password admin` or `member`), never the password. Cloudflare
-Access records a sign-in when it issues a new session cookie, at most once per
-person and minute, so a client that never keeps cookies cannot flood the audit;
-a mapping that needs review or a deactivated person records a refusal, also once
-per minute. Each process writes such an event once and then only reads, because
-the mapping is checked on every request. A sign-out is recorded once per
-session: signing out deletes the cookie, and replaying the same cookie records
-nothing more. New Google, password
-and Access sessions fail closed: if the event cannot be written, no session
-cookie is issued (Google redirects to `?signin=failed`, password and Access
-sign-in answer 503). Existing sessions keep working. A refusal or sign-out whose
-event cannot be written is logged and still refused or signed out.
+Connect keep an anonymous refusal once per provider, client network, reason and
+minute. A wrong shared password records `invalid_password` with the actor
+`anonymous` (sign-in rate limits bound these); a password sign-in's actor is the
+shared account (`Shared password admin` or `member`), never the password.
+Cloudflare Access records a sign-in when it issues a new session cookie, and a
+refusal for a mapping that needs review or a deactivated person, each at most
+once per person and minute, so a client that never keeps cookies cannot flood
+the audit. A sign-out is recorded once per session; replaying its cookie records
+nothing more. New Google, password and Access sessions fail closed: if the event
+cannot be written, no session cookie is issued (Google redirects to
+`?signin=failed`, password and Access sign-in answer 503). Existing sessions keep
+working. A refusal or sign-out whose event cannot be written is logged and still
+refused or signed out.
 
 Authorization is checked at admission and again at model/tool boundaries.
 Approval does not override revoked permissions. Personal memory and credentials
@@ -128,8 +126,7 @@ Register a single-tenant application ("Accounts in this organizational directory
 only") with a web redirect URI and a client secret. Under Token configuration,
 add the `email` and `xms_edov` optional ID token claims; Entra does not send
 `email_verified`. In the enterprise application, set Assignment required and
-assign the people or groups who may sign in. Use the tenant issuer; the shared
-`common`, `organizations` and `consumers` issuers are refused.
+assign the people or groups who may sign in. Use the tenant issuer.
 
 ```json
 [{"id": "entra", "label": "Microsoft", "issuer": "https://login.microsoftonline.com/<tenant-id>/v2.0",
@@ -162,33 +159,29 @@ person is, an administrator resolves the review in the database:
 - **Two candidate accounts:** merge them, or change the email of or remove the
   duplicate, so that exactly one account has the address.
 
-Moving a domain to a provider changes its people's authority: running sessions
-need fresh authorization, and workflows blocked by the change must be re-enabled
-by their owners, as with the Access cutover.
+Moving a domain to a provider, or changing the provider's `require_scim_user`,
+changes its people's authority: running sessions need fresh authorization, and
+workflows blocked by the change must be re-enabled by their owners, as with the
+Access cutover.
 
 Disabling someone at the provider stops new sign-ins. An existing session lasts
 up to 12 hours and their automations keep running, as with Google. Pair the
 provider with [SCIM provisioning](enterprise-governance.md#roles-and-provisioning):
 deactivation then revokes access immediately, and `require_scim_user` refuses
 anyone who is not provisioned and active, including existing sessions and
-grants. Changing `require_scim_user` changes the provider's authority, so running
-work needs fresh authorization. Group claims do not grant roles; use SCIM group
-grants.
+grants. Group claims do not grant roles; use SCIM group grants.
 
-The governance audit records `identity_binding.created` when a subject is first
-pinned, `sign_in.succeeded` for every sign-in, and `sign_in.refused` with a fixed
-reason (`cancelled`, `issuer`, `unavailable`, `token`, `claims`,
-`email_unverified`, `domain`, `mapping_review`, `not_provisioned` or
-`deactivated`) after a consumed sign-in attempt. Events carry no tokens, codes or
-claims; a refusal names the person only after their identity was verified, and
-an anonymous refusal is kept once per provider, client network, reason and minute.
+OpenID Connect sign-in records the [sign-in events](#google-and-cloudflare) above,
+plus `identity_binding.created` when a subject is first pinned. Its refusal
+reasons after a consumed sign-in attempt are `cancelled`, `issuer`, `unavailable`,
+`token`, `claims`, `email_unverified`, `domain`, `mapping_review`,
+`not_provisioned` or `deactivated`.
 
 ## API keys
 
 [Service accounts](enterprise-governance.md#service-accounts-and-api-keys) authenticate
-programmatic readers with `Authorization: Bearer moyai_sk_<id>.<secret>`. Keys
-work only in existing-product mode and only on the exact read operations listed
-there: the audit feed and export and the organization spend report.
+programmatic readers with `Authorization: Bearer moyai_sk_<id>.<secret>` on the
+exact read operations listed there, in existing-product mode only.
 
 An `Authorization` value that mentions `moyai_sk_` is always treated as an API
 key. It is verified before, and instead of, every cookie, Cloudflare Access
@@ -201,9 +194,6 @@ and revoke it. Skipping CSRF is safe for keys: an `Authorization` header is
 not sent automatically by browsers, Moyai sets no CORS policy that would let
 another origin send one, and every key operation is a `GET`.
 
-A key's authority is not a person's. The request runs as a service principal
-(`service:<account>:<key>`) that holds only its account's permissions, has no
-email and no built-in role's permissions, cannot start or continue sessions,
-turns, workflows or approvals, and cannot change governance configuration.
-Every request and each page of an export rechecks the key's revocation and
-expiry and its account's state and permissions.
+The request runs as a service principal (`service:<account>:<key>`) that holds
+only its account's permissions, never a person's; the service account section
+lists what it cannot do and when it is rechecked.
