@@ -325,7 +325,8 @@ an existing Lambda computer.
 With enforcement on, the session's effective domains (its binding intersected
 with the live mandatory policy) are passed to Modal when its computer is created:
 on the agent's first workspace use, in continuation preparation, and when a
-checkpoint is restored. An empty list allows no destination. A restricted
+checkpoint is restored. An empty list allows no destination; an unrestricted
+session's computer is created exactly as before. A restricted
 computer records a digest of its creation-time allowlist in an immutable Modal
 sandbox tag. Every agent workspace or tool activity, human desktop or browser
 action, desktop stream, and preparation that reuses a computer compares that tag

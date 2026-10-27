@@ -389,6 +389,11 @@ def test_csv_export_neutralizes_spreadsheet_formulas(store, audit):
     assert [json.loads(row[6]) for row in rows[2:]] == [{'note': value} for value in reversed(hostile)]
     assert all(row[1] == 'governance' and row[2] == 'role.created' and row[4] == 'role' for row in rows[1:])
     assert all(not cell.startswith(governance_audit.FORMULA_PREFIXES) for row in rows for cell in row)
+    # Activity cells take the same escaping.
+    activity_row(store, BASE + timedelta(minutes=2), actor=hostile[0], session_id='+1')
+    rows = list(csv.reader(io.StringIO(''.join(audit.export(None, 'csv')), newline='')))
+    assert rows[1][1] == 'activity' and rows[1][3] == "'" + hostile[0]
+    assert all(not cell.startswith(governance_audit.FORMULA_PREFIXES) for row in rows for cell in row)
 
 
 def test_ndjson_and_csv_exports_follow_feed_order_in_pages_and_are_capped(store, audit, monkeypatch):

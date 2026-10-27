@@ -223,7 +223,7 @@ test('service account bodies stay inside the ceiling, keep the state on edit and
   assert.throws(()=>gov.serviceAccountBody({name:'Wide',description:'',permissions:['sessions.create']},undefined,ceiling),/only the permissions listed/);
   assert.throws(()=>gov.serviceAccountBody({name:'None',description:'',permissions:[]},undefined,ceiling),/at least one permission/);
   assert.throws(()=>gov.serviceAccountBody({name:'x',description:'',permissions:['audit.read']},undefined,ceiling),/between 2 and 80/);
-  assert.deepEqual(gov.serviceKeyBody(' Splunk ',365),{label:'Splunk',expires_in_days:365});
+  assert.deepEqual(gov.serviceKeyBody(' Splunk ',365),{label:'Splunk',expires_in_days:365});assert.equal(gov.DEFAULT_EXPIRY,90);
   for(const days of [0,7,366,Number.NaN])assert.throws(()=>gov.serviceKeyBody('Splunk',days),/30, 90, 180 or 365/);
   assert.throws(()=>gov.serviceKeyBody('  ',90),/between 1 and 80/);
   const five={...account,active:true,keys:Array.from({length:5},(_,i)=>({id:String(i),status:'active'}))};

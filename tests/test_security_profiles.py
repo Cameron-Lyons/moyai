@@ -390,6 +390,9 @@ def test_create_update_and_revisions_record_metadata_only_audit_events(store, pr
 
 def test_stale_unknown_and_unchanged_saves_write_nothing(store, profiles):
     created = profiles.save(body(tools=['read_file']), ADMIN)
+    # A profile without repository or model limits keeps the four-key v24 document.
+    assert store.rows('SELECT policy FROM security_profiles')[0]['policy'] == (
+        '{"connected_apps":null,"git_access":"write","network_domains":null,"tools":["read_file"]}')
     for revision in (0, 2):
         with pytest.raises(StaleRevision) as caught:
             profiles.save(body('Renamed', revision=revision), ADMIN, profile_id=created['id'])
