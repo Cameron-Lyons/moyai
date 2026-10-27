@@ -19,6 +19,7 @@ import pytest
 import pytest_asyncio
 from app.config import Settings as ProductSettings
 from app.database import sqlite_connection
+from app.enterprise_roles import GovernanceActor
 from app.user_roles import RoleChange, UserRoles
 from cryptography.fernet import Fernet, InvalidToken
 from cryptography.hazmat.primitives.asymmetric import rsa
@@ -94,6 +95,10 @@ def settings_for(tmp_path, **overrides):
     }
     values.update(overrides)
     return ProductSettings(**values)
+
+
+# A configured administrator; the role writer rechecks it against the canonical role.
+OTHER_ADMIN = GovernanceActor(id="google:other-sub", email="other@example.test", builtin_role=None, kind="individual")
 
 
 SCHEMA = (
@@ -199,7 +204,7 @@ async def test_existing_signed_google_identity_exact_id_and_live_roles(product):
     assert cookie not in repr(principal) and csrf not in repr(principal)
     UserRoles(product.store, product.settings).change(
         RoleChange(email=principal.email, role="member", revision=0),
-        {"method": "google", "identity": {"email": "other@example.test"}},
+        OTHER_ADMIN,
     )
     with pytest.raises(HTTPException) as denied:
         await product.adapter.require_current(principal.grant)
@@ -211,7 +216,7 @@ async def test_existing_signed_google_identity_exact_id_and_live_roles(product):
     # Returning to the same role must not revive an older grant (revision ABA).
     UserRoles(product.store, product.settings).change(
         RoleChange(email=principal.email, role="admin", revision=1),
-        {"method": "google", "identity": {"email": "other@example.test"}},
+        OTHER_ADMIN,
     )
     with pytest.raises(HTTPException):
         await product.adapter.require_current(principal.grant)
@@ -515,7 +520,7 @@ async def test_each_activity_attempt_checks_source_even_when_mirror_is_unchanged
     assert await environment.run(guarded_business_activity, principal.grant) == "authorized"
     UserRoles(product.store, product.settings).change(
         RoleChange(email=principal.email, role="member", revision=0),
-        {"method": "google", "identity": {"email": "other@example.test"}},
+        OTHER_ADMIN,
     )
     assert mirror["role"] == "admin"
     with pytest.raises(HTTPException):
@@ -667,3 +672,42 @@ async def test_projection_rechecks_a_local_revocation_under_the_user_row_lock(tm
             with pytest.raises(HTTPException) as denied:
                 await product.adapter.project_native_user(db, principal)
             assert denied.value.status_code == 401
+
+
+async def test_role_editor_passes_the_authenticated_principal_off_the_event_loop(product):
+    import threading
+
+    import httpx
+    from fastapi import APIRouter, FastAPI
+
+    from moyai import product_auth
+
+    principal = await product.adapter.authenticate(request(google_cookie(product.adapter)[0]))
+    roles, seen = UserRoles(product.store, product.settings), []
+
+    class Roles:
+        def change(self, body, actor):
+            seen.append((threading.current_thread() is threading.main_thread(), actor))
+            return roles.change(body, actor)
+
+    def session_info(_request):
+        raise AssertionError("The role editor must not re-read the legacy session on the event loop.")
+
+    async def actor(request: Request):
+        request.state.product_principal = principal
+        return SimpleNamespace(role=principal.role, governance_permissions=principal.effective_permissions)
+
+    runtime = SimpleNamespace(product=SimpleNamespace(
+        google=SimpleNamespace(routes=APIRouter), roles=Roles(), security=SimpleNamespace(session_info=session_info),
+    ))
+    app = FastAPI()
+    app.include_router(product_auth.routes(runtime, actor))
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.put("/api/settings/users/role", json={
+            "email": "member@example.test", "role": "admin", "revision": 0,
+        })
+    assert response.status_code == 200, response.text
+    assert response.json() == {"email": "member@example.test", "role": "admin", "revision": 1}
+    [(on_event_loop, governed)] = seen
+    assert not on_event_loop and governed.id == "google:admin-sub" and governed.email == "admin@example.test"
+    assert governed.kind == "individual" and governed.builtin_role == "admin"

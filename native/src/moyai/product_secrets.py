@@ -243,17 +243,18 @@ class ProductSecrets:
     def require_mutation(
         self, request: Request, principal: ProductPrincipal, connection: Any, native_root: str | None = None,
         *, personal: bool = False,
-    ):
-        # Use the canonical role helper through THIS writer connection. Calling
-        # Security.role with its ordinary Store here would nest a pool checkout.
+    ) -> frozenset[str]:
+        # Every Security call here passes THIS writer connection. Resolving the
+        # session through the ordinary Store would nest a pool checkout.
         security: Any = copy.copy(self.security)
         # This service checks source/native root privacy explicitly. The old
         # route-path guard understands legacy run IDs only.
         security.session_privacy = None
-        security.require(request, mutation=True, connection=connection)
-        # Re-read the canonical role at the actual synchronous write boundary.
-        # A stale request snapshot cannot retain administrator privileges.
-        admin = security.role(request, connection=connection) == "admin"
+        # Re-read the canonical role and permissions once, at the actual synchronous
+        # write boundary. A stale request snapshot cannot retain administrator privileges.
+        info = security.session_info(request, connection=connection)
+        security.require(request, mutation=True, connection=connection, info=info)
+        admin = info["role"] == "admin"
         if (principal.role == "admin") != admin:
             raise HTTPException(403, "Your product role changed. Refresh before saving.")
         if principal.individual:
@@ -292,7 +293,6 @@ class ProductSecrets:
                 ):
                     raise HTTPException(404, "The credential session is no longer available.")
         if principal.method == "cloudflare":
-            info = security.session_info(request) or {}
             identity = info.get("identity") or {}
             binding = connection.execute(
                 "SELECT subject FROM access_identities WHERE issuer=? AND user_id=? AND email=?",
@@ -300,8 +300,9 @@ class ProductSecrets:
             ).fetchone()
             if not binding or binding["subject"] != identity.get("sub"):
                 raise HTTPException(401, "The Access identity mapping changed before saving.")
-        # Organization credentials follow live credentials.publish, which custom roles can delegate.
-        return security.has_actor_permission(principal.id, "credentials.publish", connection=connection)
+        # Live permissions from the same resolution. Organization credentials
+        # follow credentials.publish, which custom roles can delegate.
+        return security.permissions_for_info(info)
 
     async def create(self, request: Request, principal: ProductPrincipal, body: ProductSaveSecret):
         native = None
@@ -312,9 +313,10 @@ class ProductSecrets:
         def save():
             with self.store.connect() as conn:
                 conn.begin_write()
-                admin = self.require_mutation(request, principal, conn, native, personal=body.scope == "personal")
+                permissions = self.require_mutation(request, principal, conn, native, personal=body.scope == "personal")
                 return self.credentials.insert_secret(
-                    conn, body, principal.id, admin, authorized_native_root=native,
+                    conn, body, principal.id, "credentials.publish" in permissions,
+                    authorized_native_root=native, permissions=permissions,
                 )
 
         identity = await source_database(save)
@@ -360,7 +362,7 @@ class ProductSecrets:
         def save():
             with self.store.connect() as conn:
                 conn.begin_write()
-                admin = self.require_mutation(request, principal, conn)
+                admin = "credentials.publish" in self.require_mutation(request, principal, conn)
                 row = conn.execute("SELECT * FROM provider_secrets WHERE id=?", (identity,)).fetchone()
                 if not row or not (row["owner_id"] == principal.id or row["scope"] == "organization" and admin):
                     raise HTTPException(404, "Credentials not found.")

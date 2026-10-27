@@ -29,11 +29,10 @@ from decimal import Decimal
 from typing import Annotated, LiteralString
 
 from fastapi import HTTPException
-from fastapi.exceptions import RequestValidationError
-from pydantic import AfterValidator, BaseModel, ConfigDict, Field, ValidationError
+from pydantic import AfterValidator, BaseModel, ConfigDict, Field
 from pydantic_core import PydanticCustomError
 
-from .enterprise_roles import actor_label
+from .enterprise_roles import STALE, actor_label, validated
 from .governance_audit import initialize_schema as initialize_audit
 from .governance_audit import record_event_in, timestamp
 from .schema_initializers import initialize_spend_limits as initialize_schema
@@ -43,7 +42,6 @@ SCOPES = ('organization', 'user', 'session')  # evaluate() reports exceeded scop
 MAX_LIMIT_USD = 1_000_000
 MAX_CHANGES = 50
 MAX_USER_LIMITS = 10_000
-STALE = 'This changed elsewhere. Reload and try again.'
 _INVALID_ID: LiteralString = 'Use organization, user-default, session-default or user:<work email>.'
 _RANGE: LiteralString = 'Use a limit from 0 to 1,000,000 USD.'  # Keep in step with MAX_LIMIT_USD.
 _EMAIL = re.compile(r"[a-z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-z0-9.-]+")  # Same shape as app.user_roles.
@@ -200,19 +198,6 @@ def evaluate(limits: SpendLimitSet, usage: Mapping[str, int | float | Decimal | 
         if used is None or not _finite(used) or used < 0 or _decimal(used) >= _decimal(float(limit)):
             exceeded.append(scope)
     return exceeded
-
-
-def validated[M: BaseModel](model: type[M], value) -> M:
-    """Validate a library input like a request body: errors become a safe 422."""
-    if isinstance(value, model):
-        return value
-    if isinstance(value, BaseModel):
-        value = value.model_dump()
-    try:
-        return model.model_validate(value)
-    except ValidationError as error:
-        raise RequestValidationError(error.errors(include_url=False, include_input=False,
-                                                  include_context=False)) from None
 
 
 def _view(row):

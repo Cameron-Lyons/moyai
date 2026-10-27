@@ -68,7 +68,8 @@ const auditPages=[
   [entry('a4','spend_limit.updated','spend_limit','organization',{limit_usd:5000,previous_usd:null})],
 ];
 const rolesView=()=>({roles:state.roles,assignments:state.assignments,group_roles:state.groupRoles,groups:state.groups,grantable:state.role==='admin'?null:state.permissions,builtin_admin:state.role==='admin'});
-// Like the server, usage totals (and each row's used_usd) are null for a caller without spend.read.
+// Like the server, spend.manage alone can read the listing, and both GET and writes return
+// null usage totals (and a null used_usd on each row) to a caller without spend.read.
 const spendView=(usage=true)=>({limits:usage?state.limits:state.limits.map(row=>({...row,used_usd:null})),
   usage:usage?{organization_month_usd:1234.56,period_start:'2026-10-01T00:00:00+00:00',unknown_requests:0}:null,can_manage:state.permissions.includes('spend.manage')});
 async function handle(req,res,next) {
@@ -142,10 +143,10 @@ async function handle(req,res,next) {
   }
   // Spend limits
   if(p.startsWith('/api/admin/spend-limits')) {
-    if(!has('spend.read'))return deny();
-    if(method==='GET')return json(spendView());
+    if(!has('spend.read')&&!has('spend.manage'))return deny();
+    if(method==='GET')return json(spendView(has('spend.read')));
     // Writes always return the full listing; usage depends on the caller's spend.read.
-    const listing=()=>spendView(!state.withoutSpendRead);
+    const listing=()=>spendView(has('spend.read'));
     if(!has('spend.manage'))return deny();
     if(method==='PUT'){for(const change of data.changes){const row=state.limits.find(item=>item.id===change.id);
         if((row?.revision??0)!==change.revision)return json({detail:STALE},409);}
@@ -257,7 +258,7 @@ test('navigation, palette and direct routes follow permissions, and standalone h
 test('roles: create with grouped permissions, assign by email, grant a group and archive with an explained effect',async t=>{
   reset();const page=await pageFor(t,'#settings/roles');
   await page.getByRole('heading',{name:'Auditor'}).waitFor();
-  const meReads=()=>state.requests.filter(req=>req.path==='/api/me').length;let reads=meReads();
+  const meReads=()=>state.requests.filter(req=>req.path==='/api/me').length,reads=meReads();
   assert.equal(await page.getByRole('heading',{name:'Legacy operations'}).count(),0,'archived roles are filtered out by default');
   await page.getByRole('button',{name:'New role',exact:true}).click();
   const dialog=page.getByRole('dialog',{name:'New role'});await dialog.waitFor();
@@ -271,7 +272,6 @@ test('roles: create with grouped permissions, assign by email, grant a group and
   await dialog.getByRole('button',{name:'Create role'}).click();await dialog.waitFor({state:'hidden'});
   assert.deepEqual(last('/api/admin/roles','POST').body,{id:'finance-reviewer',name:'Finance Reviewer',description:'',permissions:['audit.read','sessions.read','spend.read']});
   await page.getByRole('heading',{name:'Finance Reviewer'}).waitFor();
-  await waitFor(()=>meReads()>reads,'own access is re-read after a role change');reads=meReads();
 
   await page.getByRole('button',{name:'Assign role',exact:true}).click();
   const assign=page.getByRole('dialog',{name:'Assign a custom role'});await assign.getByRole('textbox',{name:'Work email'}).fill('  Erin@Example.test ');
@@ -286,7 +286,6 @@ test('roles: create with grouped permissions, assign by email, grant a group and
   await page.getByRole('button',{name:'Change grant for Finance'}).click();
   const grant=page.getByRole('dialog',{name:'Grant for Finance'});await choose(grant,page,'Additional role','Auditor');await grant.getByRole('button',{name:'Save grant'}).click();await grant.waitFor({state:'hidden'});
   assert.deepEqual(last('/api/admin/group-roles/g-fin','PUT').body,{role_id:'auditor',revision:0});
-  await waitFor(()=>meReads()>reads,'own access is re-read after a group grant');
 
   await page.getByRole('button',{name:'Archive Contractor'}).click();
   const archive=page.getByRole('dialog',{name:'Archive Contractor?'});
@@ -296,6 +295,9 @@ test('roles: create with grouped permissions, assign by email, grant a group and
   assert.equal(state.requests.filter(req=>req.method==='DELETE').length,0,'cancel sends nothing');
   await page.getByRole('button',{name:'Archive Contractor'}).click();await page.getByRole('dialog',{name:'Archive Contractor?'}).getByRole('button',{name:'Archive role'}).click();
   await waitFor(()=>last('/api/admin/roles/contractor','DELETE'));assert.equal(last('/api/admin/roles/contractor','DELETE').query,'?revision=1');
+  await page.getByRole('heading',{name:'Contractor'}).waitFor({state:'detached'});
+  // The server refuses changes that reach the signed-in person, so saves only refresh this page.
+  assert.equal(meReads(),reads,'successful saves do not re-read access or reset the workspace');
 });
 
 test('roles: a stale edit offers reload and a 403 clears the page once permission is lost',async t=>{
@@ -412,7 +414,7 @@ test('spend limits: blank means no limit, overrides add/edit/remove, and only ch
   await table.getByText('carol@example.test').waitFor({state:'detached'});
   assert.equal(spendReads(),reads,'saves that return the full listing replace it without another read');
   const summary=page.getByRole('definition').filter({hasText:'$1,234.56'});assert.equal(await summary.count(),1);
-  state.withoutSpendRead=true;
+  state.permissions=state.permissions.filter(x=>x!=='spend.read');
   await page.getByRole('button',{name:'Edit limit for dan@example.test'}).click();const bare=page.getByRole('dialog',{name:'Edit limit for dan@example.test'});
   await bare.getByRole('textbox',{name:'Monthly limit (USD)'}).fill('40');await bare.getByRole('button',{name:'Save limit'}).click();await bare.waitFor({state:'hidden'});
   await table.getByText('$40.00').waitFor();
@@ -420,6 +422,19 @@ test('spend limits: blank means no limit, overrides add/edit/remove, and only ch
   assert.equal(await summary.count(),0,'usage totals are hidden when the listing has none');
   assert.equal(await table.getByRole('row').filter({hasText:'dan@example.test'}).getByRole('cell',{name:'—',exact:true}).count(),1,'per-person spend is unknown without usage');
   assert.equal(spendReads(),reads,'a listing without usage still replaces the page without another read');
+});
+
+test('spend limits: spend.manage without spend.read edits limits without seeing usage',async t=>{
+  reset({role:'member',permissions:[...MEMBER,'spend.manage']});const page=await pageFor(t,'#settings/spend-limits');
+  await page.getByText('Per-person overrides',{exact:true}).waitFor();
+  const table=page.getByRole('region',{name:'Per-person spend overrides'});await table.getByText('carol@example.test',{exact:true}).waitFor();
+  assert.equal(await page.locator('dl[aria-label="Organization spend this month"]').count(),0,'no usage totals without spend.read');
+  assert.equal(await page.getByText('You can view limits. Changing them requires the spend.manage permission.').count(),0);
+  assert.equal(await table.getByRole('row').filter({hasText:'carol@example.test'}).getByRole('cell',{name:'—',exact:true}).count(),1,'per-person spend is unknown without usage');
+  const save=page.getByRole('button',{name:'Save limits'});assert.equal(await save.isDisabled(),true);
+  await page.getByRole('textbox',{name:'Organization monthly limit'}).fill('6000');await save.click();await page.getByText('Limits saved.').waitFor();
+  assert.deepEqual(last('/api/admin/spend-limits','PUT').body,{changes:[{id:'organization',limit_usd:6000,revision:3}]});
+  assert.equal(await page.locator('dl[aria-label="Organization spend this month"]').count(),0,'the saved listing has no usage either');
 });
 
 test('audit log: filters, date validation, cursor paging and exports',async t=>{
@@ -467,6 +482,24 @@ test('load more with an empty final page stops paging instead of returning to th
   assert.equal(await page.getByRole('button',{name:'Load more users'}).count(),0);assert.equal(await users.getByRole('row').count(),3);
 });
 
+test('losing access while loading more clears audit and directory rows and re-reads access',async t=>{
+  reset();const page=await pageFor(t,'#settings/audit-log');
+  const meReads=()=>state.requests.filter(req=>req.path==='/api/me').length;
+  const table=page.getByRole('region',{name:'Audit log entries'});await table.getByText('Role created',{exact:true}).waitFor();
+  let reads=meReads();state.permissions=state.permissions.filter(x=>x!=='audit.read');
+  await page.getByRole('button',{name:'Load more'}).click();
+  await page.getByRole('heading',{name:'Permission required'}).waitFor();
+  assert.ok(meReads()>reads,'own access is re-read after a 403');
+  assert.equal(await page.getByText('Role created',{exact:true}).count(),0,'loaded audit entries are removed');
+  reset();await page.evaluate(()=>{location.hash='settings/provisioning';});await page.reload();
+  const users=page.getByRole('region',{name:'Directory users'});await users.getByText('Dana Former').waitFor();
+  reads=meReads();state.permissions=state.permissions.filter(x=>x!=='scim.manage');
+  await page.getByRole('button',{name:'Load more users'}).click();
+  await page.getByRole('heading',{name:'Permission required'}).waitFor();
+  assert.ok(meReads()>reads,'own access is re-read after a 403');
+  assert.equal(await page.getByText('Dana Former').count(),0,'loaded directory users are removed');
+});
+
 test('Users shows custom roles and replacing one needs explicit confirmation',async t=>{
   reset();const page=await pageFor(t,'#settings/users');
   const table=page.getByRole('region',{name:'Workspace users'});await table.getByText('Custom role · built-in Member').waitFor();await table.getByText('Deactivated by directory').waitFor();
@@ -505,7 +538,11 @@ for(const width of [1440,320])test(`role and policy editors stay labelled, conta
     assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true);
   };
   await check(role);
-  if(width===320)assert.equal(await role.getByRole('textbox',{name:'Role name'}).evaluate(el=>getComputedStyle(el).fontSize),'16px','mobile inputs avoid zoom');
+  if(width===320){
+    assert.equal(await role.getByRole('textbox',{name:'Role name'}).evaluate(el=>getComputedStyle(el).fontSize),'16px','mobile inputs avoid zoom');
+    const heights=await role.locator('.ns-gov-check label').evaluateAll(labels=>labels.map(label=>label.getBoundingClientRect().height));
+    assert.ok(heights.length>0&&heights.every(height=>height>=44),'permission labels are 44px tap targets');
+  }
   await role.getByRole('textbox',{name:'Role name'}).fill('Synthetic reviewer');await role.getByRole('checkbox',{name:'Read the audit log'}).click();
   if(screens)await page.screenshot({path:path.join(screens,`roles-editor-${width}.png`)});
   await role.getByRole('button',{name:'Cancel'}).click();await role.waitFor({state:'hidden'});

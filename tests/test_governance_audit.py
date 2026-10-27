@@ -503,6 +503,8 @@ def test_feed_order_is_byte_order_whatever_the_database_collation(store, audit):
 def test_postgres_feed_pages_use_the_byte_ordered_indexes(store):
     if not store.database:
         pytest.skip('PostgreSQL plans only.')
+    for action in ('scim_user.created', 'security_profile.created', 'security_profile.updated'):
+        governance_row(store, BASE, action=action, resource_type=action.partition('.')[0])
     expected = {'connections': 'idx_connection_audit_time', 'credentials': 'idx_credential_audit_time',
                 'governance': 'idx_governance_audit_time', 'user_roles': 'idx_user_role_audit_time'}
     position = (BASE, 'governance', 'a' * 32)
@@ -512,12 +514,75 @@ def test_postgres_feed_pages_use_the_byte_ordered_indexes(store):
         for source in governance_audit._POSTGRES_SOURCES:
             for filters, index in ((AuditFilters(), expected[source.name]),
                                    (parse_filters(after='2026-10-16T00:00:00Z'), expected[source.name]),
-                                   (parse_filters(action='role.created'), 'idx_governance_audit_action')):
-                statement = source.statement(filters, position, 51)
-                if statement is None:
-                    continue
-                plan = '\n'.join(row[0] for row in conn.execute('EXPLAIN ' + statement[0], statement[1]).fetchall())
-                assert index in plan and 'Sort' not in plan.replace('Sort Key', ''), (source.name, plan)
+                                   (parse_filters(action='role.created'), 'idx_governance_audit_action'),
+                                   # No index covers resource_type: one statement per security_profile.* action.
+                                   (parse_filters(resource_type='security_profile'), 'idx_governance_audit_action')):
+                statements = governance_audit._statements_in(conn, source, filters, position, 51)
+                if source.name == 'governance':
+                    assert len(statements) == (2 if filters.resource_type else 1)
+                for statement in statements:
+                    plan = '\n'.join(row[0] for row in conn.execute('EXPLAIN ' + statement[0],
+                                                                    statement[1]).fetchall())
+                    assert index in plan and 'Sort' not in plan.replace('Sort Key', ''), (source.name, plan)
+
+
+def test_resource_type_filters_page_through_each_of_its_actions(store, audit, monkeypatch):
+    """Regression: no index covers resource_type, so a filtered page walked every governance row."""
+    random.seed(24)
+    wanted = set()
+    for index in range(90):
+        instant = BASE + timedelta(seconds=random.randint(0, 4), microseconds=random.choice((0, 1, 999999)))
+        if index % 6 == 0:
+            action = random.choice(('security_profile.created', 'security_profile.updated',
+                                    'security_profile.disabled'))
+            wanted.add(('governance', governance_row(store, instant, action=action,
+                                                     resource_type='security_profile')))
+        else:
+            governance_row(store, instant, action=random.choice(('scim_user.created', 'scim_user.updated')),
+                           resource_type='scim_user')
+        if index % 9 == 0:
+            user_role_row(store, instant)
+    # resource_type stays a recheck on a row whose action names another type.
+    governance_row(store, BASE, action='security_profile.updated', resource_type='role')
+    expected = [key for key in oracle(store) if key in wanted]
+    filters = parse_filters(resource_type='security_profile')
+    assert len(expected) == 15
+    calls, original = [], governance_audit._Source.statement
+
+    def statement(self, filters, *args):
+        calls.append((self.name, filters.action))
+        return original(self, filters, *args)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(governance_audit._Source, 'statement', statement)
+        assert pages(audit, filters, limit=1) == pages(audit, filters, limit=7) == expected
+    assert {action for name, action in calls if name == 'governance'} == {
+        'security_profile.created', 'security_profile.disabled', 'security_profile.updated'}
+    assert [(entry['source'], entry['id']) for entry in records(audit.export(filters, 'ndjson'))] == expected
+    assert pages(audit, parse_filters(resource_type='spend_limit')) == []
+    # Older layouts' types name their actions differently, so they keep one unsplit statement.
+    legacy = governance_row(store, BASE, action='security.defaults.updated', resource_type='SecurityDefaults')
+    assert pages(audit, parse_filters(resource_type='SecurityDefaults')) == [('governance', legacy)]
+    # At the action cap some actions may be unseen, so one unsplit statement reads them all.
+    monkeypatch.setattr(governance_audit, 'MAX_FACET_ACTIONS', 2)
+    assert pages(audit, filters, limit=1) == pages(audit, filters, limit=7) == expected
+
+
+def test_recorded_actions_name_their_resource_type(store, audit):
+    """Regression: a mismatched action committed, then vanished from resource_type-filtered pages and exports."""
+    with store.connect() as conn:
+        conn.begin_write()
+        for action, resource_type in (('profile.updated', 'security_profile'), ('role_assignment.updated', 'role')):
+            with pytest.raises(ValueError, match=r'^Name governance actions <resource_type>\.<verb>\.$'):
+                record_event_in(conn, action, 'owner@example.com', resource_type, 'profile')
+    assert store.rows('SELECT * FROM governance_audit_events') == []
+    with store.connect() as conn:
+        conn.begin_write()
+        kept = record_event_in(conn, 'security_profile.updated', 'owner@example.com', 'security_profile', 'profile')
+        # Types outside RESOURCE_TYPES keep their own names; the filter reads them unsplit.
+        older = record_event_in(conn, 'role.updated', 'owner@example.com', 'CustomRole', 'auditor')
+    assert pages(audit, parse_filters(resource_type='security_profile')) == [('governance', kept)]
+    assert pages(audit, parse_filters(resource_type='CustomRole')) == [('governance', older)]
 
 
 def test_exports_release_one_chunk_per_page(store, audit, monkeypatch):

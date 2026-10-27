@@ -53,7 +53,7 @@ export function SecurityPoliciesPage() {
     return <>
       <div className="ns-gov-intro"><p className="ns-notice">Each setting allows everything, allows only what you list, or allows nothing. A session uses the policy chosen when it starts; the mandatory policy then applies on top, and the stricter setting wins.</p>
         <PageActions resource={resource} /></div>
-      <Section id="gov-defaults" title="Organization defaults" description="The default is preselected when someone starts a session. The mandatory policy always applies, including to automations and delegated agents.">
+      <Section id="gov-defaults" title="Organization defaults" description="The default applies to new sessions unless someone who can manage security policies chooses another. The mandatory policy always applies, including to automations and delegated agents.">
         <DefaultsForm admin={data} onSaved={resource.refresh} />
       </Section>
       <Section id="gov-profiles" title="Policies" action={<Button onClick={() => setEditor("new")}><Plus />New policy</Button>}>
@@ -92,7 +92,7 @@ function DefaultsForm({ admin, onSaved }: { admin: SecurityProfilesAdmin; onSave
     void mutation.run(async () => { await updateSecurityProfileDefaults({ body: defaultsBody(value(defaultId), value(mandatoryId), admin.defaults.revision, admin.profiles) }) }, () => { setSaved(true); onSaved() }) }}>
     <div className="ns-gov-field-pair">
       <div className="ns-field"><label htmlFor={`${id}-default`}>Default for new sessions</label><Choice id={`${id}-default`} label="Default for new sessions" value={defaultId} disabled={mutation.busy} onChange={next => { setDefaultId(next); setSaved(false) }} options={options(admin.defaults.default_profile_id, "No default (unrestricted)")} />
-        <p className="ns-field-hint">People can pick another enabled policy when they start a session.</p></div>
+        <p className="ns-field-hint">New sessions use this policy. Only people with the Manage security policies permission can choose another enabled policy when they start a session or set up a workflow.</p></div>
       <div className="ns-field"><label htmlFor={`${id}-mandatory`}>Mandatory policy</label><Choice id={`${id}-mandatory`} label="Mandatory policy" value={mandatoryId} disabled={mutation.busy} onChange={next => { setMandatoryId(next); setSaved(false) }} options={options(admin.defaults.mandatory_profile_id, "No mandatory policy")} />
         <p className="ns-field-hint">Changes also apply to work that is already running.</p></div>
     </div>

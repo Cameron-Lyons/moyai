@@ -98,7 +98,8 @@ jobs:
   governance:
     name: Canonical governance services
     # Native enforcement calls these app/ services (roles, SCIM, policies,
-    # spend limits, audit); no other job runs their suites.
+    # spend limits, audit). postgres-runtime runs their suites on SQLite;
+    # this job runs them against real PostgreSQL.
     runs-on: ubuntu-latest
     timeout-minutes: 15
     services:
@@ -126,8 +127,7 @@ jobs:
           python-version: '3.13'
       - run: uv sync --frozen
         working-directory: native
-      - run: uv run --project native pytest -q --tb=short $GOVERNANCE_TESTS tests/test_storage_maintenance.py
-      - run: uv run --project native pytest -q --tb=short --postgres-backend $GOVERNANCE_TESTS
+      - run: uv run --frozen --project native pytest -q --tb=short --postgres-backend $GOVERNANCE_TESTS
   workspace-node:
     name: Coding computer Node (${{ matrix.platform }})
     runs-on: ubuntu-latest
@@ -153,17 +153,19 @@ jobs:
   runtime:
     # Preserve the existing required check and reject failed, cancelled or
     # skipped prerequisites; a successful shard cannot stand in for the suite.
-    needs: [quality, tests, workspace-node]
+    needs: [quality, tests, governance, workspace-node]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - name: Require quality checks and every native test shard
+      - name: Require quality checks, every native test shard and the governance suites
         env:
           QUALITY_RESULT: ${{ needs.quality.result }}
           TESTS_RESULT: ${{ needs.tests.result }}
+          GOVERNANCE_RESULT: ${{ needs.governance.result }}
           NODE_RESULT: ${{ needs.workspace-node.result }}
         run: |
           test "$QUALITY_RESULT" = success
           test "$TESTS_RESULT" = success
+          test "$GOVERNANCE_RESULT" = success
           test "$NODE_RESULT" = success

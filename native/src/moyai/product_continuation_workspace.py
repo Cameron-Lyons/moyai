@@ -282,8 +282,10 @@ class ProductWorkspaceCompatibility:
         ))
 
     async def turn_context(self, scope: RunScope) -> dict[str, Any] | None:
-        await self.runtime.database.authorize_scope(scope)
         async with self.runtime.database.sessions() as db:
+            # One transaction, so the governed workspace check reuses this
+            # check's principal and policy. The final check below stays fresh.
+            await self.runtime.database.authorize_scope(scope, db=db)
             row = await db.get(ProductExecutionContext, scope.turn_id)
             if row is None:
                 return None

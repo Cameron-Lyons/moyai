@@ -3,6 +3,7 @@
 import json
 import os
 from types import SimpleNamespace
+from typing import Any
 from urllib.parse import urlsplit
 from uuid import uuid4
 
@@ -140,6 +141,97 @@ async def test_native_session_secret_scope_is_namespaced_and_unusable_by_legacy_
     # namespace. No row was copied into canonical runs.
     assert not secrets_api.bridge.store.rows("SELECT id FROM runs WHERE id=?", (root,))
     assert (await secrets_api.client.get("/api/credentials", params={"run_id": "0" * 32})).status_code == 404
+
+
+async def test_shared_password_admin_manages_organization_secrets(secrets_api):
+    bridge = secrets_api.bridge
+    bridge.store.execute(
+        "INSERT INTO users(id,kind,email,name,created_at,updated_at) VALUES(?,?,?,?,?,?)",
+        ("shared:password:admin", "shared", "", "Shared", "c", "u"),
+    )
+    response = Response()
+    sid = bridge.security.new_session(response, "admin")
+    client = secrets_api.client
+    client.cookies.set("workspace_session", response.headers["set-cookie"].split(";", 1)[0].split("=", 1)[1])
+    client.headers["X-CSRF-Token"] = bridge.security.csrf(sid)
+    # Password sessions carry no resolved governance set; built-in permissions apply.
+    created = await client.post("/api/credentials/secrets", json=secret(scope="organization"))
+    assert created.status_code == 201, created.text
+    row = (await client.get("/api/credentials")).json()["secrets"][0]
+    updated = await client.patch("/api/credentials/secrets/" + row["id"], json={"revision": row["revision"], "label": "Shared"})
+    assert updated.status_code == 200, updated.text
+    assert (await client.delete("/api/credentials/secrets/" + row["id"])).json() == {"revoked": True}
+
+
+async def test_cloudflare_access_secret_mutations_stay_on_the_writer_connection(runtime, bridge):
+    import time
+
+    import jwt
+    from app.security import Security
+    from cryptography.hazmat.primitives.asymmetric import rsa
+
+    from moyai.product_access import access_session
+
+    settings = bridge.settings.model_copy(update={
+        "public_url": "https://workspace.example.test", "cloudflare_access_login": True,
+        "cloudflare_access_team_domain": "synthetic.cloudflareaccess.com",
+        "cloudflare_access_audience": "employee-audience", "cloudflare_access_broker_audience": "broker-audience",
+    })
+    security = Security(settings, UserRoles(bridge.store, settings))
+    source = create_async_engine(f"sqlite+aiosqlite:///file:{bridge.store.path}?mode=ro&uri=true")
+    identity = ProductIdentityAdapter(settings, source, native_engine=runtime.database.engine)
+    claims = {"issuer": identity.access.issuer, "sub": "admin-subject", "email": "admin@example.test",
+              "domain": "example.test"}
+    with bridge.store.connect() as db:
+        db.execute(
+            "INSERT INTO users(id,kind,email,name,created_at,updated_at) VALUES(?,?,?,?,?,?)",
+            ("google:admin", "google", claims["email"], "Admin", "2026-10-15", "2026-10-15"),
+        )
+        db.execute("INSERT INTO access_identities VALUES(?,?,?,?,?)",
+                   (claims["issuer"], claims["sub"], claims["email"], "google:admin", "created"))
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    identity.access.keys = {"local-key": key.public_key()}
+    identity.access.expires = time.monotonic() + 3600
+    token = jwt.encode({
+        "iss": claims["issuer"], "sub": claims["sub"], "email": claims["email"], "type": "app",
+        "aud": settings.cloudflare_access_audience, "iat": int(time.time()), "exp": int(time.time()) + 300,
+    }, key, algorithm="RS256", headers={"kid": "local-key"})
+    product: Any = SimpleNamespace(
+        store_proxy=bridge.store, security=security, settings=settings, identity=identity,
+        history=ProductHistoryAdapter(identity, source),
+    )
+    runtime.product = product
+    app = FastAPI()
+    app.include_router(ProductSecrets(runtime).routes())
+
+    @app.middleware("http")
+    async def verified_access(request, call_next):
+        # The native app middleware sets request.state.access_session the same way.
+        assert await access_session(product, request) is None
+        return await call_next(request)
+
+    info = {"sid": "signed-access-session", "method": "cloudflare",
+            "audience": settings.cloudflare_access_audience, "identity": claims}
+    try:
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url=settings.public_url) as client:
+            client.cookies.set("workspace_session", security.signer.dumps(info))
+            client.headers.update({
+                "Origin": settings.public_url, "X-CSRF-Token": security.csrf(info["sid"]),
+                "cf-access-jwt-assertion": token,
+            })
+            # Each mutation re-reads the Access session through the writer's own
+            # connection; a second Store checkout would be a nested-borrow error.
+            created = await client.post("/api/credentials/secrets", json=secret(scope="organization"))
+            assert created.status_code == 201, created.text
+            row = (await client.get("/api/credentials")).json()["secrets"][0]
+            assert row["scope"] == "organization" and row["can_manage"]
+            updated = await client.patch("/api/credentials/secrets/" + row["id"],
+                                         json={"revision": row["revision"], "label": "Access"})
+            assert updated.status_code == 200, updated.text
+            assert (await client.delete("/api/credentials/secrets/" + row["id"])).json() == {"revoked": True}
+    finally:
+        runtime.product = None
+        await source.dispose()
 
 
 async def test_postgres_pool_one_secret_mutations_reuse_live_role_transaction(tmp_path):

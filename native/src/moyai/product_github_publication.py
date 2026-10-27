@@ -84,17 +84,18 @@ class Publications:
             authorize=lambda: self.service.check(self.scope, self.grant), recheck=method == "GET",
         )
 
-    async def governed(self, *, write: bool) -> None:
-        # Each credential release rechecks the live role and session policy.
+    async def governed(self) -> None:
+        # A write release rechecks connections.write and write Git access; the
+        # scope check's governance admission already covers what a read needs.
         governance = getattr(self.database, "governance", None)
         if governance is not None:
-            await governance.connection(self.scope, self.grant, write=write)
+            await governance.connection(self.scope, self.grant, write=True)
 
     async def token(self, *, workflows: bool = False) -> str:
         await self.service.check(self.scope, self.grant)
         if self.grant.read_only:
             raise ToolFailed("This selected GitHub connection is read only.")
-        await self.governed(write=True)
+        await self.governed()
         token = await self.service.execution.call(lambda bound: bound.github.installation_token(
             credentials=bound.github.saved_credentials(), repository=self.target, write=True, workflows=workflows,
         ))
@@ -103,8 +104,8 @@ class Publications:
 
     async def protection_token(self) -> str:
         """Use installed read access without widening the repository write token."""
+        # The scope check's governance admission already covers a read release.
         await self.service.check(self.scope, self.grant)
-        await self.governed(write=False)
         try:
             token = await self.service.execution.call(lambda bound: bound.github.installation_token(
                 credentials=bound.github.saved_credentials(), repository=self.target, protection=True,

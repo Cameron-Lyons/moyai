@@ -75,7 +75,15 @@ export async function sendJson(input: string | Request, init: RequestInit = {}):
 /** File download with the same headers and error policy; the name comes from Content-Disposition. */
 export async function apiDownload(path: string, signal?: AbortSignal): Promise<{ blob: Blob; filename: string }> {
   const response = await send(`/api${path}`, { signal })
-  return { blob: await response.blob(), filename: /filename="([^"]+)"/.exec(response.headers.get("Content-Disposition") ?? "")?.[1] ?? "" }
+  let blob: Blob
+  try {
+    blob = await response.blob()
+  } catch (error) {
+    if (signal?.aborted || (error instanceof Error && error.name === "AbortError")) throw error
+    // A streamed body can end early (lost access or connection) after a 200.
+    throw new ApiError("The download was interrupted before it finished. Check your access and try again.", 0)
+  }
+  return { blob, filename: /filename="([^"]+)"/.exec(response.headers.get("Content-Disposition") ?? "")?.[1] ?? "" }
 }
 
 /** Legacy: `T` is an unchecked cast. New code calls the generated SDK from ./generated/api. */

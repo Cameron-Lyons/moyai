@@ -11,6 +11,7 @@ from typing import Annotated, Any
 
 import anyio
 import modal
+from fastapi import HTTPException
 from openai import AsyncOpenAI, DefaultAsyncHttpxClient
 from opentelemetry.trace import get_tracer
 from pydantic import Field, TypeAdapter
@@ -39,8 +40,9 @@ from pydantic_ai_harness import (
 from pydantic_ai_harness.ask_user import AskUserRequest, Question
 from pydantic_ai_harness.conversation_search import SnapshotHistorySource
 from pydantic_ai_harness.planning import PlanItem
-from temporalio import workflow
+from temporalio import activity, workflow
 from temporalio.common import RetryPolicy
+from temporalio.exceptions import ApplicationError
 
 from .artifacts import artifact_capability
 from .browser import browser_capability
@@ -283,8 +285,24 @@ class Authority(AbstractCapability[RunScope]):
 
     @durable_operation('governance_catalog')
     async def governance_catalog(self, scope: RunScope, definitions: list[tuple[str, bool | None]]) -> list[str]:
-        governance = getattr(self.database, 'governance', None)
-        return await governance.tools(scope, definitions) if governance is not None else [name for name, _ in definitions]
+        """The check operation and the policy's tool filter in one transaction."""
+        async with self.database.sessions() as db:
+            try:
+                await self.database.authorize_scope(scope, db=db)
+                governance = getattr(self.database, 'governance', None)
+                if governance is None:
+                    return [name for name, _ in definitions]
+                return await governance.tools(scope, definitions, db=db)
+            except (PermissionError, HTTPException) as error:
+                if not activity.in_activity():
+                    raise
+                # The body runs the interceptor's full scope check, so a refusal
+                # keeps the error type the interceptor raises for one.
+                raise ApplicationError(
+                    "Execution authority changed before this activity attempt.",
+                    type="MoyaiGuidanceChanged" if isinstance(error, GuidanceChanged) else "MoyaiPermissionDenied",
+                    non_retryable=True,
+                ) from error
 
     async def prepare_tools(self, ctx: RunContext[RunScope], tool_defs: list[ToolDefinition]) -> list[ToolDefinition]:
         if not self.governed():

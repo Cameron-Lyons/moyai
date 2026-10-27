@@ -9,7 +9,7 @@ const ts=require('typescript');
 const React=require('react');
 const {renderToStaticMarkup}=require('react-dom/server');
 const root=path.resolve(__dirname,'..');
-let server,gov,settings,permissions,sdk,homeSubmission;
+let server,gov,settings,permissions,sdk,api,homeSubmission;
 test.before(async()=>{
   const {createServer}=await import('vite');
   server=await createServer({configFile:path.join(root,'native/web/vite.config.ts'),optimizeDeps:{noDiscovery:true,include:[]},server:{middlewareMode:true},appType:'custom'});
@@ -17,6 +17,7 @@ test.before(async()=>{
   settings=await server.ssrLoadModule('/settings.tsx');
   permissions=await server.ssrLoadModule('/permissions.ts');
   sdk=await server.ssrLoadModule('/generated/api/index.ts');
+  api=await server.ssrLoadModule('/api.ts');
   (await server.ssrLoadModule('/generated/api/client.gen.ts')).client.setConfig({baseUrl:'https://moyai.test'});
   const source=ts.createSourceFile('home.tsx',fs.readFileSync(path.join(root,'native/web/home.tsx'),'utf8'),ts.ScriptTarget.Latest,true,ts.ScriptKind.TSX);
   const fn=source.statements.find(node=>ts.isFunctionDeclaration(node)&&node.name?.text==='homeSubmission');assert.ok(fn);
@@ -117,6 +118,17 @@ test('audit filters use whole UTC days, a 100-day window, normalized actors and 
   assert.equal(gov.auditExportPath(gov.emptyAuditFilters,'csv'),'/admin/governance/audit/export?format=csv');
   assert.equal(gov.actionLabel('scim_token.revoked'),'SCIM token revoked');assert.equal(gov.actionLabel(''),'Change recorded');
   assert.equal(gov.detailText(['a','b']),'a, b');assert.equal(gov.detailText(null),'None');
+});
+
+test('an audit export that ends early is a friendly ApiError, and a cancelled export stays an abort',async t=>{
+  const exportPath='/admin/governance/audit/export?format=csv';
+  // The server streams pages after the 200 and closes the body if access is lost mid-export.
+  t.mock.method(global,'fetch',async()=>new Response(new ReadableStream({start(stream){stream.enqueue(new TextEncoder().encode('id,action\n'));stream.error(new TypeError('network error'));}}),
+    {headers:{'Content-Disposition':'attachment; filename="governance.csv"'}}));
+  await assert.rejects(api.apiDownload(exportPath),error=>error instanceof api.ApiError&&error.status===0&&/interrupted before it finished/.test(error.message));
+  const controller=new AbortController();
+  t.mock.method(global,'fetch',async()=>new Response(new ReadableStream({start(stream){stream.enqueue(new TextEncoder().encode('id,action\n'));controller.abort();stream.error(new DOMException('The operation was aborted.','AbortError'));}})));
+  await assert.rejects(api.apiDownload(exportPath,controller.signal),error=>!(error instanceof api.ApiError)&&error.name==='AbortError');
 });
 
 test('role rows escape content, show usage and hide actions for archived or out-of-reach roles',()=>{

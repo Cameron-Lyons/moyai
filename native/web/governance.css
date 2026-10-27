@@ -106,4 +106,7 @@
   :is(.native-settings, .native-settings-dialog) .ns-gov-copy-row { flex-wrap: wrap; }
   :is(.native-settings, .native-settings-dialog) .ns-gov-copy-row input { flex-basis: 100%; }
   .native-settings .ns-gov-builtins dl { grid-template-columns: minmax(0, 1fr); }
+  /* 44px tap targets like the shared .ns-check rule; the checkbox stays level with the centered label. */
+  .native-settings-dialog .ns-gov-check label { display: flex; align-items: center; min-height: 44px; }
+  .native-settings-dialog .ns-gov-check > button[role="checkbox"] { margin-top: 14px; }
 }

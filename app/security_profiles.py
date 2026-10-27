@@ -1,19 +1,22 @@
 """Session security profiles and the organization default and mandatory profile.
 
 A policy narrows what a session may use: connected_apps (managed connectors),
-tools (tool names offered to the agent), git_access and network_domains (the
-Modal outbound_domain_allowlist). For each list, null is unrestricted, [] allows
-nothing and a list allows only its entries. intersect() never widens: lists meet
-by intersection, git access takes the minimum and null is the identity.
+tools (tool names offered to the agent), git_access and network_domains (a
+hostname allowlist). For each list, null is unrestricted, [] allows nothing and
+a list allows only its entries. intersect() never widens: lists meet by
+intersection, git access takes the minimum and null is the identity.
 
-Domains are exact hostnames or '*.' plus a hostname. Modal matches TLS SNI on
-port 443: '*.example.com' covers example.com and every subdomain depth, and an
-exact entry covers only itself. Intersection and redundancy removal follow those
-semantics exactly. Hostnames are lowercase A-labels. Unicode input is converted
-with UTS #46 non-transitional (IDNA2008) mapping, the form clients send in SNI,
-never the stdlib IDNA 2003 codec, which rewrites 'straße.de' to 'strasse.de'.
-IP literals in any spelling, ports, schemes, paths, user names, single-label
-names and single-label wildcards such as '*.com' are rejected.
+network_domains is validated, stored and intersected, but no installed provider
+enforces egress, so ProductGovernance.require_provider refuses every non-null
+value at admission. Domains are exact hostnames or '*.' plus a hostname, with
+Modal's TLS SNI semantics on port 443: '*.example.com' covers example.com and
+every subdomain depth, and an exact entry covers only itself. Intersection and
+redundancy removal follow those semantics exactly. Hostnames are lowercase
+A-labels. Unicode input is converted with UTS #46 non-transitional (IDNA2008)
+mapping, the form clients send in SNI, never the stdlib IDNA 2003 codec, which
+rewrites 'straße.de' to 'strasse.de'. IP literals in any spelling, ports,
+schemes, paths, user names, single-label names and single-label wildcards such
+as '*.com' are rejected.
 
 Profiles are revisioned and never deleted. Disabling one keeps its revisions,
 so native session bindings (moyai_product_session_policies) stay auditable. This
@@ -42,13 +45,13 @@ from uuid import uuid4
 
 import idna
 from fastapi import HTTPException
-from fastapi.exceptions import RequestValidationError
 from pydantic import AfterValidator, BaseModel, ConfigDict, Field, ValidationError, field_validator
 from pydantic_core import PydanticCustomError
 
-from .enterprise_roles import actor_label
+from .enterprise_roles import STALE, actor_label, validated
 from .governance_audit import initialize_schema as initialize_audit
 from .governance_audit import record_event_in, timestamp
+from .permissions import GITHUB_PUBLICATION_TOOLS, TOOL_PERMISSIONS
 from .schema_initializers import initialize_security_profiles as initialize_schema
 
 CONNECTED_APPS = {'github': 'GitHub', 'linear': 'Linear', 'slack': 'Slack', 'notion': 'Notion'}
@@ -60,7 +63,6 @@ TOOL_NAME = re.compile(r'[a-z][a-z0-9_]{0,127}')
 MAX_DOMAINS = 200
 MAX_TOOLS = 500
 MAX_PROFILES = 500
-STALE = 'This changed elsewhere. Reload and try again.'
 
 _LABEL = re.compile(r'[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?')
 # WHATWG URL parsing and inet_aton read a name whose last label is a number as
@@ -224,12 +226,6 @@ def intersect_domains(first: Iterable[str], second: Iterable[str]) -> tuple[str,
     return reduce_domains(entry for one in first for other in second if (entry := _meet(one, other)))
 
 
-def domain_allows(entries: Iterable[str] | None, host: str) -> bool:
-    """Whether a normalized allowlist (None is unrestricted) admits one lowercase A-label host."""
-    return entries is None or any(_under(host, _base(entry)) if entry.startswith('*.') else host == entry
-                                  for entry in entries)
-
-
 def _no_controls(value: str) -> str:
     if any(ord(character) < 32 or ord(character) == 127 for character in value):
         raise PydanticCustomError('name', 'Use a name without control characters.')
@@ -269,9 +265,6 @@ class ProfilePolicy(BaseModel):
     @classmethod
     def _domains(cls, values):
         return None if values is None else reduce_domains(normalize_domain(value) for value in values)
-
-
-UNRESTRICTED = ProfilePolicy()
 
 
 def _policy(value):
@@ -371,19 +364,6 @@ class MandatoryProfile(NamedTuple):
     policy: ProfilePolicy
 
 
-def validated[M: BaseModel](model: type[M], value) -> M:
-    """Validate a library input like a request body: errors become a safe 422."""
-    if isinstance(value, model):
-        return value
-    if isinstance(value, BaseModel):
-        value = value.model_dump()
-    try:
-        return model.model_validate(value)
-    except ValidationError as error:
-        raise RequestValidationError(error.errors(include_url=False, include_input=False,
-                                                  include_context=False)) from None
-
-
 def _tool_label(name):
     return name.replace('_', ' ').capitalize()
 
@@ -392,11 +372,7 @@ _TOOL_GROUPS = (
     ('credentials_', 'Credentials'), ('automation_', 'Automations'), ('browser_', 'Browser'),
     ('github_', 'GitHub'), ('linear_', 'Linear'), ('notion_', 'Notion'), ('slack_', 'Slack'),
 )
-_NAMED_GROUPS = {
-    **dict.fromkeys(('create_pull_request', 'update_pull_request', 'publication_status',
-                     'request_pull_request_write_access'), 'GitHub'),
-    'load_capability': 'Skills',
-}
+_NAMED_GROUPS = {**dict.fromkeys(GITHUB_PUBLICATION_TOOLS, 'GitHub'), 'load_capability': 'Skills'}
 
 
 def _tool_group(name):
@@ -407,26 +383,15 @@ def _tool_group(name):
     return next((group for prefix, group in _TOOL_GROUPS if name.startswith(prefix)), 'Workspace')
 
 
-def policy_catalog(tools: Iterable[str | Mapping] | None = None) -> dict:
-    """Choices for the policy editor: connected apps and the known tool names.
+def policy_catalog() -> dict:
+    """Choices for the policy editor: connected apps and the app.permissions.TOOL_PERMISSIONS names.
 
-    tools defaults to the app.permissions.TOOL_PERMISSIONS names when defined.
-    Entries may be names or {id, label?, group?}; names a policy cannot hold are
-    skipped. Tools are ordered by group, then id.
+    Names a policy cannot hold are skipped. Tools are ordered by group, then id.
     """
-    if tools is None:
-        from . import permissions
-        tools = sorted(getattr(permissions, 'TOOL_PERMISSIONS', None) or ())
-    entries = {}
-    for tool in tools:
-        extra = tool if isinstance(tool, Mapping) else {}
-        name = extra.get('id') if extra else tool
-        if not isinstance(name, str) or not TOOL_NAME.fullmatch(name) or name in entries:
-            continue
-        entries[name] = {'id': name, 'label': extra.get('label') or _tool_label(name),
-                         'group': extra.get('group') or _tool_group(name)}
+    entries = [{'id': name, 'label': _tool_label(name), 'group': _tool_group(name)}
+               for name in TOOL_PERMISSIONS if TOOL_NAME.fullmatch(name)]
     return {'connected_apps': [{'id': key, 'label': label} for key, label in CONNECTED_APPS.items()],
-            'tools': sorted(entries.values(), key=lambda entry: (entry['group'], entry['id']))}
+            'tools': sorted(entries, key=lambda entry: (entry['group'], entry['id']))}
 
 
 _COLUMNS = 'id,name,enabled,revision,policy,updated_by,updated_at'
@@ -483,19 +448,6 @@ class SecurityProfiles:
         defaults = self.defaults_in(conn)
         return {defaults['default_profile_id'], defaults['mandatory_profile_id']} - {''}
 
-    def defaults(self) -> dict:
-        with self.store.connect() as conn:
-            conn.begin_read()
-            return self.defaults_in(conn)
-
-    def get(self, profile_id: str) -> dict:
-        with self.store.connect() as conn:
-            conn.begin_read()
-            row = self._row_in(conn, profile_id)
-        if row is None:
-            raise ProfileNotFound()
-        return _view(row)
-
     def catalog(self) -> dict:
         """Enabled profiles a person may choose for a new session, plus the defaults."""
         with self.store.connect() as conn:
@@ -508,14 +460,14 @@ class SecurityProfiles:
                 'default_profile_id': defaults['default_profile_id'],
                 'mandatory': {'id': mandatory['id'], 'name': mandatory['name']} if mandatory else None}
 
-    def admin_listing(self, tools: Iterable[str | Mapping] | None = None) -> dict:
+    def admin_listing(self) -> dict:
         """Every profile including disabled ones, the defaults and the editor catalog."""
         with self.store.connect() as conn:
             conn.begin_read()
             defaults = self.defaults_in(conn)
             rows = [dict(row) for row in conn.execute(f'SELECT {_COLUMNS} FROM security_profiles')]
         return {'profiles': [_view(row) for row in _ordered(rows)], 'defaults': defaults,
-                'catalog': policy_catalog(tools)}
+                'catalog': policy_catalog()}
 
     @staticmethod
     def _revise_in(conn, row, *, name, enabled, policy, label, action):
@@ -626,7 +578,19 @@ class SecurityProfiles:
 
     def mandatory_in(self, conn, defaults: dict | None = None) -> MandatoryProfile | None:
         """The current mandatory profile, or None. A dangling selection fails closed."""
-        identity = (self.defaults_in(conn) if defaults is None else defaults)['mandatory_profile_id']
+        if defaults is None:
+            # One round trip for governed transactions that only need the floor.
+            row = conn.execute('''SELECT d.mandatory_profile_id AS mandatory_id, p.id AS profile_id,
+                    p.revision AS revision, p.policy AS policy
+                FROM security_profile_defaults d LEFT JOIN security_profiles p ON p.id = d.mandatory_profile_id
+                WHERE d.id=1''').fetchone()
+            if row is None or not row['mandatory_id']:
+                return None
+            identity = row['mandatory_id']
+            if row['profile_id'] is None or not PROFILE_ID.fullmatch(identity):
+                raise OrganizationPolicyUnavailable()
+            return MandatoryProfile(identity, row['revision'], _stored(row['policy']))
+        identity = defaults['mandatory_profile_id']
         if not identity:
             return None
         row = self._row_in(conn, identity)
@@ -634,11 +598,6 @@ class SecurityProfiles:
             raise OrganizationPolicyUnavailable()
         # Applied even if disabled out of band: the selection still restricts.
         return MandatoryProfile(identity, row['revision'], _stored(row['policy']))
-
-    def mandatory(self) -> MandatoryProfile | None:
-        with self.store.connect() as conn:
-            conn.begin_read()
-            return self.mandatory_in(conn)
 
     def resolve_for_new_session_in(self, conn, requested_id: str = '') -> SessionBinding:
         """Resolve a new session's binding in the caller's canonical snapshot.
@@ -661,8 +620,3 @@ class SecurityProfiles:
         mandatory = self.mandatory_in(conn, defaults)
         policy = intersect(_stored(selected['policy']) if selected else None, mandatory.policy if mandatory else None)
         return SessionBinding(identity if selected else '', selected['revision'] if selected else 0, policy)
-
-    def resolve_for_new_session(self, requested_id: str = '') -> SessionBinding:
-        with self.store.connect() as conn:
-            conn.begin_read()
-            return self.resolve_for_new_session_in(conn, requested_id)

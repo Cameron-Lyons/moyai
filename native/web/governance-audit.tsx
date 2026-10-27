@@ -3,11 +3,11 @@ import { Download } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { TableCell, TableRow } from "@/components/ui/table"
-import { apiDownload, csrfToken } from "./api"
+import { ApiError, apiDownload, csrfToken } from "./api"
 import { saveBlob } from "./debug-trace"
 import { Choice, RecordTable, dateTime, errorText } from "./settings"
 import { actionLabel, auditExportPath, auditPageQuery, auditQuery, emptyAuditFilters } from "./governance-data"
-import { AuditDetails, LoadGate, MutationError, PageActions, dataOf, useGovMutation, useGovResource } from "./governance-shared"
+import { AuditDetails, LoadGate, MutationError, PageActions, accessChanged, dataOf, useGovMutation, useGovResource } from "./governance-shared"
 import { listGovernanceAudit, type AuditEntry, type AuditFacets, type AuditPage as AuditResponse } from "./generated/api"
 import type { AuditExportFormat, AuditFilters } from "./governance-types"
 
@@ -35,12 +35,13 @@ export function AuditLogPage() {
   const resource = useGovResource(`audit:${JSON.stringify(query)}`, signal => listGovernanceAudit({ query, signal }).then(dataOf))
   const [facets, setFacets] = useState<AuditFacets>({ actions: [], resource_types: [] })
   const [pages, setPages] = useState<{ base?: AuditResponse; entries: AuditEntry[]; next: string | null; loaded: boolean; loading: boolean; error: string }>({ entries: [], next: null, loaded: false, loading: false, error: "" })
-  const loadMore = useRef<AbortController | null>(null)
+  const loadMore = useRef<AbortController | null>(null), exportAbort = useRef<AbortController | null>(null)
   const exporter = useGovMutation(), [format, setFormat] = useState<AuditExportFormat>("csv")
   useEffect(() => { if (resource.data?.facets) setFacets(resource.data.facets) }, [resource.data])
   // New filters or a refresh discard pages loaded for the previous result.
   useEffect(() => { loadMore.current?.abort(); setPages({ base: resource.data, entries: [], next: null, loaded: false, loading: false, error: "" }) }, [resource.data])
-  useEffect(() => () => loadMore.current?.abort(), [])
+  // Leaving the page stops paging and any export still streaming.
+  useEffect(() => () => { loadMore.current?.abort(); exportAbort.current?.abort() }, [])
   const change = (patch: Partial<AuditFilters>) => { setFormError(""); setDraft(previous => ({ ...previous, ...patch })) }
   const apply = (next: AuditFilters) => {
     try { auditQuery(next) } catch (reason) { setFormError(reason instanceof Error ? reason.message : "Check the filters."); return }
@@ -49,7 +50,9 @@ export function AuditLogPage() {
   const download = (value: AuditExportFormat) => {
     let file: { blob: Blob; filename: string }
     setFormat(value)
-    void exporter.run(async () => { file = await apiDownload(auditExportPath(applied, value)) }, () => saveBlob(file.blob, file.filename || `governance.${value}`))
+    // Exports are single-flight, so no earlier controller is still live here.
+    void exporter.run(async () => { exportAbort.current = new AbortController(); file = await apiDownload(auditExportPath(applied, value), exportAbort.current.signal) },
+      () => saveBlob(file.blob, file.filename || `governance.${value}`))
   }
   const clear = () => { setDraft(emptyAuditFilters); apply(emptyAuditFilters) }
   const options = (values: string[], current: string, all: string, label: (value: string) => string) =>
@@ -83,7 +86,15 @@ export function AuditLogPage() {
         void listGovernanceAudit({ query: auditPageQuery(applied, next), signal: controller.signal }).then(({ data: page }) => {
           if (controller.signal.aborted || auth !== csrfToken()) return
           setPages(previous => previous.base === data ? { base: data, entries: [...previous.entries, ...page.entries], next: page.next_cursor, loaded: true, loading: false, error: "" } : previous)
-        }, reason => { if (!controller.signal.aborted) setPages(previous => ({ ...previous, loading: false, error: errorText(reason) })) })
+        }, reason => {
+          if (controller.signal.aborted) return
+          if (reason instanceof ApiError && reason.status === 403) {
+            // Lost access: drop loaded pages now, re-read access and the gated first page.
+            setPages({ entries: [], next: null, loaded: false, loading: false, error: "" })
+            accessChanged(); resource.refresh(); return
+          }
+          setPages(previous => ({ ...previous, loading: false, error: errorText(reason) }))
+        })
       }
       return <>
         <p className="ns-muted ns-gov-count" role="status">{entries.length.toLocaleString()} {entries.length === 1 ? "entry" : "entries"} shown{next ? "; more are available" : ""}.</p>

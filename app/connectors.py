@@ -8,7 +8,6 @@ import time
 from urllib.parse import urlencode
 
 import httpx
-from fastapi import HTTPException
 from pydantic import Field
 
 from .db import Store, database, now
@@ -157,7 +156,7 @@ class Connectors:
         self.slack_identities = None
         self.personal_slack = PersonalSlack(store, security, settings, self)
 
-    def check_execution(self, run, tool=None):
+    def check_execution(self, run):
         if not run:
             return
         fresh = self.store.run(run['id'])
@@ -166,14 +165,6 @@ class Connectors:
                 or any(fresh[key] != run[key] for key in ('token_hash', 'active_user_id', 'active_message_id'))):
             raise ConnectorError('The executing session changed. No further action was sent.',
                                  code='execution_changed', dispatched=False)
-        roles = getattr(self.store, 'user_roles', None)
-        if roles:
-            try:
-                from .permissions import tool_permission
-                roles.require_actor(fresh['active_user_id'] or fresh['owner_id'],
-                                    tool_permission(tool) if tool else 'connections.read')
-            except HTTPException as error:
-                raise ConnectorError(error.detail, code='access_denied', dispatched=False) from None
 
     def connection_revision(self, provider):
         rows = self.store.rows('SELECT encrypted FROM connections WHERE provider=?', (provider,))
@@ -181,7 +172,7 @@ class Connectors:
 
     def guard(self, name, run, revision):
         """Recheck after preflight awaits and immediately before external actions."""
-        self.check_execution(run, name)
+        self.check_execution(run)
         provider = TOOLS[name][0]
         fresh = self.store.run(run['id']) if run else None
         if (not self.allowed(name, run=run) or self.connection_revision(provider) != revision
@@ -375,7 +366,7 @@ class Connectors:
         if not self.allowed('linear_my_issues'):
             raise ConnectorError('The Linear connection is disabled.', dispatched=False)
         headers = self.headers('linear', await self.credentials('linear'))
-        self.check_execution(run, 'linear_my_issues')
+        self.check_execution(run)
         query = """query($email:String!,$first:Int!,$after:String){issues(first:$first,after:$after,filter:{assignee:{email:{eq:$email}},
             state:{type:{nin:["completed","canceled"]}}}){
             nodes{id identifier title description url priority updatedAt state{name type} team{key name}}
@@ -424,7 +415,7 @@ class Connectors:
             headers = self.headers(provider, selection.credentials if selection else await self.credentials(provider))
         if not self.allowed(name, run=run, as_bot=bot):
             raise ConnectorError("This operation is disabled by your organization's connection policy.", dispatched=False)
-        self.check_execution(run, name)
+        self.check_execution(run)
         if name in notion_tools.TOOLS:
             return await notion_tools.call(self, name, args, headers, run)
         if provider == "linear":
@@ -571,7 +562,7 @@ class Connectors:
         # the full requested text remains represented across acknowledged parts.
         results, rich_text, completed = [], [], 0
         async def append_batch(batch):
-            self.check_execution(run, name)
+            self.check_execution(run)
             if not self.allowed(name):
                 raise ConnectorError('The organization connection changed.', code='access_changed', dispatched=False)
             return await self.request('PATCH', url, headers=headers, json={'children': batch})

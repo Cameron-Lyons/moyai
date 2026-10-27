@@ -281,6 +281,33 @@ async def test_github_credentials_recheck_authority_after_parallel_requests(brid
     assert all(isinstance(result, (HTTPException, PermissionError)) for result in results)
 
 
+async def test_write_credential_release_rechecks_governance_before_credentials(bridge, monkeypatch):
+    """A read release relies on authorize_scope's governed admission; a write also rechecks write access."""
+    save(bridge, "linear")
+    scope = await scope_for(bridge, "linear")
+    grant = scope.grants[0]
+    checks, released, state = [], [], {"refused": False}
+
+    async def connection(run_scope, selected, *, write=False):
+        checks.append((selected.id, write))
+        if state["refused"]:
+            raise HTTPException(403, "This connection is disabled by the session security policy.")
+
+    async def credentials(selected, *, write):
+        released.append(write)
+        return {"access_token": "synthetic-token"}
+
+    monkeypatch.setattr(bridge.database, "governance", SimpleNamespace(connection=connection), raising=False)
+    monkeypatch.setattr(bridge, "_credentials", credentials)
+    await bridge.credentials(scope, grant)
+    await bridge.credentials(scope, grant, write=True)
+    assert checks == [(grant.id, True)] and released == [False, True]
+    state["refused"] = True
+    with pytest.raises(HTTPException, match="disabled by the session security policy"):
+        await bridge.credentials(scope, grant, write=True)
+    assert released == [False, True]
+
+
 async def test_cancelled_github_credential_request_releases_only_its_repository_lock(bridge, monkeypatch):
     github_accounts(bridge, 2)
     scope = await scope_for(bridge, "github")

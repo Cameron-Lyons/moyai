@@ -55,6 +55,9 @@ class AuthorizedActivity(ActivityInboundInterceptor):
                 exempt = name in {
                     "agent__moyai__capability__moyai_interactive_delegation__start",
                     "agent__moyai__capability__moyai_interactive_delegation__send_message",
+                    # Its body runs authorize_scope and the policy filter in one
+                    # transaction and maps refusals to the same ApplicationError types.
+                    "agent__moyai__capability__moyai_authority__governance_catalog",
                 }
                 governance = getattr(self.database, "governance", None)
                 if governance is None or not name.endswith("__call_tool"):

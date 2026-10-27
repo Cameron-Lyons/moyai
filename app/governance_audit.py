@@ -12,7 +12,10 @@ connection_audit and credential_audit tables into one feed ordered by
 (created_at DESC, source, id DESC). Reads never take the writer lock: a page is
 one read-only snapshot (REPEATABLE READ READ ONLY on PostgreSQL) in which each
 source is read through its (created_at, id) index with the filters and a LIMIT in
-SQL. Legacy rows are normalized to fixed actions and identifiers; their free-text
+SQL. No index covers resource_type, but record_event_in requires
+'<resource_type>.<verb>' actions for RESOURCE_TYPES, so a filter on one of them
+reads one governance keyset statement per matching action through the action index.
+Legacy rows are normalized to fixed actions and identifiers; their free-text
 action column is classified and never returned, and their details hold only
 enumerated values.
 
@@ -106,12 +109,16 @@ def record_event_in(conn, action, actor, resource_type, resource_id, details=Non
     Validation happens before any SQL and never echoes values. TypeError: a
     field is not text or details are not a JSON object. ValueError: a field is
     empty, has NUL or exceeds its bound (action/resource_type 64 characters,
-    actor/resource_id 512), or details exceed 4096 UTF-8 bytes or hold NaN.
+    actor/resource_id 512), details exceed 4096 UTF-8 bytes or hold NaN, or a
+    resource type in RESOURCE_TYPES has an action outside '<resource_type>.'.
     RuntimeError: the connection holds no write transaction.
     """
     values = (_text(action, 'action', MAX_ACTION), _text(actor, 'actor', MAX_IDENTIFIER),
               _text(resource_type, 'resource type', MAX_RESOURCE_TYPE),
               _text(resource_id, 'resource id', MAX_IDENTIFIER), _details(details))
+    # The feed's resource_type filter reads these rows through their actions.
+    if values[2] in RESOURCE_TYPES and not values[0].startswith(values[2] + '.'):
+        raise ValueError('Name governance actions <resource_type>.<verb>.')
     if not _in_write_transaction(conn):
         raise RuntimeError('Record governance audit events inside the mutation’s write transaction.')
     identity = uuid4().hex
@@ -429,6 +436,24 @@ _ACTION_SCAN = '''WITH RECURSIVE seen(action,n) AS (
     SELECT action FROM seen WHERE action IS NOT NULL'''
 
 
+def _statements_in(conn, source, filters, position, limit):
+    """The source's keyset statements; a governance resource type reads each of its actions.
+
+    Each statement filters on one '<resource_type>.' action, so it walks
+    idx_governance_audit_action and keeps resource_type=? as a recheck. Types
+    outside RESOURCE_TYPES (older layouts wrote 'security.defaults.updated' as
+    SecurityDefaults) and an action list at its cap keep one unsplit statement.
+    """
+    if source.name == 'governance' and filters.action is None and filters.resource_type in RESOURCE_TYPES:
+        found = [row['action'] for row in conn.execute(_ACTION_SCAN, (MAX_FACET_ACTIONS,)).fetchall()]
+        if len(found) < MAX_FACET_ACTIONS:
+            prefix = filters.resource_type + '.'
+            return [source.statement(filters.model_copy(update={'action': action}), position, limit)
+                    for action in found if action.startswith(prefix)]
+    statement = source.statement(filters, position, limit)
+    return [] if statement is None else [statement]
+
+
 class _Item(NamedTuple):
     order: tuple
     position: tuple  # (instant, source, id): the cursor key
@@ -554,15 +579,13 @@ class GovernanceAudit:
         """Merge per-source pages; return (items, position after them or None)."""
         items, boundary = [], None
         for source in _SOURCES if isinstance(conn, sqlite3.Connection) else _POSTGRES_SOURCES:
-            statement = source.statement(filters, position, limit + 1)
-            if statement is None:
-                continue
-            rows = conn.execute(*statement).fetchall()
-            fetched = [_item(source, row) for row in rows]
-            if len(fetched) > limit and (boundary is None or fetched[-1].order < boundary.order):
-                # Rows of this source beyond its last fetched row are unknown.
-                boundary = fetched[-1]
-            items.extend(fetched)
+            for statement in _statements_in(conn, source, filters, position, limit + 1):
+                rows = conn.execute(*statement).fetchall()
+                fetched = [_item(source, row) for row in rows]
+                if len(fetched) > limit and (boundary is None or fetched[-1].order < boundary.order):
+                    # Rows of this statement beyond its last fetched row are unknown.
+                    boundary = fetched[-1]
+                items.extend(fetched)
         start = _order(position) if position is not None else None
         # SQL bounds are exact for writer spellings; this guard also places rows
         # stored in other ISO forms without repeating them.

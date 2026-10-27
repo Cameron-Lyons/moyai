@@ -71,6 +71,83 @@ async def test_signed_slack_cookie_and_unsigned_identity_headers_cannot_authenti
         assert error.value.status_code == 401
 
 
+@pytest.mark.parametrize("change", ["unlinked", "unavailable", "manual", "foreign"])
+async def test_unverified_slack_senders_hold_no_permissions(secrets_api, change):
+    """As in canonical actor checks, a sender without a verified, eligible email is never a member."""
+    api = secrets_api
+    identity = await enroll(api)
+    if change == "unavailable":
+        api.bridge.store.execute("UPDATE users SET link_status='unavailable',profile_eligible=0 WHERE id=?", (identity,))
+    elif change == "manual":
+        api.bridge.store.execute(
+            "UPDATE users SET link_status='manual',linked_user_id='google:owner' WHERE id=?", (identity,),
+        )
+    elif change == "foreign":
+        api.bridge.store.execute(
+            "UPDATE users SET email='sender@elsewhere.test',profile_eligible=1,link_status='linked' WHERE id=?",
+            (identity,),
+        )
+    principal = await api.identity.current(identity)
+    assert principal.kind == "slack" and principal.effective_permissions == frozenset()
+    # ProductGovernance.principal and every governed admission require this first.
+    with pytest.raises(HTTPException) as denied:
+        principal.require("sessions.create")
+    assert denied.value.status_code == 403
+
+
+async def test_slack_intake_without_identity_linking_never_verifies_the_sender(secrets_api, monkeypatch):
+    """With linking disabled, intake skips the profile lookup, so the sender stays unverified and is refused."""
+    from app.permissions import MEMBER_PERMISSIONS
+
+    from moyai.product_slack import ProductSlack
+    api = secrets_api
+    await enroll(api)
+    api.bridge.connectors.save("slack", {
+        "access_token": "local-user-token", "bot": {
+            "access_token": "local-bot-token", "bot_user_id": "UBOT00001", "team": {"id": "TTEST0001"},
+            "scope": "users:read,users:read.email",
+        },
+    }, "Local installation")
+
+    async def profile(method, url, **kwargs):
+        assert url.endswith("/users.info") and kwargs["params"] == {"user": "UTEST0001"}
+        return {"ok": True, "user": {"id": "UTEST0001", "team_id": "TTEST0001",
+                "profile": {"email": "owner@example.test", "real_name": "Verified owner"}}}
+
+    monkeypatch.setattr(api.bridge.connectors, "request", profile)
+    api.runtime.product_connections = api.bridge
+    slack = ProductSlack(api.runtime)
+    api.bridge.settings.slack_identity_linking_enabled = False
+    _, principal = await slack.actor("TTEST0001", "UTEST0001", refresh_profile=True)
+    assert principal.kind == "slack" and principal.effective_permissions == frozenset()
+    with pytest.raises(HTTPException) as denied:
+        principal.require("sessions.create")
+    assert denied.value.status_code == 403
+    # The same intake with linking enabled verifies the in-domain profile.
+    api.bridge.settings.slack_identity_linking_enabled = True
+    _, principal = await slack.actor("TTEST0001", "UTEST0001", refresh_profile=True)
+    assert principal.effective_permissions == MEMBER_PERMISSIONS
+
+
+async def test_verified_slack_sender_follows_directory_state(secrets_api):
+    from app.permissions import MEMBER_PERMISSIONS
+    api = secrets_api
+    identity = await enroll(api)
+    api.bridge.store.execute(
+        "UPDATE users SET email='owner@example.test',profile_eligible=1,link_status='linked' WHERE id=?", (identity,),
+    )
+    assert (await api.identity.current(identity)).effective_permissions == MEMBER_PERMISSIONS
+    # A SCIM tombstone for the verified email revokes the sender outright.
+    api.bridge.store.execute(
+        "INSERT INTO scim_users(id,user_name,profile,active,deleted_at,created_at,updated_at,revision,access_epoch) "
+        "VALUES(?,?,'{}',1,?,?,?,1,1)",
+        ("0" * 32, "owner@example.test", "2026-10-20", "2026-10-01", "2026-10-20"),
+    )
+    with pytest.raises(HTTPException) as denied:
+        await api.identity.current(identity)
+    assert denied.value.status_code == 401
+
+
 @pytest.mark.parametrize("change", ["allowlist", "disabled", "profile", "native_epoch"])
 async def test_slack_authority_checks_live_source_and_native_controls(secrets_api, change):
     api = secrets_api

@@ -3,9 +3,9 @@ import { KeyRound, Plus, TriangleAlert } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { TableCell, TableRow } from "@/components/ui/table"
-import { csrfToken } from "./api"
+import { ApiError, csrfToken } from "./api"
 import { Choice, Empty, RecordTable, Toolbar, contains, dateTime, errorText } from "./settings"
-import { ActivityList, CopyField, DialogActions, GovConfirm, GovDialog, LoadGate, MutationError, PageActions, Section, StatusBadge, dataOf, useGovMutation, useGovResource } from "./governance-shared"
+import { ActivityList, CopyField, DialogActions, GovConfirm, GovDialog, LoadGate, MutationError, PageActions, Section, StatusBadge, accessChanged, dataOf, useGovMutation, useGovResource } from "./governance-shared"
 import {
   createScimToken, getScimAdmin, revokeScimToken,
   type CreatedScimToken, type ScimAdmin, type ScimGroupSummary as ScimGroup, type ScimToken, type ScimUserSummary as ScimUser,
@@ -61,7 +61,15 @@ export function ProvisioningPage({ canManageRoles }: { canManageRoles: boolean }
       void getScimAdmin({ query: { limit: PAGE_SIZE, cursor: next }, signal: controller.signal }).then(({ data: page }) => {
         if (controller.signal.aborted || auth !== csrfToken()) return
         setPages(previous => previous.base === data ? { base: data, items: [...previous.items, ...page.users.items], next: page.users.next_cursor, loaded: true, loading: false, error: "" } : previous)
-      }, reason => { if (!controller.signal.aborted) setPages(previous => ({ ...previous, loading: false, error: errorText(reason) })) })
+      }, reason => {
+        if (controller.signal.aborted) return
+        if (reason instanceof ApiError && reason.status === 403) {
+          // Lost access: drop loaded pages now, re-read access and the gated first page.
+          setPages({ items: [], next: null, loaded: false, loading: false, error: "" })
+          accessChanged(); resource.refresh(); return
+        }
+        setPages(previous => ({ ...previous, loading: false, error: errorText(reason) }))
+      })
     }
     // The first page (no cursor) carries the sections; load-more pages only add users.
     const tokens = data.tokens ?? [], groups = data.groups ?? [], activity = data.activity ?? []

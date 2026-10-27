@@ -27,6 +27,7 @@ from .enterprise_roles import (
     GovernanceConflict,
     GovernanceForbidden,
     canonical_fetch,
+    directory_fetch,
     resolve_access,
     role_permissions,
     scim_state_in,
@@ -54,46 +55,6 @@ class RoleChange(BaseModel):
         if not re.fullmatch(r"[a-z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-z0-9.-]+", value):
             raise ValueError('Enter a work email address.')
         return value
-
-
-class _Snapshot:
-    """Directory rows preloaded once and served to resolve_access without per-person reads."""
-
-    def __init__(self, conn):
-        self.scim = {}
-        # Later rows win: tombstones first, then live rows, each by update time.
-        for row in conn.execute('''SELECT id,user_name,active,deleted_at,access_epoch FROM scim_users
-                ORDER BY (deleted_at=''),updated_at,id'''):
-            self.scim[row['user_name']] = {'id': row['id'], 'active': row['active'], 'deleted_at': row['deleted_at'],
-                                           'access_epoch': row['access_epoch']}
-        self.assignments = {row['email']: dict(row) for row in conn.execute(
-            'SELECT email,role_id,revision FROM enterprise_role_assignments')}
-        self.roles = {row['id']: dict(row) for row in conn.execute(
-            'SELECT id,name,permissions,permissions_revision,archived FROM enterprise_roles')}
-        self.grants = {}
-        for row in conn.execute('''SELECT u.user_name,r.group_id,r.revision,r.role_id,e.permissions,e.archived,
-                    e.permissions_revision AS role_revision
-                FROM enterprise_group_roles r
-                JOIN scim_groups g ON g.id=r.group_id AND g.deleted_at=''
-                JOIN scim_group_members m ON m.group_id=g.id
-                JOIN scim_users u ON u.id=m.user_id AND u.deleted_at='' AND u.active=1
-                LEFT JOIN enterprise_roles e ON e.id=r.role_id
-                WHERE r.role_id IS NOT NULL ORDER BY r.group_id'''):
-            self.grants.setdefault(row['user_name'], []).append(dict(row))
-
-    def fetch(self, name, params):
-        if name == 'scim_user':
-            row = self.scim.get(params['email'])
-            return [row] if row else []
-        if name == 'assignment':
-            row = self.assignments.get(params['email'])
-            return [row] if row else []
-        if name == 'role':
-            row = self.roles.get(params['role_id'])
-            return [row] if row else []
-        if name == 'group_grants':
-            return self.grants.get(params['email'], [])
-        raise KeyError(name)
 
 
 class UserRoles:
@@ -206,18 +167,15 @@ class UserRoles:
                 elif not person['name']:
                     person['name'] = row['name']
             # A fixed number of statements for any directory size, with the same rules as access_in.
-            snapshot = _Snapshot(conn)
+            fetch = directory_fetch(conn)
             for email, person in people.items():
                 assignment = assignments.get(email)
                 role = assignment['role'] if assignment else self.default_role(email)
-                state = resolve_access(snapshot.fetch, email, role)
-                access_revision = int(snapshot.assignments.get(email, {}).get('revision', 0))
+                state = resolve_access(fetch, email, role)
                 person.update(
                     role=role, revision=assignment['revision'] if assignment else 0,
-                    access_role_id=state.role_id, access_role_name=state.role_name or state.role_id,
-                    access_revision=access_revision,
                     access_role={'id': state.role_id, 'name': state.role_name or state.role_id,
-                                 'revision': access_revision} if state.role_id else None,
+                                 'revision': state.assignment_revision} if state.role_id else None,
                     active=state.scim_active is not False, permissions=sorted(state.permissions),
                 )
             audit = [dict(row) for row in conn.execute('SELECT email,previous_role,role,actor,created_at FROM user_role_audit ORDER BY id DESC LIMIT 30')]
@@ -225,7 +183,7 @@ class UserRoles:
                 'activity': audit, 'domains': sorted(self.settings.google_domains())}
 
     def change(self, body, actor):
-        """actor: a GovernanceActor, ProductPrincipal or legacy session dict; rechecked in the writer."""
+        """actor: a GovernanceActor or ProductPrincipal; rechecked in the writer."""
         if not actor:
             raise HTTPException(401, 'Sign in to the workspace.')
         if not self.eligible(body.email):

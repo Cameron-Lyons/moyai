@@ -130,17 +130,18 @@ def test_directory_reports_custom_roles_activity_and_effective_permissions(direc
         for email, row in rows.items():
             state = service.roles.access_in(conn, email)
             assert set(row['permissions']) == state.permissions, email
-            assert (row['role'], row['active'], row['access_role_id']) == (
+            assert (row['role'], row['active'], (row['access_role'] or {}).get('id')) == (
                 service.roles.role_in(conn, email), state.scim_active is not False, state.role_id), email
     assert rows['maya@example.com']['access_role'] == {'id': 'reader', 'name': 'Reader', 'revision': 1}
     assert rows['maya@example.com']['permissions'] == ['sessions.read', 'workspace.read']
     assert set(rows['grace@example.com']['permissions']) == MEMBER_PERMISSIONS | {'connections.manage'}
     assert rows['grace@example.com']['access_role'] is None and rows['grace@example.com']['active'] is True
-    assert rows['old@example.com']['access_role_id'] == 'retired' and rows['old@example.com']['permissions'] == []
+    assert rows['old@example.com']['access_role']['id'] == 'retired' and rows['old@example.com']['permissions'] == []
     assert rows['dan@example.com']['active'] is False and rows['dan@example.com']['permissions'] == []
     assert rows['second@example.com']['role'] == 'admin' and rows['second@example.com']['permissions'] == []
-    # A built-in member row is no custom role, but its revision is reported for confirmations.
-    assert rows['mo@example.com']['access_role'] is None and rows['mo@example.com']['access_revision'] == 2
+    # A built-in member row is no custom role, so the editor needs no confirmation to replace it.
+    assert rows['mo@example.com']['access_role'] is None
+    assert not {'access_role_id', 'access_role_name', 'access_revision'} & rows['mo@example.com'].keys()
     assert set(rows['owner@example.com']['permissions']) == ALL
     executed = statements(monkeypatch)
     service.roles.directory()
@@ -245,11 +246,11 @@ def test_delegated_built_in_role_editors_stay_within_their_bounds(directory):
     denied(error, 403, AMPLIFY)
 
 
-def test_legacy_session_actors_and_errors_remain_compatible(directory):
+def test_unclaimed_actors_defer_to_the_canonical_role_and_errors_keep_their_status(directory):
     service = directory
-    admin = {'method': 'google', 'role': 'admin', 'identity': {'email': 'owner@example.com', 'sub': 'owner'}}
+    admin = GovernanceActor(id='google:owner', email='owner@example.com', builtin_role=None, kind='individual')
     assert service.roles.change(RoleChange(email='new@example.com', role='member', revision=0), admin)['revision'] == 1
-    member = {'method': 'google', 'role': 'member', 'identity': {'email': 'new@example.com', 'sub': 'new'}}
+    member = GovernanceActor(id='google:new', email='new@example.com', builtin_role=None, kind='individual')
     with pytest.raises(HTTPException) as error:
         service.roles.change(RoleChange(email='other@example.com', role='member', revision=0), member)
     assert error.value.status_code == 403

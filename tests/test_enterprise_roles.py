@@ -34,14 +34,14 @@ from app.enterprise_roles import (
     RoleCreate,
     RoleUpdate,
     canonical_fetch,
-    qualified_fetch,
+    directory_fetch,
     resolve_access,
+    snapshot_fetch,
 )
 from app.permissions import (
     BUILTIN_PERMISSIONS,
     DEFAULT_TOOL_PERMISSION,
     MEMBER_PERMISSIONS,
-    NATIVE_TOOL_NAMES,
     PERMISSIONS,
     TOOL_PERMISSIONS,
     catalog,
@@ -120,7 +120,12 @@ def test_catalog_lists_every_permission_once_with_labels_and_groups():
     assert {entry['id'] for entry in entries} == set(PERMISSIONS) and len(entries) == len(PERMISSIONS)
     assert all(entry['label'] and entry['group'] and entry['description'] == PERMISSIONS[entry['id']] for entry in entries)
     assert BUILTIN_PERMISSIONS['admin'] == frozenset(PERMISSIONS) and MEMBER_PERMISSIONS < ALL
-    assert len(MEMBER_PERMISSIONS) == 16 and len(PERMISSIONS) == 28
+    # The default member grant is spelled out so any widening reads as a reviewable diff.
+    assert sorted(MEMBER_PERMISSIONS) == [
+        'automations.manage', 'automations.read', 'connections.read', 'connections.write', 'credentials.manage',
+        'credentials.read', 'environments.read', 'memory.manage', 'memory.read', 'sessions.create', 'sessions.manage',
+        'sessions.read', 'skills.manage', 'skills.read', 'spend.personal', 'workspace.read']
+    assert len(PERMISSIONS) == 28
 
 
 def tool_names_of(capability):
@@ -179,7 +184,7 @@ def test_every_native_tool_has_an_explicit_permission():
     assert {'shell', 'delegate_task', 'credentials_run', 'automation_retire', 'create_pull_request'} <= exposed
     # The framework's deferred-capability loader serves saved and bundled skills.
     exposed.add('load_capability')
-    assert exposed - NATIVE_TOOL_NAMES == set()
+    assert exposed - set(TOOL_PERMISSIONS) == set()
     # Static net: any tool a native module registers must be explicit too.
     registered = set()
     for path in (ROOT / 'native/src/moyai').rglob('*.py'):
@@ -201,10 +206,9 @@ def test_every_native_tool_has_an_explicit_permission():
                     if isinstance(argument, ast.Name):
                         registered.add(argument.id)
     assert {'save_artifact', 'browser_open', 'automation_list', 'credentials_list', 'publication_status'} <= registered
-    assert registered - NATIVE_TOOL_NAMES == set()
-    assert set(TOOL_PERMISSIONS) == NATIVE_TOOL_NAMES
+    assert registered - set(TOOL_PERMISSIONS) == set()
     assert all(TOOL_PERMISSIONS[name] in PERMISSIONS and tool_permission(name) == TOOL_PERMISSIONS[name]
-               for name in NATIVE_TOOL_NAMES)
+               for name in TOOL_PERMISSIONS)
 
 
 def test_connector_tools_follow_the_canonical_read_write_catalog():
@@ -259,9 +263,19 @@ def test_route_permissions_follow_the_resource(method, path, permission):
     assert route_permission(SimpleNamespace(scope={'path': path}, method=method)) == permission
 
 
-def test_resolution_is_pure_and_matches_named_queries(governance):
+def canonical_read_engine(service):
+    """A SQLAlchemy engine on the governance store and its quoted, qualified table names."""
     import sqlalchemy
-    from sqlalchemy import text
+    if service.store.database:
+        schema = service.store.database.schema
+        engine = sqlalchemy.create_engine('postgresql+psycopg://' + os.environ['MOYAI_TEST_POSTGRES_URL'].split('://', 1)[1])
+        return engine, SimpleNamespace(_table=lambda name: f'"{schema}"."{name}"')
+    return sqlalchemy.create_engine(f'sqlite:///{service.store.path}'), SimpleNamespace(
+        _table=lambda name: f'"main"."{name}"')
+
+
+def test_resolution_is_pure_and_matches_named_queries(governance):
+    from moyai.product_governance import CanonicalRead
     service = governance
     role(service)
     role(service, 'operator', ['connections.manage', 'workspace.read'])
@@ -272,22 +286,76 @@ def test_resolution_is_pure_and_matches_named_queries(governance):
         canonical = resolve_access(canonical_fetch(conn), 'bob@example.com', 'member')
     assert canonical.permissions == {'sessions.read', 'workspace.read', 'connections.manage'}
     assert canonical.groups == ((team, 1, 'operator'),) and canonical.role_id == 'reader' and not canonical.default
-    # The native adapter's form: SQLAlchemy text(), :named parameters and qualified quoted tables.
-    if service.store.database:
-        schema = service.store.database.schema
-        engine = sqlalchemy.create_engine('postgresql+psycopg://' + os.environ['MOYAI_TEST_POSTGRES_URL'].split('://', 1)[1])
-        table = lambda name: f'"{schema}"."{name}"'
-    else:
-        engine = sqlalchemy.create_engine(f'sqlite:///{service.store.path}')
-        table = lambda name: f'"main"."{name}"'
+    # The native adapter's form: CanonicalRead binds SQLAlchemy text() and qualified quoted tables.
+    engine, identity = canonical_read_engine(service)
     try:
         with engine.connect() as session:
-            fetch = qualified_fetch(lambda sql, params: session.execute(text(sql), params).mappings().all(), table)
-            assert resolve_access(fetch, 'bob@example.com', 'member') == canonical
-            assert resolve_access(fetch, 'nobody@example.com', 'member').default
+            read = CanonicalRead(session, identity)
+            assert resolve_access(canonical_fetch(read), 'bob@example.com', 'member') == canonical
+            assert resolve_access(snapshot_fetch(read, 'bob@example.com'), 'bob@example.com', 'member') == canonical
+            assert resolve_access(snapshot_fetch(read, 'nobody@example.com'), 'nobody@example.com', 'member').default
     finally:
         engine.dispose()
-    assert all('{' in sql and ':' in sql for sql in ACCESS_QUERIES.values())
+    assert all('{' not in sql and ':' in sql for sql in ACCESS_QUERIES.values())
+
+
+def test_snapshot_and_directory_reads_match_per_query_resolution(governance, monkeypatch):
+    """One statement per person (native checks) and one batch (users page) keep resolve_access's results."""
+    from moyai.product_governance import CanonicalRead
+    service = governance
+    role(service)
+    role(service, 'operator', ['connections.manage', 'workspace.read'])
+    role(service, 'auditor', ['spend.read'])
+    role(service, 'retired', ['memory.read'])
+    # A tombstone and a live row for one userName, with two grants.
+    first = provision(service, 'ann@example.com')
+    service.scim.delete(service.header, 'User', first)
+    ann = provision(service, 'ann@example.com')
+    ops, audit = directory_group(service, 'Ops', [ann]), directory_group(service, 'Audit', [ann])
+    service.enterprise.set_group_role(ops, GroupRoleChange(role_id='operator'), OWNER)
+    service.enterprise.set_group_role(audit, GroupRoleChange(role_id='auditor'), OWNER)
+    assign(service, 'ann@example.com', 'reader')
+    # An inactive member of a granted group, and an administrator in one.
+    idle = provision(service, 'idle@example.com', active=False)
+    owner = provision(service, 'owner@example.com')
+    service.scim.write(service.header, {}, 'Group', 'PUT', {'displayName': 'Ops', 'members': [
+        {'value': ann}, {'value': idle}, {'value': owner}]}, ops)
+    # Archived, missing and built-in-named assigned roles, and a 'member' reset row.
+    assign(service, 'old@example.com', 'retired')
+    service.enterprise.archive('retired', 1, OWNER)
+    stamp = '2026-01-01T00:00:00+00:00'
+    for email, role_id in (('ghost@example.com', 'vanished'), ('named@example.com', 'admin')):
+        service.store.execute('INSERT INTO enterprise_role_assignments VALUES(?,?,1,?,?)', (email, role_id, 'test', stamp))
+    assign(service, 'reset@example.com', 'reader')
+    assign(service, 'reset@example.com', 'member', revision=1)
+    emails = ('ann@example.com', 'idle@example.com', 'owner@example.com', 'old@example.com', 'ghost@example.com',
+              'named@example.com', 'reset@example.com', 'nobody@example.com')
+    engine, identity = canonical_read_engine(service)
+    try:
+        with service.store.connect() as conn, engine.connect() as session:
+            directory = directory_fetch(conn)
+            read = CanonicalRead(session, identity)
+            for email in emails:
+                builtin = service.roles.role_in(conn, email)
+                expected = resolve_access(canonical_fetch(conn), email, builtin)
+                for fetch in (snapshot_fetch(conn, email), snapshot_fetch(read, email), directory):
+                    assert resolve_access(fetch, email, builtin) == expected, email
+            executed = statements(monkeypatch)
+            fetch = snapshot_fetch(conn, 'ann@example.com')
+            ann_state = resolve_access(fetch, 'ann@example.com', 'member')
+            assert len(executed) == 1
+            # It serves only this email's reads and its assigned role.
+            for name, params in (('scim_user', {'email': 'idle@example.com'}), ('role', {'role_id': 'operator'}),
+                                 ('users', {'email': 'ann@example.com'})):
+                with pytest.raises(KeyError):
+                    fetch(name, params)
+    finally:
+        engine.dispose()
+    assert ann_state.groups == tuple(sorted(((audit, 1, 'auditor'), (ops, 1, 'operator'))))
+    assert ann_state.permissions == {'sessions.read', 'workspace.read', 'connections.manage', 'spend.read'}
+    assert ann_state.directory is not None and ann_state.directory[0] == ann
+    assert access(service, 'idle@example.com').permissions == frozenset()
+    assert access(service, 'owner@example.com').groups == () and access(service, 'ghost@example.com').permissions == frozenset()
 
 
 def test_default_state_and_member_rows_never_change_governance(governance):
@@ -762,15 +830,16 @@ def test_actor_snapshots_are_rechecked_in_the_writer(governance):
     with pytest.raises(GovernanceForbidden) as error:
         role(service, 'reader', actor=person('mgr@example.com'))
     denied(error, 403, DEACTIVATED)
-    # ProductPrincipal-shaped objects and legacy session dicts are accepted.
+    # ProductPrincipal-shaped objects are accepted.
     principal = SimpleNamespace(id='google:owner', kind='google', method='google', email='owner@example.com',
                                 role='admin', permissions=ALL)
     assert role(service, 'reader', actor=principal)['updated_by'] == 'owner@example.com'
-    legacy = {'method': 'google', 'role': 'admin', 'identity': {'email': 'Owner@Example.com', 'sub': 'owner'}}
-    assert role(service, 'second', actor=legacy)['revision'] == 1
-    # Legacy dicts without a role claim defer to the canonical role; malformed actors fail closed.
-    assert role(service, 'third', actor={'method': 'google', 'identity': {'email': 'owner@example.com'}})
-    for actor in ({'id': 'google:x', 'email': None}, {'id': None}, {'method': 'invented', 'role': 'admin'}):
+    # Actors without a role claim defer to the canonical role; mappings and other malformed actors fail closed.
+    unclaimed = GovernanceActor(id='google:owner', email='Owner@Example.com', builtin_role=None, kind='individual')
+    assert role(service, 'second', actor=unclaimed)['revision'] == 1
+    for actor in ({'id': 'google:x', 'email': None}, {'id': None}, {'method': 'invented', 'role': 'admin'},
+                  {'method': 'google', 'role': 'admin', 'identity': {'email': 'owner@example.com', 'sub': 'owner'}},
+                  SimpleNamespace(id=None, role='admin'), object()):
         with pytest.raises(GovernanceForbidden):
             role(service, 'fourth', actor=actor)
 
@@ -847,8 +916,8 @@ def test_actor_labels_match_across_governance_writers():
     from app.enterprise_roles import actor_label
     assert actor_label(person('Owner@Example.com', 'admin')) == 'owner@example.com'
     assert actor_label(GovernanceActor(id='shared:local:admin')) == 'Local preview admin'
-    assert actor_label({'method': 'password', 'role': 'member'}) == 'Shared password member'
-    assert actor_label({'method': 'google', 'identity': {'email': 'A@Example.com', 'sub': '1'}}) == 'a@example.com'
+    assert actor_label(GovernanceActor(id='shared:password:member')) == 'Shared password member'
+    assert actor_label(GovernanceActor(id='google:1', email='A@Example.com', kind='individual')) == 'a@example.com'
     google = SimpleNamespace(id='google:1', kind='google', method='google', email='Owner@Example.com', individual=True)
     assert actor_label(google) == 'owner@example.com'
     # A Slack-claimed profile email never labels a governance change.
@@ -856,7 +925,8 @@ def test_actor_labels_match_across_governance_writers():
     assert actor_label(slack) == 'slack:T1:U1'
     assert actor_label(GovernanceActor(id='shared:invented:admin')) == 'shared:invented:admin'
     for actor in (None, object(), 'owner@example.com', GovernanceActor(id=''), GovernanceActor(id='x' * 513),
-                  GovernanceActor(id='google:\x00'), {'method': 'invented'}):
+                  GovernanceActor(id='google:\x00'), {'method': 'invented'},
+                  {'method': 'password', 'role': 'member'}):
         with pytest.raises(TypeError):
             actor_label(actor)
 

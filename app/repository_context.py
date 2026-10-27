@@ -14,7 +14,6 @@ from collections import Counter
 from pathlib import PurePosixPath
 from urllib.parse import quote
 
-from fastapi import HTTPException
 from pydantic import BaseModel, ConfigDict, Field
 
 from .connector_errors import ConnectorError
@@ -167,17 +166,10 @@ class RepositoryContext:
         self.authority({**run, 'github_connection_version': version}, target)
         return snapshot
 
-    def require_permitted(self, run):
-        """Injection reveals repository content: require connections.read access."""
-        roles = getattr(self.store, 'user_roles', None)
-        if roles:
-            roles.require_actor(run.get('active_user_id') or run.get('owner_id'), 'connections.read')
-
     def context(self, run):
         if not self.settings.repository_context_enabled or 'github' not in run.get('plugins', []):
             return ''
         try:
-            self.require_permitted(run)
             snapshot = self.snapshot(run)
             if not snapshot:
                 return ''  # A cold/failed index never holds up a model request.
@@ -191,8 +183,8 @@ class RepositoryContext:
                 'Verify facts against your working branch before changing code. Use repository_context_search '
                 'for task-related paths and repository_context_read for exact source ranges; if unavailable, inspect the checkout.\n'
                 + json.dumps({**self.metadata(snapshot), **snapshot['guide']}, ensure_ascii=False))
-        except (ConnectorError, HTTPException):
-            return ''  # Denied or revoked access never blocks inference.
+        except ConnectorError:
+            return ''
 
     @staticmethod
     def metadata(snapshot):

@@ -199,18 +199,25 @@ SESSION_TOOLS = (
     'save_artifact', 'attach_link', 'attachment_copy', 'browser_open', 'browser_read', 'browser_action',
     'desktop_read', 'desktop_action',
 )
+# Product GitHub branch, stack and pull-request tools. The model sees them under
+# a GitHub grant prefix; connector_tool() classifies the unprefixed names.
+GITHUB_READ_TOOLS = ('checkout', 'stack', 'stacks', 'publication_status')
+GITHUB_WRITE_TOOLS = (
+    'add_to_stack', 'close_pull_request', 'convert_pull_request_to_draft', 'create_branch', 'create_review',
+    'create_stack', 'delete_pending_review', 'edit_pending_review', 'open_pull_request', 'publish_branch',
+    'rebase_pull_request', 'reopen_pull_request', 'request_pr_lifecycle_access', 'retarget_pull_request',
+    'submit_review', 'create_pull_request', 'update_pull_request', 'request_pull_request_write_access',
+)
 TOOL_PERMISSIONS = {
     **dict.fromkeys(('get_goal', 'swarm_board', 'swarm_read'), 'sessions.read'),
     **dict.fromkeys(('update_goal', 'request_browser_login', 'swarm_assign', 'swarm_claim_lead',
                      'swarm_finish', 'swarm_publish'), 'sessions.manage'),
     **dict.fromkeys(('skill_list', 'skill_read'), 'skills.read'),
     **dict.fromkeys(('skill_create', 'skill_update', 'skill_delete'), 'skills.manage'),
-    **dict.fromkeys(('checkout', 'github_checkout', 'stack', 'stacks'), 'connections.read'),
-    **dict.fromkeys(('add_to_stack', 'close_pull_request', 'convert_pull_request_to_draft',
-                     'create_branch', 'create_review', 'create_stack', 'delete_pending_review',
-                     'edit_pending_review', 'open_pull_request', 'publish_branch', 'rebase_pull_request',
-                     'reopen_pull_request', 'request_pr_lifecycle_access', 'retarget_pull_request',
-                     'submit_review'), 'connections.write'),
+    **dict.fromkeys(GITHUB_READ_TOOLS, 'connections.read'),
+    # Registered under its prefixed name; connector_tool() maps it to ('github', 'checkout').
+    'github_checkout': 'connections.read',
+    **dict.fromkeys(GITHUB_WRITE_TOOLS, 'connections.write'),
     **dict.fromkeys(SESSION_TOOLS, DEFAULT_TOOL_PERMISSION),
     # Native deferred capabilities are saved and bundled skills.
     'load_capability': 'skills.read',
@@ -223,21 +230,8 @@ TOOL_PERMISSIONS = {
     **dict.fromkeys(('automation_webhook_setup', 'automation_grant', 'automation_self_update',
                      'automation_claim_item', 'automation_create', 'automation_update', 'automation_migrate',
                      'automation_enable', 'automation_pause', 'automation_retire'), 'automations.manage'),
-    # Product GitHub publication tools; the model sees them under a GitHub grant prefix.
-    'publication_status': 'connections.read',
-    **dict.fromkeys(('create_pull_request', 'update_pull_request', 'request_pull_request_write_access'),
-                    'connections.write'),
 }
-GITHUB_PUBLICATION_TOOLS = frozenset({
-    'publication_status', 'create_pull_request', 'update_pull_request', 'request_pull_request_write_access',
-    'checkout', 'stack', 'stacks', 'add_to_stack', 'close_pull_request',
-    'convert_pull_request_to_draft', 'create_branch', 'create_review', 'create_stack',
-    'delete_pending_review', 'edit_pending_review', 'open_pull_request', 'publish_branch',
-    'rebase_pull_request', 'reopen_pull_request', 'request_pr_lifecycle_access',
-    'retarget_pull_request', 'submit_review',
-})
-# Every tool name native agents register outside connector toolsets.
-NATIVE_TOOL_NAMES = frozenset(TOOL_PERMISSIONS)
+GITHUB_PUBLICATION_TOOLS = frozenset(GITHUB_READ_TOOLS + GITHUB_WRITE_TOOLS)
 # Scoped connector tools reach the model as `<kind>_<first 8 grant-id characters>_<tool>`.
 CONNECTOR_TOOL = re.compile(r'(github|linear|notion|slack)_([0-9a-f]{8})_([a-z][a-z0-9_]*)')
 

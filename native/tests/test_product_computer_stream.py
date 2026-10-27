@@ -10,6 +10,7 @@ from fastapi import HTTPException, WebSocket
 from itsdangerous.timed import TimestampSigner
 from test_computer_stream import Remote, Socket, ready_computer
 from test_product_identity import (
+    OTHER_ADMIN,
     cloudflare_setup,
     google_cookie,
 )
@@ -104,8 +105,7 @@ async def test_source_role_change_cannot_replace_original_stream_grant(runtime, 
     access = await product_access(runtime, product)
     original = access.product_grant
     UserRoles(product.store, product.settings).change(
-        RoleChange(email="admin@example.test", role="member", revision=0),
-        {"method": "google", "identity": {"email": "other@example.test"}},
+        RoleChange(email="admin@example.test", role="member", revision=0), OTHER_ADMIN,
     )
     with pytest.raises(HTTPException):
         await validate(runtime, access)

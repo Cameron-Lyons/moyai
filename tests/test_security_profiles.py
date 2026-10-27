@@ -10,9 +10,9 @@ from dataclasses import dataclass
 import pytest
 from app import security_profiles
 from app.db import Store
+from app.permissions import GITHUB_PUBLICATION_TOOLS, TOOL_PERMISSIONS
 from app.security_profiles import (
     STALE,
-    UNRESTRICTED,
     CorruptPolicy,
     DefaultsUnavailable,
     InvalidPolicy,
@@ -24,7 +24,6 @@ from app.security_profiles import (
     SaveProfile,
     SecurityProfiles,
     StaleRevision,
-    domain_allows,
     dump_policy,
     effective,
     intersect,
@@ -67,6 +66,30 @@ def events(store):
 
 def body(name='Restricted', revision=0, enabled=True, **policy):
     return {'name': name, 'revision': revision, 'enabled': enabled, 'policy': policy}
+
+
+def read(store, call, *args):
+    """One *_in read in its own snapshot, as native admission calls them."""
+    with store.connect() as conn:
+        conn.begin_read()
+        return call(conn, *args)
+
+
+def resolve(store, profiles, *args):
+    return read(store, profiles.resolve_for_new_session_in, *args)
+
+
+def stored(profiles, profile_id):
+    return next(profile for profile in profiles.admin_listing()['profiles'] if profile['id'] == profile_id)
+
+
+def domain_allows(entries, host):
+    """Reference matcher with Modal's TLS SNI semantics; None is unrestricted."""
+    def matches(entry):
+        if entry.startswith('*.'):
+            return host == entry[2:] or host.endswith(entry[1:])
+        return host == entry
+    return entries is None or any(matches(entry) for entry in entries)
 
 
 # Policy validation
@@ -219,11 +242,11 @@ def test_lists_narrow_git_takes_the_minimum_and_null_is_identity():
     result = intersect({'tools': ['a', 'b'], 'connected_apps': ['github', 'slack'], 'git_access': 'read'},
                        None, {'tools': ['b', 'c'], 'git_access': 'write'}, ProfilePolicy(connected_apps=['slack']))
     assert result == ProfilePolicy(tools=['b'], connected_apps=['slack'], git_access='read')
-    assert intersect() == UNRESTRICTED == intersect(None, {}, UNRESTRICTED)
+    assert intersect() == ProfilePolicy() == intersect(None, {}, ProfilePolicy())
     assert intersect({'git_access': 'none'}, {'git_access': 'read'}).git_access == 'none'
     assert intersect({'tools': []}, {'tools': ['a']}).tools == ()
     assert effective({'tools': ['a', 'b']}, {'tools': ['b']}).tools == ('b',)
-    assert effective(None, None) == UNRESTRICTED
+    assert effective(None, None) == ProfilePolicy()
 
 
 @pytest.mark.parametrize('value', ['null', '[]', 0, False, '', ['tools'], 1.5])
@@ -283,7 +306,7 @@ def test_create_update_and_revisions_record_metadata_only_audit_events(store, pr
     assert security_profiles.PROFILE_ID.fullmatch(created['id'])
     assert created['policy'] == {'connected_apps': None, 'tools': ['read_file'], 'git_access': 'write',
                                  'network_domains': ['secret-host.example']}
-    assert profiles.get(created['id']) == created
+    assert stored(profiles, created['id']) == created
     updated = profiles.save(body('Locked', revision=1, git_access='none'), ADMIN, profile_id=created['id'])
     assert updated['revision'] == 2 and updated['name'] == 'Locked' and updated['policy']['git_access'] == 'none'
     assert [(row['revision'], json.loads(row['policy'])['git_access']) for row in store.rows(
@@ -309,8 +332,7 @@ def test_stale_unknown_and_unchanged_saves_write_nothing(store, profiles):
     with pytest.raises(ProfileNotFound) as missing:
         profiles.save(body(revision=1), ADMIN, profile_id='f' * 32)
     assert missing.value.status_code == 404
-    with pytest.raises(ProfileNotFound):
-        profiles.get('not-a-profile-id')
+    assert read(store, SecurityProfiles._row_in, 'not-a-profile-id') is None
     # The same values in another spelling are unchanged: no revision, no event.
     same = profiles.save(body(revision=1, tools=['read_file', 'read_file']), ADMIN, profile_id=created['id'])
     assert same == created
@@ -354,8 +376,8 @@ def test_disable_is_revisioned_idempotent_and_blocked_for_defaults(store, profil
 
 
 def test_defaults_require_enabled_profiles_and_current_revision(store, profiles):
-    assert profiles.defaults() == {'default_profile_id': '', 'mandatory_profile_id': '', 'revision': 0,
-                                   'updated_at': None, 'updated_by': ''}
+    assert read(store, profiles.defaults_in) == {'default_profile_id': '', 'mandatory_profile_id': '', 'revision': 0,
+                                                 'updated_at': None, 'updated_by': ''}
     first = profiles.save(body('First'), ADMIN)
     second = profiles.save(body('Second'), ADMIN)
     profiles.disable(second['id'], 1, ADMIN)
@@ -369,7 +391,7 @@ def test_defaults_require_enabled_profiles_and_current_revision(store, profiles)
     saved = profiles.save_defaults({'default_profile_id': first['id'], 'mandatory_profile_id': first['id'],
                                     'revision': 0}, ADMIN)
     assert saved['revision'] == 1 and saved['updated_by'] == 'admin@example.com' and saved['updated_at']
-    assert profiles.defaults() == saved
+    assert read(store, profiles.defaults_in) == saved
     with pytest.raises(StaleRevision):
         profiles.save_defaults({'revision': 0}, ADMIN)
     unchanged = profiles.save_defaults({'default_profile_id': first['id'], 'mandatory_profile_id': first['id'],
@@ -397,44 +419,51 @@ def test_catalogs_show_enabled_profiles_and_admin_listing_shows_all(store, profi
         'profiles': [{'id': alpha['id'], 'name': 'Alpha', 'policy': alpha['policy']},
                      {'id': zeta['id'], 'name': 'zeta', 'policy': zeta['policy']}],
         'default_profile_id': zeta['id'], 'mandatory': {'id': alpha['id'], 'name': 'Alpha'}}
-    listing = profiles.admin_listing(tools=['read_file', {'id': 'create_pull_request', 'label': 'Open a PR'},
-                                            'Bad-Name', 'read_file', {'id': 'browser_open', 'group': 'Web'}])
+    listing = profiles.admin_listing()
     assert [profile['name'] for profile in listing['profiles']] == ['Alpha', 'beta', 'zeta']
     assert listing['profiles'][1]['enabled'] is False and listing['defaults']['revision'] == 1
-    assert listing['catalog'] == {
-        'connected_apps': [{'id': 'github', 'label': 'GitHub'}, {'id': 'linear', 'label': 'Linear'},
-                           {'id': 'slack', 'label': 'Slack'}, {'id': 'notion', 'label': 'Notion'}],
-        'tools': [{'id': 'create_pull_request', 'label': 'Open a PR', 'group': 'GitHub'},
-                  {'id': 'browser_open', 'label': 'Browser open', 'group': 'Web'},
-                  {'id': 'read_file', 'label': 'Read file', 'group': 'Workspace'}]}
-    assert policy_catalog()['connected_apps'] == listing['catalog']['connected_apps']
+    catalog = listing['catalog']
+    assert catalog == policy_catalog()
+    assert catalog['connected_apps'] == [{'id': 'github', 'label': 'GitHub'}, {'id': 'linear', 'label': 'Linear'},
+                                         {'id': 'slack', 'label': 'Slack'}, {'id': 'notion', 'label': 'Notion'}]
+    # Every tool a role can grant, grouped for the editor.
+    assert [tool['id'] for tool in catalog['tools']] == sorted(
+        TOOL_PERMISSIONS, key=lambda name: (security_profiles._tool_group(name), name))
+    for tool in ({'id': 'create_pull_request', 'label': 'Create pull request', 'group': 'GitHub'},
+                 {'id': 'browser_open', 'label': 'Browser open', 'group': 'Browser'},
+                 {'id': 'read_file', 'label': 'Read file', 'group': 'Workspace'}):
+        assert tool in catalog['tools']
+    # Every GitHub publication tool is listed under GitHub, not Workspace.
+    publication = [tool for tool in catalog['tools'] if tool['id'] in GITHUB_PUBLICATION_TOOLS]
+    assert len(publication) == len(GITHUB_PUBLICATION_TOOLS)
+    assert {tool['group'] for tool in publication} == {'GitHub'}
 
 
 def test_new_sessions_bind_the_selection_narrowed_by_the_mandatory_profile(store, profiles):
-    assert profiles.resolve_for_new_session() == ('', 0, UNRESTRICTED)
-    assert profiles.mandatory() is None
+    assert resolve(store, profiles) == ('', 0, ProfilePolicy())
+    assert read(store, profiles.mandatory_in) is None
     default = profiles.save(body('Default', tools=['read_file', 'shell'], network_domains=['*.example.com']), ADMIN)
     chosen = profiles.save(body('Chosen', git_access='read'), ADMIN)
     mandatory = profiles.save(body('Floor', tools=['read_file'], connected_apps=['github'],
                                    network_domains=['api.example.com', 'other.org']), ADMIN)
     profiles.save_defaults({'default_profile_id': default['id'], 'revision': 0}, ADMIN)
-    binding = profiles.resolve_for_new_session('')
+    binding = resolve(store, profiles, '')
     assert binding == (default['id'], 1, ProfilePolicy(tools=['read_file', 'shell'], network_domains=['*.example.com']))
     profiles.save_defaults({'default_profile_id': default['id'], 'mandatory_profile_id': mandatory['id'],
                             'revision': 1}, ADMIN)
-    profile_id, revision, policy = profiles.resolve_for_new_session()
+    profile_id, revision, policy = resolve(store, profiles)
     assert (profile_id, revision) == (default['id'], 1)
     assert policy == ProfilePolicy(tools=['read_file'], connected_apps=['github'], network_domains=['api.example.com'])
-    chosen_binding = profiles.resolve_for_new_session(chosen['id'])
+    chosen_binding = resolve(store, profiles, chosen['id'])
     assert chosen_binding.profile_id == chosen['id'] and chosen_binding.policy == ProfilePolicy(
         tools=['read_file'], connected_apps=['github'], git_access='read',
         network_domains=['api.example.com', 'other.org'])
-    floor = profiles.mandatory()
+    floor = read(store, profiles.mandatory_in)
     assert floor == (mandatory['id'], 1, load_policy(dump_policy(ProfilePolicy.model_validate(mandatory['policy']))))
     # Loosening the mandatory profile later never widens a pinned binding.
     loosened = profiles.save(body('Floor', revision=1), ADMIN, profile_id=mandatory['id'])
-    assert profiles.mandatory() == (mandatory['id'], loosened['revision'], UNRESTRICTED)
-    assert effective(chosen_binding.policy, profiles.mandatory().policy) == chosen_binding.policy
+    assert read(store, profiles.mandatory_in) == (mandatory['id'], loosened['revision'], ProfilePolicy())
+    assert effective(chosen_binding.policy, read(store, profiles.mandatory_in).policy) == chosen_binding.policy
 
 
 def test_unavailable_selections_fail_closed(store, profiles):
@@ -442,28 +471,28 @@ def test_unavailable_selections_fail_closed(store, profiles):
     profiles.disable(disabled['id'], 1, ADMIN)
     for requested in (disabled['id'], 'e' * 32, 'not-hex', 'E' * 32):
         with pytest.raises(ProfileUnavailable) as caught:
-            profiles.resolve_for_new_session(requested)
+            resolve(store, profiles, requested)
         assert caught.value.detail == 'This security policy is no longer available. Choose another policy.'
     with pytest.raises(TypeError):
-        profiles.resolve_for_new_session(None)  # type: ignore[arg-type]
+        resolve(store, profiles, None)
     default = profiles.save(body('Default'), ADMIN)
     profiles.save_defaults({'default_profile_id': default['id'], 'mandatory_profile_id': default['id'],
                             'revision': 0}, ADMIN)
     # Out-of-band edits that bypass the service must not fall back to unrestricted.
     store.execute('UPDATE security_profiles SET enabled=0 WHERE id=?', (default['id'],))
     with pytest.raises(OrganizationPolicyUnavailable):
-        profiles.resolve_for_new_session()
-    assert profiles.mandatory().profile_id == default['id']  # A disabled mandatory profile still restricts.
+        resolve(store, profiles)
+    assert read(store, profiles.mandatory_in).profile_id == default['id']  # A disabled mandatory profile still restricts.
     store.execute("UPDATE security_profile_defaults SET mandatory_profile_id=? WHERE id=1", ('d' * 32,))
     with pytest.raises(OrganizationPolicyUnavailable):
-        profiles.mandatory()
+        read(store, profiles.mandatory_in)
     store.execute("UPDATE security_profile_defaults SET default_profile_id='',mandatory_profile_id='' WHERE id=1")
     for text in ('null', '{}', '[]'):
         store.execute('UPDATE security_profiles SET enabled=1,policy=? WHERE id=?', (text, default['id']))
         with pytest.raises(CorruptPolicy):
-            profiles.resolve_for_new_session(default['id'])
+            resolve(store, profiles, default['id'])
         with pytest.raises(CorruptPolicy):
-            profiles.get(default['id'])
+            profiles.admin_listing()
 
 
 def test_failed_audit_rolls_back_the_change(store, profiles, monkeypatch):
@@ -556,4 +585,4 @@ def test_writers_recheck_security_manage_inside_the_transaction(store, tmp_path)
                   lambda: profiles.save_defaults({'revision': 1}, officer)):
         with pytest.raises(GovernanceForbidden):
             write()
-    assert profile_events() == before and profiles.get(created['id'])['name'] == 'Restricted'
+    assert profile_events() == before and stored(profiles, created['id'])['name'] == 'Restricted'

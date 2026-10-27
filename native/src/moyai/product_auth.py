@@ -136,12 +136,14 @@ def routes(runtime: Runtime, actor) -> APIRouter:
         from .product_governance import permission_for_user
         if not permission_for_user(user, 'users.manage'):
             raise HTTPException(403, "An organization administrator must perform this action.")
+        from app.enterprise_roles import GovernanceActor
         from app.user_roles import RoleChange
         # Reuse the product's optimistic revision, last-admin protection, audit,
-        # and writer lock. The handler rechecks the actor inside that transaction.
-        info = product.security.session_info(request)
+        # and writer lock. The handler rechecks the authenticated principal
+        # inside that transaction, off the event loop.
         result = await asyncio.to_thread(
-            product.roles.change, RoleChange(**body.model_dump()), info,
+            product.roles.change, RoleChange(**body.model_dump()),
+            GovernanceActor.from_principal(request.state.product_principal),
         )
         return ProductUserRoleResult.model_validate(result)
 

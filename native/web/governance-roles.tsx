@@ -7,7 +7,7 @@ import { Checkbox } from "@/components/ui/checkbox"
 import { TableCell, TableRow } from "@/components/ui/table"
 import { Choice, Empty, RecordTable, Toolbar, contains, dateTime } from "./settings"
 import { assignmentBody, groupRoleBody, permissionGroups, permissionLabel, roleBody, roleIdFromName, roleUsage, type RoleDraft } from "./governance-data"
-import { DialogActions, GovConfirm, GovDialog, LoadGate, MutationError, PageActions, Section, StatusBadge, accessChanged, dataOf, useGovMutation, useGovResource } from "./governance-shared"
+import { DialogActions, GovConfirm, GovDialog, LoadGate, MutationError, PageActions, Section, StatusBadge, dataOf, useGovMutation, useGovResource } from "./governance-shared"
 import {
   archiveGovernanceRole, assignGovernanceRole, createGovernanceRole, getPermissions, listGovernanceRoles, updateGovernanceGroupRole, updateGovernanceRole,
   type DirectoryGroup, type GovernanceGroupRole as GroupRole, type GovernanceRole as Role, type GovernanceRoleAssignment as RoleAssignment, type PermissionInfo, type RolesAdmin,
@@ -69,8 +69,9 @@ export function RolesPage() {
   const catalog = useGovResource("permissions", signal => getPermissions({ signal }).then(dataOf))
   const resource = useGovResource("roles", signal => listGovernanceRoles({ signal }).then(dataOf))
   const refresh = () => { catalog.refresh(); resource.refresh() }
-  // Any of these changes can alter the signed-in person's own permissions.
-  const saved = () => { resource.refresh(); accessChanged() }
+  // The server refuses changes that reach the signed-in person's own access
+  // (SELF/OWN_GROUP); a 403 re-reads access through useGovMutation.
+  const saved = () => resource.refresh()
   const both = { data: catalog.data && resource.data ? { catalog: catalog.data, admin: resource.data } : undefined, loading: catalog.loading || resource.loading,
     error: catalog.error || resource.error, status: catalog.error ? catalog.status : resource.status, refresh }
   const [search, setSearch] = useState(""), [state, setState] = useState("active"), [people, setPeople] = useState("")

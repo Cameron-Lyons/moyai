@@ -448,7 +448,7 @@ def test_attribute_projection_matches_groups_without_loading_members(provision, 
 
 def test_handlers_query_the_database_off_the_event_loop(provision, monkeypatch):
     import asyncio
-    service, client = provision.service, provision.client
+    client = provision.client
     running, original = [], Scim._token_in
 
     def token_in(conn, header):
@@ -466,7 +466,6 @@ def test_handlers_query_the_database_off_the_event_loop(provision, monkeypatch):
     assert patch(client, '/scim/v2/Users/' + person['id'], [{'op': 'replace', 'path': 'title', 'value': 'Lead'}]).status_code == 200
     assert client.delete('/scim/v2/Users/' + person['id']).status_code == 204
     assert len(running) >= 7 and not any(running)
-    assert service.create_token  # Admin methods are synchronous; native routes call them in threads.
 
 
 async def test_body_limit_stops_reading_declared_and_chunked_requests(provision):
@@ -548,6 +547,30 @@ def test_last_active_administrator_cannot_be_deprovisioned(provision):
     assert not store.rows("SELECT 1 FROM governance_audit_events WHERE action IN ('scim_user.deactivated','scim_user.deleted')")
     # Provisioning another person never counts as losing the last administrator.
     assert user(client, 'member@example.com', active=False)['active'] is False
+
+
+def test_only_deactivating_an_administrator_computes_the_administrators(provision, monkeypatch):
+    """Regression: every user write computed the active administrators twice under the exclusive writer."""
+    client, roles = provision.client, provision.roles
+    computed, admins_in = [], roles.admins_in
+    monkeypatch.setattr(roles, 'admins_in', lambda conn: computed.append(1) or admins_in(conn))
+    person = user(client)
+    path = '/scim/v2/Users/' + person['id']
+    assert patch(client, path, [{'op': 'replace', 'path': 'title', 'value': 'Lead'}]).status_code == 200
+    assert patch(client, path, [{'op': 'replace', 'path': 'active', 'value': False}]).status_code == 200
+    assert client.delete(path).status_code == 204 and user(client, 'other@example.com', active=False)
+    assert computed == []
+    # An unprovisioned administrator is active, so creating it inactive would remove the last one.
+    created = client.post('/scim/v2/Users', json={'userName': 'owner@example.com', 'active': False})
+    assert scim_type(created, 409) is None and computed == [1] and active(provision, 'owner@example.com')
+    provision.settings.google_admin_emails = 'owner@example.com,second@example.com'
+    owner = user(client, 'owner@example.com')
+    computed.clear()
+    assert client.delete('/scim/v2/Users/' + owner['id']).status_code == 204 and computed == [1]
+    second = user(client, 'second@example.com')
+    computed.clear()
+    assert scim_type(client.delete('/scim/v2/Users/' + second['id']), 409) is None and computed == [1]
+    assert active(provision, 'second@example.com')
 
 
 @pytest.mark.parametrize('operation', ['patch', 'delete'])
@@ -676,6 +699,39 @@ def test_admin_directory_pages_users_with_counts_and_constant_statements(provisi
     assert len(executed) == baseline
 
 
+def test_admin_directory_pages_start_at_the_cursor_and_activity_walks_the_audit_index(provision, monkeypatch):
+    """Regression: on PostgreSQL the activity order missed the byte-ordered audit index, and the keyset
+    OR could not bound idx_scim_users_name, so each page read from the start of the table."""
+    from app.database import PostgresConnection, SQLiteConnection
+    service, client, store = provision.service, provision.client, provision.store
+    for index in range(3):
+        user(client, f'u{index}@example.com')
+    executed = []
+    for kind, execute in ((SQLiteConnection, sqlite3.Connection.execute), (PostgresConnection, PostgresConnection.execute)):
+        monkeypatch.setattr(kind, 'execute', lambda conn, statement, params=(), execute=execute: executed.append(
+            (statement, params)) or execute(conn, statement, params))
+    service.directory(service.directory(limit=1, actor=OWNER)['users']['next_cursor'], 1, OWNER)
+    monkeypatch.undo()
+    activity = next(item for item in executed if 'FROM governance_audit_events' in item[0])
+    page = [item for item in executed if 'FROM scim_users u' in item[0]][-1]
+    assert page[1][0] == 'u0@example.com'
+    with store.connect() as conn:
+        if store.database:
+            conn.execute('SET LOCAL enable_seqscan = off')
+            conn.execute('SET LOCAL enable_sort = off')
+            plans = ['\n'.join(row[0] for row in conn.execute('EXPLAIN ' + statement, params).fetchall())
+                     for statement, params in (activity, page)]
+            assert 'idx_governance_audit_time' in plans[0] and 'Sort' not in plans[0].replace('Sort Key', ''), plans[0]
+            assert 'idx_scim_users_name' in plans[1] and 'Index Cond: (user_name >=' in plans[1], plans[1]
+        else:
+            plans = ['\n'.join(row[3] for row in conn.execute('EXPLAIN QUERY PLAN ' + statement, params).fetchall())
+                     for statement, params in (activity, page)]
+            assert 'idx_governance_audit_time' in plans[0] and 'TEMP B-TREE' not in plans[0], plans[0]
+            # Without the bound SQLite unions an OR of index searches and sorts everything after the cursor.
+            assert 'SEARCH u USING INDEX idx_scim_users_name (user_name>?)' in plans[1], plans[1]
+            assert 'MULTI-INDEX OR' not in plans[1] and 'TEMP B-TREE' not in plans[1], plans[1]
+
+
 def test_group_grants_follow_live_membership(provision):
     client, roles = provision.client, provision.roles
     roles.enterprise.create(RoleCreate(id='connector', name='Connector', permissions=['connections.manage']), OWNER)
@@ -757,6 +813,30 @@ def test_unauthenticated_delete_returns_while_another_writer_holds_the_lock(prov
     finally:
         release()
     assert client.delete('/scim/v2/Users/' + person['id']).status_code == 204
+
+
+def test_route_writes_check_the_credential_once_before_the_writer(provision, monkeypatch):
+    """Regression: POST, PUT and PATCH accepted the credential in Scim.body, then took another
+    connection only to repeat that lookup before requesting the writer."""
+    client, store = provision.client, provision.store
+    person = user(client)
+    team = group(client, [person])
+    connections, connect = [], store.connect
+    monkeypatch.setattr(store, 'connect', lambda **kwargs: connections.append(kwargs) or connect(**kwargs))
+
+    def opened(response, status=200):
+        assert response.status_code == status, response.text
+        count = sum(kwargs.get('write_scope') != 'scim-token-use' for kwargs in connections)
+        connections.clear()
+        return count
+
+    # The body's credential read, then the writer. DELETE has no body, so it reads before the writer itself.
+    assert opened(client.post('/scim/v2/Users', json={'userName': 'new@example.com'}), 201) == 2
+    assert opened(client.put('/scim/v2/Users/' + person['id'], json={'userName': person['userName'], 'title': 'Lead'})) == 2
+    assert opened(patch(client, '/scim/v2/Users/' + person['id'], [{'op': 'replace', 'path': 'title', 'value': 'x'}])) == 2
+    assert opened(patch(client, '/scim/v2/Groups/' + team['id'], [{'op': 'replace', 'path': 'displayName', 'value': 'Ops'}]),
+                  204) == 2
+    assert opened(client.delete('/scim/v2/Users/' + person['id']), 204) == 2
 
 
 def test_token_use_bookkeeping_never_fails_or_stalls_a_request(provision, monkeypatch):

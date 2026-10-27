@@ -11,8 +11,6 @@ from .db import now
 from .schema_initializers import initialize_organization_scope as initialize_schema
 
 
-NAMESPACE_FIELDS = ('temporal_namespace', 'temporal_task_queue', 'object_storage_prefix',
-                    'lambda_checkpoint_prefix', 'modal_app_name', 'modal_volume_name', 'substrate_atespace')
 POPULATED_TABLES = ('runs', 'users', 'connections', 'automations', 'provider_secrets',
                     'memory_notes', 'skills', 'user_roles', 'enterprise_roles',
                     'scim_users', 'scim_groups', 'security_profiles')
@@ -88,7 +86,6 @@ class OrganizationScope:
         if store.schema_updates:
             initialize_schema(store)
         self.bind()
-        store.organization_scope = self
         store.organization_id = settings.moyai_organization_id
 
     def bind(self):
@@ -97,8 +94,3 @@ class OrganizationScope:
             conn.begin_write()
             if require_pin(conn, identity):
                 conn.execute('INSERT INTO organization_scope(id,organization_id,created_at) VALUES(1,?,?)', (identity, now()))
-
-    def metadata(self):
-        return {'id': self.settings.moyai_organization_id,
-                'deployment_mode': 'dedicated' if self.settings.moyai_organization_id else 'legacy',
-                'namespaces': {field: getattr(self.settings, field) for field in NAMESPACE_FIELDS}}

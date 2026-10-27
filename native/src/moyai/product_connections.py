@@ -245,9 +245,12 @@ class ProductConnections:
 
     async def credentials(self, scope: RunScope, grant: Grant, *, write: bool = False) -> dict[str, Any]:
         await self.check(scope, grant)
+        # authorize_scope's governance admission already enforces connections.read
+        # and the session policy for every selected grant; a write release also
+        # needs connections.write and write Git access.
         governance = getattr(self.database, 'governance', None)
-        if governance is not None:
-            await governance.connection(scope, grant, write=write)
+        if write and governance is not None:
+            await governance.connection(scope, grant, write=True)
         if write and grant.read_only:
             raise PermissionError("This product account is read only.")
         lock = self.connectors.locks[grant.kind]

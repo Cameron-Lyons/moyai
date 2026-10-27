@@ -7,8 +7,10 @@ nothing (never the member default), and a SCIM-deactivated or deleted person
 holds nothing. A direct 'member' assignment row is equivalent to no row.
 
 resolve_access is pure: it reads through fetch(name, params) over
-ACCESS_QUERIES, so canonical connections (canonical_fetch) and the native
-identity adapter's async snapshot (qualified_fetch) share one rule set.
+ACCESS_QUERIES, so canonical connections (canonical_fetch), the native identity
+adapter's single-statement snapshot (snapshot_fetch over
+product_governance.CanonicalRead) and the users page (directory_fetch) share
+one rule set and one grant join.
 
 Delegation never amplifies. Anyone other than a built-in administrator may
 grant, change or remove only access whose permissions they hold directly
@@ -37,7 +39,8 @@ from functools import cache
 from typing import Any
 
 from fastapi import HTTPException
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from fastapi.exceptions import RequestValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from .governance_audit import record_event_in, timestamp
 from .permissions import BUILTIN_PERMISSIONS, MEMBER_PERMISSIONS, PERMISSIONS, shared_actor_role
@@ -88,6 +91,19 @@ class GovernanceConflict(GovernanceError):
 
 class GovernanceInvalid(GovernanceError):
     status = 422
+
+
+def validated[M: BaseModel](model: type[M], value) -> M:
+    """Validate a library input like a request body: errors become a safe 422."""
+    if isinstance(value, model):
+        return value
+    if isinstance(value, BaseModel):
+        value = value.model_dump()
+    try:
+        return model.model_validate(value)
+    except ValidationError as error:
+        raise RequestValidationError(error.errors(include_url=False, include_input=False,
+                                                  include_context=False)) from None
 
 
 def normalized_email(value: str) -> str:
@@ -159,60 +175,108 @@ class GroupRoleChange(BaseModel):
     revision: int = Field(default=0, ge=0)
 
 
-# Named parameters and {table} placeholders; canonical_fetch and qualified_fetch adapt them.
-ACCESS_TABLES = ('user_roles', 'scim_users', 'scim_groups', 'scim_group_members',
-                 'enterprise_roles', 'enterprise_role_assignments', 'enterprise_group_roles')
-ACCESS_QUERIES = {
-    # A live row wins over tombstones, then the latest update (idx_scim_users_lookup).
-    'scim_user': ("SELECT id, active, deleted_at, access_epoch FROM {scim_users} WHERE user_name=:email "
-                  "ORDER BY (deleted_at='') DESC, updated_at DESC LIMIT 1"),
-    'assignment': 'SELECT role_id, revision FROM {enterprise_role_assignments} WHERE email=:email',
-    'role': 'SELECT id, name, permissions, permissions_revision, archived FROM {enterprise_roles} WHERE id=:role_id',
-    'group_grants': '''SELECT r.group_id, r.revision, r.role_id, e.permissions, e.archived,
+# Canonical SQL with :named parameters and bare table names. canonical_fetch
+# binds them on a Store connection; product_governance.CanonicalRead also
+# qualifies the tables (single spaces after FROM/JOIN, no literal '?').
+# A live row wins over tombstones, then the latest update (idx_scim_users_lookup).
+_SCIM_USER = ("SELECT id, active, deleted_at, access_epoch FROM scim_users WHERE user_name=:email "
+              "ORDER BY (deleted_at='') DESC, updated_at DESC, id DESC LIMIT 1")
+# Grants applying through live, active SCIM membership, for every person.
+_GRANTS = '''SELECT u.user_name, r.group_id, r.revision, r.role_id, e.permissions, e.archived,
             e.permissions_revision AS role_revision
-        FROM {enterprise_group_roles} r
-        JOIN {scim_groups} g ON g.id=r.group_id AND g.deleted_at=''
-        JOIN {scim_group_members} m ON m.group_id=g.id
-        JOIN {scim_users} u ON u.id=m.user_id AND u.deleted_at='' AND u.active=1
-        LEFT JOIN {enterprise_roles} e ON e.id=r.role_id
-        WHERE u.user_name=:email AND r.role_id IS NOT NULL ORDER BY r.group_id''',
+        FROM enterprise_group_roles r
+        JOIN scim_groups g ON g.id=r.group_id AND g.deleted_at=''
+        JOIN scim_group_members m ON m.group_id=g.id
+        JOIN scim_users u ON u.id=m.user_id AND u.deleted_at='' AND u.active=1
+        LEFT JOIN enterprise_roles e ON e.id=r.role_id
+        WHERE r.role_id IS NOT NULL'''
+ACCESS_QUERIES = {
+    'scim_user': _SCIM_USER,
+    'assignment': 'SELECT role_id, revision FROM enterprise_role_assignments WHERE email=:email',
+    'role': 'SELECT id, name, permissions, permissions_revision, archived FROM enterprise_roles WHERE id=:role_id',
+    'group_grants': _GRANTS + ' AND u.user_name=:email ORDER BY r.group_id',
 }
+# Each ACCESS_QUERIES read for one email, as columns '<prefix><key>' of one statement.
+_SNAPSHOT_PARTS = (
+    ('scim_user', 's', 'scim_', ('id', 'active', 'deleted_at', 'access_epoch')),
+    ('assignment', 'a', 'assignment_', ('role_id', 'revision')),
+    ('role', 'd', 'role_', ('id', 'name', 'permissions', 'permissions_revision', 'archived')),
+    ('group_grants', 'g', 'grant_', ('group_id', 'revision', 'role_id', 'permissions', 'archived', 'role_revision')),
+)
+# One row per grant (or one row without any). idx_scim_users_name keeps at most
+# one live userName row, so s is the grants' user u exactly when s is live and
+# active, the condition under which resolve_access reads grants.
+ACCESS_SNAPSHOT = 'SELECT ' + ', '.join(
+    f'{alias}.{key} AS {prefix}{key}' for _, alias, prefix, keys in _SNAPSHOT_PARTS for key in keys) + f'''
+        FROM (SELECT CAST(:email AS TEXT) AS email) q
+        LEFT JOIN ({_SCIM_USER}) s ON 1=1
+        LEFT JOIN enterprise_role_assignments a ON a.email=q.email
+        LEFT JOIN enterprise_roles d ON d.id=a.role_id
+        LEFT JOIN ({_GRANTS} AND u.user_name=:email) g ON s.deleted_at='' AND s.active=1
+        ORDER BY g.group_id'''
 NAMED = re.compile(r'(?<![:\w]):([a-z_]+)\b')
 
 Fetch = Callable[[str, Mapping[str, Any]], Iterable[Mapping[str, Any]]]
 
 
-def qualified_queries(table: Callable[[str], str]) -> dict[str, str]:
-    """ACCESS_QUERIES with each {name} replaced by table(name); :named parameters remain."""
-    names = {name: table(name) for name in ACCESS_TABLES}
-    return {key: sql.format(**names) for key, sql in ACCESS_QUERIES.items()}
-
-
-def qualified_fetch(execute: Callable[[str, dict[str, Any]], Iterable[Mapping[str, Any]]],
-                    table: Callable[[str], str]) -> Fetch:
-    """A resolve_access fetch over named-parameter SQL and qualified table names.
-
-    execute(sql, params) runs one read and returns mapping rows. The native
-    identity adapter runs it inside its own REPEATABLE READ snapshot, e.g. under
-    AsyncSession.run_sync with
-    `lambda sql, params: session.execute(text(sql), params).mappings().all()`
-    and its schema-qualified, quoted `_table`.
-    """
-    queries = qualified_queries(table)
-    return lambda name, params: list(execute(queries[name], dict(params)))
-
-
 @cache
-def _positional(name: str) -> tuple[str, tuple[str, ...]]:
-    sql = ACCESS_QUERIES[name].format(**{table: table for table in ACCESS_TABLES})
+def _positional(sql: str) -> tuple[str, tuple[str, ...]]:
     return NAMED.sub('?', sql), tuple(NAMED.findall(sql))
+
+
+def _rows(conn, sql: str, params: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Rows of named-parameter SQL on a qmark connection (a Store connection or CanonicalRead)."""
+    sql, order = _positional(sql)
+    return [dict(row) for row in conn.execute(sql, tuple(params[key] for key in order)).fetchall()]
 
 
 def canonical_fetch(conn) -> Fetch:
     """A resolve_access fetch on a canonical Store connection (qmark bindings, search_path tables)."""
+    return lambda name, params: _rows(conn, ACCESS_QUERIES[name], params)
+
+
+def snapshot_fetch(conn, email: str) -> Fetch:
+    """resolve_access's reads for one email from one ACCESS_SNAPSHOT statement.
+
+    The native identity adapter checks every request, stream event and
+    admission with it in one round trip. It serves exactly what ACCESS_QUERIES
+    would return, for this email and its assigned role only.
+    """
+    rows = _rows(conn, ACCESS_SNAPSHOT, {'email': email})
+    assigned = rows[0]['assignment_role_id']
+    parts = {name: (prefix, keys) for name, _, prefix, keys in _SNAPSHOT_PARTS}
+
     def fetch(name, params):
-        sql, order = _positional(name)
-        return [dict(row) for row in conn.execute(sql, tuple(params[key] for key in order)).fetchall()]
+        prefix, keys = parts[name]
+        if dict(params) != ({'role_id': assigned} if name == 'role' else {'email': email}):
+            raise KeyError(name)
+        # Each part's first key is NOT NULL in a stored row, so NULL means no row.
+        return [{key: row[prefix + key] for key in keys} for row in (rows if name == 'group_grants' else rows[:1])
+                if row[prefix + keys[0]] is not None]
+    return fetch
+
+
+def directory_fetch(conn) -> Fetch:
+    """resolve_access's reads for every email from a fixed number of statements (the users page)."""
+    scim = {}
+    # Later rows win, the order _SCIM_USER reverses: tombstones, then live rows, each by update and id.
+    for row in conn.execute('''SELECT id, user_name, active, deleted_at, access_epoch FROM scim_users
+            ORDER BY (deleted_at=''), updated_at, id'''):
+        scim[row['user_name']] = {key: row[key] for key in ('id', 'active', 'deleted_at', 'access_epoch')}
+    assignments = {row['email']: {'role_id': row['role_id'], 'revision': row['revision']}
+                   for row in conn.execute('SELECT email, role_id, revision FROM enterprise_role_assignments')}
+    roles = {row['id']: dict(row) for row in conn.execute(
+        'SELECT id, name, permissions, permissions_revision, archived FROM enterprise_roles')}
+    grants: dict[str, list[dict[str, Any]]] = {}
+    for row in conn.execute(_GRANTS + ' ORDER BY r.group_id'):
+        grants.setdefault(row['user_name'], []).append(dict(row))
+
+    def fetch(name, params):
+        if name == 'group_grants':
+            return grants.get(params['email'], [])
+        row = roles.get(params['role_id']) if name == 'role' else {
+            'scim_user': scim, 'assignment': assignments}[name].get(params['email'])
+        return [row] if row else []
     return fetch
 
 
@@ -350,12 +414,10 @@ class GovernanceActor:
     id: the principal id (`google:<sub>`, a canonical users id, or
     `shared:<local|password>:<role>`). email: the individual's email; empty
     for shared actors. builtin_role: 'admin' or 'member' as authenticated, or
-    None for no claim (legacy session dicts, whose role was already derived
-    from the canonical role). permissions: the principal's effective
-    permissions, or None when the caller has no snapshot. direct_permissions: directly held
-    permissions, or None to rely on in-transaction resolution. kind:
-    'individual' (verified Google/Access person), 'shared', or another principal
-    kind, which is refused; empty infers it from id.
+    None for no claim, which defers to the canonical role. permissions: the
+    principal's effective permissions, or None when the caller has no snapshot.
+    kind: 'individual' (verified Google/Access person), 'shared', or another
+    principal kind, which is refused; empty infers it from id.
 
     Services never trust these alone. Each operation re-resolves the actor's
     built-in role, SCIM state and permissions inside its own transaction and
@@ -365,7 +427,6 @@ class GovernanceActor:
     email: str = ''
     builtin_role: str | None = 'member'
     permissions: frozenset[str] | None = None
-    direct_permissions: frozenset[str] | None = None
     kind: str = ''
 
     @property
@@ -387,20 +448,6 @@ class GovernanceActor:
                    permissions=None if permissions is None else frozenset(permissions),
                    kind='individual' if individual else 'shared' if kind == 'shared' else kind or 'unknown')
 
-    @classmethod
-    def from_session(cls, info: Mapping[str, Any]) -> 'GovernanceActor':
-        """From a legacy Security.session_info dict, which carries no permission snapshot."""
-        method, role = info.get('method', 'password'), info.get('role', '')
-        if method in {'google', 'cloudflare'}:
-            identity = info.get('identity') or {}
-            email = str(identity.get('email', '')).strip().lower()
-            subject = identity.get('sub') if method == 'google' else ''
-            return cls(id=f'google:{subject}' if subject else f'{method}:{email}', email=email,
-                       builtin_role=None, kind='individual')
-        if method in {'local', 'password'}:
-            return cls(id=f'shared:{method}:{role}', builtin_role=None, kind='shared')
-        return cls(id='', builtin_role=None, kind='unknown')
-
 
 def shared_label(actor_id) -> str | None:
     """'Local preview admin' or 'Shared password member' for a shared:<method>:<role> id, else None."""
@@ -415,14 +462,12 @@ def actor_label(actor) -> str:
     """The updated_by/audit label of a governance actor; the same text as Authority.label.
 
     Accepts a GovernanceActor, a ProductPrincipal (only an individual's email
-    counts, never a Slack-claimed one), a legacy session dict, or any object
-    with string .id and .email. The label is the lowercased email when present,
-    the shared sign-in name for shared:<method>:<role> ids, otherwise the id.
-    TypeError when no bounded label exists, so callers fail before any write.
+    counts, never a Slack-claimed one), or any object with string .id and
+    .email. The label is the lowercased email when present, the shared sign-in
+    name for shared:<method>:<role> ids, otherwise the id. TypeError when no
+    bounded label exists, so callers fail before any write.
     """
-    if isinstance(actor, Mapping) and 'method' in actor:
-        actor = GovernanceActor.from_session(actor)
-    elif not isinstance(actor, GovernanceActor) and isinstance(individual := getattr(actor, 'individual', None), bool):
+    if not isinstance(actor, GovernanceActor) and isinstance(individual := getattr(actor, 'individual', None), bool):
         email = getattr(actor, 'email', '') if individual else ''
         actor = GovernanceActor(id=getattr(actor, 'id', ''), email=email if isinstance(email, str) else '')
     email, identity = getattr(actor, 'email', None), getattr(actor, 'id', None)
@@ -437,17 +482,11 @@ def actor_label(actor) -> str:
 
 
 def coerce_actor(actor) -> GovernanceActor | None:
+    """A GovernanceActor, or one from a ProductPrincipal; anything malformed is forbidden."""
     if actor is None or isinstance(actor, GovernanceActor):
         return actor
-    if isinstance(actor, Mapping):
-        if 'method' in actor:
-            return GovernanceActor.from_session(actor)
-        fields = ('id', 'email', 'builtin_role', 'permissions', 'direct_permissions', 'kind')
-        values = {key: actor[key] for key in fields if key in actor}
-        for key in ('permissions', 'direct_permissions'):
-            if values.get(key) is not None:
-                values[key] = frozenset(values[key])
-        return GovernanceActor(**values)
+    if isinstance(actor, Mapping) or not isinstance(getattr(actor, 'id', None), str):
+        raise GovernanceForbidden(FORBIDDEN)
     return GovernanceActor.from_principal(actor)
 
 
@@ -485,7 +524,7 @@ class EnterpriseRoles:
     """Revisioned custom roles, assignments and group grants over a canonical Store.
 
     Methods are synchronous; native routes call them through asyncio.to_thread.
-    actor is a GovernanceActor, a ProductPrincipal, or a legacy session dict.
+    actor is a GovernanceActor or a ProductPrincipal.
     """
 
     def __init__(self, user_roles):
@@ -501,7 +540,6 @@ class EnterpriseRoles:
         if actor is None:
             raise GovernanceUnauthenticated('Sign in to the workspace.')
         claimed = ALL_PERMISSIONS if actor.permissions is None else actor.permissions
-        claimed_direct = ALL_PERMISSIONS if actor.direct_permissions is None else actor.direct_permissions
         kind = actor.resolved_kind
         if kind == 'shared':
             role = shared_actor_role(actor.id, self.user_roles.settings)
@@ -510,7 +548,7 @@ class EnterpriseRoles:
             permissions = BUILTIN_PERMISSIONS[role] & claimed
             admin = role == 'admin' and permissions == ALL_PERMISSIONS
             return Authority(shared_label(actor.id) or actor.id, '', admin, permissions,
-                             None if admin else permissions & claimed_direct)
+                             None if admin else permissions)
         if kind != 'individual':
             raise GovernanceForbidden(FORBIDDEN)
         email = (actor.email or '').strip().lower()
@@ -523,7 +561,7 @@ class EnterpriseRoles:
         permissions = state.permissions & claimed
         admin = role == 'admin' and actor.builtin_role in {None, 'admin'} and permissions == ALL_PERMISSIONS
         return Authority(email, email, admin, permissions,
-                         None if admin else state.direct_permissions & permissions & claimed_direct)
+                         None if admin else state.direct_permissions & permissions)
 
     def authorize_in(self, conn, actor, permission: str) -> Authority:
         return self.authority_in(conn, actor).require(permission)

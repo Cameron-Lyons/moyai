@@ -127,7 +127,7 @@ class CanonicalConnectorExecution:
                 selected_name in TOOLS and TOOLS[selected_name][0] == grant.kind
                 and (not TOOLS[selected_name][1] or not grant.read_only)
             )
-            bound.check_execution = lambda _run, _tool=None: None
+            bound.check_execution = lambda _run: None
             bound.guard = lambda *_args, **_kwargs: None
             bound.personal_slack.select = selected_slack
             bound.personal_slack.recheck = lambda _selection: None

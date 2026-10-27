@@ -120,26 +120,31 @@ class ProductGovernance:
         await db.flush()
         return row
 
-    # Effective policies of bound sessions, per root transaction. Bindings are
-    # immutable, and the shared gate callers take through principal() keeps
-    # mandatory-profile writers out until the transaction ends, so a repeat
-    # read in one transaction is the same value.
+    # Effective policies of bound sessions, and the mandatory profile, per root
+    # transaction. Bindings are immutable, and the shared gate callers take
+    # through principal() keeps mandatory-profile writers out until the
+    # transaction ends, so a repeat read in one transaction is the same value.
     _policies: WeakKeyDictionary[Any, dict[str, Any]] = WeakKeyDictionary()
 
     async def policy(self, db, session_id):
         from app.security_profiles import ProfilePolicy, effective, load_policy
         row = await db.get(ProductSessionPolicy, session_id)
-        # bind() may still pin an unbound session later in this transaction.
-        transaction = db.sync_session.get_transaction() if row is not None else None
+        transaction = db.sync_session.get_transaction()
         memo = {} if transaction is None else self._policies.setdefault(transaction, {})
-        if session_id not in memo:
-            mandatory = await db.run_sync(lambda sync: self.product.profiles.mandatory_in(
+        if session_id in memo:
+            return memo[session_id]
+        if '\0mandatory' not in memo:
+            memo['\0mandatory'] = await db.run_sync(lambda sync: self.product.profiles.mandatory_in(
                 CanonicalRead(sync, self.identity)))
-            # Sessions predating the migration had no selected profile. The live
-            # mandatory policy still applies to these historical sessions.
-            memo[session_id] = effective(load_policy(row.policy) if row else ProfilePolicy(),
-                                         mandatory.policy if mandatory else None)
-        return memo[session_id]
+        mandatory = memo['\0mandatory']
+        # Sessions predating the migration had no selected profile. The live
+        # mandatory policy still applies to these historical sessions.
+        policy = effective(load_policy(row.policy) if row else ProfilePolicy(),
+                           mandatory.policy if mandatory else None)
+        # bind() may still pin an unbound session later in this transaction.
+        if row is not None:
+            memo[session_id] = policy
+        return policy
 
     @staticmethod
     def require_provider(policy):
@@ -163,8 +168,16 @@ class ProductGovernance:
         """Whether a session under this policy may select a connection of this kind."""
         # A GitHub grant under no Git access would only fail every turn's tool
         # discovery, so it is refused with the other disallowed connections.
-        return (policy.connected_apps is None or kind in policy.connected_apps) and not (
-            kind == 'github' and policy.git_access == 'none')
+        return ProductGovernance.connection_denial(policy, kind) is None
+
+    @staticmethod
+    def connection_denial(policy, kind, *, write=False):
+        """Why this policy refuses a connection of this kind, or None."""
+        if policy.connected_apps is not None and kind not in policy.connected_apps:
+            return 'This connection is disabled by the session security policy.'
+        if kind == 'github' and (policy.git_access == 'none' or write and policy.git_access != 'write'):
+            return 'Managed Git access is disabled by the session security policy.'
+        return None
 
     async def workspace(self, db, scope, context):
         principal = await self.principal(db, scope.product_grant)
@@ -172,8 +185,7 @@ class ProductGovernance:
             principal.require('environments.read')
         if context.get('repo_url'):
             principal.require('connections.read')
-            policy = await self.policy(db, scope.session_id)
-            if policy.git_access == 'none' or (policy.connected_apps is not None and 'github' not in policy.connected_apps):
+            if not self.admits(await self.policy(db, scope.session_id), 'github'):
                 raise HTTPException(403, 'The repository exceeds the session security policy.')
 
     @staticmethod
@@ -187,11 +199,8 @@ class ProductGovernance:
         aliases = {name, operation, f'{provider}_{operation}' if provider else name}
         if policy.tools is not None and not aliases.intersection(policy.tools):
             return 'This tool is disabled by the session security policy.'
-        if provider and policy.connected_apps is not None and provider not in policy.connected_apps:
-            return 'This connection is disabled by the session security policy.'
-        if provider == 'github' and (
-                policy.git_access == 'none' or policy.git_access != 'write' and permission == 'connections.write'):
-            return 'Managed Git access is disabled by the session security policy.'
+        if provider:
+            return ProductGovernance.connection_denial(policy, provider, write=permission == 'connections.write')
         return None
 
     async def check_tool(self, scope, name, *, read_only=None, db=None):
@@ -206,16 +215,13 @@ class ProductGovernance:
     async def connection(self, scope, grant, *, write=False):
         async with self.database.sessions.begin() as db:
             await self.principal(db, scope.product_grant, 'connections.write' if write else 'connections.read')
-            policy = await self.policy(db, scope.session_id)
-            if policy.connected_apps is not None and grant.kind not in policy.connected_apps:
-                raise HTTPException(403, 'This connection is disabled by the session security policy.')
-            if grant.kind == 'github' and (policy.git_access == 'none' or write and policy.git_access != 'write'):
-                raise HTTPException(403, 'Managed Git access is disabled by the session security policy.')
+            if denial := self.connection_denial(await self.policy(db, scope.session_id), grant.kind, write=write):
+                raise HTTPException(403, denial)
 
-    async def tools(self, scope, definitions):
-        async with self.database.sessions.begin() as db:
-            principal = await self.principal(db, scope.product_grant)
-            policy = await self.policy(db, scope.session_id)
+    async def tools(self, scope, definitions, *, db=None):
+        async with self._snapshot(db) as transaction:
+            principal = await self.principal(transaction, scope.product_grant)
+            policy = await self.policy(transaction, scope.session_id)
             return [name for name, read_only in definitions
                     if self._tool_denial(principal, policy, name, read_only) is None]
 
@@ -228,16 +234,14 @@ class ProductGovernance:
                 yield snapshot
 
     async def check_model(self, scope, *, db=None):
-        from app.spend_limits import evaluate, limit_ids, limits_from_rows
+        from app.spend_limits import SpendLimits, evaluate
 
         from .inference_usage import InferenceUsage
         async with self._snapshot(db) as transaction:
             principal = await self.principal(transaction, scope.product_grant)
             self.require_provider(await self.policy(transaction, scope.session_id))
-            rows = (await transaction.execute(
-                text(f'SELECT id,limit_usd FROM {self.identity._table("spend_limits")} WHERE id = ANY(:ids)'),
-                {'ids': list(limit_ids(principal.email))})).mappings().all()
-            limits = limits_from_rows(rows, principal.email)
+            limits = await transaction.run_sync(lambda sync: SpendLimits.resolve_in(
+                CanonicalRead(sync, self.identity), principal.email))
             if limits.unlimited:
                 return
             ledger = SpendLedger(self.database)
@@ -277,8 +281,7 @@ class ProductGovernance:
         self.require_provider(binding.policy)
         if not all(self.admits(binding.policy, kind) for kind in definition.plugins):
             raise HTTPException(403, 'The workflow connections exceed its security policy.')
-        if definition.repo_url and (binding.policy.git_access == 'none' or (
-                binding.policy.connected_apps is not None and 'github' not in binding.policy.connected_apps)):
+        if definition.repo_url and not self.admits(binding.policy, 'github'):
             raise HTTPException(403, 'The workflow repository exceeds its security policy.')
         if scope is not None and intersect(await self.policy(db, scope.session_id), binding.policy) != binding.policy:
             raise HTTPException(403, 'A workflow cannot exceed the security policy of its creating session.')

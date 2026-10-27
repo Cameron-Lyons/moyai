@@ -22,7 +22,7 @@ def test_governance_upgrade_preserves_old_rows_and_mandatory_ceiling(tmp_path):
                 INSERT INTO scim_users VALUES('inactive','','worker@example.com','{}',0,'','now','now',2);
                 INSERT INTO scim_users VALUES('active','','active@example.com','{}',1,'','now','now',1);
                 INSERT INTO security_profile_defaults VALUES(1,3,'default','ceiling','owner','now');
-                INSERT INTO governance_audit_events VALUES('event','profile.updated','owner','security_profile','profile','now');
+                INSERT INTO governance_audit_events VALUES('event','security_profile.updated','owner','security_profile','profile','now');
             """)
         initialize_components(store)
         assert store.rows('SELECT user_name,access_epoch FROM scim_users ORDER BY id') == [

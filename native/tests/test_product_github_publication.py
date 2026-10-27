@@ -388,6 +388,35 @@ async def test_revoked_selected_grant_blocks_publication_before_provider_dispatc
     assert not f.provider.calls
 
 
+async def test_write_tokens_recheck_live_git_access_and_reads_rely_on_the_scope_check(publication, monkeypatch):
+    """Regression: a read token opened a second governed transaction its scope check had already covered."""
+    from test_product_governance import attach, defaults, profile
+    f = publication
+    governance = attach(f.product)
+    checks, minted = [], []
+    original = governance.connection
+    async def connection(scope, grant, *, write=False):
+        checks.append(write)
+        await original(scope, grant, write=write)
+    async def installation_token(**kwargs):
+        minted.append(kwargs.get("write", False))
+        return "synthetic-token"
+    monkeypatch.setattr(governance, "connection", connection)
+    monkeypatch.setattr(f.service.connectors.github, "installation_token", installation_token)
+    assert await f.publisher.protection_token() == "synthetic-token"
+    assert await f.publisher.token() == "synthetic-token"
+    assert checks == [True] and minted == [False, True]
+    await defaults(f.product, mandatory=await profile(f.product, {"git_access": "read"}))
+    with pytest.raises(HTTPException, match="Managed Git access"):
+        await f.publisher.token()
+    assert await f.publisher.protection_token() == "synthetic-token"
+    # The scope check's admission refuses a read once the policy excludes GitHub.
+    await defaults(f.product, mandatory=await profile(f.product, {"git_access": "none"}))
+    with pytest.raises(HTTPException, match="disabled by the session security policy"):
+        await f.publisher.protection_token()
+    assert minted == [False, True, False]
+
+
 async def test_external_pr_access_requires_sdk_approval_and_current_head(publication):
     f = publication
     tools = toolset(f.service, f.scope, f.grant)

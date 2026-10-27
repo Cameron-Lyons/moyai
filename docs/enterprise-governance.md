@@ -44,6 +44,13 @@ A custom role replaces an internal user's default permissions; active SCIM group
 grants add permissions by union. Assignments do not change sign-in eligibility or
 make shared conversations private. Built-in roles cannot be edited or archived.
 
+In existing-product mode, Slack senders need a verified in-domain Slack profile.
+That requires `SLACK_IDENTITY_LINKING_ENABLED` (the default) and the `users:read`
+and `users:read.email` Slack scopes. A verified sender never exceeds member access.
+Senders who are unverified, or linked only manually, hold no permissions and are
+refused; upstream admitted them as members. Deployments that disable identity
+linking cannot verify new senders, so those senders are refused.
+
 The server checks permissions independently of navigation visibility. Native
 session and turn admission, tool catalogs, actual tool attempts and retries,
 connection credentials, model dispatch, memory recall, and workspace preparation

@@ -14,6 +14,7 @@ from pydantic import BaseModel, ConfigDict, Field, HttpUrl, SecretStr, model_val
 
 from .database import Connection, DatabaseRow
 from .db import database, now
+from .enterprise_roles import FORBIDDEN
 from .identities import PROFILE_MAX_AGE_SECONDS
 from .aws_login import AWSLogin, AWS_LOGIN_DESCRIPTION, login_required
 from app.aws_credentials import bundle as aws_bundle
@@ -458,10 +459,17 @@ class Credentials:
                     raise HTTPException(422, 'Invalid AWS SSO profile or cache.') from None
         return value
 
-    def insert_secret(self, conn, body, user_id, admin, root_id='', *, authorized_native_root=None):
+    def write_permissions(self, conn, user_id, permissions=None):
+        """Live permissions for a credential write, resolved once on the writer's connection."""
+        if permissions is None:
+            permissions = self.security.user_roles.permissions_for_actor_in(conn, user_id)
+        if 'credentials.manage' not in permissions:
+            raise HTTPException(403, FORBIDDEN)
+        return permissions
+
+    def insert_secret(self, conn, body, user_id, admin, root_id='', *, authorized_native_root=None, permissions=None):
         if self.security.user_roles:
-            self.security.user_roles.require_actor(user_id, 'credentials.manage', connection=conn)
-            admin = self.security.has_actor_permission(user_id, 'credentials.publish', connection=conn)
+            admin = 'credentials.publish' in self.write_permissions(conn, user_id, permissions)
         if body.scope == 'organization' and not admin:
             raise HTTPException(403, 'Only an administrator can save organization credentials.')
         if body.scope != 'organization' and not user_id.startswith(('google:', 'cloudflare:')) and not self.security.local_preview():
@@ -1109,11 +1117,14 @@ class Credentials:
     def update_secret(self, secret_id, body, user_id, admin, *, authorized_native_root=None, authorize=None):
         with self.store.connect() as conn:
             conn.begin_write()
-            if self.security.user_roles:
-                self.security.user_roles.require_actor(user_id, 'credentials.manage', connection=conn)
-                admin = self.security.has_actor_permission(user_id, 'credentials.publish', connection=conn)
             if authorize is not None:
-                admin = authorize(conn)
+                # The caller re-resolves this session's live permissions on conn.
+                permissions = authorize(conn)
+                admin = 'credentials.publish' in permissions
+                if self.security.user_roles:
+                    self.write_permissions(conn, user_id, permissions)
+            elif self.security.user_roles:
+                admin = 'credentials.publish' in self.write_permissions(conn, user_id)
             row = conn.execute('SELECT * FROM provider_secrets WHERE id=? AND revoked_at=\'\'', (secret_id,)).fetchone()
             if not row or (row['scope'] == 'organization' and not admin) or (row['scope'] != 'organization' and row['owner_id'] != user_id):
                 raise HTTPException(404, 'Credentials not found.')
@@ -1162,7 +1173,7 @@ class Credentials:
 
         def actor(request, mutation=False):
             self.security.require(request, mutation=mutation)
-            return self.store.identity(self.security.session_info(request)), self.security.has_permission(request, 'credentials.publish')
+            return self.store.identity(self.security.session_info(request)), self.security.role(request) == 'admin'
 
         @router.get('/api/credentials')
         def list_keys(request: Request, run_id: str = ''):
@@ -1198,9 +1209,6 @@ class Credentials:
             user, admin = actor(request, True)
             with self.store.connect() as conn:
                 conn.begin_write()
-                if self.security.user_roles:
-                    self.security.user_roles.require_actor(user, 'credentials.manage', connection=conn)
-                    admin = self.security.has_actor_permission(user, 'credentials.publish', connection=conn)
                 row = conn.execute('SELECT * FROM provider_secrets WHERE id=?', (secret_id,)).fetchone()
                 if not row or not (row['owner_id'] == user or (row['scope'] == 'organization' and admin)):
                     raise HTTPException(404, 'Credentials not found.')

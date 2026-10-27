@@ -644,10 +644,14 @@ class Scim:
 
     # Resources
 
-    def guard_admins_in(self, conn, before):
-        # Directory writes change activity, never roles. A write may not remove
-        # the last active administrator, but it is not blamed for an earlier loss.
-        if before and not self.roles.admins_in(conn):
+    def guard_admins_in(self, conn, email):
+        # Called before email's account becomes inactive. Directory writes
+        # change activity, never roles, and only email's live row, so the active
+        # administrators afterwards are the current ones less email. A write may
+        # not remove the last one, but it is not blamed for an earlier loss.
+        # Only an eligible administrator holder pays for the full computation.
+        if (self.roles.eligible(email) and self.roles.role_in(conn, email) == 'admin'
+                and self.roles.admins_in(conn) == {email}):
             raise ScimError(409, 'Keep at least one active administrator. Promote another user first.')
 
     def resource_in(self, conn, kind, identity, *, related=True):
@@ -712,7 +716,8 @@ class Scim:
         if created and conn.execute("SELECT 1 FROM scim_users WHERE user_name=? AND deleted_at=''",
                                     (data['userName'],)).fetchone():
             raise ScimError(409, 'A user with this userName already exists.', 'uniqueness')
-        before = self.roles.admins_in(conn)
+        if not data['active']:
+            self.guard_admins_in(conn, data['userName'])
         stamp = timestamp()
         was = None if saved is None else bool(saved['active'])
         if created:
@@ -731,7 +736,6 @@ class Scim:
             profile=excluded.profile,active=excluded.active,updated_at=excluded.updated_at,revision=scim_users.revision+1,
             access_epoch=scim_users.access_epoch+excluded.access_epoch''',
                      (identity, external, data['userName'], json.dumps(profile), int(data['active']), stamp, stamp, epoch))
-        self.guard_admins_in(conn, before)
         action = ('created' if created else 'deactivated' if was and not data['active']
                   else 'reactivated' if was is False and data['active'] else 'updated')
         details = {'token_id': token['id'], 'active': data['active']}
@@ -921,13 +925,16 @@ class Scim:
         self.touch(token)
         return result
 
-    def write(self, header, params, kind, method, body, identity=None):
+    def write(self, header, params, kind, method, body, identity=None, *, admitted=False):
         """POST, PUT or PATCH; the projected resource, or None for a Group PATCH that asked for none (204).
 
         A Group PATCH response would cost the stored group's size, so it is read
         after commit and only when attributes/excludedAttributes asks for it.
+        admitted means the caller already accepted the credential on a read
+        (Scim.body); the recheck under the writer still decides.
         """
-        self.admit(header)
+        if not admitted:
+            self.admit(header)
         selection = self.projection(params, kind)
         identity = resource_identity(identity)
         with self.store.connect() as conn:
@@ -964,10 +971,10 @@ class Scim:
         with self.store.connect() as conn:
             conn.begin_write()
             token = self.authenticate_in(conn, header, write=True)
-            self.resource_in(conn, kind, identity, related=False)
+            current = self.resource_in(conn, kind, identity, related=False)
             stamp = timestamp()
-            before = self.roles.admins_in(conn) if kind == 'User' else set()
             if kind == 'User':
+                self.guard_admins_in(conn, current['userName'])
                 # A deleted userName is reprovisioned under a new id with history.
                 conn.execute('''UPDATE scim_users SET active=0,deleted_at=?,updated_at=?,revision=revision+1,
                     access_epoch=access_epoch+1 WHERE id=?''', (stamp, stamp, identity))
@@ -979,7 +986,6 @@ class Scim:
                                 (identity,)).fetchone():
                     narrow_group_in(conn, identity)
                 conn.execute('DELETE FROM scim_group_members WHERE group_id=?', (identity,))
-            self.guard_admins_in(conn, before)
             record_event_in(conn, f'scim_{kind.lower()}.deleted', token['label'], f'scim_{kind.lower()}', identity,
                             {'token_id': token['id']})
 
@@ -1024,11 +1030,12 @@ class Scim:
             conn.begin_read()
             authority = self.roles.enterprise.authorize_in(conn, actor, 'scim.manage') if actor is not None else None
             # Bounded by the page: one correlated count per listed user, through idx_scim_group_members_user.
+            # The redundant user_name>=? lets idx_scim_users_name start at the cursor; the OR alone cannot.
             rows = conn.execute('''SELECT u.id,u.user_name,u.profile,u.active,u.external_id,u.updated_at,
                     (SELECT COUNT(*) FROM scim_group_members m JOIN scim_groups g ON g.id=m.group_id AND g.deleted_at=''
                      WHERE m.user_id=u.id) AS groups_count
-                FROM scim_users u WHERE u.deleted_at='' AND (u.user_name>? OR (u.user_name=? AND u.id>?))
-                ORDER BY u.user_name,u.id LIMIT ?''', (after[0], after[0], after[1], limit + 1)).fetchall()
+                FROM scim_users u WHERE u.deleted_at='' AND u.user_name>=? AND (u.user_name>? OR (u.user_name=? AND u.id>?))
+                ORDER BY u.user_name,u.id LIMIT ?''', (after[0], after[0], after[0], after[1], limit + 1)).fetchall()
             # Load more keeps the first page's sections; recomputing them would re-aggregate every membership.
             if not cursor:
                 groups = [{'id': row['id'], 'display_name': row['display_name'], 'member_count': int(row['member_count']),
@@ -1043,12 +1050,14 @@ class Scim:
                               ORDER BY g.display_key,g.id''')]
                 tokens = [_token_view(row) for row in conn.execute('''SELECT id,label,prefix,created_at,created_by,
                     last_used_at,revoked_at FROM scim_tokens ORDER BY created_at DESC,id DESC''')]
+                # PostgreSQL walks idx_governance_audit_time back only in its byte order, as the audit feed does.
+                order = ' COLLATE "C"' if self.store.database else ''
                 activity = [{'id': row['id'], 'source': 'governance', 'action': row['action'], 'actor': row['actor'],
                              'resource_type': row['resource_type'], 'resource_id': row['resource_id'],
                              'details': json.loads(row['details']), 'created_at': row['created_at']}
-                            for row in conn.execute('''SELECT * FROM governance_audit_events
+                            for row in conn.execute(f'''SELECT * FROM governance_audit_events
                                 WHERE resource_type IN ('scim_user','scim_group','scim_token')
-                                ORDER BY created_at DESC,id DESC LIMIT 20''')]
+                                ORDER BY created_at{order} DESC,id{order} DESC LIMIT 20''')]
         items = []
         for row in rows[:limit]:
             profile = json.loads(row['profile'])
@@ -1195,9 +1204,9 @@ def render(content) -> bytes:
     return json.dumps(content, ensure_ascii=False, allow_nan=False, separators=(',', ':')).encode('utf-8')
 
 
-def _rendered(operation, *args):
+def _rendered(operation, *args, **kwargs):
     """Run operation and render its result in the same worker thread: large pages never block the event loop."""
-    result = operation(*args)
+    result = operation(*args, **kwargs)
     return result, None if result is None else render(result)
 
 
@@ -1212,16 +1221,17 @@ def _resource_routes(router, service, kind):
         _, content = await database(_rendered, service.read, _authorization(request), _params(request), kind, identity)
         return Response(content, media_type=MEDIA)
 
+    # Writes follow Scim.body, which already accepted the credential before the writer is requested.
     async def creating(request: Request):
         body = await service.body(request)
         result, content = await database(_rendered, service.write, _authorization(request), _params(request), kind,
-                                         'POST', body)
+                                         'POST', body, admitted=True)
         return Response(content, status_code=201, media_type=MEDIA, headers={'Location': result['meta']['location']})
 
     async def updating(identity: str, request: Request):
         body = await service.body(request)
         result, content = await database(_rendered, service.write, _authorization(request), _params(request), kind,
-                                         request.method, body, identity)
+                                         request.method, body, identity, admitted=True)
         if result is None:  # A Group PATCH that asked for no attributes (RFC 7644 section 3.5.2).
             return Response(status_code=204)
         return Response(content, media_type=MEDIA)

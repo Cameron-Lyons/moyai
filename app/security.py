@@ -208,12 +208,6 @@ class Security:
             return self.user_roles.permissions(info['identity']['email'])
         return BUILTIN_PERMISSIONS.get(info.get('role'), frozenset())
 
-    def permissions(self, request: Request):
-        return self.permissions_for_info(self.session_info(request))
-
-    def has_permission(self, request: Request, permission: str) -> bool:
-        return permission in self.permissions(request)
-
     def has_actor_permission(self, actor_id, permission, *, connection=None):
         if self.user_roles is None:
             return permission in BUILTIN_PERMISSIONS.get(shared_actor_role(actor_id, self.settings), frozenset())
@@ -229,8 +223,8 @@ class Security:
         info = self.session_info(request)
         return info["sid"] if info else None
 
-    def role(self, request: Request, *, connection=None) -> str | None:
-        info = self.session_info(request, connection=connection)
+    def role(self, request: Request) -> str | None:
+        info = self.session_info(request)
         return info["role"] if info else None
 
     def client_key(self, request: Request) -> str:
@@ -247,8 +241,9 @@ class Security:
         return hmac.new(self.secret.encode(), f"csrf:{sid}".encode(), hashlib.sha256).hexdigest()
 
     def require(self, request: Request, *, mutation: bool = False, admin: bool = False,
-                permission: str | None = None, connection=None) -> str:
-        info = self.session_info(request, connection=connection)
+                permission: str | None = None, connection=None, info=None) -> str:
+        # Callers that already resolved this request's session_info may pass it.
+        info = info if info is not None else self.session_info(request, connection=connection)
         sid = info['sid'] if info else None
         if not sid:
             raise HTTPException(401, "Sign in to the workspace.")

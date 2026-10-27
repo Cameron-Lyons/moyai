@@ -110,7 +110,6 @@ class ProductPrincipal:
     native_auth_version: int = field(default=1, repr=False)
     role_revision: int = field(default=0, repr=False)
     permissions: frozenset[str] | None = None
-    direct_permissions: frozenset[str] | None = None
     access_role: dict[str, str] | None = None
 
     @property
@@ -321,29 +320,34 @@ class ProductIdentityAdapter:
     async def govern_principal(self, db: AsyncSession, principal: ProductPrincipal) -> ProductPrincipal:
         from dataclasses import replace
 
-        from app.enterprise_roles import qualified_fetch, resolve_access
+        from app.enterprise_roles import resolve_access, snapshot_fetch
         from app.permissions import BUILTIN_PERMISSIONS
+
+        from .product_governance import CanonicalRead
         if principal.kind == 'shared':
-            return replace(principal, permissions=BUILTIN_PERMISSIONS[principal.role],
-                           direct_permissions=BUILTIN_PERMISSIONS[principal.role])
+            return replace(principal, permissions=BUILTIN_PERMISSIONS[principal.role])
         if not principal.email or not self.roles.eligible(principal.email):
-            return replace(principal, permissions=BUILTIN_PERMISSIONS['member'],
-                           direct_permissions=BUILTIN_PERMISSIONS['member'])
+            if principal.kind != 'slack':
+                raise HTTPException(401, "The product account is outside the allowed organization.")
+            # As in canonical actor checks, a Slack sender without a verified,
+            # eligible email holds nothing; accounting or manual links do not count.
+            return replace(principal, permissions=frozenset())
+        # One statement per check: this runs for every request and stream event.
         state = await db.run_sync(lambda session: resolve_access(
-            qualified_fetch(lambda sql, values: [dict(row) for row in session.execute(text(sql), values).mappings()], self._table),
+            snapshot_fetch(CanonicalRead(session, self), principal.email),
             principal.email, principal.role if principal.individual else 'member'))
         if state.scim_active is False:
             raise HTTPException(401, 'This workspace account has been deactivated.')
-        permissions, direct = state.permissions, state.direct_permissions
+        permissions = state.permissions
         if principal.kind == 'slack':
             # As in canonical actor checks, a Slack sender never exceeds member access.
-            permissions, direct = permissions & BUILTIN_PERMISSIONS['member'], direct & BUILTIN_PERMISSIONS['member']
+            permissions = permissions & BUILTIN_PERMISSIONS['member']
         entry = state.authority_entry()
         version = principal.authority_version
         if entry is not None:
             version = hmac.new(self.legacy_security.secret.encode(), json.dumps(
                 [version, entry], sort_keys=True, separators=(',', ':')).encode(), hashlib.sha256).hexdigest()
-        return replace(principal, permissions=permissions, direct_permissions=direct,
+        return replace(principal, permissions=permissions,
                        authority_version=version, access_role=(
                            {'id': state.role_id, 'name': state.role_name or state.role_id} if state.role_id else None))
 

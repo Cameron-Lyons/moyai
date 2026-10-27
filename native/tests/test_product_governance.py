@@ -618,6 +618,33 @@ async def test_audit_feed_and_export_apply_the_requested_window(governed):
         ('2026-10-01T00:00:00+00:00', '2026-10-16T00:00:00+00:00')] * 2
 
 
+@pytest.mark.parametrize('lost', ['permission', 'authority'])
+async def test_audit_export_stops_when_permission_is_lost_between_pages(governed, monkeypatch, lost):
+    """The export rechecks live audit.read before releasing each page, not just at request time."""
+    product, released = governed, []
+    class TwoPages:
+        def export(self, filters, format):
+            for chunk in ('created_at,action\nfirst\n', 'second\n'):
+                released.append(chunk)
+                yield chunk
+    original = product.adapter.require_current
+    async def changed_after_first_page(grant):
+        principal = await original(grant)
+        if released and lost == 'authority':
+            raise HTTPException(401, 'Product authority changed; fresh authorization is required.')
+        # Otherwise live authority still verifies, but the role no longer grants audit.read.
+        return replace(principal, permissions=frozenset()) if released else principal
+    monkeypatch.setattr(product.adapter, 'require_current', changed_after_first_page)
+    async with governance_client(product, audit=TwoPages()) as client:
+        # The 200 status and headers are already sent, so Starlette re-raises
+        # the handled HTTPException as a RuntimeError caused by it.
+        with pytest.raises(RuntimeError) as raised:
+            await client.get('/api/admin/governance/audit/export')
+    cause = raised.value.__cause__
+    assert isinstance(cause, HTTPException) and cause.status_code == (403 if lost == 'permission' else 401)
+    assert released == ['created_at,action\nfirst\n']  # The second page was never pulled from the store.
+
+
 async def test_no_git_access_refuses_github_grants_and_workflow_plugins(governed):
     from moyai.product_automations import AutomationDefinition
     product, governance = governed, governed.database.governance
@@ -631,6 +658,86 @@ async def test_no_git_access_refuses_github_grants_and_workflow_plugins(governed
             await governance.admission(db, session, principal, [SimpleNamespace(kind='github')])
         with pytest.raises(HTTPException, match='connections exceed'):
             await governance.workflow(db, principal, AutomationDefinition(name='Git', prompt='Work', plugins=['github']))
+
+
+async def test_credential_release_and_workspace_preparation_recheck_live_policy(governed):
+    """Credential release and workspace preparation refuse what the live role and policy no longer allow."""
+    from moyai.product_continuation_models import ProductExecutionContext
+    from moyai.product_continuation_workspace import ProductWorkspaceCompatibility, fingerprint
+    product, governance = governed, governed.database.governance
+    _, _, prepared = await authority.active_turn(product)
+    scope, github = prepared.scope, SimpleNamespace(kind='github')
+    repository = {'source_schema': 'moyai', 'repo_url': 'https://github.com/acme/app'}
+    async with product.database.sessions.begin() as db:
+        db.add(ProductExecutionContext(turn_id=scope.turn_id, actor_id=scope.actor_id,
+                                       descriptor=product.database.security.seal(repository),
+                                       fingerprint=fingerprint(repository)))
+    workspace = ProductWorkspaceCompatibility(SimpleNamespace(
+        database=product.database, security=product.database.security, product_identity=product.adapter))
+    await governance.connection(scope, github, write=True)
+    assert await workspace.turn_context(scope) == repository
+    await defaults(product, mandatory=await profile(product, {'git_access': 'read'}))
+    with pytest.raises(HTTPException, match='Managed Git access'):
+        await governance.connection(scope, github, write=True)
+    await governance.connection(scope, github)
+    await defaults(product, mandatory=await profile(product, {'connected_apps': ['linear']}))
+    with pytest.raises(HTTPException, match='connection is disabled'):
+        await governance.connection(scope, github)
+    # Each check runs in its own transaction, so it reads the policy just written.
+    with pytest.raises(HTTPException, match='repository exceeds'):
+        await workspace.turn_context(scope)
+    await defaults(product)
+    principal = await member_role(product, ['sessions.create', 'sessions.read'])
+    scope = replace(scope, product_grant=principal.grant)
+    for check in (lambda db: governance.workspace(db, scope, {'environment_build_id': 'build'}),
+                  lambda db: governance.workspace(db, scope, repository)):
+        with pytest.raises(HTTPException, match='role does not allow'):
+            async with product.database.sessions.begin() as db:
+                await check(db)
+    async with product.database.sessions.begin() as db:
+        await governance.workspace(db, scope, {})
+    with pytest.raises(HTTPException, match='role does not allow'):
+        await governance.connection(scope, github)
+
+
+async def test_network_mandatory_policy_stops_a_running_session(governed):
+    """A mandatory network restriction stops a running session, not only new ones."""
+    product, governance = governed, governed.database.governance
+    _, _, prepared = await authority.active_turn(product)
+    scope = prepared.scope
+    await governance.check_tool(scope, 'read_file', read_only=True)
+    await governance.check_model(scope)
+    await defaults(product, mandatory=await profile(product, {'network_domains': []}))
+    for check in (lambda: governance.check_tool(scope, 'read_file', read_only=True),
+                  lambda: governance.check_model(scope), lambda: product.database.authorize_scope(scope)):
+        with pytest.raises(HTTPException, match='cannot enforce'):
+            await check()
+
+
+async def test_tool_catalog_checks_scope_and_policy_in_one_transaction(governed, monkeypatch):
+    """Regression: the per-step catalog resolved the principal and policy again in a second transaction."""
+    from temporalio.exceptions import ApplicationError
+
+    from moyai.agent import Authority
+    product = governed
+    await defaults(product, await profile(product, {'tools': ['read_file']}))
+    _, _, prepared = await authority.active_turn(product)
+    catalog, resolved = Authority(product.database).governance_catalog, []
+    original = product.adapter._current
+    async def counted(*args, **kwargs):
+        resolved.append(1)
+        return await original(*args, **kwargs)
+    monkeypatch.setattr(product.adapter, '_current', counted)
+    assert await catalog(prepared.scope, [('read_file', True), ('shell', False)]) == ['read_file']
+    assert len(resolved) == 1
+    await defaults(product, mandatory=await profile(product, {'network_domains': []}))
+    with pytest.raises(HTTPException, match='cannot enforce'):
+        await catalog(prepared.scope, [('read_file', True)])
+    # In an activity attempt a refusal keeps the activity interceptor's error type.
+    monkeypatch.setattr('moyai.agent.activity.in_activity', lambda: True)
+    with pytest.raises(ApplicationError) as denied:
+        await catalog(prepared.scope, [('read_file', True)])
+    assert denied.value.type == 'MoyaiPermissionDenied' and denied.value.non_retryable
 
 
 canonical_connections = automation_fixtures.canonical_connections
@@ -774,6 +881,7 @@ async def test_effective_policy_is_read_once_per_transaction(governed, monkeypat
     """Regression: every tool and model check re-read the policy its transaction had already computed."""
     product, governance = governed, governed.database.governance
     session = await product.database.create_session(product.actor, NewSession())
+    other = await product.database.create_session(product.actor, NewSession())
     profiles, reads = governance.product.profiles, []
     original = profiles.mandatory_in
     monkeypatch.setattr(profiles, 'mandatory_in', lambda read: reads.append(read) or original(read))
@@ -781,6 +889,13 @@ async def test_effective_policy_is_read_once_per_transaction(governed, monkeypat
         await governance.principal(db, product.principal)
         first = await governance.policy(db, session.id)
         assert await governance.policy(db, session.id) is first and len(reads) == 1
+        # Other sessions, including an unbound pre-governance one, reuse the
+        # transaction's mandatory read; the unbound one stays unpinned for bind().
+        await governance.policy(db, other.id)
+        for _ in range(2):
+            await governance.policy(db, 'unbound-session-id')
+        assert len(reads) == 1
+        assert 'unbound-session-id' not in governance._policies[db.sync_session.get_transaction()]
     await defaults(product, mandatory=await profile(product, {'tools': ['read_file']}))
     async with product.database.sessions.begin() as db:
         await governance.principal(db, product.principal)
