@@ -40,6 +40,7 @@ from .inference_guardrails import (
     blocked,
     unattested,
 )
+from .inference_spend import DENIED, broker_refusal
 from .models import Base, now
 from .usage_projection import ProjectionError, UsageProjection
 
@@ -598,9 +599,11 @@ class InferenceUsageTransport(httpx.AsyncBaseTransport):
                     raise
                 context.latest = None
                 response = await self.transport.handle_async_request(proxied)
-                if response.headers.get("x-moyai-inference-denied") == "1":
+                if response.headers.get(DENIED) == "1":
                     from .product_inference import InferenceAdmissionError
-                    context.admission_error = InferenceAdmissionError("Product broker admission refused.")
+                    # Only a fixed spend reason crosses; any other keeps the generic refusal.
+                    context.admission_error = broker_refusal(response.headers) or InferenceAdmissionError(
+                        "Product broker admission refused.")
                 if response.headers.get(HEADER) in ERROR_TYPES:
                     context.guardrail = response.headers[HEADER]
                 return response

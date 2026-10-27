@@ -5,6 +5,7 @@ import { SkillComposer } from "./skill-composer"
 import { GoalChip, goalCommandAction } from "./goal"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { SpaceBackdrop } from "./space-backdrop"
+import { SpendStatusNotice } from "./spend-status"
 import "./home.css"
 import { ApiError, csrfToken } from "./api"
 import { AttachButton, AttachmentPreviews, useAttachments, useFileDrop, FileDropOverlay } from "./attachments"
@@ -30,8 +31,10 @@ export function homeSubmission(prompt: string, model: string, privateSession: bo
   return { body, visibility, session, signature: JSON.stringify([visibility, body, securityProfileId]) }
 }
 
-export function Home({ models, defaultModel, initiallyPrivate = false, individual = true, productMode = "standalone", connectionVersion = "", preferences, securityPolicies = false, recentSessions, recentLoading, onSearchSessions, onCreated, onStarted }: {
+export function Home({ models, defaultModel, initiallyPrivate = false, individual = true, productMode = "standalone", connectionVersion = "", preferences, securityPolicies = false, spendStatus = false, recentSessions, recentLoading, onSearchSessions, onCreated, onStarted }: {
   models: string[]; defaultModel: string; initiallyPrivate?: boolean; individual?: boolean; productMode?: "standalone" | "existing"; connectionVersion?: string; preferences?: GeneralPreferences; securityPolicies?: boolean
+  /** Show the personal monthly budget notice (existing product mode with spend.personal). */
+  spendStatus?: boolean
   recentSessions: { key: string; title: Session["title"]; href: string }[]; recentLoading: boolean; onSearchSessions: () => void
   onCreated: () => Promise<void>; onStarted: (conversation: NewConversation) => void
 }) {
@@ -180,6 +183,7 @@ export function Home({ models, defaultModel, initiallyPrivate = false, individua
       <form className="home-form" onSubmit={event => { event.preventDefault(); void send() }}>
         {error && <p className="error" role="alert">{error}</p>}
         {noModel && <p className="error" role="alert">This security policy allows no models. Choose another policy or ask an administrator.</p>}
+        {spendStatus && <SpendStatusNotice />}
         {needsAccounts && catalog.scope === accountScope && catalog.error && !skipAccounts && <div className="home-connection-error" role="alert">
           <span className="error">{catalog.error}</span>
           <Button type="button" variant="outline" size="sm" disabled={busy} onClick={() => setAccountsVersion(value => value + 1)}>Retry connections</Button>

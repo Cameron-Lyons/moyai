@@ -41,7 +41,8 @@ async function handle(req,res,next) {
   if(url.pathname.startsWith('/api/auth/oidc/'))return json({url:'https://idp.example.test/authorize?fixture=1'});
   if(url.pathname==='/api/logout'){state.signedIn=false;return json({signed_out:true});}
   if(!state.signedIn)return json({detail:'Sign in.'},401);
-  if(url.pathname==='/api/me')return json({user:{id:'viewer',name:state.viewerName||'Test viewer',role:'admin',individual:state.individual},csrf:'fixture-csrf',models:state.models||['test-model'],default_model:state.defaultModel||'test-model',product_mode:state.mode,preferences:state.preferences||{delivery_mode:'when_idle',connection_ids:null}});
+  if(url.pathname==='/api/me')return json({user:{id:'viewer',name:state.viewerName||'Test viewer',role:'admin',individual:state.individual},csrf:'fixture-csrf',models:state.models||['test-model'],default_model:state.defaultModel||'test-model',product_mode:state.mode,preferences:state.preferences||{delivery_mode:'when_idle',connection_ids:null},...(state.permissions?{permissions:state.permissions}:{})});
+  if(url.pathname==='/api/spend/status'&&state.spendStatus)return json(state.spendStatus);
   if(url.pathname==='/api/sessions'&&req.method==='POST'){state.createdSession=true;const id='c'.repeat(32);state.sessionOverrides={...state.sessionOverrides,[id]:{...state.sessionOverrides?.[id],model:data.model||'test-model'}};return json(session(id));}
   if(url.pathname==='/api/sessions')return json(state.denied?[]:[session(),...(state.createdSession?[session('c'.repeat(32))]:[])]);
   if(url.pathname==='/api/connections') {
@@ -936,6 +937,40 @@ for(const tool of ['browser_open','shell','github_create_pull_request','slack_po
   assert.equal(await page.getByRole('button',{name:'Record verified outcome',exact:true}).count(),0);
   await page.getByRole('textbox',{name:'Message Moyai',exact:true}).fill('Continue with the task.');
   assert.equal(await page.getByRole('button',{name:'Send message',exact:true}).isEnabled(),true);
+});
+
+test('a spend refusal says why in the failure banner and the composer notice reads the budget again',async t=>{
+  const refusal='Your monthly model spend limit has been reached. It resets on the first day of next month (UTC); ask a spend manager to raise it.';
+  const status=personal=>({period_start:'2026-10-01T00:00:00+00:00',resets_at:'2026-11-01T00:00:00+00:00',warning_ratio:2/3,personal,organization_reached:false,organization_pending:false});
+  const scope=patch=>({limit_usd:30,used_usd:21,level:'warning',source:'group',group_name:'Engineering',...patch});
+  const turn=patch=>({id:turnId,actor_id:'viewer',is_self:true,model:'test-model',connections:[],usage:{},created_at:'2026-10-19T17:10:55Z',...patch});
+  reset({turns:[turn({status:'running'})],spendStatus:status(scope())});
+  const page=await pageFor(t,'#'+sessionId,1440,page=>page.addInitScript(()=>localStorage.setItem('moyai-appearance','light')));
+  const notice=page.locator('.composer-wrap .spend-status');
+  await notice.getByText('You have used $21.00 of your $30.00 monthly model budget. It resets on November 1 (UTC).',{exact:true}).waitFor();
+  assert.equal(await notice.getAttribute('role'),'status');
+  const reads=()=>state.requests.filter(row=>row.path==='/api/spend/status').length,before=reads();
+  // The turn fails at its first refused model request; its saved error is the fixed sentence.
+  await waitFor(()=>clients.size>0,'SSE connected');
+  state.status='failed';state.turns=[turn({status:'failed',error:refusal,finished_at:'2026-10-19T17:11:02Z'})];
+  state.spendStatus=status(scope({used_usd:30,level:'reached'}));
+  emit({},undefined,'finished');
+  await page.getByText(refusal,{exact:true}).waitFor();
+  await notice.getByText(/^Your \$30\.00 monthly model budget is used up\. New model requests are refused until November 1 \(UTC\)/).waitFor();
+  assert.ok(reads()>before,'the failed turn reads the budget again');
+  assert.match(await notice.getAttribute('class'),/\berror\b/);
+  assert.equal(await page.evaluate(()=>document.documentElement.dataset.theme),'light');
+  assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true);
+  if(process.env.MOYAI_UI_CAPTURE_DIR) {
+    await fs.mkdir(process.env.MOYAI_UI_CAPTURE_DIR,{recursive:true});
+    await page.screenshot({path:path.join(process.env.MOYAI_UI_CAPTURE_DIR,'spend-refusal-1440-light.png')});
+  }
+  // Without spend.personal the composer neither reads nor shows the budget; the failure still says why.
+  reset({status:'failed',turns:[turn({status:'failed',error:refusal})],spendStatus:status(scope({used_usd:30,level:'reached'})),
+    permissions:['workspace.read','sessions.read','sessions.create','sessions.manage']});
+  await page.reload();await page.getByText(refusal,{exact:true}).waitFor();
+  await page.getByRole('textbox',{name:'Message Moyai',exact:true}).waitFor();await page.waitForTimeout(200);
+  assert.equal(reads(),0);assert.equal(await notice.count(),0);
 });
 
 function failureFixture(overrides={}) {

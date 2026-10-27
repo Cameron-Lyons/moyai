@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from app.spend_limits import SpendLimitReached
 from fastapi import HTTPException
 from temporalio import activity
 from temporalio.exceptions import ApplicationError
@@ -12,6 +13,7 @@ from temporalio.worker import ActivityInboundInterceptor, ExecuteActivityInput, 
 from .contracts import GuidanceChanged, RunScope
 from .database import Database
 from .inference_guardrails import denial
+from .inference_spend import denial as spend_denial
 from .inference_usage import INFERENCE_ACTIVITY, InferenceActivity
 from .performance import computer_timing
 
@@ -98,6 +100,10 @@ class AuthorizedActivity(ActivityInboundInterceptor):
             except Exception as error:
                 if usage.guardrail is not None:
                     raise denial(usage.guardrail) from None
+                if isinstance(usage.admission_error, SpendLimitReached):
+                    # Its fixed sentence becomes the turn's error (TurnWorkflow), and
+                    # as the chain's last failure it names a delegated child's failure.
+                    raise spend_denial(usage.admission_error) from None
                 if usage.admission_error is not None:
                     raise ApplicationError(
                         "Product inference admission refused; no new model request was dispatched.",

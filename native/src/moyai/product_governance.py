@@ -4,9 +4,9 @@ from __future__ import annotations
 import json
 import re
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from weakref import WeakKeyDictionary
 
 from fastapi import HTTPException
@@ -14,6 +14,9 @@ from sqlalchemy import Numeric, and_, cast, exists, false, func, literal, not_, 
 
 from .product_governance_models import ProductSessionPolicy
 from .product_identity import ROLE_REFUSAL
+
+if TYPE_CHECKING:
+    from app.spend_limits import SpendLimitSet
 
 # A request without a reported cost stops blocking budgets after this long.
 RECEIPT_WINDOW = timedelta(days=1)
@@ -25,6 +28,12 @@ IN_FLIGHT_MARGIN = timedelta(minutes=1)
 # LiteLLM records a gateway error at zero spend, and a duplicate receipt's
 # charge is already counted on the request that holds it.
 UNBILLED = ('gateway_error', 'duplicate_provider_receipt')
+
+
+def month_period(now: datetime | None = None) -> tuple[str, str]:
+    """The current UTC calendar month as (start, next month's start) ISO timestamps."""
+    start = (now or datetime.now(UTC)).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    return start.isoformat(), (start + timedelta(days=32)).replace(day=1).isoformat()
 
 
 class SpendLedger:
@@ -41,7 +50,7 @@ class SpendLedger:
         from .inference_usage import InferenceUsage as usage
         from .product_inference import ProductInferenceRequest as request
         now = datetime.now(UTC)
-        self.period_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0).isoformat()
+        self.period_start = month_period(now)[0]
         started = now - timedelta(seconds=database.settings.model_timeout_seconds) - IN_FLIGHT_MARGIN
         in_flight = and_(usage.status == 'pending', usage.created_at >= started.isoformat())
         unpriced = and_(usage.cost_usd.is_(None), usage.status != 'not_dispatched', not_(in_flight),
@@ -61,6 +70,17 @@ class SpendLedger:
         self.awaiting = func.count().filter(unpriced, recoverable)
         self.unresolved = func.count().filter(unpriced, not_(recoverable))
         self.in_flight = func.count().filter(in_flight)
+
+
+@dataclass(frozen=True)
+class SpendState:
+    """One person's limits and the usage admission compares with them.
+
+    usage holds only the limited scopes, as USD Decimal totals, or None while a
+    finished request's cost can still be recovered (which fails closed).
+    """
+    limits: SpendLimitSet
+    usage: dict[str, Any] = field(default_factory=dict)
 
 
 class CanonicalRead:
@@ -505,12 +525,65 @@ class ProductGovernance:
             async with self.database.sessions.begin() as snapshot:
                 yield snapshot
 
+    def _person(self, email, actor_id):
+        """Ledger rows of every canonical actor with this email, or of one actor without an email."""
+        from .inference_usage import InferenceUsage
+        return InferenceUsage.actor_id.in_(
+            select(text('id')).select_from(text(self.identity._table('users')))
+            .where(text('email=:email')).params(email=email)) if email else InferenceUsage.actor_id == actor_id
+
+    async def spend_state(self, db, principal, session_id: str | None = None) -> SpendState:
+        """Limits and usage for one principal in db's snapshot; without session_id, no session scope.
+
+        Admission and the personal status share it. One canonical statement
+        reads the limits, directory tiers included; each limited scope then
+        adds one ledger sum (_spent), and nothing is written.
+        """
+        from app.spend_limits import SpendLimits
+
+        from .inference_usage import InferenceUsage
+        limits = await db.run_sync(lambda sync: SpendLimits.resolve_in(
+            CanonicalRead(sync, self.identity), principal.email))
+        if limits.unlimited:
+            return SpendState(limits)
+        ledger = SpendLedger(self.database)
+        month = InferenceUsage.created_at >= ledger.period_start
+        scopes = {'organization': [month], 'user': [month, self._person(principal.email, principal.id)]}
+        if session_id is not None and limits.session is not None:
+            # policy() has already loaded this binding during admission.
+            bound = await db.get(ProductSessionPolicy, session_id)
+            root = bound.family_root if bound else session_id
+            # A delegated child shares every ancestor's lifetime session
+            # budget. The whole family's total is the largest one that any
+            # ancestor's limit sees, so every member is checked against it.
+            # IN over a union keeps both lookups indexed; an OR would scan the ledger.
+            scopes['session'] = [InferenceUsage.session_id.in_(select(ProductSessionPolicy.session_id).where(
+                ProductSessionPolicy.family_root == root).union_all(select(literal(root))))]
+        usage = {}
+        for kind, clauses in scopes.items():
+            if getattr(limits, kind) is not None:
+                usage[kind] = await self._spent(db, ledger, *clauses)
+        return SpendState(limits, usage)
+
+    @staticmethod
+    async def _spent(db, ledger, *clauses):
+        """Ledger spend matching clauses as admission counts it; None while a cost is awaited."""
+        total, awaiting = (await db.execute(select(ledger.spent, ledger.awaiting).where(*clauses))).one()
+        return None if awaiting else total
+
+    async def month_spend(self, db, email):
+        """A person's month-to-date spend, the sum spend_state reads for their monthly limit.
+
+        The limit lookup reads it whether or not a limit applies, which spend_state skips.
+        """
+        from .inference_usage import InferenceUsage
+        ledger = SpendLedger(self.database)
+        return await self._spent(db, ledger, InferenceUsage.created_at >= ledger.period_start, self._person(email, ''))
+
     async def check_model(self, scope, *, model, db=None):
         """Admit one paid request for this model: the session policy, then spend limits."""
         from app.governance_activity import model_fields
-        from app.spend_limits import SpendLimits, evaluate
-
-        from .inference_usage import InferenceUsage
+        from app.spend_limits import SpendLimitReached, evaluation, refusal
         async with self._snapshot(db) as transaction:
             principal = await self.principal(transaction, scope.product_grant, action='policy.model_denied',
                                              session_id=scope.session_id, turn_id=scope.turn_id, subject=model,
@@ -520,40 +593,14 @@ class ProductGovernance:
             await self.require_session_provider(transaction, policy, scope.session_id, denial, **model_fields(model))
             # Before the spend lookup, which returns early when nothing is limited.
             await self._require_model(policy, model, denial)
-            limits = await transaction.run_sync(lambda sync: SpendLimits.resolve_in(
-                CanonicalRead(sync, self.identity), principal.email))
-            if limits.unlimited:
-                return
-            ledger = SpendLedger(self.database)
-            # policy() above has already loaded this binding.
-            bound = await transaction.get(ProductSessionPolicy, scope.session_id)
-            root = bound.family_root if bound else scope.session_id
-            scopes = {
-                'organization': [InferenceUsage.created_at >= ledger.period_start],
-                'user': [InferenceUsage.created_at >= ledger.period_start, InferenceUsage.actor_id.in_(
-                    select(text('id')).select_from(text(self.identity._table('users')))
-                    .where(text('email=:email')).params(email=principal.email))
-                    if principal.email else InferenceUsage.actor_id == principal.id],
-                # A delegated child shares every ancestor's lifetime session
-                # budget. The whole family's total is the largest one that any
-                # ancestor's limit sees, so every member is checked against it.
-                # IN over a union keeps both lookups indexed; an OR would scan the ledger.
-                'session': [InferenceUsage.session_id.in_(select(ProductSessionPolicy.session_id).where(
-                    ProductSessionPolicy.family_root == root).union_all(select(literal(root))))],
-            }
-            usage = {}
-            for kind, clauses in scopes.items():
-                if getattr(limits, kind) is not None:
-                    total, awaiting = (await transaction.execute(
-                        select(ledger.spent, ledger.awaiting).where(*clauses))).one()
-                    usage[kind] = None if awaiting else total
-            if exceeded := evaluate(limits, usage):
+            state = await self.spend_state(transaction, principal, scope.session_id)
+            if (reason := refusal(state.limits, state.usage)) is not None:
+                refused = SpendLimitReached(reason)
+                exceeded, pending = evaluation(state.limits, state.usage)
                 # Scopes only: no amounts, limits or receipts.
-                raise await self._refuse(
-                    denial, 'spend_limit',
-                    'The configured spend limit has been reached. Ask a spend manager to review it.',
-                    **model_fields(model), scopes=exceeded,
-                    awaiting_cost=any(usage.get(kind) is None for kind in exceeded))
+                await self._refuse(denial, 'spend_limit', refused.detail, **model_fields(model),
+                                   scopes=exceeded, awaiting_cost=bool(pending))
+                raise refused
 
     async def profile_policy(self, db, requested=''):
         """The policy a new session would bind under this profile ('' is the default), mandatory included."""

@@ -6654,6 +6654,64 @@
         "title": "EffectResolveResult",
         "type": "object"
       },
+      "EffectiveSpendLimit": {
+        "description": "The monthly limit that applies to one person: override, else their most permissive tier, else the default.",
+        "properties": {
+          "email": {
+            "title": "Email",
+            "type": "string"
+          },
+          "group_id": {
+            "title": "Group Id",
+            "type": "string"
+          },
+          "group_name": {
+            "title": "Group Name",
+            "type": "string"
+          },
+          "limit_usd": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Limit Usd"
+          },
+          "source": {
+            "enum": [
+              "override",
+              "group",
+              "default"
+            ],
+            "title": "Source",
+            "type": "string"
+          },
+          "used_usd": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Used Usd"
+          }
+        },
+        "required": [
+          "email",
+          "limit_usd",
+          "source",
+          "group_id",
+          "group_name",
+          "used_usd"
+        ],
+        "title": "EffectiveSpendLimit",
+        "type": "object"
+      },
       "EventTrigger-Input": {
         "additionalProperties": false,
         "properties": {
@@ -10300,6 +10358,51 @@
           "limitation"
         ],
         "title": "PersonalSlackStatus",
+        "type": "object"
+      },
+      "PersonalSpendStatus": {
+        "description": "The caller's monthly model budget, computed live.",
+        "properties": {
+          "organization_pending": {
+            "title": "Organization Pending",
+            "type": "boolean"
+          },
+          "organization_reached": {
+            "title": "Organization Reached",
+            "type": "boolean"
+          },
+          "period_start": {
+            "title": "Period Start",
+            "type": "string"
+          },
+          "personal": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SpendScopeStatus"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "resets_at": {
+            "title": "Resets At",
+            "type": "string"
+          },
+          "warning_ratio": {
+            "title": "Warning Ratio",
+            "type": "number"
+          }
+        },
+        "required": [
+          "period_start",
+          "resets_at",
+          "warning_ratio",
+          "personal",
+          "organization_reached",
+          "organization_pending"
+        ],
+        "title": "PersonalSpendStatus",
         "type": "object"
       },
       "PlanStep": {
@@ -19024,6 +19127,62 @@
         "title": "SourcedHistorySession",
         "type": "object"
       },
+      "SpendGroupLimitView": {
+        "description": "A directory group's tier: it replaces user-default for the group's active members.",
+        "properties": {
+          "group_id": {
+            "title": "Group Id",
+            "type": "string"
+          },
+          "group_name": {
+            "title": "Group Name",
+            "type": "string"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "limit_usd": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Limit Usd"
+          },
+          "member_count": {
+            "title": "Member Count",
+            "type": "integer"
+          },
+          "revision": {
+            "title": "Revision",
+            "type": "integer"
+          },
+          "updated_at": {
+            "title": "Updated At",
+            "type": "string"
+          },
+          "updated_by": {
+            "title": "Updated By",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "group_id",
+          "group_name",
+          "member_count",
+          "limit_usd",
+          "revision",
+          "updated_at",
+          "updated_by"
+        ],
+        "title": "SpendGroupLimitView",
+        "type": "object"
+      },
       "SpendLimitChange": {
         "additionalProperties": false,
         "description": "One row change. limit_usd is required: null removes the limit, 0 blocks.",
@@ -19159,11 +19318,32 @@
             "title": "Can Manage",
             "type": "boolean"
           },
+          "directory_groups": {
+            "items": {
+              "$ref": "#/components/schemas/DirectoryGroup"
+            },
+            "title": "Directory Groups",
+            "type": "array"
+          },
+          "group_limits": {
+            "items": {
+              "$ref": "#/components/schemas/SpendGroupLimitView"
+            },
+            "title": "Group Limits",
+            "type": "array"
+          },
           "limits": {
             "items": {
               "$ref": "#/components/schemas/SpendLimitView"
             },
             "title": "Limits",
+            "type": "array"
+          },
+          "orphaned_group_limits": {
+            "items": {
+              "$ref": "#/components/schemas/SpendOrphanedGroupLimitView"
+            },
+            "title": "Orphaned Group Limits",
             "type": "array"
           },
           "usage": {
@@ -19179,10 +19359,115 @@
         },
         "required": [
           "limits",
+          "group_limits",
+          "directory_groups",
+          "orphaned_group_limits",
           "usage",
           "can_manage"
         ],
         "title": "SpendLimitsAdmin",
+        "type": "object"
+      },
+      "SpendOrphanedGroupLimitView": {
+        "description": "A tier whose directory group was deleted: it applies to no one, but counts toward tier capacity.",
+        "properties": {
+          "group_id": {
+            "title": "Group Id",
+            "type": "string"
+          },
+          "group_name": {
+            "title": "Group Name",
+            "type": "string"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "limit_usd": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Limit Usd"
+          },
+          "revision": {
+            "title": "Revision",
+            "type": "integer"
+          },
+          "updated_at": {
+            "title": "Updated At",
+            "type": "string"
+          },
+          "updated_by": {
+            "title": "Updated By",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "group_id",
+          "group_name",
+          "limit_usd",
+          "revision",
+          "updated_at",
+          "updated_by"
+        ],
+        "title": "SpendOrphanedGroupLimitView",
+        "type": "object"
+      },
+      "SpendScopeStatus": {
+        "properties": {
+          "group_name": {
+            "title": "Group Name",
+            "type": "string"
+          },
+          "level": {
+            "enum": [
+              "ok",
+              "warning",
+              "reached",
+              "pending"
+            ],
+            "title": "Level",
+            "type": "string"
+          },
+          "limit_usd": {
+            "title": "Limit Usd",
+            "type": "number"
+          },
+          "source": {
+            "enum": [
+              "override",
+              "group",
+              "default"
+            ],
+            "title": "Source",
+            "type": "string"
+          },
+          "used_usd": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Used Usd"
+          }
+        },
+        "required": [
+          "limit_usd",
+          "used_usd",
+          "level",
+          "source",
+          "group_name"
+        ],
+        "title": "SpendScopeStatus",
         "type": "object"
       },
       "SpendUsage": {
@@ -22120,6 +22405,48 @@
           }
         },
         "summary": "Spend Save"
+      }
+    },
+    "/api/admin/spend-limits/effective": {
+      "get": {
+        "description": "The monthly limit admission applies to one person, read as admission reads it; usage needs spend.read.",
+        "operationId": "getEffectiveSpendLimit",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "email",
+            "required": true,
+            "schema": {
+              "maxLength": 254,
+              "minLength": 3,
+              "title": "Email",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EffectiveSpendLimit"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Spend Effective"
       }
     },
     "/api/admin/spend-limits/{identity}": {
@@ -29476,6 +29803,25 @@
         "tags": [
           "product-billing"
         ]
+      }
+    },
+    "/api/spend/status": {
+      "get": {
+        "description": "The caller's own monthly limit and usage, computed live as admission counts them.\n\nOf the organization limit it says only whether it is reached, never\namounts; the session limit is shown where a session fails.",
+        "operationId": "getSpendStatus",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PersonalSpendStatus"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Spend Status"
       }
     },
     "/api/swarms": {

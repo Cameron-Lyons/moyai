@@ -25,6 +25,15 @@ def integration_model(scenario: str, *, gates: tuple[asyncio.Event, asyncio.Even
             assert activity is not None
             activity.guardrail = "blocked"
             raise RuntimeError("Violated guardrail policy: flagged-private-input")
+        if scenario == "spend":
+            # Admission refused the request under the person's monthly limit.
+            from app.spend_limits import SpendLimitReached
+
+            from moyai.inference_usage import INFERENCE_ACTIVITY
+            activity = INFERENCE_ACTIVITY.get()
+            assert activity is not None
+            activity.admission_error = SpendLimitReached("user")
+            raise RuntimeError("Product admission refused this model request.")
         if scenario == "image":
             images = [
                 value for message in messages for part in message.parts

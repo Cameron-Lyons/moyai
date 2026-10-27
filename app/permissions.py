@@ -71,7 +71,7 @@ def route_permission(request):
         return None if read else 'spend.manage'
     if path.startswith('/api/admin/spend'):
         return 'spend.read' if read else 'spend.manage'
-    if path == '/api/spend':
+    if path in {'/api/spend', '/api/spend/status'}:
         return 'spend.personal'
     if path.startswith('/api/product/automations'):
         return 'automations.read' if read else 'automations.manage'

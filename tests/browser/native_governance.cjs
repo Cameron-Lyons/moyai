@@ -9,6 +9,8 @@ const {chromium} = require('playwright');
 let server,browser,base,state;
 const screens = process.env.MOYAI_GOVERNANCE_SCREENS || '';
 const P1='0123456789abcdef'.repeat(2), P2='fedcba9876543210'.repeat(2), P3='00112233445566778899aabbccddeeff';
+// SCIM group ids, as the directory issues them.
+const GE='e0'.repeat(16), GF='f0'.repeat(16);
 const STALE='This changed elsewhere. Reload and try again.';
 const stamp='2026-10-15T09:30:00+00:00';
 const catalogRows=[
@@ -42,8 +44,10 @@ function reset(overrides={}) {
       {id:'legacy-ops',name:'Legacy operations',description:'',permissions:['runtime.manage'],revision:4,archived:true,updated_at:stamp,updated_by:'admin@example.test'},
     ],
     assignments:[{email:'bob@example.test',role_id:'auditor',role_name:'Auditor',revision:2,role_revision:4,updated_at:stamp,updated_by:'admin@example.test'}],
-    groupRoles:[{group_id:'g-eng',group_name:'Engineering',role_id:'contractor',role_name:'Contractor',revision:1,updated_at:stamp,updated_by:'admin@example.test'}],
-    groups:[{id:'g-eng',display_name:'Engineering',member_count:12},{id:'g-fin',display_name:'Finance',member_count:3}],
+    groupRoles:[{group_id:GE,group_name:'Engineering',role_id:'contractor',role_name:'Contractor',revision:1,updated_at:stamp,updated_by:'admin@example.test'}],
+    groups:[{id:GE,display_name:'Engineering',member_count:12},{id:GF,display_name:'Finance',member_count:3}],
+    tiers:[{group_id:GE,limit_usd:50,revision:2,updated_at:stamp,updated_by:'admin@example.test'}],orphanedTiers:[],
+    memberships:{'bob@example.test':[GE,GF]},spendStatus:null,
     tokens:[{id:'tok-1',label:'Okta production',prefix:'moyai_scim_ab12',created_at:stamp,created_by:'admin@example.test',last_used_at:stamp,revoked_at:null},
       {id:'tok-0',label:'Old connector',prefix:'moyai_scim_99zz',created_at:'2026-01-02T10:00:00+00:00',created_by:'admin@example.test',last_used_at:null,revoked_at:'2026-02-01T10:00:00+00:00'}],
     profiles:[profile(P1,'Standard engineering',{network_domains:['github.com','registry.npmjs.org','*.githubusercontent.com']}),
@@ -78,8 +82,20 @@ const auditPages=[
 const rolesView=()=>({roles:state.roles,assignments:state.assignments,group_roles:state.groupRoles,groups:state.groups,grantable:state.role==='admin'?null:state.permissions,builtin_admin:state.role==='admin'});
 // Like the server, spend.manage alone can read the listing, and both GET and writes return
 // null usage totals (and a null used_usd on each row) to a caller without spend.read.
+// Only a limit manager gets the live directory groups to choose a tier's group from.
 const spendView=(usage=true)=>({limits:usage?state.limits:state.limits.map(row=>({...row,used_usd:null})),
+  group_limits:state.tiers.map(row=>{const group=state.groups.find(item=>item.id===row.group_id);return {...row,id:'group:'+row.group_id,group_name:group.display_name,member_count:group.member_count};}),
+  directory_groups:state.permissions.includes('spend.manage')?state.groups:[],orphaned_group_limits:state.orphanedTiers,
   usage:usage?{organization_month_usd:1234.56,period_start:'2026-10-01T00:00:00+00:00',unknown_requests:0}:null,can_manage:state.permissions.includes('spend.manage')});
+// Override, else the most permissive tier of the person's groups (null beats any amount), else the default.
+function effectiveLimit(email) {
+  const override=state.limits.find(row=>row.id==='user:'+email);
+  if(override)return {email,limit_usd:override.limit_usd,source:'override',group_id:'',group_name:''};
+  const tiers=state.tiers.filter(row=>(state.memberships[email]??[]).includes(row.group_id));
+  if(!tiers.length)return {email,limit_usd:state.limits.find(row=>row.id==='user-default').limit_usd,source:'default',group_id:'',group_name:''};
+  const best=tiers.find(row=>row.limit_usd===null)??tiers.reduce((a,b)=>b.limit_usd>a.limit_usd?b:a);
+  return {email,limit_usd:best.limit_usd,source:'group',group_id:best.group_id,group_name:state.groups.find(group=>group.id===best.group_id).display_name};
+}
 async function handle(req,res,next) {
   const url=new URL(req.url,'http://localhost');
   if(!url.pathname.startsWith('/api/'))return next();
@@ -173,22 +189,32 @@ async function handle(req,res,next) {
       if(method==='DELETE'){row.enabled=false;row.revision++;return json(row);}}
   }
   // Spend limits
+  if(p==='/api/spend/status')return has('spend.personal')?state.spendStatus?json(state.spendStatus):json({period_start:'2026-10-01T00:00:00+00:00',resets_at:'2026-11-01T00:00:00+00:00',warning_ratio:2/3,personal:null,organization_reached:false,organization_pending:false}):deny();
   if(p.startsWith('/api/admin/spend-limits')) {
     if(!has('spend.read')&&!has('spend.manage'))return deny();
+    if(p==='/api/admin/spend-limits/effective'&&method==='GET'){const email=url.searchParams.get('email');
+      if(!/^[^@\s]+@[^@\s]+$/.test(email??''))return json({detail:'Enter a work email address.'},422);
+      return json({...effectiveLimit(email),used_usd:has('spend.read')?12.5:null});}
     if(method==='GET')return json(spendView(has('spend.read')));
     // Writes always return the full listing; usage depends on the caller's spend.read.
     const listing=()=>spendView(has('spend.read'));
     if(!has('spend.manage'))return deny();
-    if(method==='PUT'){for(const change of data.changes){const row=state.limits.find(item=>item.id===change.id);
+    const tierOf=id=>state.tiers.find(item=>'group:'+item.group_id===id),deletedOf=id=>state.orphanedTiers.find(item=>item.id===id);
+    if(method==='PUT'){for(const change of data.changes){const row=change.id.startsWith('group:')?tierOf(change.id):state.limits.find(item=>item.id===change.id);
         if((row?.revision??0)!==change.revision)return json({detail:STALE},409);}
-      for(const change of data.changes){const row=state.limits.find(item=>item.id===change.id);
+      for(const change of data.changes){
+        if(change.id.startsWith('group:')){const row=tierOf(change.id);
+          if(row)Object.assign(row,{limit_usd:change.limit_usd,revision:row.revision+1,updated_at:stamp});
+          else state.tiers.push({group_id:change.id.slice(6),limit_usd:change.limit_usd,revision:1,updated_at:stamp,updated_by:'admin@example.test'});
+          continue;}
+        const row=state.limits.find(item=>item.id===change.id);
         if(row)Object.assign(row,{limit_usd:change.limit_usd,revision:row.revision+1,updated_at:stamp});
         else state.limits.push({id:change.id,kind:'user',subject:change.id.slice(5),limit_usd:change.limit_usd,revision:1,updated_at:stamp,updated_by:'admin@example.test',used_usd:0});}
       return json(listing());}
     const match=p.match(/^\/api\/admin\/spend-limits\/(.+)$/);
-    if(match&&method==='DELETE'){const id=decodeURIComponent(match[1]),row=state.limits.find(item=>item.id===id);
+    if(match&&method==='DELETE'){const id=decodeURIComponent(match[1]),row=id.startsWith('group:')?tierOf(id)??deletedOf(id):state.limits.find(item=>item.id===id);
       if(!row||Number(url.searchParams.get('revision'))!==row.revision)return json({detail:STALE},409);
-      state.limits=state.limits.filter(item=>item.id!==id);return json(listing());}
+      state.limits=state.limits.filter(item=>item.id!==id);state.tiers=state.tiers.filter(item=>item!==row);state.orphanedTiers=state.orphanedTiers.filter(item=>item!==row);return json(listing());}
   }
   // Audit log
   if(p==='/api/admin/governance/audit/export') {
@@ -317,7 +343,7 @@ test('roles: create with grouped permissions, assign by email, grant a group and
 
   await page.getByRole('button',{name:'Change grant for Finance'}).click();
   const grant=page.getByRole('dialog',{name:'Grant for Finance'});await choose(grant,page,'Additional role','Auditor');await grant.getByRole('button',{name:'Save grant'}).click();await grant.waitFor({state:'hidden'});
-  assert.deepEqual(last('/api/admin/group-roles/g-fin','PUT').body,{role_id:'auditor',revision:0});
+  assert.deepEqual(last('/api/admin/group-roles/'+GF,'PUT').body,{role_id:'auditor',revision:0});
 
   await page.getByRole('button',{name:'Archive Contractor'}).click();
   const archive=page.getByRole('dialog',{name:'Archive Contractor?'});
@@ -475,7 +501,7 @@ test('spend limits: blank means no limit, overrides add/edit/remove, and only ch
   await edit.getByRole('textbox',{name:'Monthly limit (USD)'}).fill('');await edit.getByRole('button',{name:'Save limit'}).click();await edit.waitFor({state:'hidden'});
   assert.deepEqual(last('/api/admin/spend-limits','PUT').body,{changes:[{id:'user:carol@example.test',limit_usd:null,revision:2}]});
   await page.getByRole('button',{name:'Remove override for carol@example.test'}).click();const remove=page.getByRole('dialog',{name:'Remove the override for carol@example.test?'});
-  await remove.getByText(/They return to the default monthly limit \(\$200\.00\)/).waitFor();await remove.getByRole('button',{name:'Remove override'}).click();await remove.waitFor({state:'hidden'});
+  await remove.getByText(/They return to their directory group tier, if any, or the default monthly limit \(\$200\.00\)/).waitFor();await remove.getByRole('button',{name:'Remove override'}).click();await remove.waitFor({state:'hidden'});
   assert.equal(last('/api/admin/spend-limits/user:carol@example.test','DELETE').query,'?revision=3');
   await table.getByText('carol@example.test').waitFor({state:'detached'});
   assert.equal(spendReads(),reads,'saves that return the full listing replace it without another read');
@@ -488,6 +514,100 @@ test('spend limits: blank means no limit, overrides add/edit/remove, and only ch
   assert.equal(await summary.count(),0,'usage totals are hidden when the listing has none');
   assert.equal(await table.getByRole('row').filter({hasText:'dan@example.test'}).getByRole('cell',{name:'—',exact:true}).count(),1,'per-person spend is unknown without usage');
   assert.equal(spendReads(),reads,'a listing without usage still replaces the page without another read');
+});
+
+test('spend limits: directory group tiers, the unlimited confirmation and the limit lookup',async t=>{
+  reset();const page=await pageFor(t,'#settings/spend-limits');
+  const tiers=page.getByRole('region',{name:'Directory group spend tiers'});await tiers.getByText('Engineering',{exact:true}).waitFor();
+  await page.getByText(/else the highest tier among their directory groups \(no limit is highest\), else the default/).waitFor();
+  assert.equal(await tiers.getByRole('row').filter({hasText:'Engineering'}).getByRole('cell',{name:'$50.00',exact:true}).count(),1);
+  await page.getByRole('button',{name:'Add tier'}).click();const add=page.getByRole('dialog',{name:'Add a directory group tier'});
+  assert.match(await add.getByRole('combobox',{name:'Directory group'}).innerText(),/Finance · 3 active members/,'only untiered groups are offered');
+  await add.getByRole('textbox',{name:'Monthly limit per person (USD)'}).fill('');
+  await add.getByRole('button',{name:'Add tier'}).click();
+  await add.getByRole('alert').getByText(/Save Finance without a limit\? Its active members without an override will have no monthly limit/).waitFor();
+  assert.equal(last('/api/admin/spend-limits','PUT'),undefined,'an unlimited tier needs a second, explicit save');
+  if(screens)await page.screenshot({path:path.join(screens,'spend-tier-editor-1440.png')});
+  await add.getByRole('button',{name:'Save without a limit'}).click();await add.waitFor({state:'hidden'});
+  assert.deepEqual(last('/api/admin/spend-limits','PUT').body,{changes:[{id:'group:'+GF,limit_usd:null,revision:0}]});
+  await tiers.getByRole('row').filter({hasText:'Finance'}).getByText('Members are exempt from the default').waitFor();
+  assert.equal(await page.getByRole('button',{name:'Add tier'}).count(),0,'every group has a tier');
+  await page.getByRole('button',{name:'Edit tier for Engineering'}).click();const edit=page.getByRole('dialog',{name:'Edit tier for Engineering'});
+  assert.equal(await edit.getByRole('combobox',{name:'Directory group'}).count(),0);
+  await edit.getByRole('textbox',{name:'Monthly limit per person (USD)'}).fill('75');await edit.getByRole('button',{name:'Save tier'}).click();await edit.waitFor({state:'hidden'});
+  assert.deepEqual(last('/api/admin/spend-limits','PUT').body,{changes:[{id:'group:'+GE,limit_usd:75,revision:2}]});
+  // The lookup explains which limit applies, as admission resolves it.
+  await page.getByRole('textbox',{name:'Work email'}).fill('Bob@Example.test');await page.getByRole('button',{name:'Check limit'}).click();
+  const result=page.locator('dl[aria-label="Spend limit for bob@example.test"]');await result.getByText('Finance group tier').waitFor();
+  await result.getByText('No limit').waitFor();await result.getByText('$12.50').waitFor();
+  assert.equal(last('/api/admin/spend-limits/effective','GET').query,'?email=bob%40example.test');
+  await page.getByRole('button',{name:'Remove tier for Finance'}).click();const remove=page.getByRole('dialog',{name:'Remove the tier for Finance?'});
+  await remove.getByText(/Its 3 active members return to their next highest tier, or the default monthly limit \(\$200\.00\)/).waitFor();
+  await remove.getByRole('button',{name:'Remove tier'}).click();await remove.waitFor({state:'hidden'});
+  assert.equal(last('/api/admin/spend-limits/group:'+GF,'DELETE').query,'?revision=1');
+  await page.getByRole('button',{name:'Check limit'}).click();await result.getByText('Engineering group tier').waitFor();await result.getByText('$75.00').waitFor();
+  await page.getByRole('textbox',{name:'Work email'}).fill('carol@localhost');await page.getByRole('button',{name:'Check limit'}).click();
+  await page.getByRole('alert').getByText(/Enter a work email address/).waitFor();
+  // Tiers of deleted groups apply to no one, but use capacity until a limit manager removes them.
+  const gone=(id,name,revision)=>({id:'group:'+id,group_id:id,group_name:name,limit_usd:10,revision,updated_at:stamp,updated_by:'admin@example.test'});
+  state.orphanedTiers=[gone('d0'.repeat(16),'Retired',3),gone('c0'.repeat(16),'',1)];await page.getByRole('button',{name:'Refresh'}).click();
+  await page.getByText('2 tiers belong to deleted directory groups and no longer apply. Remove them to free tier capacity.',{exact:false}).waitFor();
+  const deleted=page.getByRole('region',{name:'Tiers of deleted directory groups'});
+  await deleted.getByText('Retired',{exact:true}).waitFor();await deleted.getByText('Unknown group',{exact:true}).waitFor();
+  await shoot(page,'spend-deleted-tiers-1440-dark.png');
+  if(screens){await page.evaluate(()=>localStorage.setItem('moyai-appearance','light'));await page.reload();
+    await deleted.getByText('Retired',{exact:true}).waitFor();await shoot(page,'spend-deleted-tiers-1440-light.png');}
+  await page.getByRole('button',{name:'Remove tier for deleted group Retired'}).click();
+  const removeDeleted=page.getByRole('dialog',{name:'Remove the tier for deleted group Retired?'});
+  await removeDeleted.getByText(/It applies to no one, since its directory group was deleted/).waitFor();
+  await removeDeleted.getByRole('button',{name:'Remove tier'}).click();await removeDeleted.waitFor({state:'hidden'});
+  assert.equal(last('/api/admin/spend-limits/group:'+'d0'.repeat(16),'DELETE').query,'?revision=3');
+  await page.getByText('1 tier belongs to a deleted directory group and no longer applies.',{exact:false}).waitFor();
+  assert.equal(await deleted.getByText('Retired',{exact:true}).count(),0);
+  // A read-only viewer sees tiers, and deleted groups' tiers, without actions.
+  reset({role:'member',permissions:[...MEMBER,'spend.read'],orphanedTiers:[gone('d0'.repeat(16),'Retired',3)]});await page.reload();
+  await page.getByRole('region',{name:'Directory group spend tiers'}).getByText('Engineering',{exact:true}).waitFor();
+  await page.getByRole('region',{name:'Tiers of deleted directory groups'}).getByText('Retired',{exact:true}).waitFor();
+  assert.equal(await page.getByRole('button',{name:/tier for Engineering|Add tier|deleted group/}).count(),0);
+  assert.equal(await page.getByText('Remove them to free tier capacity.',{exact:false}).count(),0);
+  // Without spend.manage the listing has no untiered groups; that is not "no directory groups".
+  reset({role:'member',permissions:[...MEMBER,'spend.read'],tiers:[]});await page.reload();
+  await page.getByText('No tiers. People without an override use the default monthly limit.').waitFor();
+  assert.equal(await page.getByText(/No directory groups yet/).count(),0);
+  // Without directory groups, the section points to Provisioning.
+  reset({groups:[],tiers:[]});await page.reload();
+  const section=page.getByRole('region',{name:'Directory group tiers',exact:true});
+  await section.getByText(/No directory groups yet/).waitFor();assert.equal(await section.getByRole('link',{name:'Provisioning'}).count(),1);
+});
+
+test('Home shows the personal budget notice at two-thirds, at the limit and while a cost is recorded',async t=>{
+  const scope=patch=>({limit_usd:30,used_usd:21,level:'warning',source:'group',group_name:'Engineering',...patch});
+  const status=(personal,organization_reached=false,organization_pending=false)=>({period_start:'2026-10-01T00:00:00+00:00',resets_at:'2026-11-01T00:00:00+00:00',warning_ratio:2/3,personal,organization_reached,organization_pending});
+  reset({spendStatus:status(scope())});const page=await pageFor(t,'');await page.getByRole('textbox',{name:'Message Moyai'}).waitFor();
+  const notice=page.locator('.spend-status');
+  await notice.getByText('You have used $21.00 of your $30.00 monthly model budget. It resets on November 1 (UTC).').waitFor();
+  assert.equal(await notice.getAttribute('role'),'status');assert.match(await notice.getAttribute('class'),/\bnotice\b/);
+  if(screens)await page.screenshot({path:path.join(screens,'spend-notice-1440.png')});
+  state.spendStatus=status(scope({used_usd:30,level:'reached'}));await page.reload();
+  await notice.getByText(/Your \$30\.00 monthly model budget is used up\. New model requests are refused until November 1 \(UTC\)/).waitFor();
+  assert.match(await notice.getAttribute('class'),/\berror\b/);
+  state.spendStatus=status(scope({used_usd:null,level:'pending'}));await page.reload();
+  await notice.getByText(/An earlier model request's cost is still being recorded/).waitFor();
+  state.spendStatus=status(null,true);await page.reload();
+  await notice.getByText(/The organization's monthly model budget is used up/).waitFor();
+  state.spendStatus=status(null,false,true);await page.reload();
+  await notice.getByText(/An earlier model request's cost is still being recorded/).waitFor();
+  state.spendStatus=status(scope({used_usd:5,level:'ok'}));await page.reload();await page.getByRole('textbox',{name:'Message Moyai'}).waitFor();
+  await waitFor(()=>state.requests.filter(req=>req.path==='/api/spend/status').length>=6,'status read');
+  assert.equal(await notice.count(),0,'nothing below two-thirds');
+  await page.setViewportSize({width:320,height:640});state.spendStatus=status(scope());await page.reload();await notice.waitFor();
+  assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true,'the notice wraps at 320px');
+  // Without spend.personal, or outside existing-product mode, nothing is read or shown.
+  for(const overrides of [{role:'member',permissions:MEMBER.filter(x=>x!=='spend.personal')},{mode:'standalone'}]) {
+    reset({spendStatus:status(scope()),...overrides});await page.reload();await page.getByRole('textbox',{name:'Message Moyai'}).waitFor();
+    await page.waitForTimeout(200);
+    assert.equal(state.requests.filter(req=>req.path==='/api/spend/status').length,0);assert.equal(await notice.count(),0);
+  }
 });
 
 test('spend limits: spend.manage without spend.read edits limits without seeing usage',async t=>{

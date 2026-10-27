@@ -21,6 +21,7 @@ from starlette.responses import Response, StreamingResponse
 
 from .contracts import RunScope
 from .inference_guardrails import HEADER as GUARDRAIL_HEADER
+from .inference_spend import denied_headers
 from .inference_usage import INFERENCE_ACTIVITY, InferenceActivity
 from .models import now
 from .product_inference import InferenceAdmissionError, drain
@@ -58,9 +59,10 @@ async def _read(upstream: httpx2.Response, limit: int) -> bytes | None:
 
 
 def _failed(activity: InferenceActivity) -> Response:
-    # Upstream errors can contain credentials; only fixed outcomes cross.
+    # Upstream errors can contain credentials; only fixed outcomes cross, such
+    # as a spend refusal's reason.
     if activity.admission_error is not None:
-        return Response(status_code=409, headers={"x-moyai-inference-denied": "1"})
+        return Response(status_code=409, headers=denied_headers(activity.admission_error))
     if activity.guardrail is not None:
         return Response(status_code=502, headers={GUARDRAIL_HEADER: activity.guardrail})
     return Response(status_code=502)
@@ -142,13 +144,13 @@ async def _maintenance_response(
     # Shutdown removes the slot runner. Check before constructing its coroutine;
     # registration has no intervening await and perform() checks admission again.
     if not service.started or service.slots is None:
-        return Response(status_code=409, headers={"x-moyai-inference-denied": "1"})
+        return Response(status_code=409, headers=denied_headers(None))
 
     async def perform() -> Response:
         try:
             client = service.upstream_client()
         except InferenceAdmissionError:
-            return Response(status_code=409, headers={"x-moyai-inference-denied": "1"})
+            return Response(status_code=409, headers=denied_headers(None))
         token = INFERENCE_ACTIVITY.set(activity)
         upstream = None
         try:
@@ -210,7 +212,7 @@ def product_inference_routes(service: ProductInferenceService) -> APIRouter:
         try:
             _verify(service, authorization, route, None)
         except InferenceAdmissionError:
-            return Response(status_code=403, headers={"x-moyai-inference-denied": "1"})
+            return Response(status_code=403, headers=denied_headers(None))
         content = bytearray()
         async for chunk in request.stream():
             content.extend(chunk)
@@ -225,7 +227,7 @@ def product_inference_routes(service: ProductInferenceService) -> APIRouter:
             else:
                 await service.database.authorize_scope(scope)
         except (InferenceAdmissionError, PermissionError, HTTPException):
-            return Response(status_code=403, headers={"x-moyai-inference-denied": "1"})
+            return Response(status_code=403, headers=denied_headers(None))
         activity = InferenceActivity(
             service.database, scope, identity, requests=ordinal - 1, logical_identity=logical,
             foreground=foreground, broker_received_at=received_at,
@@ -235,7 +237,7 @@ def product_inference_routes(service: ProductInferenceService) -> APIRouter:
         try:
             client = service.upstream_client()
         except InferenceAdmissionError:
-            return Response(status_code=409, headers={"x-moyai-inference-denied": "1"})
+            return Response(status_code=409, headers=denied_headers(None))
         token = INFERENCE_ACTIVITY.set(activity)
         try:
             upstream = await client.send(client.build_request(

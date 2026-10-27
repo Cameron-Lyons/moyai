@@ -20,6 +20,7 @@ import { cancelQueuedTurn, createSession, createSessionAnswer, createSessionMess
 import { listHistorySessions, searchHistory, type HistorySessionList, type SourcedHistorySession } from "./generated/api"
 import { downloadDebugTrace } from "./debug-trace"
 import { FailureBanner } from "./failure-banner"
+import { SpendStatusNotice } from "./spend-status"
 import { AttachButton, AttachmentPreviews, useAttachments, useFileDrop, FileDropOverlay } from "./attachments"
 import slackLogo from "./assets/slack-logo.svg"
 import { Home } from "./home"
@@ -388,7 +389,8 @@ function App() {
           onSession={session => { setCurrentSession(session); setInitialConversation(previous => previous?.value.session.id === (session?.id ?? nativeSelected) ? null : previous) }} />
         : selected
         ? <div className="center" role={routeError ? "alert" : "status"}>{routeError || "Opening conversation…"}{routeError && <Button variant="outline" onClick={() => setRouteRevision(value => value + 1)}>Retry</Button>}</div>
-        : <Home initiallyPrivate={startPrivate} preferences={me.preferences} models={me.models} defaultModel={me.default_model} individual={me.user.individual !== false} productMode={me.product_mode} connectionVersion={connectionVersion} securityPolicies={me.product_mode === "existing" && access !== null && can(access, "security.manage")} onCreated={refresh}
+        : <Home initiallyPrivate={startPrivate} preferences={me.preferences} models={me.models} defaultModel={me.default_model} individual={me.user.individual !== false} productMode={me.product_mode} connectionVersion={connectionVersion} securityPolicies={me.product_mode === "existing" && access !== null && can(access, "security.manage")}
+          spendStatus={me.product_mode === "existing" && access !== null && can(access, "spend.personal")} onCreated={refresh}
           recentSessions={listView === "active" ? sessions.map(row => sessionUpdates.apply(row))
             .filter(row => sessionCreatedByMe(row, me.user.id) && !row.parent_session_id && !row.archived && !row.deleted)
             .sort((a, b) => (Date.parse(b.updated_at ?? "") || 0) - (Date.parse(a.updated_at ?? "") || 0)).slice(0, 5)
@@ -1157,6 +1159,8 @@ function Conversation({ id, me, connections, connectionVersion, refreshList, wor
             {notice.key === "history" && <Button type="button" size="sm" variant="ghost" disabled={historyState.loading} onClick={() => void reloadAfterAction()}>Retry history</Button>}
             <Button type="button" size="sm" variant="ghost" onClick={notice.clear}>Dismiss</Button>
           </div>)}
+          {!sideMode && me.product_mode === "existing" && can({ role: me.user.role, permissions: me.permissions }, "spend.personal")
+            && <SpendStatusNotice refreshKey={view.turns[0]?.error ? view.turns[0].id : ""} />}
           {answeringQuestion && <p className="question-reply-hint">Your reply will answer the pending question.</p>}
           {requestAnswered && <p className="question-reply-hint">Your answer was sent. You can send a follow-up.</p>}
           {session.status === "waiting" && view.can_answer && !answeringQuestion && !requestAnswered && <p className="notice">Resolve the requests above to continue. New messages will be queued.</p>}

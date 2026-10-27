@@ -17,6 +17,7 @@ import test_product_automations as automation_fixtures
 import test_product_inference as inference_fixtures
 import test_product_skill_tools as skill_fixtures
 from app.security_profiles import ProfilePolicy, SecurityProfiles, dump_policy
+from app.spend_limits import REACHED, SpendLimitReached
 from fastapi import HTTPException
 from sqlalchemy import func, select, text, update
 from sqlalchemy.exc import DBAPIError
@@ -313,25 +314,115 @@ async def test_workflow_network_policies_follow_the_default_provider(governed, m
                 await governance.workflow(db, principal, definition, model='test')
 
 
-@pytest.mark.parametrize('kind', ['organization', 'user-default', 'session-default', 'user'])
-async def test_spend_limits_block_actual_paid_dispatch_at_each_scope(inference, kind):
+ENGINEERING, FINANCE = 'e' * 32, 'f' * 32
+GROUP_NAMES = {ENGINEERING: 'Engineering', FINANCE: 'Finance'}
+
+
+async def spend_limit(product, identity, limit):
+    kind, _, subject = identity.partition(':')
+    await source_write(product, '''INSERT INTO moyai.spend_limits VALUES(:id,:kind,:subject,:limit,1,'owner','now')
+        ON CONFLICT(id) DO UPDATE SET limit_usd=:limit''', id=identity, kind=kind, subject=subject, limit=limit)
+
+
+async def directory_member(product, *groups):
+    """Provision the admitted person in these groups. Provisioning alone keeps their saved authority."""
+    await source_write(product, '''INSERT INTO moyai.scim_users VALUES('directory-admin','','admin@example.test','{}',1,'',
+        'now','now',1,0) ON CONFLICT(id) DO NOTHING''')
+    for group in groups:
+        await source_write(product, '''INSERT INTO moyai.scim_groups VALUES(:id,'',:name,:key,'','now','now',1)
+            ON CONFLICT(id) DO NOTHING''', id=group, name=GROUP_NAMES[group], key=GROUP_NAMES[group].casefold())
+        await source_write(product, "INSERT INTO moyai.scim_group_members VALUES(:id,'directory-admin')", id=group)
+
+
+async def group_tier(product, group, limit):
+    await source_write(product, '''INSERT INTO moyai.spend_group_limits VALUES(:id,:limit,1,'owner','now')
+        ON CONFLICT(group_id) DO UPDATE SET limit_usd=:limit''', id=group, limit=limit)
+
+
+async def refused(ctx, logical, reason):
+    with pytest.raises(SpendLimitReached, match='spend limit') as caught:
+        await perform(ctx, logical=logical)
+    assert (caught.value.status_code, caught.value.reason, caught.value.detail) == (403, reason, REACHED[reason])
+
+
+@pytest.mark.parametrize(('kind', 'reason'), [('organization', 'organization'), ('user-default', 'user'),
+                                              ('session-default', 'session'), ('user', 'user'), ('group', 'user')])
+async def test_spend_limits_block_actual_paid_dispatch_at_each_scope(inference, kind, reason):
     ctx = inference
     attach(ctx.product)
-    identity = 'user:admin@example.test' if kind == 'user' else kind
-    await source_write(ctx.product, 'INSERT INTO moyai.spend_limits VALUES(:id,:kind,:subject,0.20,1,\'owner\',\'now\')',
-                       id=identity, kind=kind, subject='admin@example.test' if kind == 'user' else '')
+    if kind == 'group':
+        # A directory member's tier, without a default or override.
+        await directory_member(ctx.product, ENGINEERING)
+        await group_tier(ctx.product, ENGINEERING, 0.20)
+    else:
+        await spend_limit(ctx.product, 'user:admin@example.test' if kind == 'user' else kind, 0.20)
     await perform(ctx, cost='0.25')  # Soft threshold: this admitted request can cross it.
-    with pytest.raises(HTTPException, match='spend limit'):
-        await perform(ctx, logical='second')
+    await refused(ctx, 'second', reason)
     assert len(ctx.calls) == len(await requests(ctx)) == 1
+
+
+async def test_admission_applies_the_override_else_the_most_permissive_live_tier(inference):
+    ctx = inference
+    attach(ctx.product)
+    await spend_limit(ctx.product, 'user-default', 0.10)
+    await directory_member(ctx.product, ENGINEERING, FINANCE)
+    await group_tier(ctx.product, ENGINEERING, 0.20)
+    await group_tier(ctx.product, FINANCE, 5.0)
+    await perform(ctx, logical='first', cost='0.25')
+    await perform(ctx, logical='second')  # The $5 tier beats the $0.20 tier and replaces the $0.10 default.
+    await spend_limit(ctx.product, 'user:admin@example.test', 0.10)
+    await refused(ctx, 'override', 'user')  # An override beats every tier.
+    await source_write(ctx.product, "DELETE FROM moyai.spend_limits WHERE id='user:admin@example.test'")
+    # Leaving a group through SCIM applies at the next request, and the saved grant stays valid.
+    await source_write(ctx.product, 'DELETE FROM moyai.scim_group_members WHERE group_id=:id', id=FINANCE)
+    await refused(ctx, 'left', 'user')
+    await group_tier(ctx.product, ENGINEERING, None)
+    await perform(ctx, logical='unlimited')  # An unlimited tier exempts its members from the default.
+    # A deleted group's tier stops applying; the default returns.
+    await source_write(ctx.product, "UPDATE moyai.scim_groups SET deleted_at='now' WHERE id=:id", id=ENGINEERING)
+    await refused(ctx, 'deleted', 'user')
+    assert len(ctx.calls) == 3
+
+
+async def test_directory_tiers_add_no_admission_statement_or_write(inference):
+    from sqlalchemy import event
+    ctx = inference
+    governance = attach(ctx.product)
+    statements = []
+
+    def record(conn, cursor, statement, parameters, context, executemany):
+        statements.append(statement)
+
+    async def admitted():
+        statements.clear()
+        async with ctx.product.database.sessions.begin() as db:
+            await governance.check_model(ctx.scope, model='test', db=db)
+        return list(statements)
+    engine = ctx.product.database.engine.sync_engine
+    event.listen(engine, 'before_cursor_execute', record)
+    try:
+        unlimited = await admitted()
+        await spend_limit(ctx.product, 'user-default', 10.0)
+        limited = await admitted()
+        await directory_member(ctx.product, ENGINEERING, FINANCE)
+        await group_tier(ctx.product, ENGINEERING, 5.0)
+        await group_tier(ctx.product, FINANCE, 6.0)
+        tiered = await admitted()
+    finally:
+        event.remove(engine, 'before_cursor_execute', record)
+    # The limits read is one statement either way; a limited person adds one ledger sum.
+    assert len(tiered) == len(limited) == len(unlimited) + 1
+    for run in (unlimited, limited, tiered):
+        reads = [statement for statement in run if 'spend_limits' in statement]
+        assert len(reads) == 1 and 'spend_group_limits' in reads[0] and 'UNION ALL' in reads[0]
+        assert not [statement for statement in run if statement.lstrip().upper().startswith(('INSERT', 'UPDATE', 'DELETE'))]
 
 
 async def test_zero_budget_and_unpriced_cost_block_before_provider_call(inference):
     ctx = inference
     attach(ctx.product)
     await source_write(ctx.product, "INSERT INTO moyai.spend_limits VALUES('organization','organization','',0,1,'owner','now')")
-    with pytest.raises(HTTPException, match='spend limit'):
-        await perform(ctx)
+    await refused(ctx, 'logical-one', 'organization')
     assert not ctx.calls and not await requests(ctx)
     await source_write(ctx.product, "UPDATE moyai.spend_limits SET limit_usd=10 WHERE id='organization'")
     entered, release = asyncio.Event(), asyncio.Event()
@@ -353,8 +444,7 @@ async def test_zero_budget_and_unpriced_cost_block_before_provider_call(inferenc
     assert len(ctx.calls) == 2
     # A finished request without a reported cost makes the limit fail closed.
     await perform(ctx, logical='unpriced', cost=None)
-    with pytest.raises(HTTPException, match='spend limit'):
-        await perform(ctx, logical='after')
+    await refused(ctx, 'after', 'pending')
     assert len(ctx.calls) == 3
 
 
@@ -509,7 +599,7 @@ async def test_spend_page_reports_usage_as_admission_counts_it(inference):
 
     class Listing:
         def listing(self):
-            return {'limits': [dict(SPEND_ROW), dict(person)]}
+            return spend_listing(SPEND_ROW, person)
     task = asyncio.create_task(perform(ctx, logical='running', handler=running))
     async with governance_client(ctx.product, spend_limits=Listing()) as client:
         try:
@@ -598,6 +688,19 @@ def governance_client(product, **services):
 
 SPEND_ROW = {'id': 'organization', 'kind': 'organization', 'subject': '', 'limit_usd': 10.0, 'revision': 1,
              'updated_at': '2026-10-21T00:00:00Z', 'updated_by': 'admin@example.test'}
+TIER_ROW = {'id': 'group:' + 'e' * 32, 'group_id': 'e' * 32, 'group_name': 'Engineering', 'member_count': 3,
+            'limit_usd': None, 'revision': 2, 'updated_at': '2026-10-21T00:00:00Z', 'updated_by': 'admin@example.test'}
+ORPHAN_ROW = {'id': 'group:' + 'd' * 32, 'group_id': 'd' * 32, 'group_name': 'Retired', 'limit_usd': 4.0,
+              'revision': 3, 'updated_at': '2026-10-21T00:00:00Z', 'updated_by': 'admin@example.test'}
+UNTIERED = {'id': 'f' * 32, 'display_name': 'Finance', 'member_count': 2}
+
+
+def spend_listing(*rows, tiers=(), orphans=()):
+    """SpendLimits.listing's shape; Finance is a live group without a tier."""
+    return {'limits': [dict(row) for row in rows], 'group_limits': [dict(row) for row in tiers],
+            'directory_groups': [{'id': row['group_id'], 'display_name': row['group_name'],
+                                  'member_count': row['member_count']} for row in tiers] + [UNTIERED],
+            'orphaned_group_limits': [dict(row) for row in orphans]}
 
 
 async def test_spend_management_without_read_permission_does_not_return_usage(governed, monkeypatch):
@@ -605,19 +708,25 @@ async def test_spend_management_without_read_permission_does_not_return_usage(go
     await member_role(product, ['spend.manage'])
     class ConfigurationOnly:
         def save(self, body, actor):
-            return {'limits': [SPEND_ROW]}
+            return spend_listing(SPEND_ROW, tiers=[TIER_ROW], orphans=[ORPHAN_ROW])
         def delete(self, identity, revision, actor):
             return {'id': identity, 'deleted': True}
         def listing(self):
-            return {'limits': [SPEND_ROW]}
+            return spend_listing(SPEND_ROW, tiers=[TIER_ROW], orphans=[ORPHAN_ROW])
     def no_usage():
         pytest.fail('A limit writer without spend.read reached the usage query.')
     async with governance_client(product, spend_limits=ConfigurationOnly(),
                                  database=SimpleNamespace(sessions=no_usage)) as client:
-        configuration = {'limits': [{**SPEND_ROW, 'used_usd': None}], 'usage': None, 'can_manage': True}
-        response = await client.put('/api/admin/spend-limits', json={'changes': [{'id': 'organization', 'limit_usd': 10.0, 'revision': 0}]})
+        # A limit manager gets every live group to choose from, and the ids of deleted groups' tiers.
+        configuration = {**spend_listing({**SPEND_ROW, 'used_usd': None}, tiers=[TIER_ROW], orphans=[ORPHAN_ROW]),
+                         'usage': None, 'can_manage': True}
+        response = await client.put('/api/admin/spend-limits', json={'changes': [
+            {'id': 'organization', 'limit_usd': 10.0, 'revision': 0},
+            {'id': 'group:' + 'E' * 32, 'limit_usd': None, 'revision': 1}]})
         assert response.status_code == 200 and response.json() == configuration
         response = await client.delete('/api/admin/spend-limits/user:person@example.test?revision=1')
+        assert response.status_code == 200 and response.json() == configuration
+        response = await client.delete(f"/api/admin/spend-limits/group:{'d' * 32}?revision=3")
         assert response.status_code == 200 and response.json() == configuration
         # Exercise the handler's own check; route_permission is tested on its own.
         monkeypatch.setattr('app.permissions.route_permission', lambda request: None)
@@ -625,6 +734,131 @@ async def test_spend_management_without_read_permission_does_not_return_usage(go
         assert response.status_code == 200 and response.json() == configuration
         await source_write(product, "UPDATE moyai.enterprise_roles SET permissions='[\"workspace.read\"]' WHERE id='restricted'")
         assert (await client.get('/api/admin/spend-limits')).status_code == 403
+
+
+async def test_spend_readers_see_tiers_but_not_untiered_directory_groups(inference):
+    ctx = inference
+    attach(ctx.product)
+    await member_role(ctx.product, ['spend.read'])
+
+    class Listing:
+        def listing(self):
+            return spend_listing(SPEND_ROW, tiers=[TIER_ROW], orphans=[ORPHAN_ROW])
+    async with governance_client(ctx.product, spend_limits=Listing()) as client:
+        response = await client.get('/api/admin/spend-limits')
+    assert response.status_code == 200
+    body = response.json()
+    # Tier rows name their groups; the other live groups are only for choosing one.
+    assert body['group_limits'] == [TIER_ROW] and body['orphaned_group_limits'] == [ORPHAN_ROW]
+    assert body['directory_groups'] == [] and body['can_manage'] is False and body['usage'] is not None
+
+
+async def test_personal_status_warns_at_two_thirds_and_at_the_limit(inference):
+    ctx = inference
+    attach(ctx.product)
+
+    async def status(client):
+        response = await client.get('/api/spend/status')
+        assert response.status_code == 200
+        body = response.json()
+        assert body['period_start'] < body['resets_at'] and body['warning_ratio'] == 2 / 3
+        assert body['resets_at'].endswith('-01T00:00:00+00:00')
+        assert not (body['organization_reached'] and body['organization_pending'])
+        organization = 'reached' if body['organization_reached'] else 'pending' if body['organization_pending'] else None
+        return body['personal'], organization
+    async with governance_client(ctx.product) as client:
+        assert await status(client) == (None, None)  # No monthly limit applies.
+        await directory_member(ctx.product, ENGINEERING)
+        await group_tier(ctx.product, ENGINEERING, 0.30)
+        tier = {'limit_usd': 0.3, 'source': 'group', 'group_name': 'Engineering'}
+        assert await status(client) == ({**tier, 'used_usd': 0.0, 'level': 'ok'}, None)
+        await perform(ctx, logical='first', cost='0.2')
+        assert await status(client) == ({**tier, 'used_usd': 0.2, 'level': 'warning'}, None)
+        await perform(ctx, logical='second', cost='0.1')
+        assert await status(client) == ({**tier, 'used_usd': 0.3, 'level': 'reached'}, None)
+        # Only whether the organization limit refuses requests, never its amounts.
+        await spend_limit(ctx.product, 'organization', 0.30)
+        assert (await status(client))[1] == 'reached'
+        await spend_limit(ctx.product, 'organization', None)
+        await group_tier(ctx.product, ENGINEERING, 10.0)
+        await perform(ctx, logical='unpriced', cost=None)
+        assert await status(client) == ({**tier, 'limit_usd': 10.0, 'used_usd': None, 'level': 'pending'}, None)
+        # An awaited cost blocks the organization limit too, as admission's 'pending' refusal says.
+        await spend_limit(ctx.product, 'organization', 100.0)
+        assert (await status(client))[1] == 'pending'
+        await spend_limit(ctx.product, 'organization', None)
+        await spend_limit(ctx.product, 'user:admin@example.test', None)
+        assert await status(client) == (None, None)  # An unlimited override.
+    await member_role(ctx.product, ['sessions.read', 'sessions.create'])
+    async with governance_client(ctx.product) as client:
+        assert (await client.get('/api/spend/status')).status_code == 403
+
+
+async def test_limit_lookup_resolves_a_person_as_admission_does(inference):
+    ctx = inference
+    attach(ctx.product)
+    await spend_limit(ctx.product, 'user-default', 1.0)
+    await directory_member(ctx.product, ENGINEERING)
+    await group_tier(ctx.product, ENGINEERING, 5.0)
+    await perform(ctx, cost='0.25')
+    async with governance_client(ctx.product) as client:
+        lookup = (await client.get('/api/admin/spend-limits/effective', params={'email': ' Admin@Example.test'})).json()
+        assert lookup == {'email': 'admin@example.test', 'limit_usd': 5.0, 'source': 'group', 'group_id': ENGINEERING,
+                          'group_name': 'Engineering', 'used_usd': 0.25}
+        other = (await client.get('/api/admin/spend-limits/effective', params={'email': 'other@example.test'})).json()
+        assert other == {'email': 'other@example.test', 'limit_usd': 1.0, 'source': 'default', 'group_id': '',
+                         'group_name': '', 'used_usd': 0.0}
+        assert (await client.get('/api/admin/spend-limits/effective', params={'email': 'not-an-email'})).status_code == 422
+    # A limit manager without spend.read sees the limit, not the usage.
+    await member_role(ctx.product, ['spend.manage'])
+    async with governance_client(ctx.product) as client:
+        lookup = (await client.get('/api/admin/spend-limits/effective', params={'email': 'admin@example.test'})).json()
+        assert (lookup['limit_usd'], lookup['used_usd']) == (5.0, None)
+    await source_write(ctx.product, "UPDATE moyai.enterprise_roles SET permissions='[\"sessions.read\"]' WHERE id='restricted'")
+    async with governance_client(ctx.product) as client:
+        assert (await client.get('/api/admin/spend-limits/effective',
+                                 params={'email': 'admin@example.test'})).status_code == 403
+
+
+async def test_broker_relays_a_spend_refusal_reason_to_the_worker(inference):
+    from fastapi import FastAPI
+
+    from moyai.inference_usage import INFERENCE_ACTIVITY, InferenceActivity, InferenceUsageTransport
+    from moyai.product_inference import ProductInferenceService
+    from moyai.product_inference_routes import product_inference_routes
+    ctx = inference
+    attach(ctx.product)
+    await spend_limit(ctx.product, 'session-default', 0.0)
+    ctx.service.settings = ctx.service.settings.model_copy(update={'public_url': 'https://workspace.invalid'})
+
+    async def upstream(_request):
+        pytest.fail('A refused request reached the gateway.')
+    await inference_fixtures.install_broker_upstream(ctx, upstream)
+    app = FastAPI()
+    app.include_router(product_inference_routes(ctx.service))
+    worker_database = SimpleNamespace(settings=ctx.product.settings, product_identity=ctx.product.adapter)
+    worker = ProductInferenceService(worker_database, ctx.service.settings.model_copy(update={
+        'moyai_separate_broker': True, 'moyai_runtime_role': 'worker', 'litellm_api_key': '',
+    }), None)
+    worker_database.product_inference = worker
+    await worker.start()
+    try:
+        activity = InferenceActivity(worker_database, ctx.scope, 'refused/1', logical_identity='refused')
+        token = INFERENCE_ACTIVITY.set(activity)
+        try:
+            async with httpx2.AsyncClient(transport=InferenceUsageTransport(
+                httpx2.ASGITransport(app=app), require_admission=True,
+            )) as client:
+                response = await client.post('https://gateway.invalid/v1/responses', json={'model': 'test'})
+        finally:
+            INFERENCE_ACTIVITY.reset(token)
+        assert response.status_code == 409 and not response.content
+        assert response.headers['x-moyai-inference-denied'] == '1'
+        assert response.headers['x-moyai-inference-denied-reason'] == 'spend-session'
+        assert isinstance(activity.admission_error, SpendLimitReached) and activity.admission_error.reason == 'session'
+        assert not await requests(ctx) and not ctx.service.active and ctx.service.slots.active == 0
+    finally:
+        await worker.close()
 
 
 async def test_policy_editor_offers_installation_repositories_and_workspace_models(governed, monkeypatch):

@@ -283,8 +283,87 @@ class SpendUsage(GovernanceView):
     unresolved_requests: int
 
 
+LimitSource = Literal["override", "group", "default"]
+
+
+class SpendGroupLimitView(GovernanceView):
+    """A directory group's tier: it replaces user-default for the group's active members."""
+
+    # "group:<group_id>", the id that updateSpendLimits and deleteSpendLimit take.
+    id: str
+    group_id: str
+    group_name: str
+    # Active members of the live group.
+    member_count: int
+    # Monthly limit per member: None is unlimited (exempt from user-default); zero blocks.
+    limit_usd: float | None
+    revision: int
+    updated_at: str
+    updated_by: str
+
+
+class SpendOrphanedGroupLimitView(GovernanceView):
+    """A tier whose directory group was deleted: it applies to no one, but counts toward tier capacity."""
+
+    # "group:<group_id>", the id that deleteSpendLimit takes.
+    id: str
+    group_id: str
+    # The deleted group's last display name; "" when unknown.
+    group_name: str
+    limit_usd: float | None
+    revision: int
+    updated_at: str
+    updated_by: str
+
+
 class SpendLimitsAdmin(GovernanceView):
     limits: list[SpendLimitView]
+    # Tiers of live directory groups, in directory_groups order.
+    group_limits: list[SpendGroupLimitView]
+    # Every live directory group, to choose a tier's group; empty without spend.manage.
+    directory_groups: list[DirectoryGroup]
+    # Tiers of deleted groups by last name; a limit manager removes them.
+    orphaned_group_limits: list[SpendOrphanedGroupLimitView]
     # None for a limit manager without spend.read.
     usage: SpendUsage | None
     can_manage: bool
+
+
+class EffectiveSpendLimit(GovernanceView):
+    """The monthly limit that applies to one person: override, else their most permissive tier, else the default."""
+
+    email: str
+    # None is unlimited; zero blocks.
+    limit_usd: float | None
+    source: LimitSource
+    # The tier's group for source "group", else "".
+    group_id: str
+    group_name: str
+    # Month-to-date spend; None without spend.read or while a cost is awaited.
+    used_usd: float | None
+
+
+class SpendScopeStatus(GovernanceView):
+    limit_usd: float
+    # None while an earlier request's cost is awaited ("pending").
+    used_usd: float | None
+    # "warning" from warning_ratio of the limit; "reached" refuses new model requests.
+    level: Literal["ok", "warning", "reached", "pending"]
+    source: LimitSource
+    # The tier's group for source "group", else "".
+    group_name: str
+
+
+class PersonalSpendStatus(GovernanceView):
+    """The caller's monthly model budget, computed live."""
+
+    # The UTC calendar month the monthly limits cover.
+    period_start: str
+    resets_at: str
+    warning_ratio: float
+    # None when no monthly limit applies to the caller.
+    personal: SpendScopeStatus | None
+    # Whether the organization's monthly limit refuses new model requests; never its amounts.
+    organization_reached: bool
+    # Whether it refuses them until an earlier request's cost is recorded; never its amounts.
+    organization_pending: bool

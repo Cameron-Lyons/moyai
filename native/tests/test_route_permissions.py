@@ -20,6 +20,7 @@ UNGATED = {
     ("GET", "/api/me"): "the caller's own identity and permissions",
     ("GET", "/api/permissions"): "the catalog and the caller's own permissions",
     ("GET", "/api/admin/spend-limits"): "the handler accepts spend.read or spend.manage",
+    ("GET", "/api/admin/spend-limits/effective"): "the handler accepts spend.read or spend.manage",
 }
 
 

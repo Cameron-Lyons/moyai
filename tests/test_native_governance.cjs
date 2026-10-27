@@ -104,6 +104,40 @@ test('spend amounts: blank is no limit, zero blocks, and only changed rows are s
   assert.equal(gov.limitText(null),'No limit');assert.equal(gov.limitText(0),'Blocked ($0.00)');assert.equal(gov.usd(1234.5),'$1,234.50');
 });
 
+test('spend tiers: group ids, the limit source and the personal budget notice',()=>{
+  const tier={id:'group:'+'e'.repeat(32),group_id:'e'.repeat(32),group_name:'Engineering',member_count:12,limit_usd:50,revision:3,updated_at:stamp,updated_by:'admin@example.test'};
+  assert.deepEqual(gov.tierChange('e'.repeat(32),'25',undefined),{id:'group:'+'e'.repeat(32),limit_usd:25,revision:0});
+  assert.deepEqual(gov.tierChange('ignored','',tier),{id:tier.id,limit_usd:null,revision:3});
+  for(const bad of ['','g-eng','E'.repeat(32)])assert.throws(()=>gov.tierChange(bad,'5',undefined),/Choose a directory group/);
+  assert.throws(()=>gov.tierChange('e'.repeat(32),'-1',undefined),/dollar amount/);
+  assert.equal(gov.limitSourceText('override',''),'Per-person override');
+  assert.equal(gov.limitSourceText('group','Engineering'),'Engineering group tier');
+  assert.equal(gov.limitSourceText('group',''),'Directory group tier');
+  assert.equal(gov.limitSourceText('default',''),'Default monthly limit');
+  const status=(personal,organization_reached=false,organization_pending=false)=>({period_start:'2026-10-01T00:00:00+00:00',resets_at:'2026-11-01T00:00:00+00:00',warning_ratio:2/3,personal,organization_reached,organization_pending});
+  const scope=patch=>({limit_usd:30,used_usd:5,level:'ok',source:'group',group_name:'Engineering',...patch});
+  assert.equal(gov.spendNotice(status(null)),null);assert.equal(gov.spendNotice(status(scope())),null);
+  const warning=gov.spendNotice(status(scope({used_usd:21,level:'warning'})));
+  assert.equal(warning.tone,'warning');assert.match(warning.text,/\$21\.00 of your \$30\.00 monthly model budget/);assert.match(warning.text,/November 1/);
+  const reached=gov.spendNotice(status(scope({used_usd:30,level:'reached'})));
+  assert.equal(reached.tone,'reached');assert.match(reached.text,/\$30\.00 monthly model budget is used up/);
+  assert.match(gov.spendNotice(status(scope({limit_usd:0,used_usd:0,level:'reached'}))).text,/blocked by a \$0 monthly limit/);
+  const organization=gov.spendNotice(status(scope({used_usd:21,level:'warning'}),true));
+  assert.equal(organization.tone,'reached');assert.match(organization.text,/organization's monthly model budget is used up/);assert.doesNotMatch(organization.text,/\$/);
+  assert.equal(gov.spendNotice(status(scope({used_usd:null,level:'pending'}))).tone,'pending');
+  // An organization limit waiting on a cost refuses requests too; the notice still holds no amounts.
+  const waiting=gov.spendNotice(status(scope({used_usd:21,level:'warning'}),false,true));
+  assert.equal(waiting.tone,'pending');assert.match(waiting.text,/cost is still being recorded/);assert.doesNotMatch(waiting.text,/\$/);
+  assert.equal(gov.spendNotice(status(scope({used_usd:30,level:'reached'}),false,true)).tone,'reached','a reached personal limit comes first');
+  const rows=render(gov.TierRows,{rows:[tier,{...tier,id:'group:'+'f'.repeat(32),group_id:'f'.repeat(32),group_name:'<b>Finance</b>',limit_usd:null}],canManage:false,onEdit(){},onRemove(){}});
+  assert.doesNotMatch(rows,/>Edit<|>Remove<|Actions|<b>/);assert.match(rows,/&lt;b&gt;Finance/);assert.match(rows,/Members are exempt from the default/);assert.match(rows,/\$50\.00/);
+  assert.match(render(gov.TierRows,{rows:[tier],canManage:true,onEdit(){},onRemove(){}}),/Edit<span class="visually-hidden"> tier for Engineering/);
+  const deleted={id:'group:'+'d'.repeat(32),group_id:'d'.repeat(32),group_name:'',limit_usd:4,revision:3,updated_at:stamp,updated_by:'admin@example.test'};
+  const deletedRows=render(gov.DeletedTierRows,{rows:[deleted],canManage:true,onRemove(){}});
+  assert.match(deletedRows,/Unknown group/);assert.match(deletedRows,/Remove<span class="visually-hidden"> tier for deleted group Unknown group/);assert.match(deletedRows,/\$4\.00/);
+  assert.doesNotMatch(render(gov.DeletedTierRows,{rows:[{...deleted,group_name:'Retired'}],canManage:false,onRemove(){}}),/>Remove<|Actions/);
+});
+
 test('audit filters use whole UTC days, a 100-day window, normalized actors and matching export paths',async t=>{
   const filters={action:'role.created',actor:' Admin@Example.test ',resource_type:'role',from:'2026-07-08',to:'2026-10-15'};
   const query=gov.auditQuery(filters);

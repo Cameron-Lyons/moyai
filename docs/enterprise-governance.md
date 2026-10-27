@@ -9,19 +9,24 @@ not required.
 
 Apply canonical schema revision **25** and native application migration
 **2026-10-21-product-governance-v24** during the coordinated maintenance window
-in [the deployment contract](pydantic-deployment.md). Canonical revision 25 combines
-upstream revision 22 with the governance branch's older revision 22, plus the
-role permissions revision added after the first combined revision 23 (revision 24)
-and the service account, activity audit and spend tier tables (revision 25); none
-of the older layouts is admitted as the combined release. Revision 25 raises the
-compatibility floor, so revision 24 services must not overlap it: they would
-ignore spend tiers. Rolling back to them needs the reviewed database restore
-procedure. Revision 25 needs no native migration of its own. The v24 native
-migration follows upstream v23 (automation chats), adds an immutable
-session-policy table and preserves the previous 23 migration receipts. It is also a registered
+in [the deployment contract](pydantic-deployment.md). Canonical revision 25
+combines upstream revision 22 with the governance branch's older revision 22,
+plus the role permissions revision added after the first combined revision 23
+(revision 24) and the service account, activity audit and spend tier tables
+(revision 25); none of the older layouts is admitted as the combined release.
+Revision 25 raises the compatibility floor, so revision 24 services must not
+overlap it: they would ignore spend tiers. Rolling back to them needs the
+reviewed database restore procedure. The floor cannot tell revision 25 builds
+apart, so tier admission ships in the same release as revision 25: a revision 25
+build without it would accept the schema and ignore tiers, and must never run
+against a store where tiers have been written. If tiers had shipped later, they
+would have needed their own revision and floor. Revision 25 needs no native
+migration of its own. The v24 native migration follows upstream v23 (automation
+chats), adds an immutable session-policy table and preserves the previous 23
+migration receipts. It is also a registered
 [online expansion](native-online-schema.md), so the native table can be prepared
-while v23 services run; the canonical revision still needs the maintenance
-window. Normal startup verifies both schemas; it does not run migrations.
+while v23 services run; the canonical revision still needs the maintenance window.
+Normal startup verifies both schemas; it does not run migrations.
 
 The canonical upgrade retains existing governance configuration and audit events,
 copies the older `floor_profile_id` into the mandatory policy, and adds SCIM
@@ -256,10 +261,89 @@ refuse, so a mixed rollout fails closed.
 ## Spend limits
 
 Configure organization and per-person UTC calendar-month limits, a default
-lifetime session limit, and per-email overrides. `null` means unlimited; zero
-blocks new paid model requests. Per-email totals include all canonical actors
-with that email. A session's total includes its delegated descendants, and a
-child must also remain below every ancestor's session budget.
+lifetime session limit, directory group tiers, and per-email overrides. `null`
+means unlimited; zero blocks new paid model requests. Per-email totals include
+all canonical actors with that email. A session's total includes its delegated
+descendants, and a child must also remain below every ancestor's session budget.
+
+### Directory group tiers
+
+A tier sets the monthly limit per person for the members of one provisioned SCIM
+group, under the id `group:<SCIM group id>` on the same revision-checked
+`/api/admin/spend-limits` writes as the other limits (`spend.manage`). A
+person's monthly limit is:
+
+1. their per-email override, if one exists (even an unlimited one);
+2. otherwise the most permissive tier among their groups: no limit beats any
+   amount, then the highest amount wins;
+3. otherwise the default monthly limit per person.
+
+A tier replaces the default, so it can be lower or higher. The organization and
+session limits still apply on top. Only live groups count, and only for live,
+active SCIM users whose userName is the person's email, the same membership rule
+as group grants. Tiers also apply to built-in administrators: a budget is not a
+permission. People who were never provisioned by SCIM use their override or the
+default. A stored tier that is not a valid amount blocks its members, whatever
+their other tiers allow.
+
+Most permissive means adding a membership never lowers a budget, so a low tier on
+a broad group such as "All employees" does not cap members of a higher tier. To
+restrict one person, give them an override (`$0` blocks them). Because SCIM
+membership chooses the tier, **whoever controls identity provider groups (SCIM
+token holders and IdP administrators) also controls who gets which budget**;
+`scim_group.*` audit events record membership changes. A tier without a limit
+exempts its members from the default, so Settings asks for confirmation.
+
+Membership and tier changes apply from each person's next model request, without
+invalidating running sessions. A deleted group's tier stops applying and its
+members fall back to their next tier or the default, which may be higher. Spend
+limits lists such tiers separately, by the group's last name; they count toward
+the 1,000-tier capacity until a spend manager removes them. A group the identity
+provider creates again has a new id and needs a new tier. A delegated spend
+manager (anyone but a built-in administrator) cannot create, change or remove
+the tier of a live group they belong to. Each tier change records
+`spend_limit.created`, `spend_limit.updated` or `spend_limit.deleted` with
+`kind: "group"` and the group's name.
+
+Settings → Spend limits shows the tiers with their active member counts and a
+"Check a person's limit" lookup (`/api/admin/spend-limits/effective`), which
+resolves one email exactly as admission does and names the override, tier or
+default that applies. It shows the month's spend only to `spend.read` holders.
+Only `spend.manage` holders receive the other live directory groups, to choose a
+new tier's group.
+
+### Refusals and notices
+
+A refused model request fails its turn with the non-retryable
+`MoyaiSpendLimitReached` denial and one fixed sentence, which the web failure
+banner and the Slack thread show. The sentences name the limit but never an
+amount, since sessions and their failures can be shared:
+
+| Reason | Message |
+| --- | --- |
+| Organization | The organization's monthly model spend limit has been reached. Ask a spend manager to review it. |
+| Person | Your monthly model spend limit has been reached. It resets on the first day of next month (UTC); ask a spend manager to raise it. |
+| Session | This session has reached its model spend limit. Start a new session or ask a spend manager to raise the per-session limit. |
+| Pending cost | A spend limit applies and an earlier model request's cost is still being recorded. Try again in a few minutes. |
+
+A limit that recorded spend has reached is reported before one that only awaits a
+cost, since waiting would not help. In split deployments the broker passes only
+this reason to the worker, in its own `x-moyai-inference-denied-reason` header;
+an older or unknown value keeps the generic admission failure, and the request
+is refused either way. Workflows remain enabled: a monthly budget resets by
+itself. Turns that failed before this release keep the generic message.
+
+Home and the conversation composer show people with `spend.personal` a notice
+from `/api/spend/status`, computed live as admission counts spend: once they
+have used two-thirds of their monthly limit, when it is reached, while an
+earlier request's cost is still being recorded, and when the organization's
+monthly limit refuses requests because it is reached or awaits such a cost (the
+status says only which, never its amounts). The notice loads with the page, on
+window focus at most every five minutes, and after a turn fails. It is advisory:
+admission enforces limits whether or not it shows. Durable alerts, Slack or
+email messages, and requests for more budget are not implemented.
+
+### Admission
 
 The inference admission transaction that records the durable request receipt
 checks the budget. Requests still in flight neither count nor block concurrent
@@ -288,12 +372,13 @@ request is unpriced: each limited scope refuses new requests until recovery
 settles the previous ones, and with recovery disabled the limits never block.
 
 A session budget reads only its delegation family, through the family root
-bound with each session. Organization and per-person budgets sum the month's
-ledger rows on every model request, inside the admission transaction, so that
-check grows with the month's request volume. The ledger keeps its existing time,
-actor and session indexes. A covering index or running totals would change the
-ledger that the billing-storage consolidation copies and re-indexes, so they need
-a reviewed billing-storage migration.
+bound with each session. The limits, a person's tiers included, are one read in
+the admission transaction, which writes nothing more for them. Organization and
+per-person budgets sum the month's ledger rows on every model request, inside
+the admission transaction, so that check grows with the month's request volume.
+The ledger keeps its existing time, actor and session indexes. A covering index
+or running totals would change the ledger that the billing-storage consolidation
+copies and re-indexes, so they need a reviewed billing-storage migration.
 
 Native Slack intake does not transcribe audio, since gateway transcription is
 neither admitted against these limits nor recorded in the ledger. The original
@@ -486,7 +571,9 @@ purge and its cutoff in your change log.
 | `/api/admin/security-profiles`, `/api/admin/security-profiles/defaults` | Revision-checked policy configuration, with the editor's app, tool, repository and model choices and the deployment's network enforcement |
 | `/api/security-policy/new-session` | Policy and default model a new session would get; `sessions.create`, and `security.manage` to name a `profile_id` |
 | `/api/sessions/{id}/security-policy` | Accessible session's effective policy |
-| `/api/admin/spend-limits` | Spend configuration and reported usage |
+| `/api/admin/spend-limits` | Spend configuration (overrides and `group:<id>` tiers) and reported usage |
+| `/api/admin/spend-limits/effective` | The monthly limit that applies to one email, and its source |
+| `/api/spend/status` | The caller's own monthly limit and usage (`spend.personal`) |
 | `/api/admin/governance/audit`, `/api/admin/governance/audit/export` | Audit feed and export |
 
 Configuration writes reuse canonical optimistic revisions, live writer-fenced

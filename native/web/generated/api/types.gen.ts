@@ -3685,6 +3685,38 @@ export type EffectResolveResult = {
 };
 
 /**
+ * EffectiveSpendLimit
+ *
+ * The monthly limit that applies to one person: override, else their most permissive tier, else the default.
+ */
+export type EffectiveSpendLimit = {
+    /**
+     * Email
+     */
+    email: string;
+    /**
+     * Group Id
+     */
+    group_id: string;
+    /**
+     * Group Name
+     */
+    group_name: string;
+    /**
+     * Limit Usd
+     */
+    limit_usd: number | null;
+    /**
+     * Source
+     */
+    source: 'override' | 'group' | 'default';
+    /**
+     * Used Usd
+     */
+    used_usd: number | null;
+};
+
+/**
  * EventTrigger
  */
 export type EventTriggerInput = {
@@ -5810,6 +5842,35 @@ export type PersonalSlackStatus = {
      * Oauth Configured
      */
     oauth_configured: boolean;
+};
+
+/**
+ * PersonalSpendStatus
+ *
+ * The caller's monthly model budget, computed live.
+ */
+export type PersonalSpendStatus = {
+    /**
+     * Organization Pending
+     */
+    organization_pending: boolean;
+    /**
+     * Organization Reached
+     */
+    organization_reached: boolean;
+    /**
+     * Period Start
+     */
+    period_start: string;
+    personal: SpendScopeStatus | null;
+    /**
+     * Resets At
+     */
+    resets_at: string;
+    /**
+     * Warning Ratio
+     */
+    warning_ratio: number;
 };
 
 /**
@@ -10780,6 +10841,46 @@ export type SourcedHistorySession = {
 };
 
 /**
+ * SpendGroupLimitView
+ *
+ * A directory group's tier: it replaces user-default for the group's active members.
+ */
+export type SpendGroupLimitView = {
+    /**
+     * Group Id
+     */
+    group_id: string;
+    /**
+     * Group Name
+     */
+    group_name: string;
+    /**
+     * Id
+     */
+    id: string;
+    /**
+     * Limit Usd
+     */
+    limit_usd: number | null;
+    /**
+     * Member Count
+     */
+    member_count: number;
+    /**
+     * Revision
+     */
+    revision: number;
+    /**
+     * Updated At
+     */
+    updated_at: string;
+    /**
+     * Updated By
+     */
+    updated_by: string;
+};
+
+/**
  * SpendLimitChange
  *
  * One row change. limit_usd is required: null removes the limit, 0 blocks.
@@ -10856,10 +10957,84 @@ export type SpendLimitsAdmin = {
      */
     can_manage: boolean;
     /**
+     * Directory Groups
+     */
+    directory_groups: Array<DirectoryGroup>;
+    /**
+     * Group Limits
+     */
+    group_limits: Array<SpendGroupLimitView>;
+    /**
      * Limits
      */
     limits: Array<SpendLimitView>;
+    /**
+     * Orphaned Group Limits
+     */
+    orphaned_group_limits: Array<SpendOrphanedGroupLimitView>;
     usage: SpendUsage | null;
+};
+
+/**
+ * SpendOrphanedGroupLimitView
+ *
+ * A tier whose directory group was deleted: it applies to no one, but counts toward tier capacity.
+ */
+export type SpendOrphanedGroupLimitView = {
+    /**
+     * Group Id
+     */
+    group_id: string;
+    /**
+     * Group Name
+     */
+    group_name: string;
+    /**
+     * Id
+     */
+    id: string;
+    /**
+     * Limit Usd
+     */
+    limit_usd: number | null;
+    /**
+     * Revision
+     */
+    revision: number;
+    /**
+     * Updated At
+     */
+    updated_at: string;
+    /**
+     * Updated By
+     */
+    updated_by: string;
+};
+
+/**
+ * SpendScopeStatus
+ */
+export type SpendScopeStatus = {
+    /**
+     * Group Name
+     */
+    group_name: string;
+    /**
+     * Level
+     */
+    level: 'ok' | 'warning' | 'reached' | 'pending';
+    /**
+     * Limit Usd
+     */
+    limit_usd: number;
+    /**
+     * Source
+     */
+    source: 'override' | 'group' | 'default';
+    /**
+     * Used Usd
+     */
+    used_usd: number | null;
 };
 
 /**
@@ -12870,6 +13045,36 @@ export type UpdateSpendLimitsResponses = {
 };
 
 export type UpdateSpendLimitsResponse = UpdateSpendLimitsResponses[keyof UpdateSpendLimitsResponses];
+
+export type GetEffectiveSpendLimitData = {
+    body?: never;
+    path?: never;
+    query: {
+        /**
+         * Email
+         */
+        email: string;
+    };
+    url: '/api/admin/spend-limits/effective';
+};
+
+export type GetEffectiveSpendLimitErrors = {
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+};
+
+export type GetEffectiveSpendLimitError = GetEffectiveSpendLimitErrors[keyof GetEffectiveSpendLimitErrors];
+
+export type GetEffectiveSpendLimitResponses = {
+    /**
+     * Successful Response
+     */
+    200: EffectiveSpendLimit;
+};
+
+export type GetEffectiveSpendLimitResponse = GetEffectiveSpendLimitResponses[keyof GetEffectiveSpendLimitResponses];
 
 export type DeleteSpendLimitData = {
     body?: never;
@@ -17404,6 +17609,22 @@ export type GetSpendReportResponses = {
 };
 
 export type GetSpendReportResponse = GetSpendReportResponses[keyof GetSpendReportResponses];
+
+export type GetSpendStatusData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/api/spend/status';
+};
+
+export type GetSpendStatusResponses = {
+    /**
+     * Successful Response
+     */
+    200: PersonalSpendStatus;
+};
+
+export type GetSpendStatusResponse = GetSpendStatusResponses[keyof GetSpendStatusResponses];
 
 export type StartSwarmData = {
     body: NewSwarm;

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Iterator
+from itertools import islice
 from typing import TYPE_CHECKING, Any
 
 from pydantic_ai.messages import ModelRequest, ModelResponse, RetryPromptPart, ToolCallPart, ToolReturnPart
@@ -12,6 +14,8 @@ from temporalio.exceptions import ActivityError, ApplicationError
 
 from .history_handoff import is_turn_run, latest_turn_snapshot
 from .inference_guardrails import ERROR_TYPES as GUARDRAIL_ERRORS
+from .inference_spend import ERROR_TYPE as SPEND_ERROR
+from .inference_spend import REACHED as SPEND_NOTICES
 from .models import Event, Turn
 from .presentation import private_tool, redact
 from .progress import progress_secrets
@@ -46,11 +50,21 @@ def safe_failure_metadata(value: dict[str, Any] | None) -> dict[str, Any] | None
     return {"exception_chain": chain} if chain else None
 
 
+def failure_chain(error: BaseException | None) -> Iterator[BaseException]:
+    """The error, then each cause: Temporal's failure cause, else __cause__, else unsuppressed __context__."""
+    seen: set[int] = set()
+    while error is not None and id(error) not in seen:
+        seen.add(id(error))
+        yield error
+        cause = getattr(error, "cause", None) or error.__cause__
+        if cause is None and not error.__suppress_context__:
+            cause = error.__context__
+        error = cause if isinstance(cause, BaseException) else None
+
+
 def capture_failure(error: BaseException) -> dict[str, Any] | None:
-    chain, seen = [], set()
-    current: BaseException | None = error
-    while current is not None and id(current) not in seen and len(chain) < 8:
-        seen.add(id(current))
+    chain = []
+    for current in islice(failure_chain(error), 8):
         item = {"type": type(current).__name__}
         if isinstance(current, ApplicationError) and current.type:
             item["application_type"] = current.type
@@ -58,10 +72,6 @@ def capture_failure(error: BaseException) -> dict[str, Any] | None:
             item["activity_type"] = current.activity_type
             item["activity_id"] = current.activity_id
         chain.append(item)
-        cause = getattr(current, "cause", None) or current.__cause__
-        if cause is None and not current.__suppress_context__:
-            cause = current.__context__
-        current = cause if isinstance(cause, BaseException) else None
     return safe_failure_metadata({"exception_chain": chain})
 
 
@@ -90,6 +100,16 @@ def guardrail_outcome(metadata: dict[str, Any] | None) -> str | None:
         outcomes[item["application_type"]] for item in (metadata or {}).get("exception_chain", ())
         if item.get("application_type") in outcomes
     ), None)
+
+
+def spend_notice(error: BaseException | None) -> str | None:
+    """The fixed sentence of the spend limit refusal that failed this chain, if one did.
+
+    Only a REACHED sentence crosses; any other message keeps the generic notice.
+    """
+    denial = next((item for item in failure_chain(error)
+                   if isinstance(item, ApplicationError) and item.type == SPEND_ERROR), None)
+    return denial.message if denial is not None and denial.message in SPEND_NOTICES.values() else None
 
 
 async def guardrail_refused(database: Database, turn: Turn) -> bool:

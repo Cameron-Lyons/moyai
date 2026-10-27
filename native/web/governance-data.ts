@@ -2,8 +2,8 @@
 // function validates locally with plain-language errors; the server remains
 // authoritative and re-validates every field.
 import type {
-  AuditEntry, ExportGovernanceAuditData, GovernanceGroupRole, GovernanceRole, GovernanceRoleAssignment, GroupRoleChange, PermissionInfo, PolicyCatalog, PolicyCatalogRepository,
-  PolicyView, ProfileDefaults, ProfilePolicy, RoleAssignment, RoleCreate, RoleUpdate, SaveProfile, SecurityProfileView, SpendLimitChange, SpendLimitView,
+  AuditEntry, EffectiveSpendLimit, ExportGovernanceAuditData, GovernanceGroupRole, GovernanceRole, GovernanceRoleAssignment, GroupRoleChange, PermissionInfo, PersonalSpendStatus, PolicyCatalog, PolicyCatalogRepository,
+  PolicyView, ProfileDefaults, ProfilePolicy, RoleAssignment, RoleCreate, RoleUpdate, SaveProfile, SecurityProfileView, SpendGroupLimitView, SpendLimitChange, SpendLimitView,
 } from "./generated/api"
 import type { AuditExportFormat, AuditFilterQuery, AuditFilters, AuditQuery, ConnectedApp, GitAccess } from "./governance-types"
 
@@ -210,6 +210,32 @@ export function spendChanges(limits: readonly SpendLimitView[], drafts: Record<s
 export function overrideChange(email: string, text: string, existing: SpendLimitView | undefined): SpendLimitChange {
   if (existing) return { id: existing.id, limit_usd: parseUsd(text), revision: existing.revision }
   return { id: `user:${normalizeEmail(email)}`, limit_usd: parseUsd(text), revision: 0 }
+}
+/** A directory group's tier: a new tier sends revision 0, an edit the revision that was displayed. */
+export function tierChange(groupId: string, text: string, existing: SpendGroupLimitView | undefined): SpendLimitChange {
+  if (existing) return { id: existing.id, limit_usd: parseUsd(text), revision: existing.revision }
+  if (!/^[0-9a-f]{32}$/.test(groupId)) throw new Error("Choose a directory group.")
+  return { id: `group:${groupId}`, limit_usd: parseUsd(text), revision: 0 }
+}
+/** Where a person's monthly limit comes from: override, else their most permissive group tier, else the default. */
+export function limitSourceText(source: EffectiveSpendLimit["source"], groupName: string): string {
+  if (source === "override") return "Per-person override"
+  if (source === "group") return groupName ? `${groupName} group tier` : "Directory group tier"
+  return "Default monthly limit"
+}
+
+const resetDay = (value: string) => Number.isFinite(Date.parse(value)) ? new Date(value).toLocaleDateString(undefined, { month: "long", day: "numeric", timeZone: "UTC" }) : "the first day of next month"
+export type SpendNotice = { tone: "warning" | "reached" | "pending"; text: string }
+/** The personal budget notice: at two-thirds of the monthly limit, at a limit, or while a cost a limit waits on is recorded. */
+export function spendNotice(status: PersonalSpendStatus): SpendNotice | null {
+  const personal = status.personal, resets = resetDay(status.resets_at)
+  if (personal?.level === "reached") return { tone: "reached", text: personal.limit_usd === 0
+    ? "Your model use is blocked by a $0 monthly limit. Ask a spend manager to raise it."
+    : `Your ${usd(personal.limit_usd)} monthly model budget is used up. New model requests are refused until ${resets} (UTC) or until a spend manager raises your limit.` }
+  if (status.organization_reached) return { tone: "reached", text: `The organization's monthly model budget is used up. New model requests are refused until ${resets} (UTC) or until a spend manager raises it.` }
+  if (personal?.level === "pending" || status.organization_pending) return { tone: "pending", text: "An earlier model request's cost is still being recorded. New model requests may be refused for a few minutes until it is." }
+  if (personal?.level === "warning") return { tone: "warning", text: `You have used ${usd(personal.used_usd)} of your ${usd(personal.limit_usd)} monthly model budget. It resets on ${resets} (UTC).` }
+  return null
 }
 
 // Audit log -------------------------------------------------------------------

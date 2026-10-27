@@ -50,12 +50,13 @@ with workflow.unsafe.imports_passed_through():
     from .contracts import CompletedTurn, PreparedTurn, RunScope, SteeringInput
     from .deployment_handoff import VERSION as DEPLOYMENT_HANDOFF_VERSION
     from .deployment_handoff import DeploymentHandoff
-    from .failure_diagnostics import FAILURE_VERSION, capture_failure, guardrail_outcome
+    from .failure_diagnostics import FAILURE_VERSION, capture_failure, guardrail_outcome, spend_notice
     from .history_handoff import VERSION as HISTORY_VERSION
     from .history_handoff import AgentCheckpoint, CheckpointSave, HistoryHandoff, HistoryLimits
     from .images import prompt_content
     from .inference_guardrails import MESSAGES as GUARDRAIL_MESSAGES
     from .inference_guardrails import VERSION as GUARDRAIL_VERSION
+    from .inference_spend import VERSION as SPEND_VERSION
     from .input_identity import identified_prompt
     from .live_events import public_event_sink
     from .maintenance_workspace import VERSION as MAINTENANCE_WORKSPACE_VERSION
@@ -665,6 +666,9 @@ class TurnWorkflow(PydanticAIWorkflow):
                 message = GUARDRAIL_MESSAGES[guardrail]
             else:
                 guardrail = None
+                if (spend := spend_notice(error)) is not None and workflow.patched(SPEND_VERSION):
+                    # The spend limit's fixed sentence says why, without amounts.
+                    message = spend
             if prepared is not None and guardrail is None and workflow.patched("moyai-failure-workspace-checkpoint-v1"):
                 # Capture before failure settlement clears active ownership. A
                 # capture failure must never prevent the original error settling.

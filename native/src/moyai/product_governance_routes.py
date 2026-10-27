@@ -10,18 +10,20 @@ from app.governance_audit import parse_filters
 from app.permissions import BUILTIN_PERMISSIONS, catalog
 from app.scim import TokenCreate
 from app.security_profiles import PROFILE_ID_PATTERN, ProfileDefaults, SaveProfile
-from app.spend_limits import SpendLimitChanges
+from app.spend_limits import WARNING_RATIO, SpendLimitChanges, SpendLimits, group_name_in, level
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from fastapi.responses import StreamingResponse
 
 from .product_governance_views import (
     AuditPage,
     CreatedScimToken,
+    EffectiveSpendLimit,
     GovernanceGroupRole,
     GovernanceRole,
     GovernanceRoleAssignment,
     NewSessionSecurityPolicy,
     PermissionCatalog,
+    PersonalSpendStatus,
     RolesAdmin,
     ScimAdmin,
     ScimToken,
@@ -165,9 +167,12 @@ def routes(runtime):
                                                         'default_model': model})
 
     async def spend_view(user) -> SpendLimitsAdmin:
-        """The limit listing; usage totals only for a caller holding spend.read."""
+        """The limit listing; usage totals only for spend.read, untiered directory groups only for spend.manage."""
         data = await asyncio.to_thread(product.spend_limits.listing)
-        permitted = 'spend.read' in user.effective_permissions
+        permitted, manage = 'spend.read' in user.effective_permissions, 'spend.manage' in user.effective_permissions
+        if not manage:
+            # Tier rows already name their groups; the rest are only for choosing one.
+            data['directory_groups'] = []
         usage, organization, amounts = None, None, {}
         if permitted:
             from sqlalchemy import column, select, table
@@ -193,8 +198,7 @@ def routes(runtime):
             row['used_usd'] = None if not permitted else (
                 organization if row['kind'] == 'organization'
                 else amounts.get(row['subject'], 0) if row['kind'] == 'user' else None)
-        return SpendLimitsAdmin.model_validate({**data, 'usage': usage,
-                                                'can_manage': 'spend.manage' in user.effective_permissions})
+        return SpendLimitsAdmin.model_validate({**data, 'usage': usage, 'can_manage': manage})
 
     @router.get('/api/admin/spend-limits', operation_id='getSpendLimits')
     async def spend(user=Depends(principal)) -> SpendLimitsAdmin:
@@ -212,6 +216,44 @@ def routes(runtime):
     async def spend_delete(identity: str, revision: int = Query(ge=1), user=Depends(principal)) -> SpendLimitsAdmin:
         await asyncio.to_thread(product.spend_limits.delete, identity, revision, governed(user))
         return await spend_view(user)
+
+    @router.get('/api/admin/spend-limits/effective', operation_id='getEffectiveSpendLimit')
+    async def spend_effective(email: str = Query(min_length=3, max_length=254),
+                              user=Depends(principal)) -> EffectiveSpendLimit:
+        """The monthly limit admission applies to one person, read as admission reads it; usage needs spend.read."""
+        from .product_governance import CanonicalRead
+        if 'spend.manage' not in user.effective_permissions:
+            user.require('spend.read')
+        async with runtime.database.sessions() as db:
+            effective = await db.run_sync(lambda sync: SpendLimits.effective_in(
+                CanonicalRead(sync, product.identity), email))
+            used = await runtime.database.governance.month_spend(db, effective['email']) \
+                if 'spend.read' in user.effective_permissions else None
+        return EffectiveSpendLimit.model_validate({**effective, 'used_usd': None if used is None else float(used)})
+
+    @router.get('/api/spend/status', operation_id='getSpendStatus')
+    async def spend_status(user=Depends(principal)) -> PersonalSpendStatus:
+        """The caller's own monthly limit and usage, computed live as admission counts them.
+
+        Of the organization limit it says only whether it is reached, never
+        amounts; the session limit is shown where a session fails.
+        """
+        from .product_governance import CanonicalRead, month_period
+        user.require('spend.personal')
+        start, end = month_period()
+        async with runtime.database.sessions() as db:
+            state = await runtime.database.governance.spend_state(db, user)
+            limits = state.limits
+            group = await db.run_sync(lambda sync: group_name_in(
+                CanonicalRead(sync, product.identity), limits.user_group)) if limits.user_group else ''
+        used = state.usage.get('user')
+        personal = None if limits.user is None else {
+            'limit_usd': limits.user, 'used_usd': None if used is None else float(used),
+            'level': level(limits.user, used), 'source': limits.user_source, 'group_name': group}
+        organization = level(limits.organization, state.usage.get('organization'))
+        return PersonalSpendStatus.model_validate({
+            'period_start': start, 'resets_at': end, 'warning_ratio': float(WARNING_RATIO), 'personal': personal,
+            'organization_reached': organization == 'reached', 'organization_pending': organization == 'pending'})
 
     def filters(action, actor_email, resource_type, after, before):
         return parse_filters(action=action, actor=actor_email, resource_type=resource_type,

@@ -101,6 +101,7 @@ def settings_for(tmp_path, **overrides):
 OTHER_ADMIN = GovernanceActor(id="google:other-sub", email="other@example.test", builtin_role=None, kind="individual")
 
 
+# Spend amounts are DOUBLE PRECISION, as canonical stores create them on PostgreSQL (REAL is single precision).
 SCHEMA = (
     "CREATE TABLE users (id TEXT PRIMARY KEY, kind TEXT NOT NULL, email TEXT NOT NULL DEFAULT '', name TEXT NOT NULL, linked_user_id TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)",
     "CREATE TABLE user_roles (email TEXT PRIMARY KEY, role TEXT NOT NULL CHECK(role IN ('admin','member')), revision INTEGER NOT NULL, updated_by TEXT NOT NULL, updated_at TEXT NOT NULL)",
@@ -120,7 +121,8 @@ SCHEMA = (
     'CREATE TABLE security_profiles (id TEXT PRIMARY KEY, name TEXT NOT NULL, revision INTEGER NOT NULL, enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0,1)), policy TEXT NOT NULL, updated_by TEXT NOT NULL, updated_at TEXT NOT NULL)',
     'CREATE TABLE security_profile_revisions (profile_id TEXT NOT NULL REFERENCES security_profiles(id), revision INTEGER NOT NULL, policy TEXT NOT NULL, created_by TEXT NOT NULL, created_at TEXT NOT NULL, PRIMARY KEY(profile_id,revision))',
     "CREATE TABLE security_profile_defaults (id INTEGER PRIMARY KEY CHECK(id=1), revision INTEGER NOT NULL, default_profile_id TEXT NOT NULL DEFAULT '', mandatory_profile_id TEXT NOT NULL DEFAULT '', updated_by TEXT NOT NULL, updated_at TEXT NOT NULL)",
-    "CREATE TABLE spend_limits (id TEXT PRIMARY KEY, kind TEXT NOT NULL CHECK(kind IN ('organization','user-default','session-default','user')), subject TEXT NOT NULL DEFAULT '', limit_usd REAL, revision INTEGER NOT NULL, updated_by TEXT NOT NULL, updated_at TEXT NOT NULL)",
+    "CREATE TABLE spend_limits (id TEXT PRIMARY KEY, kind TEXT NOT NULL CHECK(kind IN ('organization','user-default','session-default','user')), subject TEXT NOT NULL DEFAULT '', limit_usd DOUBLE PRECISION, revision INTEGER NOT NULL, updated_by TEXT NOT NULL, updated_at TEXT NOT NULL)",
+    'CREATE TABLE spend_group_limits (group_id TEXT PRIMARY KEY, limit_usd DOUBLE PRECISION CHECK(limit_usd BETWEEN 0 AND 1000000), revision INTEGER NOT NULL CHECK(revision > 0), updated_by TEXT NOT NULL, updated_at TEXT NOT NULL)',
     "CREATE TABLE governance_audit_events (id TEXT PRIMARY KEY, action TEXT NOT NULL, actor TEXT NOT NULL, resource_type TEXT NOT NULL, resource_id TEXT NOT NULL, details TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL)",
     "CREATE TABLE governance_activity_events (id TEXT PRIMARY KEY, action TEXT NOT NULL, outcome TEXT NOT NULL CHECK(outcome IN ('success','denied','failed')), actor TEXT NOT NULL, actor_key TEXT NOT NULL, actor_id TEXT NOT NULL DEFAULT '', resource_type TEXT NOT NULL, resource_id TEXT NOT NULL, session_id TEXT NOT NULL DEFAULT '', client TEXT NOT NULL DEFAULT '', details TEXT NOT NULL DEFAULT '{}' CHECK(length(details) <= 4096), created_at TEXT NOT NULL)",
 )

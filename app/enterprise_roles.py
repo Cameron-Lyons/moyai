@@ -515,6 +515,20 @@ class Authority:
             raise GovernanceForbidden(detail)
 
 
+def directory_groups_in(conn) -> list[dict[str, Any]]:
+    """Live directory groups by display name, each with its active member count.
+
+    Active members are the people a group grant or spend tier applies to; one
+    aggregate, not one read per group.
+    """
+    return [{'id': row['id'], 'display_name': row['display_name'], 'member_count': int(row['member_count'])}
+            for row in conn.execute('''SELECT g.id,g.display_name,g.display_key,COUNT(u.id) AS member_count
+                FROM scim_groups g LEFT JOIN scim_group_members m ON m.group_id=g.id
+                LEFT JOIN scim_users u ON u.id=m.user_id AND u.deleted_at='' AND u.active=1
+                WHERE g.deleted_at='' GROUP BY g.id,g.display_name,g.display_key
+                ORDER BY g.display_key,g.id''')]
+
+
 def _view(row) -> dict[str, Any]:
     return {'id': row['id'], 'name': row['name'], 'description': row['description'],
             'permissions': sorted(role_permissions(row['permissions'])), 'revision': int(row['revision']),
@@ -621,13 +635,7 @@ class EnterpriseRoles:
             } for row in conn.execute('''SELECT r.group_id,r.role_id,r.revision,r.updated_at,r.updated_by,g.display_name
                     FROM enterprise_group_roles r JOIN scim_groups g ON g.id=r.group_id AND g.deleted_at=''
                     ORDER BY g.display_key,r.group_id''')]
-            # Active members, which are the people a grant applies to; one aggregate, not one read per group.
-            groups = [{'id': row['id'], 'display_name': row['display_name'], 'member_count': int(row['member_count'])}
-                      for row in conn.execute('''SELECT g.id,g.display_name,g.display_key,COUNT(u.id) AS member_count
-                          FROM scim_groups g LEFT JOIN scim_group_members m ON m.group_id=g.id
-                          LEFT JOIN scim_users u ON u.id=m.user_id AND u.deleted_at='' AND u.active=1
-                          WHERE g.deleted_at='' GROUP BY g.id,g.display_name,g.display_key
-                          ORDER BY g.display_key,g.id''')]
+            groups = directory_groups_in(conn)
         grantable = [] if authority is None else None if authority.grantable is None else sorted(authority.grantable)
         return {'roles': roles, 'assignments': assignments, 'group_roles': group_roles, 'groups': groups,
                 'grantable': grantable, 'builtin_admin': bool(authority and authority.builtin_admin)}
