@@ -2,8 +2,8 @@
 
 import json
 import os
+from contextlib import asynccontextmanager
 from types import SimpleNamespace
-from typing import Any
 from urllib.parse import urlsplit
 from uuid import uuid4
 
@@ -11,10 +11,12 @@ import httpx
 import psycopg
 import pytest
 import pytest_asyncio
+from app.security import Security
 from app.user_roles import UserRoles
 from fastapi import FastAPI, Response
 from sqlalchemy.ext.asyncio import create_async_engine
 from test_product_connections import bridge as canonical_connections
+from test_product_identity import OKTA, settings_for, with_oidc
 
 from moyai.contracts import NewSession
 from moyai.product_history import ProductHistoryAdapter
@@ -63,6 +65,44 @@ def secret(**overrides):
     }
 
 
+async def manages_an_organization_secret(client, label="Shared"):
+    created = await client.post("/api/credentials/secrets", json=secret(scope="organization"))
+    assert created.status_code == 201, created.text
+    row = (await client.get("/api/credentials")).json()["secrets"][0]
+    assert row["scope"] == "organization" and row["can_manage"]
+    updated = await client.patch("/api/credentials/secrets/" + row["id"], json={"revision": row["revision"], "label": label})
+    assert updated.status_code == 200 and updated.json()["label"] == label, updated.text
+    assert (await client.delete("/api/credentials/secrets/" + row["id"])).json() == {"revoked": True}
+
+
+@asynccontextmanager
+async def signed_in(runtime, bridge, settings, user_id, info):
+    """A secrets API client whose signed session's issuer and subject are bound to user_id."""
+    claims = info["identity"]
+    security = Security(settings, UserRoles(bridge.store, settings))
+    source = create_async_engine(f"sqlite+aiosqlite:///file:{bridge.store.path}?mode=ro&uri=true")
+    identity = ProductIdentityAdapter(settings, source, native_engine=runtime.database.engine)
+    with bridge.store.connect() as db:
+        db.execute("INSERT INTO users(id,kind,email,name,created_at,updated_at) VALUES(?,?,?,?,?,?)",
+                   (user_id, user_id.partition(":")[0], claims["email"], "Person", "2026-10-15", "2026-10-15"))
+        db.execute("INSERT INTO access_identities VALUES(?,?,?,?,?)",
+                   (claims["issuer"], claims["sub"], claims["email"], user_id, "created"))
+    runtime.product = SimpleNamespace(
+        store_proxy=bridge.store, security=security, settings=settings, identity=identity,
+        history=ProductHistoryAdapter(identity, source),
+    )
+    app = FastAPI()
+    app.include_router(ProductSecrets(runtime).routes())
+    try:
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url=settings.public_url) as client:
+            client.cookies.set("workspace_session", security.signer.dumps(info))
+            client.headers.update({"Origin": settings.public_url, "X-CSRF-Token": security.csrf(info["sid"])})
+            yield SimpleNamespace(client=client, app=app, product=runtime.product)
+    finally:
+        runtime.product = None
+        await source.dispose()
+
+
 async def test_canonical_secret_crud_encryption_revision_replay_and_revocation(secrets_api):
     client = secrets_api.client
     response = await client.post("/api/credentials/secrets", json=secret())
@@ -102,12 +142,7 @@ async def test_delegated_credentials_publish_manages_organization_credentials(se
     client = secrets_api.client
     capabilities = (await client.get("/api/credentials")).json()["capabilities"]
     assert capabilities["scopes"] == ["personal", "organization"] and capabilities["organization"]
-    assert (await client.post("/api/credentials/secrets", json=secret(scope="organization"))).status_code == 201
-    row = (await client.get("/api/credentials")).json()["secrets"][0]
-    assert row["scope"] == "organization" and row["can_manage"]
-    updated = await client.patch("/api/credentials/secrets/" + row["id"], json={"revision": row["revision"], "label": "Shared"})
-    assert updated.status_code == 200 and updated.json()["label"] == "Shared", updated.text
-    assert (await client.delete("/api/credentials/secrets/" + row["id"])).json() == {"revoked": True}
+    await manages_an_organization_secret(client)
 
 
 async def test_secret_mutations_require_csrf_and_org_admin_and_hide_invalid_value(secrets_api):
@@ -155,19 +190,13 @@ async def test_shared_password_admin_manages_organization_secrets(secrets_api):
     client.cookies.set("workspace_session", response.headers["set-cookie"].split(";", 1)[0].split("=", 1)[1])
     client.headers["X-CSRF-Token"] = bridge.security.csrf(sid)
     # Password sessions carry no resolved governance set; built-in permissions apply.
-    created = await client.post("/api/credentials/secrets", json=secret(scope="organization"))
-    assert created.status_code == 201, created.text
-    row = (await client.get("/api/credentials")).json()["secrets"][0]
-    updated = await client.patch("/api/credentials/secrets/" + row["id"], json={"revision": row["revision"], "label": "Shared"})
-    assert updated.status_code == 200, updated.text
-    assert (await client.delete("/api/credentials/secrets/" + row["id"])).json() == {"revoked": True}
+    await manages_an_organization_secret(client)
 
 
 async def test_cloudflare_access_secret_mutations_stay_on_the_writer_connection(runtime, bridge):
     import time
 
     import jwt
-    from app.security import Security
     from cryptography.hazmat.primitives.asymmetric import rsa
 
     from moyai.product_access import access_session
@@ -177,120 +206,58 @@ async def test_cloudflare_access_secret_mutations_stay_on_the_writer_connection(
         "cloudflare_access_team_domain": "synthetic.cloudflareaccess.com",
         "cloudflare_access_audience": "employee-audience", "cloudflare_access_broker_audience": "broker-audience",
     })
-    security = Security(settings, UserRoles(bridge.store, settings))
-    source = create_async_engine(f"sqlite+aiosqlite:///file:{bridge.store.path}?mode=ro&uri=true")
-    identity = ProductIdentityAdapter(settings, source, native_engine=runtime.database.engine)
-    claims = {"issuer": identity.access.issuer, "sub": "admin-subject", "email": "admin@example.test",
-              "domain": "example.test"}
-    with bridge.store.connect() as db:
-        db.execute(
-            "INSERT INTO users(id,kind,email,name,created_at,updated_at) VALUES(?,?,?,?,?,?)",
-            ("google:admin", "google", claims["email"], "Admin", "2026-10-15", "2026-10-15"),
-        )
-        db.execute("INSERT INTO access_identities VALUES(?,?,?,?,?)",
-                   (claims["issuer"], claims["sub"], claims["email"], "google:admin", "created"))
+    claims = {"issuer": "https://synthetic.cloudflareaccess.com", "sub": "admin-subject",
+              "email": "admin@example.test", "domain": "example.test"}
     key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-    identity.access.keys = {"local-key": key.public_key()}
-    identity.access.expires = time.monotonic() + 3600
     token = jwt.encode({
         "iss": claims["issuer"], "sub": claims["sub"], "email": claims["email"], "type": "app",
         "aud": settings.cloudflare_access_audience, "iat": int(time.time()), "exp": int(time.time()) + 300,
     }, key, algorithm="RS256", headers={"kid": "local-key"})
-    product: Any = SimpleNamespace(
-        store_proxy=bridge.store, security=security, settings=settings, identity=identity,
-        history=ProductHistoryAdapter(identity, source),
-    )
-    runtime.product = product
-    app = FastAPI()
-    app.include_router(ProductSecrets(runtime).routes())
-
-    @app.middleware("http")
-    async def verified_access(request, call_next):
-        # The native app middleware sets request.state.access_session the same way.
-        assert await access_session(product, request) is None
-        return await call_next(request)
-
     info = {"sid": "signed-access-session", "method": "cloudflare",
             "audience": settings.cloudflare_access_audience, "identity": claims}
-    try:
-        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url=settings.public_url) as client:
-            client.cookies.set("workspace_session", security.signer.dumps(info))
-            client.headers.update({
-                "Origin": settings.public_url, "X-CSRF-Token": security.csrf(info["sid"]),
-                "cf-access-jwt-assertion": token,
-            })
-            # Each mutation re-reads the Access session through the writer's own
-            # connection; a second Store checkout would be a nested-borrow error.
-            created = await client.post("/api/credentials/secrets", json=secret(scope="organization"))
-            assert created.status_code == 201, created.text
-            row = (await client.get("/api/credentials")).json()["secrets"][0]
-            assert row["scope"] == "organization" and row["can_manage"]
-            updated = await client.patch("/api/credentials/secrets/" + row["id"],
-                                         json={"revision": row["revision"], "label": "Access"})
-            assert updated.status_code == 200, updated.text
-            assert (await client.delete("/api/credentials/secrets/" + row["id"])).json() == {"revoked": True}
-    finally:
-        runtime.product = None
-        await source.dispose()
+    async with signed_in(runtime, bridge, settings, "google:admin", info) as signed:
+        signed.product.identity.access.keys = {"local-key": key.public_key()}
+        signed.product.identity.access.expires = time.monotonic() + 3600
+        signed.client.headers["cf-access-jwt-assertion"] = token
+
+        @signed.app.middleware("http")
+        async def verified_access(request, call_next):
+            # The native app middleware sets request.state.access_session the same way.
+            assert await access_session(signed.product, request) is None
+            return await call_next(request)
+
+        # Each mutation re-reads the Access session through the writer's own
+        # connection; a second Store checkout would be a nested-borrow error.
+        await manages_an_organization_secret(signed.client, "Access")
 
 
 async def test_oidc_personal_secrets_recheck_the_pinned_subject_at_the_writer(runtime, bridge):
-    from app.config import OidcProvider
-    from app.security import Security
-
-    issuer = "https://idp.example.test/oauth2/default"
-    settings = bridge.settings.model_copy(update={
-        "oidc_providers": [OidcProvider(id="okta", label="Okta", issuer=issuer, client_id="okta-client",
-                                        domains=("example.test",))],
-        "oidc_client_secrets": {"okta": "synthetic-okta-secret"},
-    })
-    security = Security(settings, UserRoles(bridge.store, settings))
-    source = create_async_engine(f"sqlite+aiosqlite:///file:{bridge.store.path}?mode=ro&uri=true")
-    identity = ProductIdentityAdapter(settings, source, native_engine=runtime.database.engine)
-    person = {"provider": "okta", "issuer": issuer, "sub": "okta-subject", "email": "person@example.test",
+    person = {"provider": "okta", "issuer": OKTA["issuer"], "sub": "okta-subject", "email": "person@example.test",
               "domain": "example.test", "name": "Person"}
-    with bridge.store.connect() as db:
-        db.execute("INSERT INTO users(id,kind,email,name,created_at,updated_at) VALUES(?,?,?,?,?,?)",
-                   ("oidc:person", "oidc", person["email"], "Person", "2026-10-15", "2026-10-15"))
-        db.execute("INSERT INTO access_identities VALUES(?,?,?,?,?)",
-                   (issuer, person["sub"], person["email"], "oidc:person", "created"))
-    runtime.product = SimpleNamespace(
-        store_proxy=bridge.store, security=security, settings=settings, identity=identity,
-        history=ProductHistoryAdapter(identity, source),
-    )
-    app = FastAPI()
-    app.include_router(ProductSecrets(runtime).routes())
     info = {"sid": "signed-oidc-session", "role": "member", "method": "oidc", "identity": person,
-            "client_id": "okta-client"}
-    try:
-        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url=settings.public_url) as client:
-            client.cookies.set("workspace_session", security.signer.dumps(info))
-            client.headers.update({"Origin": settings.public_url, "X-CSRF-Token": security.csrf(info["sid"])})
-            created = await client.post("/api/credentials/secrets", json=secret())
-            assert created.status_code == 201, created.text
-            assert bridge.store.rows("SELECT owner_id FROM provider_secrets") == [{"owner_id": "oidc:person"}]
+            "client_id": OKTA["client_id"]}
+    async with signed_in(runtime, bridge, with_oidc(bridge.settings), "oidc:person", info) as signed:
+        client = signed.client
+        created = await client.post("/api/credentials/secrets", json=secret())
+        assert created.status_code == 201, created.text
+        assert bridge.store.rows("SELECT owner_id FROM provider_secrets") == [{"owner_id": "oidc:person"}]
 
-            # An administrator rebinds the account after this request's authority check.
-            current = identity.require_current
+        # An administrator rebinds the account after this request's authority check.
+        current = signed.product.identity.require_current
 
-            async def rebound(grant):
-                principal = await current(grant)
-                bridge.store.execute("UPDATE access_identities SET subject='another-subject'")
-                return principal
-            identity.require_current = rebound
-            refused = await client.post("/api/credentials/secrets", json=secret(client_id="second-save"))
-            assert refused.status_code == 401
-            assert refused.json()["detail"] == "The sign-in account mapping changed before saving."
-            assert len(bridge.store.rows("SELECT 1 FROM provider_secrets")) == 1
-    finally:
-        runtime.product = None
-        await source.dispose()
+        async def rebound(grant):
+            principal = await current(grant)
+            bridge.store.execute("UPDATE access_identities SET subject='another-subject'")
+            return principal
+        signed.product.identity.require_current = rebound
+        refused = await client.post("/api/credentials/secrets", json=secret(client_id="second-save"))
+        assert refused.status_code == 401
+        assert refused.json()["detail"] == "The sign-in account mapping changed before saving."
+        assert len(bridge.store.rows("SELECT 1 FROM provider_secrets")) == 1
 
 
 async def test_postgres_pool_one_secret_mutations_reuse_live_role_transaction(tmp_path):
     from app.db import Store, database
-    from app.security import Security
-    from test_product_identity import settings_for
 
     url = os.environ.get("MOYAI_TEST_POSTGRES")
     if not url:

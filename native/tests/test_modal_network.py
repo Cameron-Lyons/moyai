@@ -172,46 +172,40 @@ async def test_governed_create_is_the_harness_create_plus_the_plan(monkeypatch, 
     assert governor.calls == 2 and backend.ref == WorkspaceRef(provider="modal", id="sb-new")
 
 
-async def test_policy_narrowed_during_create_terminates_the_new_computer(monkeypatch):
+@pytest.mark.parametrize(("current", "kept"), [(NOTHING, False), (UNRESTRICTED, True)])
+async def test_a_policy_changed_during_create_keeps_the_computer_only_when_wider(monkeypatch, current, kept):
     created = computer("sb-new")
     fake = install_modal(monkeypatch, created=created)
-    backend = GovernedModalSandboxBackend(working_dir="/workspace", governor=Governor(LISTED, NOTHING))
-    with pytest.raises(NetworkPolicyMismatch):
-        await backend.get_sandbox()
+    backend = GovernedModalSandboxBackend(working_dir="/workspace", governor=Governor(LISTED, current))
+    if kept:
+        assert await backend.get_sandbox() is created
+    else:
+        with pytest.raises(NetworkPolicyMismatch):
+            await backend.get_sandbox()
+        created.exec.aio.assert_not_awaited()
+        # A retry creates a new computer under the current plan instead of recovering this one.
+        assert backend.ref is None and backend._create_name is None
     assert fake.create.await_args.kwargs["outbound_domain_allowlist"] == list(LISTED.domains)
-    created.terminate.aio.assert_awaited_once()
-    created.exec.aio.assert_not_awaited()
-    # A retry creates a new computer under the current plan instead of recovering this one.
-    assert backend.ref is None and backend._create_name is None
+    assert created.terminate.aio.await_count == (0 if kept else 1)
 
 
-async def test_widened_policy_keeps_the_new_computer(monkeypatch):
-    created = computer("sb-new")
-    install_modal(monkeypatch, created=created)
-    backend = GovernedModalSandboxBackend(working_dir="/workspace", governor=Governor(LISTED, UNRESTRICTED))
-    assert await backend.get_sandbox() is created
-    created.terminate.aio.assert_not_awaited()
-
-
-@pytest.mark.parametrize("tags", [{}, {NETWORK_TAG: OPEN}, {NETWORK_TAG: NOTHING.tag}])
-async def test_recovered_create_under_another_policy_is_refused(monkeypatch, tags):
+@pytest.mark.parametrize(("tags", "kept"), [
+    ({}, False), ({NETWORK_TAG: OPEN}, False), ({NETWORK_TAG: NOTHING.tag}, False),
+    ({NETWORK_TAG: LISTED.tag, SESSION_TAG: SESSION}, True),
+])
+async def test_a_recovered_create_is_kept_only_under_the_same_policy(monkeypatch, tags, kept):
     """A lost create reply is recovered by name; that computer may come from an attempt under another plan."""
     recovered = computer("sb-recovered", tags)
     fake = install_modal(monkeypatch, create_error=modal.exception.AlreadyExistsError("taken"), existing=recovered)
     backend = GovernedModalSandboxBackend(working_dir="/workspace", governor=Governor(LISTED))
-    with pytest.raises(NetworkPolicyMismatch):
-        await backend.get_sandbox()
+    if kept:
+        assert await backend.get_sandbox() is recovered
+    else:
+        with pytest.raises(NetworkPolicyMismatch):
+            await backend.get_sandbox()
     fake.from_name.assert_awaited_once()
     recovered.get_tags.aio.assert_awaited_once()
-    recovered.terminate.aio.assert_awaited_once()
-
-
-async def test_recovered_create_under_the_same_policy_is_kept(monkeypatch):
-    recovered = tagged(LISTED, "sb-recovered")
-    install_modal(monkeypatch, create_error=modal.exception.AlreadyExistsError("taken"), existing=recovered)
-    backend = GovernedModalSandboxBackend(working_dir="/workspace", governor=Governor(LISTED))
-    assert await backend.get_sandbox() is recovered
-    recovered.terminate.aio.assert_not_awaited()
+    assert recovered.terminate.aio.await_count == (0 if kept else 1)
 
 
 @pytest.mark.parametrize("failure", [

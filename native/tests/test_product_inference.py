@@ -133,6 +133,39 @@ async def install_broker_upstream(ctx, handler):
     )
 
 
+@asynccontextmanager
+async def separate_worker(ctx, upstream, *, settings=None):
+    """A worker runtime whose model requests reach this broker's routes, as a split deployment's do."""
+    ctx.service.settings = ctx.service.settings.model_copy(update={"public_url": "https://workspace.invalid"})
+    await install_broker_upstream(ctx, upstream)
+    app = FastAPI()
+    app.include_router(product_inference_routes(ctx.service))
+    database = SimpleNamespace(settings=settings or ctx.product.settings, product_identity=ctx.product.adapter)
+    worker = ProductInferenceService(database, ctx.service.settings.model_copy(update={
+        "moyai_separate_broker": True, "moyai_runtime_role": "worker", "litellm_api_key": "",
+    }), None)
+    database.product_inference = worker
+    await worker.start()
+    try:
+        yield SimpleNamespace(database=database, app=app)
+    finally:
+        await worker.close()
+
+
+@asynccontextmanager
+async def worker_client(worker, ctx, logical):
+    """A client bound to one logical model activity on the worker; yields (activity, client)."""
+    activity = InferenceActivity(worker.database, ctx.scope, f"{logical}/1", logical_identity=logical)
+    token = INFERENCE_ACTIVITY.set(activity)
+    try:
+        async with httpx2.AsyncClient(transport=InferenceUsageTransport(
+            httpx2.ASGITransport(app=worker.app), require_admission=True,
+        )) as client:
+            yield activity, client
+    finally:
+        INFERENCE_ACTIVITY.reset(token)
+
+
 async def test_admission_captures_exact_scope_and_physical_identity_without_legacy_run(inference):
     ctx = inference
     await perform(ctx)
@@ -947,7 +980,6 @@ async def test_ordinary_gateway_error_is_not_audited_or_relayed_as_a_guardrail(i
 
 async def test_broker_relays_only_its_own_guardrail_outcome(inference):
     ctx = inference
-    ctx.service.settings = ctx.service.settings.model_copy(update={"public_url": "https://workspace.invalid"})
     refused = True
 
     async def upstream(request):
@@ -956,35 +988,19 @@ async def test_broker_relays_only_its_own_guardrail_outcome(inference):
         return httpx2.Response(429, stream=WireStream(b'{"error":{"message":"synthetic limit"}}'), headers={
             "content-type": "application/json", "x-moyai-guardrail": "blocked",
         })
-    await install_broker_upstream(ctx, upstream)
-    app = FastAPI()
-    app.include_router(product_inference_routes(ctx.service))
-    worker_database = SimpleNamespace(settings=ctx.product.settings, product_identity=ctx.product.adapter)
-    worker = ProductInferenceService(worker_database, ctx.service.settings.model_copy(update={
-        "moyai_separate_broker": True, "moyai_runtime_role": "worker", "litellm_api_key": "",
-    }), None)
-    worker_database.product_inference = worker
-    await worker.start()
-    try:
+    async with separate_worker(ctx, upstream) as worker:
         for logical in ("refused", "limited"):
             refused = logical == "refused"
-            activity = InferenceActivity(worker_database, ctx.scope, f"{logical}/1", logical_identity=logical)
-            token = INFERENCE_ACTIVITY.set(activity)
-            try:
-                async with httpx2.AsyncClient(transport=InferenceUsageTransport(
-                    httpx2.ASGITransport(app=app), require_admission=True,
-                )) as client:
-                    sdk = AsyncOpenAI(
-                        base_url="https://gateway.invalid/v1", api_key="not-configured",
-                        max_retries=0, http_client=client,
+            async with worker_client(worker, ctx, logical) as (activity, client):
+                sdk = AsyncOpenAI(
+                    base_url="https://gateway.invalid/v1", api_key="not-configured",
+                    max_retries=0, http_client=client,
+                )
+                model = OpenAIResponsesModel("test", provider=LiteLLMProvider(openai_client=sdk))
+                with pytest.raises(ModelHTTPError) as failed:
+                    await model.request(
+                        [ModelRequest(parts=[UserPromptPart("private input")])], None, ModelRequestParameters(),
                     )
-                    model = OpenAIResponsesModel("test", provider=LiteLLMProvider(openai_client=sdk))
-                    with pytest.raises(ModelHTTPError) as failed:
-                        await model.request(
-                            [ModelRequest(parts=[UserPromptPart("private input")])], None, ModelRequestParameters(),
-                        )
-            finally:
-                INFERENCE_ACTIVITY.reset(token)
             assert failed.value.status_code == (400 if refused else 429)
             assert activity.guardrail == ("blocked" if refused else None)
             assert (failed.value.headers or {}).get("x-moyai-guardrail") == ("blocked" if refused else None)
@@ -994,13 +1010,10 @@ async def test_broker_relays_only_its_own_guardrail_outcome(inference):
         assert event["action"] == "ai_guardrail.violation" and event["resource_id"] == "bedrock-input"
         assert [row.status for row in await requests(ctx)] == ["failed", "failed"]
         assert not ctx.service.active and ctx.service.slots.active == 0
-    finally:
-        await worker.close()
 
 
 async def test_broker_refuses_an_unattested_answer_before_the_worker_reads_it(inference, monkeypatch):
     ctx = inference
-    ctx.service.settings = ctx.service.settings.model_copy(update={"public_url": "https://workspace.invalid"})
     monkeypatch.setattr(ctx.product.database.settings, "required_guardrails", "phi-presidio")
     applied = "prompt-injection"
     upstream_streams = []
@@ -1011,35 +1024,17 @@ async def test_broker_refuses_an_unattested_answer_before_the_worker_reads_it(in
         return httpx2.Response(200, stream=stream, headers={
             "content-type": "application/json", "x-litellm-applied-guardrails": applied,
         })
-    await install_broker_upstream(ctx, upstream)
-    app = FastAPI()
-    app.include_router(product_inference_routes(ctx.service))
     # The worker's own settings never decide; the broker enforces the shared value.
-    worker_database = SimpleNamespace(
-        settings=ctx.product.settings.model_copy(update={"required_guardrails": ""}),
-        product_identity=ctx.product.adapter,
-    )
-    worker = ProductInferenceService(worker_database, ctx.service.settings.model_copy(update={
-        "moyai_separate_broker": True, "moyai_runtime_role": "worker", "litellm_api_key": "",
-    }), None)
-    worker_database.product_inference = worker
-    await worker.start()
-    try:
+    unenforced = ctx.product.settings.model_copy(update={"required_guardrails": ""})
+    async with separate_worker(ctx, upstream, settings=unenforced) as worker:
         for logical in ("unattested", "attested"):
             applied = "prompt-injection" if logical == "unattested" else "phi-presidio,prompt-injection"
-            activity = InferenceActivity(worker_database, ctx.scope, f"{logical}/1", logical_identity=logical)
-            token = INFERENCE_ACTIVITY.set(activity)
-            try:
-                async with httpx2.AsyncClient(transport=InferenceUsageTransport(
-                    httpx2.ASGITransport(app=app), require_admission=True,
-                )) as client:
-                    response = await client.post(
-                        "https://gateway.invalid/v1/responses",
-                        headers={"authorization": "Bearer not-configured"},
-                        json={"model": "test", "input": "private input"},
-                    )
-            finally:
-                INFERENCE_ACTIVITY.reset(token)
+            async with worker_client(worker, ctx, logical) as (activity, client):
+                response = await client.post(
+                    "https://gateway.invalid/v1/responses",
+                    headers={"authorization": "Bearer not-configured"},
+                    json={"model": "test", "input": "private input"},
+                )
             if logical == "unattested":
                 assert response.status_code == 502 and response.content == b""
                 assert response.headers["x-moyai-guardrail"] == activity.guardrail == "unattested"
@@ -1060,5 +1055,3 @@ async def test_broker_refuses_an_unattested_answer_before_the_worker_reads_it(in
         assert (refused.status, refused.cost_usd) == ("unknown", None)
         assert (accepted.status, accepted.cost_usd) == ("completed", "0.31")
         assert not ctx.service.active and ctx.service.slots.active == 0
-    finally:
-        await worker.close()

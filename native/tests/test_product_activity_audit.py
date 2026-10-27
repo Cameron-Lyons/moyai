@@ -11,7 +11,7 @@ import asyncio
 import json
 import os
 import time
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from dataclasses import replace
 from types import SimpleNamespace
 from uuid import uuid4
@@ -63,6 +63,21 @@ async def refused(check):
     with pytest.raises(HTTPException) as error:
         await check()
     return error.value.status_code, error.value.detail
+
+
+@contextmanager
+def recorded_events(runtime, *fields):
+    """Stand in for governance.record, keeping (action, *fields) of each call."""
+    recorded = []
+
+    async def record(db, action, **event):
+        recorded.append((action, *(event[field] for field in fields)))
+
+    runtime.database.governance = SimpleNamespace(record=record)
+    try:
+        yield recorded
+    finally:
+        runtime.database.governance = None
 
 
 async def test_a_refused_tool_is_recorded_once_per_turn_with_its_error_unchanged(governed):
@@ -361,14 +376,8 @@ async def test_an_agent_workflow_change_names_its_session(automations):
 async def test_archive_records_only_a_changed_value(runtime, actor):
     from moyai.api import COOKIE, create_app
     session = await runtime.database.create_session(actor, NewSession())
-    recorded = []
-
-    async def record(db, action, **event):
-        recorded.append((action, event['resource_id'], event['session_id']))
-
-    runtime.database.governance = SimpleNamespace(record=record)
     token, csrf = runtime.security.issue_session(actor.id, actor.auth_version)
-    try:
+    with recorded_events(runtime, 'resource_id', 'session_id') as recorded:
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=create_app(runtime, run_dispatcher=False)), base_url='http://test',
             cookies={COOKIE: token}, headers={'x-moyai-csrf': csrf, 'origin': 'http://test'},
@@ -376,8 +385,6 @@ async def test_archive_records_only_a_changed_value(runtime, actor):
             for archived in (True, True, False, False):
                 response = await client.patch(f'/api/sessions/{session.id}', json={'archived': archived})
                 assert response.status_code == 200, response.text
-    finally:
-        runtime.database.governance = None
     assert recorded == [('session.archived', session.id, session.id), ('session.unarchived', session.id, session.id)]
 
 
@@ -386,16 +393,8 @@ async def test_stopping_a_team_member_records_its_stop_once(runtime, actor):
     root, _ = await runtime.database.swarms.start(actor, NewSwarm(
         prompt='Investigate the test dataset.', request_key='team', workers=2, visibility='private'))
     member = (await runtime.database.swarms.view(actor, root.id))['members'][1]['session_id']
-    recorded = []
-
-    async def record(db, action, **event):
-        recorded.append((action, event['session_id'], event['details']))
-
-    runtime.database.governance = SimpleNamespace(record=record)
-    try:
+    with recorded_events(runtime, 'session_id', 'details') as recorded:
         # The member Stop takes the team path, which stops every member.
         await runtime.database.stop(actor, member)
         await runtime.database.stop(actor, member)  # Already stopped: nothing more.
-    finally:
-        runtime.database.governance = None
     assert recorded == [('session.stopped', member, {'had_active_turn': False})]

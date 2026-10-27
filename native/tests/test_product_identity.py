@@ -481,13 +481,23 @@ OKTA = {"id": "okta", "label": "Okta", "issuer": "https://idp.example.test/oauth
         "client_id": "synthetic-okta-client", "domains": ["example.test"]}
 
 
-def oidc_adapter(product, **provider):
+def with_oidc(settings, **provider):
     from app.config import OidcProvider
 
-    return ProductIdentityAdapter(product.settings.model_copy(update={
+    return settings.model_copy(update={
         "oidc_providers": [OidcProvider(**{**OKTA, **provider})],
         "oidc_client_secrets": {"okta": "synthetic-okta-secret"},
-    }), product.source)
+    })
+
+
+def oidc_adapter(product, **provider):
+    return ProductIdentityAdapter(with_oidc(product.settings, **provider), product.source)
+
+
+def oidc_cookie(adapter, identity, client_id=OKTA["client_id"]):
+    return adapter.legacy_security.signer.dumps({
+        "sid": "signed-oidc-session", "role": "admin", "method": "oidc", "identity": identity, "client_id": client_id,
+    })
 
 
 async def oidc_setup(product):
@@ -500,11 +510,7 @@ async def oidc_setup(product):
         await db.execute(text(
             "INSERT INTO access_identities VALUES (:issuer,:subject,:email,'google:admin-sub','created')"
         ), {"issuer": identity["issuer"], "subject": identity["sub"], "email": identity["email"]})
-    cookie = adapter.legacy_security.signer.dumps({
-        "sid": "signed-oidc-session", "role": "admin", "method": "oidc", "identity": identity,
-        "client_id": OKTA["client_id"],
-    })
-    return adapter, cookie, identity
+    return adapter, oidc_cookie(adapter, identity), identity
 
 
 async def test_oidc_acts_only_through_the_pinned_binding_of_the_provider_that_owns_the_domain(product):
@@ -518,12 +524,9 @@ async def test_oidc_acts_only_through_the_pinned_binding_of_the_provider_that_ow
     with pytest.raises(HTTPException):
         await adapter.authenticate(request(google_cookie(adapter)[0]))
     # A cookie for another subject, issuer or client cannot borrow the binding.
-    for change in ({"identity": {**identity, "sub": "other-subject"}}, {"client_id": "another-client"},
-                   {"identity": {**identity, "issuer": OKTA["issuer"] + "2"}}):
-        forged = adapter.legacy_security.signer.dumps({
-            "sid": "signed-oidc-session", "role": "admin", "method": "oidc", "identity": identity,
-            "client_id": OKTA["client_id"], **change,
-        })
+    for forged in (oidc_cookie(adapter, {**identity, "sub": "other-subject"}),
+                   oidc_cookie(adapter, identity, client_id="another-client"),
+                   oidc_cookie(adapter, {**identity, "issuer": OKTA["issuer"] + "2"})):
         with pytest.raises(HTTPException):
             await adapter.authenticate(request(forged))
     # Reconfiguring the provider changes authority; removing it ends the session.
@@ -561,23 +564,16 @@ async def test_oidc_required_provisioning_applies_to_existing_sessions_and_grant
 
 
 async def test_configuring_oidc_for_another_domain_keeps_existing_authority_versions(product, tmp_path):
-    from app.config import OidcProvider
-
     base = settings_for(tmp_path, google_allowed_domains="example.test,partner.test")
     before = await ProductIdentityAdapter(base, product.source).current("google:admin-sub")
-    configured = base.model_copy(update={
-        "oidc_providers": [OidcProvider(**{**OKTA, "domains": ["partner.test"]})],
-        "oidc_client_secrets": {"okta": "synthetic-okta-secret"},
-    })
+    configured = with_oidc(base, domains=["partner.test"])
     after = await ProductIdentityAdapter(configured, product.source).current("google:admin-sub")
     assert (after.method, after.authority_version) == ("google", before.authority_version)
     access, *_ = await cloudflare_setup(product)
     granted = await access.current("google:admin-sub")
-    alongside = ProductIdentityAdapter(access.settings.model_copy(update={
-        "google_allowed_domains": "example.test",
-        "oidc_providers": [OidcProvider(**{**OKTA, "domains": ["example.test"]})],
-        "oidc_client_secrets": {"okta": "synthetic-okta-secret"},
-    }), product.source)
+    alongside = ProductIdentityAdapter(
+        with_oidc(access.settings.model_copy(update={"google_allowed_domains": "example.test"})), product.source,
+    )
     # Access stays authoritative when enabled, with the same authority.
     assert (await alongside.current("google:admin-sub")).authority_version == granted.authority_version
 
@@ -620,20 +616,18 @@ async def test_native_access_login_leaves_scim_provisioning_to_its_bearer_contro
 
 async def test_sign_in_options_list_organization_providers_unless_access_is_authoritative(product, runtime, monkeypatch):
     import httpx
-    from app.config import OidcProvider
     from app.oidc_sso import OidcSignIn
     from fastapi import APIRouter
 
     from moyai.api import create_app
 
-    oidc = {"oidc_providers": [OidcProvider(**OKTA)], "oidc_client_secrets": {"okta": "synthetic-okta-secret"}}
     access, _, _, _, token = await cloudflare_setup(product)
     cases = (
         # The provider owns example.test, the only allowed domain, so Google has nothing left to offer.
-        (product.settings.model_copy(update=oidc), {}, {
+        (with_oidc(product.settings), {}, {
             "mode": "existing", "password_enabled": True, "google_enabled": False, "access_enabled": False,
             "oidc_providers": [{"id": "okta", "label": "Okta"}]}),
-        (access.settings.model_copy(update=oidc), {"cf-access-jwt-assertion": token}, {
+        (with_oidc(access.settings), {"cf-access-jwt-assertion": token}, {
             "mode": "existing", "password_enabled": False, "google_enabled": False, "access_enabled": True,
             "oidc_providers": []}),
     )

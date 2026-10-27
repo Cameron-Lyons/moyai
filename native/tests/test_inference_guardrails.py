@@ -80,6 +80,58 @@ REFUSALS = {
 }
 
 
+async def denied_attempt(runtime, monkeypatch, scope, execute):
+    """One model-request activity attempt through AuthorizedActivity; returns its typed denial."""
+    monkeypatch.setattr("moyai.execution.activity.info", lambda: SimpleNamespace(
+        activity_type="agent__moyai__model_request", workflow_namespace="default",
+        workflow_id="workflow", workflow_run_id="run", activity_id="activity", attempt=1,
+    ))
+    interceptor = AuthorizedActivity(SimpleNamespace(execute_activity=execute), runtime.database)
+    with pytest.raises(ApplicationError) as denied:
+        await interceptor.execute_activity(
+            ExecuteActivityInput(fn=lambda: None, args=[scope], executor=None, headers={}),
+        )
+    return denied.value
+
+
+async def failed_turn(runtime, turn, monkeypatch, *, version, old_history, error_type):
+    """Run the turn on local Temporal until it fails; its typed refusal must be one non-retryable attempt."""
+    original_patched = workflow.patched
+    if old_history:
+        def before_version(identity, **kwargs):
+            return False if identity == version else original_patched(identity, **kwargs)
+        monkeypatch.setattr(workflow, "patched", before_version)
+    converter = encrypted_converter(runtime.security, runtime.objects)
+    async with await WorkflowEnvironment.start_local(
+        plugins=[PydanticAIPlugin()], data_converter=converter,
+    ) as environment:
+        runtime.client = environment.client
+        async with make_worker(runtime):
+            handle = await runtime.client.start_workflow(
+                TurnWorkflow.run, turn.id, id=turn.workflow_id, task_queue=runtime.settings.temporal_queue,
+            )
+            with pytest.raises(WorkflowFailureError) as failed:
+                await asyncio.wait_for(handle.result(), 30)
+            history = await handle.fetch_history()
+    failures = [
+        event.activity_task_failed_event_attributes.failure for event in history.events
+        if event.HasField("activity_task_failed_event_attributes")
+    ]
+    refused, = (failure for failure in failures if failure.application_failure_info.type == error_type)
+    assert refused.application_failure_info.non_retryable
+    started = [
+        event.activity_task_started_event_attributes.attempt for event in history.events
+        if event.HasField("activity_task_started_event_attributes")
+    ]
+    assert max(started) == 1
+    monkeypatch.setattr(workflow, "patched", original_patched)
+    await Replayer(
+        interceptors=[ActivityCapacity()],
+        workflows=[TurnWorkflow], plugins=[PydanticAIPlugin()], data_converter=converter,
+    ).replay_workflow(history)
+    return failed.value, history, refused
+
+
 @pytest.mark.parametrize("status", [400, 403, 422])
 @pytest.mark.parametrize("shape", sorted(REFUSALS))
 def test_litellm_refusal_shapes_keep_only_attested_names(shape, status):
@@ -193,13 +245,9 @@ def test_required_guardrails_are_validated_canonical_names(value, expected):
 
 
 def test_guardrail_outcome_reads_the_captured_failure_chain():
-    try:
-        try:
-            raise ApplicationError("x", type="MoyaiGuardrailUnattested", non_retryable=True)
-        except ApplicationError as cause:
-            raise RuntimeError("agent run failed") from cause
-    except RuntimeError as error:
-        assert guardrail_outcome(capture_failure(error)) == "unattested"
+    error = RuntimeError("agent run failed")
+    error.__cause__ = ApplicationError("x", type="MoyaiGuardrailUnattested", non_retryable=True)
+    assert guardrail_outcome(capture_failure(error)) == "unattested"
     assert guardrail_outcome(capture_failure(ApplicationError("x", type="MoyaiInferenceAdmissionDenied"))) is None
     assert guardrail_outcome(None) is None
 
@@ -261,11 +309,6 @@ async def test_attestation_is_off_without_required_guardrails(runtime):
 @pytest.mark.parametrize("outcome", ["blocked", "unattested"])
 async def test_refusal_is_a_non_retryable_denial_without_gateway_text(runtime, active, monkeypatch, outcome):
     _, _, prepared = active
-    info = SimpleNamespace(
-        activity_type="agent__moyai__model_request", workflow_namespace="default",
-        workflow_id="workflow", workflow_run_id="run", activity_id="activity", attempt=1,
-    )
-    monkeypatch.setattr("moyai.execution.activity.info", lambda: info)
     monkeypatch.setattr(runtime.database.settings, "required_guardrails", "phi-presidio")
     body, _, _ = REFUSALS["http_exception"]
 
@@ -276,49 +319,29 @@ async def test_refusal_is_a_non_retryable_denial_without_gateway_text(runtime, a
             })
         return httpx.Response(400, stream=WireStream(body), headers={"content-type": "application/json"})
 
-    class Next:
-        async def execute_activity(self, _input):
-            async with httpx.AsyncClient(transport=InferenceUsageTransport(httpx.MockTransport(gateway))) as client:
-                sdk = AsyncOpenAI(base_url="https://gateway.invalid/v1", api_key="synthetic", max_retries=0,
-                                  http_client=client)
-                model = OpenAIResponsesModel(prepared.scope.model, provider=LiteLLMProvider(openai_client=sdk))
-                await model.request(
-                    [ModelRequest(parts=[UserPromptPart(FLAGGED)])], None, ModelRequestParameters(),
-                )
+    async def execute(_input):
+        async with httpx.AsyncClient(transport=InferenceUsageTransport(httpx.MockTransport(gateway))) as client:
+            sdk = AsyncOpenAI(base_url="https://gateway.invalid/v1", api_key="synthetic", max_retries=0,
+                              http_client=client)
+            model = OpenAIResponsesModel(prepared.scope.model, provider=LiteLLMProvider(openai_client=sdk))
+            await model.request([ModelRequest(parts=[UserPromptPart(FLAGGED)])], None, ModelRequestParameters())
 
-    interceptor = AuthorizedActivity(Next(), runtime.database)
-    value = ExecuteActivityInput(fn=lambda: None, args=[prepared.scope], executor=None, headers={})
-    with pytest.raises(ApplicationError) as denied:
-        await interceptor.execute_activity(value)
-    assert denied.value.non_retryable and denied.value.type == {
+    denied = await denied_attempt(runtime, monkeypatch, prepared.scope, execute)
+    assert denied.non_retryable and denied.type == {
         "blocked": "MoyaiGuardrailBlocked", "unattested": "MoyaiGuardrailUnattested",
     }[outcome]
-    assert denied.value.message == MESSAGES[outcome]
-    assert denied.value.__cause__ is None and denied.value.__suppress_context__
+    assert denied.message == MESSAGES[outcome]
+    assert denied.__cause__ is None and denied.__suppress_context__
 
 
 @pytest.mark.parametrize("runtime", ["guardrail"], indirect=True)
 @pytest.mark.parametrize("old_history", [False, True])
 async def test_refused_turn_publishes_notice_without_preserving_context(runtime, active, monkeypatch, old_history):
     _, turn, _ = active
-    original_patched = workflow.patched
-    if old_history:
-        def before_guardrails(identity, **kwargs):
-            return False if identity == VERSION else original_patched(identity, **kwargs)
-        monkeypatch.setattr(workflow, "patched", before_guardrails)
-    converter = encrypted_converter(runtime.security, runtime.objects)
-    async with await WorkflowEnvironment.start_local(
-        plugins=[PydanticAIPlugin()], data_converter=converter,
-    ) as environment:
-        runtime.client = environment.client
-        async with make_worker(runtime):
-            handle = await runtime.client.start_workflow(
-                TurnWorkflow.run, turn.id, id=turn.workflow_id, task_queue=runtime.settings.temporal_queue,
-            )
-            with pytest.raises(WorkflowFailureError) as failed:
-                await asyncio.wait_for(handle.result(), 30)
-            history = await handle.fetch_history()
-    assert isinstance(failed.value.cause, ApplicationError)
+    failed, history, refused = await failed_turn(
+        runtime, turn, monkeypatch, version=VERSION, old_history=old_history, error_type="MoyaiGuardrailBlocked",
+    )
+    assert isinstance(failed.cause, ApplicationError)
     async with runtime.database.sessions() as db:
         row = await db.get(Turn, turn.id)
         assert row.status == "failed" and FLAGGED not in row.error
@@ -331,26 +354,10 @@ async def test_refused_turn_publishes_notice_without_preserving_context(runtime,
         if event.HasField("activity_task_scheduled_event_attributes")
     ]
     assert ("moyai_preserve_failed_workspace_v1" in scheduled) == old_history
-    failures = [
-        event.activity_task_failed_event_attributes.failure for event in history.events
-        if event.HasField("activity_task_failed_event_attributes")
-    ]
-    refused, = (failure for failure in failures if failure.application_failure_info.type == "MoyaiGuardrailBlocked")
-    assert refused.application_failure_info.non_retryable and not refused.HasField("cause")
-    assert FLAGGED not in str(refused)
-    started = [
-        event.activity_task_started_event_attributes.attempt for event in history.events
-        if event.HasField("activity_task_started_event_attributes")
-    ]
-    assert max(started) == 1
+    assert not refused.HasField("cause") and FLAGGED not in str(refused)
     # Slack's failure report keeps the notice and leaves the refused trace out.
     report = await FailureReport.for_turn(runtime, row)
     assert report.debug_log is None and report.text.endswith(row.error)
-    monkeypatch.setattr(workflow, "patched", original_patched)
-    await Replayer(
-        interceptors=[ActivityCapacity()],
-        workflows=[TurnWorkflow], plugins=[PydanticAIPlugin()], data_converter=converter,
-    ).replay_workflow(history)
 
 
 async def test_rebuilt_context_leaves_out_a_refused_turns_messages(runtime, actor):

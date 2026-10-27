@@ -52,10 +52,14 @@ def login_request():
                     "headers": [(b"origin", ORIGIN.encode())], "client": ("203.0.113.9", 4321)})
 
 
-def sign_ins(product):
-    rows = product.store.rows("SELECT action,actor,resource_id,details FROM governance_audit_events "
-                              "WHERE resource_type='sign_in' ORDER BY created_at,id")
+def sign_ins(store):
+    rows = store.rows("SELECT action,actor,resource_id,details FROM governance_audit_events "
+                      "WHERE resource_type='sign_in' ORDER BY created_at,id")
     return [(row["action"], row["actor"], row["resource_id"], json.loads(row["details"])) for row in rows]
+
+
+def failing(*args, **kwargs):
+    raise DatabaseError("synthetic audit failure")
 
 
 async def test_password_sign_in_records_success_and_refusal_without_the_password(product):
@@ -67,7 +71,7 @@ async def test_password_sign_in_records_success_and_refusal_without_the_password
         response = Response()
         assert (await password_login(runtime, PASSWORD, login_request(), response))["authenticated"]
         assert "workspace_session=" in response.headers["set-cookie"]
-    assert sign_ins(product) == [
+    assert sign_ins(product.store) == [
         ("sign_in.refused", "anonymous", "password", {"method": "password", "reason": "invalid_password"}),
         ("sign_in.succeeded", "Shared password admin", "password", {"method": "password", "enrolled": True}),
         ("sign_in.succeeded", "Shared password admin", "password", {"method": "password", "enrolled": False}),
@@ -76,22 +80,16 @@ async def test_password_sign_in_records_success_and_refusal_without_the_password
 
 
 async def test_password_sign_in_issues_no_session_without_its_event(product, monkeypatch):
-    def failing(*args, **kwargs):
-        raise DatabaseError("synthetic audit failure")
-
     monkeypatch.setattr(sign_in_audit, "succeeded_in", failing)
     response = Response()
     with pytest.raises(HTTPException) as unavailable:
         await password_login(runtime_for(product), PASSWORD, login_request(), response)
     assert unavailable.value.status_code == 503 and "set-cookie" not in response.headers
     # The account refresh rolled back with its event.
-    assert not product.store.rows("SELECT 1 FROM users") and not sign_ins(product)
+    assert not product.store.rows("SELECT 1 FROM users") and not sign_ins(product.store)
 
 
 async def test_a_lost_refusal_event_still_refuses(product, monkeypatch, caplog):
-    def failing(*args, **kwargs):
-        raise DatabaseError("synthetic audit failure")
-
     monkeypatch.setattr(sign_in_audit, "record", failing)
     with caplog.at_level("WARNING", logger="moyai.product_auth"), pytest.raises(HTTPException) as refused:
         await password_login(runtime_for(product), "wrong-password-value", login_request(), Response())
@@ -118,7 +116,7 @@ async def test_sign_out_is_recorded_per_method_and_session_and_never_blocks_sign
         await record_sign_out(resources, SimpleNamespace(
             method="slack", id="slack:team:user", csrf_token="session-5", **shared))
         await record_sign_out(resources, SimpleNamespace(method="google", csrf_token="", **person))
-    assert sign_ins(product) == [
+    assert sign_ins(product.store) == [
         ("sign_in.signed_out", "person@example.test", "okta", {"method": "oidc"}),
         ("sign_in.signed_out", "person@example.test", "google", {"method": "google"}),
         ("sign_in.signed_out", "Shared password member", "password", {"method": "password"}),
@@ -126,9 +124,6 @@ async def test_sign_out_is_recorded_per_method_and_session_and_never_blocks_sign
     assert not caplog.text
     # The session's CSRF token only keys the event; it is never stored.
     assert "session-2" not in json.dumps(product.store.rows("SELECT * FROM governance_audit_events"))
-
-    def failing(*args, **kwargs):
-        raise DatabaseError("synthetic audit failure")
 
     monkeypatch.setattr(sign_in_audit, "record", failing)
     with caplog.at_level("WARNING", logger="moyai.product_auth"):
@@ -173,9 +168,7 @@ async def test_logout_route_records_one_sign_out_per_session(tmp_path, runtime):
                     response = await client.post("/api/logout", headers={"x-csrf-token": csrf})
                     assert response.status_code == 200, response.text
                     assert response.json()["signed_out"] and "workspace_session=" in response.headers["set-cookie"]
-        rows = store.rows("SELECT action,actor,resource_id,details FROM governance_audit_events "
-                          "WHERE resource_type='sign_in' ORDER BY created_at,id")
-        assert [(row["action"], row["actor"], row["resource_id"], json.loads(row["details"])) for row in rows] == [
+        assert sign_ins(store) == [
             ("sign_in.signed_out", "admin@example.test", "google", {"method": "google"})] * 2
     finally:
         await source.dispose()
@@ -186,9 +179,6 @@ async def test_access_sign_in_database_failures_are_unavailable_not_errors():
     async def check(path, method, assertion):
         return {"sub": "subject", "issuer": "https://synthetic.cloudflareaccess.com",
                 "email": "person@example.test", "domain": "example.test"}
-
-    def failing(request, identity):
-        raise DatabaseError("synthetic enrollment or audit failure")
 
     resources = SimpleNamespace(settings=SimpleNamespace(cloudflare_access_login=True),
                                 identity=SimpleNamespace(access=SimpleNamespace(check=check)),

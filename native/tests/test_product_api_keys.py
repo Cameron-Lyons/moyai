@@ -29,6 +29,11 @@ product = identity_fixtures.product
 AUDIT, EXPORT, SPEND = '/api/admin/governance/audit', '/api/admin/governance/audit/export', '/api/admin/spend'
 INVALID = 'A valid API key is required.'
 ELSEWHERE = 'API keys cannot access this endpoint.'
+ENDINGS = {
+    'revoked': "UPDATE {keys} SET revoked_at='2026-10-01T00:00:00.000000+00:00' WHERE id=:id",
+    'expired': "UPDATE {keys} SET expires_at='2020-01-01T00:00:00.000000+00:00' WHERE id=:id",
+    'disabled': 'UPDATE {accounts} SET active=0 WHERE id=(SELECT account_id FROM {keys} WHERE id=:id)',
+}
 
 
 async def issue(engine, *, table=lambda name: name, permissions=('audit.read',), days=30, active=1, account=None):
@@ -188,8 +193,7 @@ async def test_invalid_keys_get_one_uniform_401_and_never_fall_back_to_the_brows
     valid = await issue(product.writer)
     revoked, expired = await issue(product.writer), await issue(product.writer, days=-1)
     disabled = await issue(product.writer, active=0)
-    await change(product.writer, "UPDATE {keys} SET revoked_at='2026-10-01T00:00:00.000000+00:00' WHERE id=:id",
-                 id=revoked.key)
+    await change(product.writer, ENDINGS['revoked'], id=revoked.key)
     unknown = mint()[1]
     wrong = valid.token[:-1] + ('A' if valid.token[-1] != 'A' else 'B')
     for token in (revoked.token, expired.token, disabled.token, unknown, wrong):
@@ -231,18 +235,12 @@ async def test_saved_service_grants_end_with_the_key_the_account_or_a_permission
     grant = (await adapter.authenticate(key_request(AUDIT, key.token))).grant
     await change(product.writer, "UPDATE {accounts} SET name='Renamed',revision=4 WHERE id=:id", id=key.account)
     assert (await adapter.require_current(grant)).name == 'Renamed'
-    await change(product.writer, "UPDATE {keys} SET revoked_at='2026-10-01T00:00:00.000000+00:00' WHERE id=:id",
-                 id=key.key)
-    await ended(grant)
-    second = await issue(product.writer, account=key.account)
-    grant = (await adapter.authenticate(key_request(AUDIT, second.token))).grant
-    await change(product.writer, "UPDATE {keys} SET expires_at='2020-01-01T00:00:00.000000+00:00' WHERE id=:id",
-                 id=second.key)
-    await ended(grant)
-    third = await issue(product.writer, account=key.account)
-    grant = (await adapter.authenticate(key_request(AUDIT, third.token))).grant
-    await change(product.writer, 'UPDATE {accounts} SET active=0 WHERE id=:id', id=key.account)
-    await ended(grant)
+    # Each ending stops a live grant; disabling the account comes last.
+    for statement in ENDINGS.values():
+        ending = await issue(product.writer, account=key.account)
+        grant = (await adapter.authenticate(key_request(AUDIT, ending.token))).grant
+        await change(product.writer, statement, id=ending.key)
+        await ended(grant)
     # A grant naming another account than its key's is refused, as is a malformed id.
     other = await issue(product.writer)
     other_grant = (await adapter.authenticate(key_request(AUDIT, other.token))).grant
@@ -357,8 +355,7 @@ async def test_access_exempts_only_allowlisted_key_reads_and_keys_are_refused_ev
             assert 'prefix=malformed ' in line and "path='/api/me'" in line
             assert key.token.partition('.')[2] not in caplog.text and key.token not in caplog.text
             # Once revoked, the key is refused before any handler runs.
-            await change(product.writer, "UPDATE {keys} SET revoked_at='2026-10-01T00:00:00.000000+00:00' WHERE id=:id",
-                         id=key.key)
+            await change(product.writer, ENDINGS['revoked'], id=key.key)
             response = await client.get(AUDIT, headers=key.header)
             assert response.status_code == 401 and response.json() == {'detail': INVALID}
             assert reached == ['listing', 'export']

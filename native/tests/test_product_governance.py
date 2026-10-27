@@ -192,7 +192,7 @@ async def test_restricted_sessions_run_on_modal_and_stop_on_an_existing_lambda_c
 async def test_mandatory_narrowing_changes_the_plan_and_refuses_the_running_computer(governed, monkeypatch):
     from unittest.mock import AsyncMock
 
-    from moyai.modal_network import NETWORK_TAG, NetworkPolicyMismatch, modal_kwargs, require_compatible
+    from moyai.modal_network import NetworkPolicyMismatch, modal_kwargs, require_compatible
     product, governance = governed, governed.database.governance
     monkeypatch.setattr(product.database.settings, 'network_policy_enforcement', 'modal')
     await defaults(product, await profile(product, {'network_domains': ['pypi.org', '*.example.test']}))
@@ -206,10 +206,6 @@ async def test_mandatory_narrowing_changes_the_plan_and_refuses_the_running_comp
     assert narrowed.domains == ('pypi.org',) and narrowed.tag != created.tag
     with pytest.raises(NetworkPolicyMismatch):
         await require_compatible(narrowed, computer)
-    # Loosening needs no action: the computer is within an unrestricted plan.
-    await defaults(product, mandatory='')
-    await defaults(product)
-    assert computer.get_tags.aio.await_count == 1 and NETWORK_TAG in computer.get_tags.aio.return_value
 
 
 async def test_tools_filtered_and_rechecked_for_policy_and_live_role(governed):
@@ -825,44 +821,20 @@ async def test_limit_lookup_resolves_a_person_as_admission_does(inference):
 
 
 async def test_broker_relays_a_spend_refusal_reason_to_the_worker(inference):
-    from fastapi import FastAPI
-
-    from moyai.inference_usage import INFERENCE_ACTIVITY, InferenceActivity, InferenceUsageTransport
-    from moyai.product_inference import ProductInferenceService
-    from moyai.product_inference_routes import product_inference_routes
     ctx = inference
     attach(ctx.product)
     await spend_limit(ctx.product, 'session-default', 0.0)
-    ctx.service.settings = ctx.service.settings.model_copy(update={'public_url': 'https://workspace.invalid'})
 
     async def upstream(_request):
         pytest.fail('A refused request reached the gateway.')
-    await inference_fixtures.install_broker_upstream(ctx, upstream)
-    app = FastAPI()
-    app.include_router(product_inference_routes(ctx.service))
-    worker_database = SimpleNamespace(settings=ctx.product.settings, product_identity=ctx.product.adapter)
-    worker = ProductInferenceService(worker_database, ctx.service.settings.model_copy(update={
-        'moyai_separate_broker': True, 'moyai_runtime_role': 'worker', 'litellm_api_key': '',
-    }), None)
-    worker_database.product_inference = worker
-    await worker.start()
-    try:
-        activity = InferenceActivity(worker_database, ctx.scope, 'refused/1', logical_identity='refused')
-        token = INFERENCE_ACTIVITY.set(activity)
-        try:
-            async with httpx2.AsyncClient(transport=InferenceUsageTransport(
-                httpx2.ASGITransport(app=app), require_admission=True,
-            )) as client:
-                response = await client.post('https://gateway.invalid/v1/responses', json={'model': 'test'})
-        finally:
-            INFERENCE_ACTIVITY.reset(token)
+    async with inference_fixtures.separate_worker(ctx, upstream) as worker:
+        async with inference_fixtures.worker_client(worker, ctx, 'refused') as (activity, client):
+            response = await client.post('https://gateway.invalid/v1/responses', json={'model': 'test'})
         assert response.status_code == 409 and not response.content
         assert response.headers['x-moyai-inference-denied'] == '1'
         assert response.headers['x-moyai-inference-denied-reason'] == 'spend-session'
         assert isinstance(activity.admission_error, SpendLimitReached) and activity.admission_error.reason == 'session'
         assert not await requests(ctx) and not ctx.service.active and ctx.service.slots.active == 0
-    finally:
-        await worker.close()
 
 
 async def test_policy_editor_offers_installation_repositories_and_workspace_models(governed, monkeypatch):
@@ -988,16 +960,12 @@ async def test_service_account_routes_return_a_new_key_once_and_need_their_permi
 @pytest.mark.parametrize('ending', ['revoked', 'expired', 'disabled'])
 async def test_api_key_export_stops_mid_download_when_the_key_or_its_account_ends(governed, ending):
     """The bearer export rechecks the exact key and its account before releasing each page."""
-    from test_product_api_keys import change, issue
+    from test_product_api_keys import ENDINGS, change, issue
     product, released, loop = governed, [], asyncio.get_running_loop()
     def moyai(name):
         return f'moyai.{name}'
     key = await issue(product.source, table=moyai)
-    statement = {
-        'revoked': "UPDATE {keys} SET revoked_at='2026-10-01T00:00:00.000000+00:00' WHERE id=:id",
-        'expired': "UPDATE {keys} SET expires_at='2020-01-01T00:00:00.000000+00:00' WHERE id=:id",
-        'disabled': 'UPDATE {accounts} SET active=0 WHERE id=(SELECT account_id FROM {keys} WHERE id=:id)',
-    }[ending]
+    statement = ENDINGS[ending]
     class TwoPages:
         def export(self, filters, format):
             # The first page passed its recheck; the key ends while it downloads.
@@ -1157,20 +1125,6 @@ async def test_credential_release_and_workspace_preparation_recheck_live_policy(
         await governance.connection(scope, github)
 
 
-async def test_network_mandatory_policy_stops_a_running_session(governed):
-    """A mandatory network restriction stops a running session, not only new ones."""
-    product, governance = governed, governed.database.governance
-    _, _, prepared = await authority.active_turn(product)
-    scope = prepared.scope
-    await governance.check_tool(scope, 'read_file', read_only=True)
-    await governance.check_model(scope, model=scope.model)
-    await defaults(product, mandatory=await profile(product, {'network_domains': []}))
-    for check in (lambda: governance.check_tool(scope, 'read_file', read_only=True),
-                  lambda: governance.check_model(scope, model=scope.model), lambda: product.database.authorize_scope(scope)):
-        with pytest.raises(HTTPException, match='cannot enforce'):
-            await check()
-
-
 async def test_tool_catalog_checks_scope_and_policy_in_one_transaction(governed, monkeypatch):
     """Regression: the per-step catalog resolved the principal and policy again in a second transaction."""
     from temporalio.exceptions import ApplicationError
@@ -1187,9 +1141,12 @@ async def test_tool_catalog_checks_scope_and_policy_in_one_transaction(governed,
     monkeypatch.setattr(product.adapter, '_current', counted)
     assert await catalog(prepared.scope, [('read_file', True), ('shell', False)]) == ['read_file']
     assert len(resolved) == 1
+    # A mandatory network restriction stops a running session, not only new ones.
     await defaults(product, mandatory=await profile(product, {'network_domains': []}))
     with pytest.raises(HTTPException, match='cannot enforce'):
         await catalog(prepared.scope, [('read_file', True)])
+    with pytest.raises(HTTPException, match='cannot enforce'):
+        await product.database.authorize_scope(prepared.scope)
     # In an activity attempt a refusal keeps the activity interceptor's error type.
     monkeypatch.setattr('moyai.agent.activity.in_activity', lambda: True)
     with pytest.raises(ApplicationError) as denied:
@@ -1281,6 +1238,22 @@ async def test_scheduled_governance_refusal_blocks_the_workflow_instead_of_retry
 GITHUB_TRIGGER = {'id': 'comment', 'event': {'provider': 'github', 'event': 'issue_comment', 'repository_id': 111}}
 
 
+async def shared_chat(product, policy):
+    """A shared chat bound to a new profile with this policy."""
+    return (await product.database.create_session(product.actor, NewSession(
+        visibility='shared', security_profile_id=await profile(product, policy)))).id
+
+
+async def save_into_chat(product, automation_id, chat):
+    """Point a saved workflow at this chat, bypassing the save-time checks; returns the stored definition."""
+    async with product.source.begin() as db:
+        saved = await db.scalar(text('SELECT definition FROM moyai.automations WHERE id=:id'), {'id': automation_id})
+        saved = json.dumps({**json.loads(saved), 'session_id': chat})
+        await db.execute(text('UPDATE moyai.automations SET definition=:definition WHERE id=:id'),
+                         {'id': automation_id, 'definition': saved})
+    return saved
+
+
 @pytest.mark.parametrize('narrowed', ['mandatory', 'chat', 'chat_saved_before_its_check'])
 async def test_event_admission_rechecks_github_repositories_before_the_prompt(events, narrowed):
     """Regression: after a repository limit narrowed, a GitHub event's issue and comment still reached a new run."""
@@ -1294,8 +1267,7 @@ async def test_event_admission_rechecks_github_repositories_before_the_prompt(ev
     audited(product)
     chat = None
     if narrowed == 'chat':  # A run in an existing chat, whose policy the mandatory limit narrows as well.
-        chat = (await product.database.create_session(product.actor, NewSession(
-            visibility='shared', security_profile_id=await profile(product, {'repositories': [111]})))).id
+        chat = await shared_chat(product, {'repositories': [111]})
     row = await automation_fixtures.create(
         ctx, security_profile_id=await profile(product, {'repositories': [111]}), session_id=chat,
         triggers=[GITHUB_TRIGGER])
@@ -1309,13 +1281,7 @@ async def test_event_admission_rechecks_github_repositories_before_the_prompt(ev
     if narrowed in {'mandatory', 'chat'}:
         await defaults(product, mandatory=await profile(product, {'repositories': [222]}))
     else:  # An enabled workflow saved into a chat that excludes its trigger repository, which save now refuses.
-        chat = (await product.database.create_session(product.actor, NewSession(
-            visibility='shared', security_profile_id=await profile(product, {'repositories': []})))).id
-        async with product.source.begin() as db:
-            saved = await db.scalar(text('SELECT definition FROM moyai.automations WHERE id=:id'), {'id': row['id']})
-            saved = json.dumps({**json.loads(saved), 'session_id': chat})
-            await db.execute(text('UPDATE moyai.automations SET definition=:definition WHERE id=:id'),
-                             {'id': row['id'], 'definition': saved})
+        saved = await save_into_chat(product, row['id'], await shared_chat(product, {'repositories': []}))
         async with product.database.sessions.begin() as db:
             (await db.get(Binding, row['id'])).definition_digest = definition_digest(_definition({'definition': saved}))
     delivery = {'action': 'created', 'repository': {'id': 111, 'full_name': 'acme/excluded'}, 'sender': {'type': 'User'},
@@ -1340,76 +1306,42 @@ async def test_event_admission_rechecks_github_repositories_before_the_prompt(ev
     assert (await event_fixtures.pending(ctx))[0]['context'] == '{}'
 
 
-async def test_scheduled_chat_workflow_model_is_checked_against_the_chat_policy(automations, monkeypatch):
-    """Regression: review and save checked only the workflow profile, so every run in a narrower chat was refused."""
-    from test_product_activity_audit import activity, audited
-
-    from moyai.product_automations import Migration
-    ctx = automations
-    product = ctx.product
-    audited(product)
-    monkeypatch.setattr(product.database.settings, 'model_catalog', 'other')
-    chat = (await product.database.create_session(product.actor, NewSession(
-        visibility='shared', security_profile_id=await profile(product, {'models': ['other']})))).id
-    # The workflow's default model 'test' under an unrestricted profile.
-    with pytest.raises(HTTPException) as refused:
-        await automation_fixtures.create(ctx, session_id=chat)
-    assert refused.value.status_code == 403 and 'does not allow the workflow model' in refused.value.detail
-    [denied] = await activity(product, 'policy.continuation_denied')
-    assert (denied['resource_id'], denied['details']['reason'], denied['details']['model']) == (chat, 'model_policy', 'test')
-    # A workflow saved before that check is reported by the readiness review and cannot be enabled.
-    row = await automation_fixtures.create(ctx)
-    async with product.source.begin() as db:
-        saved = json.loads(await db.scalar(text('SELECT definition FROM moyai.automations WHERE id=:id'), {'id': row['id']}))
-        await db.execute(text('UPDATE moyai.automations SET definition=:definition WHERE id=:id'),
-                         {'id': row['id'], 'definition': json.dumps({**saved, 'session_id': chat})})
-    blockers = (await ctx.service.preview(ctx.grant, row['id']))['blockers']
-    assert 'model_not_allowed_by_security_policy' in blockers
-    assert 'scheduled_chat_exceeds_security_policy' not in blockers
-    with pytest.raises(HTTPException) as blocked:
-        await ctx.service.mutate(ctx.grant, 'migrate', row['id'], Migration(
-            revision=row['revision'], request_key='migrate-' + uuid4().hex, activate=True))
-    assert blocked.value.status_code == 409 and 'model_not_allowed_by_security_policy' in blocked.value.detail['blockers']
-    # A chat that allows the model serves the workflow.
-    allowed = (await product.database.create_session(product.actor, NewSession(
-        visibility='shared', security_profile_id=await profile(product, {'models': ['other', 'test']})))).id
-    await automation_fixtures.create(ctx, session_id=allowed)
-
-
-async def test_scheduled_chat_workflow_trigger_repositories_are_checked_against_the_chat_policy(events):
-    """Regression: a chat excluding a GitHub trigger repository passed review and save, then blocked every event."""
+@pytest.mark.parametrize(('chat_policy', 'allowed', 'workflow', 'message', 'details', 'blocker'), [
+    ({'models': ['other']}, {'models': ['other', 'test']}, None, 'does not allow the workflow model',
+     {'reason': 'model_policy', 'model': 'test'}, 'model_not_allowed_by_security_policy'),
+    ({'repositories': []}, {'repositories': [111]}, {'repositories': [111]}, 'does not allow a workflow trigger repository',
+     {'reason': 'repository_policy'}, 'repository_not_allowed_by_security_policy'),
+], ids=['model', 'trigger_repository'])
+async def test_scheduled_chat_workflow_is_checked_against_the_chat_policy(
+        events, monkeypatch, chat_policy, allowed, workflow, message, details, blocker):
+    """Regression: review and save checked only the workflow profile, so a chat excluding the workflow model or a
+    GitHub trigger repository refused every run or blocked every event."""
     from test_product_activity_audit import activity, audited
 
     from moyai.product_automations import Migration
     ctx = events
     product = ctx.product
     audited(product)
-    workflow = await profile(product, {'repositories': [111]})
-    chat = (await product.database.create_session(product.actor, NewSession(
-        visibility='shared', security_profile_id=await profile(product, {'repositories': []})))).id
+    monkeypatch.setattr(product.database.settings, 'model_catalog', 'other')
+    # Without a workflow policy, the default model 'test' runs under an unrestricted profile.
+    fields = {'security_profile_id': await profile(product, workflow), 'triggers': [GITHUB_TRIGGER]} if workflow else {}
+    chat = await shared_chat(product, chat_policy)
     with pytest.raises(HTTPException) as refused:
-        await automation_fixtures.create(ctx, security_profile_id=workflow, session_id=chat, triggers=[GITHUB_TRIGGER])
-    assert refused.value.status_code == 403 and 'does not allow a workflow trigger repository' in refused.value.detail
+        await automation_fixtures.create(ctx, session_id=chat, **fields)
+    assert refused.value.status_code == 403 and message in refused.value.detail
     [denied] = await activity(product, 'policy.continuation_denied')
-    assert (denied['resource_id'], denied['details']['reason']) == (chat, 'repository_policy')
+    assert denied['resource_id'] == chat and details.items() <= denied['details'].items()
     # A workflow saved before that check is reported by the readiness review and cannot be enabled.
-    row = await automation_fixtures.create(ctx, security_profile_id=workflow, triggers=[GITHUB_TRIGGER])
-    async with product.source.begin() as db:
-        saved = json.loads(await db.scalar(text('SELECT definition FROM moyai.automations WHERE id=:id'), {'id': row['id']}))
-        await db.execute(text('UPDATE moyai.automations SET definition=:definition WHERE id=:id'),
-                         {'id': row['id'], 'definition': json.dumps({**saved, 'session_id': chat})})
+    row = await automation_fixtures.create(ctx, **fields)
+    await save_into_chat(product, row['id'], chat)
     blockers = (await ctx.service.preview(ctx.grant, row['id']))['blockers']
-    assert 'repository_not_allowed_by_security_policy' in blockers
-    assert 'scheduled_chat_exceeds_security_policy' not in blockers
+    assert blocker in blockers and 'scheduled_chat_exceeds_security_policy' not in blockers
     with pytest.raises(HTTPException) as blocked:
         await ctx.service.mutate(ctx.grant, 'migrate', row['id'], Migration(
             revision=row['revision'], request_key='migrate-' + uuid4().hex, activate=True))
-    assert blocked.value.status_code == 409
-    assert 'repository_not_allowed_by_security_policy' in blocked.value.detail['blockers']
-    # A chat that allows the trigger repository serves the workflow.
-    allowed = (await product.database.create_session(product.actor, NewSession(
-        visibility='shared', security_profile_id=await profile(product, {'repositories': [111]})))).id
-    await automation_fixtures.create(ctx, security_profile_id=workflow, session_id=allowed, triggers=[GITHUB_TRIGGER])
+    assert blocked.value.status_code == 409 and blocker in blocked.value.detail['blockers']
+    # A chat that allows it serves the workflow.
+    await automation_fixtures.create(ctx, session_id=await shared_chat(product, allowed), **fields)
 
 
 async def test_chat_event_admission_ignores_the_saved_repository_a_chat_run_never_uses(events):
@@ -1418,8 +1350,7 @@ async def test_chat_event_admission_ignores_the_saved_repository_a_chat_run_neve
     ctx = events
     product = ctx.product
     audited(product)
-    chat = (await product.database.create_session(product.actor, NewSession(
-        visibility='shared', security_profile_id=await profile(product, {'repositories': [222]})))).id
+    chat = await shared_chat(product, {'repositories': [222]})
     row = await event_fixtures.event_automation(
         ctx, session_id=chat, repo_url='https://github.com/acme/hidden', github_repository_id=111)
     assert (await ctx.service.preview(ctx.grant, row['id']))['blockers'] == []

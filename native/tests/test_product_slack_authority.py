@@ -71,28 +71,26 @@ async def test_signed_slack_cookie_and_unsigned_identity_headers_cannot_authenti
         assert error.value.status_code == 401
 
 
-@pytest.mark.parametrize("change", ["unlinked", "unavailable", "manual", "foreign"])
-async def test_unverified_slack_senders_hold_no_permissions(secrets_api, change):
-    """As in canonical actor checks, a sender without a verified, eligible email is never a member."""
-    api = secrets_api
-    identity = await enroll(api)
-    if change == "unavailable":
-        api.bridge.store.execute("UPDATE users SET link_status='unavailable',profile_eligible=0 WHERE id=?", (identity,))
-    elif change == "manual":
-        api.bridge.store.execute(
-            "UPDATE users SET link_status='manual',linked_user_id='google:owner' WHERE id=?", (identity,),
-        )
-    elif change == "foreign":
-        api.bridge.store.execute(
-            "UPDATE users SET email='sender@elsewhere.test',profile_eligible=1,link_status='linked' WHERE id=?",
-            (identity,),
-        )
-    principal = await api.identity.current(identity)
+def assert_unverified(principal):
     assert principal.kind == "slack" and principal.effective_permissions == frozenset()
     # ProductGovernance.principal and every governed admission require this first.
     with pytest.raises(HTTPException) as denied:
         principal.require("sessions.create")
     assert denied.value.status_code == 403
+
+
+@pytest.mark.parametrize("change", [
+    None, "link_status='unavailable',profile_eligible=0",
+    "link_status='manual',linked_user_id='google:owner'",
+    "email='sender@elsewhere.test',profile_eligible=1,link_status='linked'",
+], ids=["unlinked", "unavailable", "manual", "foreign"])
+async def test_unverified_slack_senders_hold_no_permissions(secrets_api, change):
+    """As in canonical actor checks, a sender without a verified, eligible email is never a member."""
+    api = secrets_api
+    identity = await enroll(api)
+    if change:
+        api.bridge.store.execute(f"UPDATE users SET {change} WHERE id=?", (identity,))
+    assert_unverified(await api.identity.current(identity))
 
 
 async def test_slack_intake_without_identity_linking_never_verifies_the_sender(secrets_api, monkeypatch):
@@ -119,10 +117,7 @@ async def test_slack_intake_without_identity_linking_never_verifies_the_sender(s
     slack = ProductSlack(api.runtime)
     api.bridge.settings.slack_identity_linking_enabled = False
     _, principal = await slack.actor("TTEST0001", "UTEST0001", refresh_profile=True)
-    assert principal.kind == "slack" and principal.effective_permissions == frozenset()
-    with pytest.raises(HTTPException) as denied:
-        principal.require("sessions.create")
-    assert denied.value.status_code == 403
+    assert_unverified(principal)
     # The same intake with linking enabled verifies the in-domain profile.
     api.bridge.settings.slack_identity_linking_enabled = True
     _, principal = await slack.actor("TTEST0001", "UTEST0001", refresh_profile=True)
