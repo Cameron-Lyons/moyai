@@ -1357,6 +1357,44 @@ async def test_effective_policy_is_read_once_per_transaction(governed, monkeypat
         assert (await governance.network_plan(session.id, db=db)).domains is None and len(reads) == 2
 
 
+async def test_one_transaction_reads_each_binding_once(inference):
+    """Regression: policy() read the binding before its memo, so a new session's model choice, the session spend
+    limit's family root and every repeat check in one transaction read it again."""
+    from sqlalchemy import event
+    ctx = inference
+    governance = attach(ctx.product)
+    await session_limit(ctx.product)
+    statements = []
+
+    def record(conn, cursor, statement, parameters, context, executemany):
+        statements.append(statement)
+
+    def binding_reads():
+        # The session limit's ledger sum names the table too, to sum the family.
+        found = [statement for statement in statements if statement.lstrip().upper().startswith('SELECT')
+                 and 'moyai_product_session_policies' in statement and 'moyai_inference_usage' not in statement]
+        statements.clear()
+        return found
+    child = await ctx.product.database.create_session(ctx.product.actor, NewSession(), inherited_from=ctx.session.id)
+    scope = replace(ctx.scope, session_id=child.id)
+    engine = ctx.product.database.engine.sync_engine
+    event.listen(engine, 'before_cursor_execute', record)
+    try:
+        await ctx.product.database.create_session(ctx.product.actor, NewSession())
+        # bind() looks for an existing binding; choosing the model does not read the new one again.
+        created = binding_reads()
+        async with ctx.product.database.sessions.begin() as db:
+            await governance.check_model(scope, model='test', db=db)
+            # One read gives the policy and the family root the session limit sums over.
+            checked = binding_reads()
+            await governance.check_model(scope, model='test', db=db)
+            await governance.check_tool(scope, 'read_file', db=db)
+            repeated = binding_reads()
+    finally:
+        event.remove(engine, 'before_cursor_execute', record)
+    assert (len(created), len(checked), repeated) == (1, 1, [])
+
+
 async def test_audit_routes_reject_bad_filters_with_the_tested_sentence(governed):
     """Regression: the routes validated filters apart from parse_filters and returned a raw error list."""
     class Unreached:

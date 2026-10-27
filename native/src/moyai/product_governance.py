@@ -242,6 +242,9 @@ class ProductGovernance:
                                    family_root=parent.family_root if parent else inherited_from or session.id)
         db.add(row)
         await db.flush()
+        # The mandatory policy read above already narrows this one, so it is the
+        # session's effective policy for the rest of this transaction.
+        self._remember(db, session.id, policy, row.family_root)
         await self.record(db, 'session.created', actor_id=principal.id, resource_id=session.id,
                           session_id=session.id, key=(session.id,), details={
                               'origin': origin, 'visibility': session.visibility,
@@ -249,19 +252,29 @@ class ProductGovernance:
                               'inherited': inherited_from is not None})
         return row
 
-    # Effective policies of bound sessions, and the mandatory profile, per root
-    # transaction. Bindings are immutable, and the shared gate callers take
-    # through principal() keeps mandatory-profile writers out until the
-    # transaction ends, so a repeat read in one transaction is the same value.
+    # Effective policies and family roots of bound sessions, and the mandatory
+    # profile, per root transaction. Bindings are immutable, and the shared gate
+    # callers take through principal() keeps mandatory-profile writers out until
+    # the transaction ends, so a repeat read in one transaction is the same value.
     _policies: WeakKeyDictionary[Any, dict[str, Any]] = WeakKeyDictionary()
+
+    def _memo(self, db):
+        """This transaction's memo; {} (discarded) before the transaction begins."""
+        transaction = db.sync_session.get_transaction()
+        return {} if transaction is None else self._policies.setdefault(transaction, {})
+
+    def _remember(self, db, session_id, policy, family_root):
+        memo = self._memo(db)
+        memo[session_id], memo['\0root:' + session_id] = policy, family_root
 
     async def policy(self, db, session_id):
         from app.security_profiles import ProfilePolicy, effective, load_policy
-        row = await db.get(ProductSessionPolicy, session_id)
-        transaction = db.sync_session.get_transaction()
-        memo = {} if transaction is None else self._policies.setdefault(transaction, {})
-        if session_id in memo:
+        # The memo first: the identity map holds a binding row only weakly, so
+        # another get would read it again.
+        if session_id in (memo := self._memo(db)):
             return memo[session_id]
+        row = await db.get(ProductSessionPolicy, session_id)
+        memo = self._memo(db)  # The get began the transaction if it had not begun.
         if '\0mandatory' not in memo:
             memo['\0mandatory'] = await db.run_sync(lambda sync: self.product.profiles.mandatory_in(
                 CanonicalRead(sync, self.identity)))
@@ -272,8 +285,15 @@ class ProductGovernance:
                            mandatory.policy if mandatory else None)
         # bind() may still pin an unbound session later in this transaction.
         if row is not None:
-            memo[session_id] = policy
+            self._remember(db, session_id, policy, row.family_root)
         return policy
+
+    async def family_root(self, db, session_id):
+        """The root of the session's delegation family; itself when unbound."""
+        if (root := self._memo(db).get('\0root:' + session_id)) is not None:
+            return root
+        bound = await db.get(ProductSessionPolicy, session_id)
+        return bound.family_root if bound else session_id
 
     async def require_provider(self, policy, provider, denial, /, **details):
         """Refuse a network restriction where the session's computer cannot enforce it.
@@ -550,9 +570,8 @@ class ProductGovernance:
         month = InferenceUsage.created_at >= ledger.period_start
         scopes = {'organization': [month], 'user': [month, self._person(principal.email, principal.id)]}
         if session_id is not None and limits.session is not None:
-            # policy() has already loaded this binding during admission.
-            bound = await db.get(ProductSessionPolicy, session_id)
-            root = bound.family_root if bound else session_id
+            # policy() has already memoized this during admission.
+            root = await self.family_root(db, session_id)
             # A delegated child shares every ancestor's lifetime session
             # budget. The whole family's total is the largest one that any
             # ancestor's limit sees, so every member is checked against it.
