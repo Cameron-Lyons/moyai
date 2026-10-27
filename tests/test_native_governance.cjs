@@ -9,13 +9,14 @@ const ts=require('typescript');
 const React=require('react');
 const {renderToStaticMarkup}=require('react-dom/server');
 const root=path.resolve(__dirname,'..');
-let server,gov,settings,permissions,sdk,api,homeSubmission;
+let server,gov,settings,permissions,sdk,api,homeSubmission,pickers;
 test.before(async()=>{
   const {createServer}=await import('vite');
   server=await createServer({configFile:path.join(root,'native/web/vite.config.ts'),optimizeDeps:{noDiscovery:true,include:[]},server:{middlewareMode:true},appType:'custom'});
   gov=await server.ssrLoadModule('/governance.tsx');
   settings=await server.ssrLoadModule('/settings.tsx');
   permissions=await server.ssrLoadModule('/permissions.ts');
+  pickers=await server.ssrLoadModule('/security-policy.ts');
   sdk=await server.ssrLoadModule('/generated/api/index.ts');
   api=await server.ssrLoadModule('/api.ts');
   (await server.ssrLoadModule('/generated/api/client.gen.ts')).client.setConfig({baseUrl:'https://moyai.test'});
@@ -228,6 +229,40 @@ test('Home sends a chosen security policy only when it is still offered',()=>{
   assert.deepEqual(homeSubmission('Task','model',false,[],[],[]).session,{model:'model',visibility:'shared'},'the default leaves the choice to the server');
   assert.throws(()=>homeSubmission('Task','model',true,[],[],[],id,[]),/no longer available/);
   assert.throws(()=>homeSubmission('Task','model',true,[],[],[],'../x',['../x']),/no longer available/);
+});
+
+test('pickers follow the effective policy: models, connections, workflow apps and repositories',()=>{
+  const open={connected_apps:null,tools:null,git_access:'write',network_domains:null,repositories:null,models:null};
+  const models=['test-model','openai/gpt-6-astra','openai/gpt-6-astra-ultrafast'];
+  assert.deepEqual(pickers.policyModels(models,null),models,'no policy read leaves every choice to admission');
+  assert.deepEqual(pickers.policyModels(models,{...open,models:['openai/gpt-6-astra-ultrafast','retired']}),['openai/gpt-6-astra-ultrafast'],'exact IDs, workspace order');
+  const astra={...open,models:['openai/gpt-6-astra','openai/gpt-6-astra-ultrafast']};
+  assert.equal(pickers.policyModel(models,open,'test-model','test-model'),'test-model');
+  assert.equal(pickers.policyModel(models,astra,'openai/gpt-6-astra-ultrafast','test-model'),'openai/gpt-6-astra-ultrafast','an allowed choice is kept');
+  assert.equal(pickers.policyModel(models,astra,'test-model','openai/gpt-6-astra-ultrafast'),'openai/gpt-6-astra-ultrafast','the policy default replaces a refused choice');
+  assert.equal(pickers.policyModel(models,astra,'test-model','test-model'),'openai/gpt-6-astra','then the first allowed model');
+  assert.equal(pickers.policyModel(models,{...open,models:[]},'test-model','test-model'),'','nothing is allowed');
+  const repo=(repository_id,kind='github')=>({kind,policy:{allowed_tools:null,require_approval:false,product:{repository_id}}});
+  const limited={...open,repositories:[7]};
+  assert.equal(pickers.policyAdmitsConnection(null,repo(8)),true);
+  assert.equal(pickers.policyAdmitsConnection(limited,repo(7)),true);
+  for(const refused of [repo(8),repo(null),repo('7'),repo(true),{kind:'github',policy:{allowed_tools:null,require_approval:false,product:null}}])
+    assert.equal(pickers.policyAdmitsConnection(limited,refused),false,'an unlisted or unverified repository is refused');
+  assert.equal(pickers.policyAdmitsConnection({...open,repositories:[]},repo(null,'linear')),true,'other apps ignore repository limits');
+  assert.equal(pickers.policyAdmitsConnection({...open,connected_apps:['github']},repo(null,'linear')),false);
+  assert.equal(pickers.policyAdmitsConnection({...open,git_access:'none'},repo(7)),false,'no Git access refuses GitHub');
+  assert.equal(pickers.policyAdmitsApp({...open,repositories:[]},'github'),false,'a workflow cannot select GitHub with no repositories');
+  assert.equal(pickers.policyAdmitsApp(limited,'github'),true);
+  assert.equal(pickers.policyAdmitsApp({...open,connected_apps:['github']},'notion'),false);
+  const known=[{id:7,full_name:'Acme/App'},{id:8,full_name:'acme/other'}];
+  assert.equal(pickers.githubRepositoryName(' https://github.com/acme/app.git/ '),'acme/app');
+  assert.equal(pickers.policyRefusesRepository(null,8,'acme/other',known),false);
+  assert.equal(pickers.policyRefusesRepository(limited,7,'acme/other',known),false,'a saved ID decides');
+  assert.equal(pickers.policyRefusesRepository(limited,8,'acme/app',known),true);
+  assert.equal(pickers.policyRefusesRepository(limited,null,'acme/app',known),false,'names match the allowed repositories case-insensitively');
+  assert.equal(pickers.policyRefusesRepository(limited,null,'acme/other',known),true);
+  assert.equal(pickers.policyRefusesRepository(limited,null,'someone/public',known),true,'an unknown repository cannot be verified');
+  assert.equal(pickers.policyRefusesRepository(limited,null,' ',known),false,'no repository');
 });
 
 const python=path.join(root,'.venv/bin/python');

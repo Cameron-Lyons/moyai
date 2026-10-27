@@ -27,9 +27,15 @@ const catalogRows=[
 const ALL=catalogRows.map(row=>row[0]);
 const MEMBER=['workspace.read','sessions.read','sessions.create','sessions.manage','connections.read','connections.write','automations.read','automations.manage','environments.read','skills.read','skills.manage','memory.read','memory.manage','credentials.read','credentials.manage','spend.personal'];
 const entry=(id,action,resource_type,resource_id,details={},actor='admin@example.test',source='governance',created_at=stamp)=>({id,source,action,actor,resource_type,resource_id,details,created_at});
+const MODELS=['test-model','openai/gpt-6-astra','openai/gpt-6-astra-ultrafast'], SID='c'.repeat(32);
+// GitHub rows carry their permanent repository ID in policy.product, as the product catalog returns them.
+const connection=(id,kind,name,repository_id=null)=>({id,name,kind,owner_id:'',shared:true,read_only:false,enabled:true,revision:1,source:'product',
+  policy:{allowed_tools:null,require_approval:false,product:{repository_id}}});
+const CONNECTIONS=[connection('gh-101','github','synthetic-org/api',101),connection('gh-102','github','synthetic-org/web',102),connection('linear','linear','Linear')];
 const profile=(id,name,policy,patch={})=>({id,name,enabled:true,revision:2,policy:{connected_apps:null,tools:null,git_access:'write',network_domains:null,repositories:null,models:null,...policy},updated_at:stamp,updated_by:'admin@example.test',...patch});
 function reset(overrides={}) {
   state={mode:'existing',role:'admin',permissions:[...ALL],accessRole:null,requests:[],conflict:false,forbidRoles:false,networkEnforcement:'off',
+    connections:[],preferences:{delivery_mode:'when_idle',connection_ids:null},session:false,sessionModel:'test-model',sessionPolicy:null,
     roles:[
       {id:'auditor',name:'Auditor',description:'Read-only compliance access for reviews.',permissions:['audit.read','sessions.read','spend.read'],revision:3,archived:false,updated_at:stamp,updated_by:'admin@example.test'},
       {id:'contractor',name:'Contractor',description:'Project sessions without organization settings.',permissions:['sessions.create','sessions.read'],revision:1,archived:false,updated_at:stamp,updated_by:'admin@example.test'},
@@ -82,11 +88,31 @@ async function handle(req,res,next) {
   const json=(value,status=200)=>{res.writeHead(status,{'Content-Type':'application/json','Cache-Control':'no-store'});res.end(JSON.stringify(value));};
   const has=permission=>state.permissions.includes(permission);
   const deny=()=>json({detail:'Your workspace role does not allow this action.'},403);
-  if(p==='/api/me')return json({user:{id:'admin@example.test',name:'Synthetic admin',role:state.role,individual:true},csrf:'fixture-csrf',models:['test-model'],default_model:'test-model',product_mode:state.mode,
+  if(p==='/api/me')return json({user:{id:'admin@example.test',name:'Synthetic admin',role:state.role,individual:true},csrf:'fixture-csrf',models:MODELS,default_model:'test-model',product_mode:state.mode,preferences:state.preferences,
     ...(state.omitPermissions?{}:{permissions:state.permissions,access_role:state.accessRole})});
-  if(p==='/api/connections'||p==='/api/session-folders')return json([]);
+  if(p==='/api/connections')return json(state.connections);
+  if(p==='/api/session-folders')return json([]);
+  // Like ProductGovernance.new_session_policy: the selected or default profile, and session_model's implicit choice.
+  const newSession=requested=>{
+    const chosen=state.profiles.find(row=>row.id===(requested||state.defaults.default_profile_id)&&row.enabled);
+    const policy=chosen?.policy??profile('','',{}).policy, allowed=MODELS.filter(model=>policy.models===null||policy.models.includes(model));
+    return {policy,default_model:allowed.includes('test-model')?'test-model':allowed[0]??null};
+  };
+  if(p==='/api/security-policy/new-session'){
+    const requested=url.searchParams.get('profile_id')||'';
+    if(requested&&!has('security.manage'))return deny();
+    return json(newSession(requested));
+  }
+  const governed=()=>({id:SID,title:'Governed work',owner_id:'admin@example.test',visibility:'shared',surface:'web',model:state.sessionModel,status:'idle',active_turn:null,archived:false,deleted:false,pinned:false,folder:'',can_manage:true});
+  if(state.session&&p===`/api/sessions/${SID}`&&method==='GET')return json({session:governed(),reference:{...governed(),source:'native',url:'/#'+SID},turns:[],messages:[],activity:[],effects:[],pending:null,goal:null,
+    can_answer:null,can_reply_with_text:null,credential_requests:null,has_unsettled_effects:false,question_deadline:null,slack_delivery:null,transcript_version:null});
+  if(state.session&&p===`/api/sessions/${SID}/security-policy`){await state.policyGate;return json({policy:state.sessionPolicy});}
+  if(state.session&&p===`/api/sessions/${SID}/read`)return json({});
   if(p==='/api/pull-requests/statuses')return json({});
-  if(p==='/api/history/sessions'||p==='/api/history/search')return json({sessions:[],has_more:false});
+  if(p==='/api/history/sessions'||p==='/api/history/search')return json({sessions:[],ancestors:[],has_more:false,next_cursor:null,notice:null});
+  // As session_model: an explicitly requested model must be allowed by the policy the session binds.
+  if(p==='/api/sessions'&&method==='POST'&&data.model&&!(newSession(data.security_profile_id).policy.models??[data.model]).includes(data.model))
+    return json({detail:'This model is not allowed by the session security policy.'},403);
   if(p==='/api/sessions'&&method==='POST')return json({id:'c'.repeat(32),title:'New conversation',owner_id:'admin@example.test',visibility:data.visibility,surface:'web',model:'test-model',status:'idle',active_turn:null,archived:false});
   if(p==='/api/sessions')return json([]);
   if(p.startsWith('/api/sessions/')&&p.endsWith('/messages')&&method==='POST')return json({id:'turn-1',session_id:'c'.repeat(32),status:'queued',actor_id:'admin@example.test',connections:[]});
@@ -553,19 +579,98 @@ test('Users shows custom roles and replacing one needs explicit confirmation',as
   assert.equal(await page.getByRole('button',{name:/Edit role/}).count(),0);
 });
 
-test('Home offers enabled security policies and sends only an explicit choice',async t=>{
-  reset();const page=await pageFor(t,'');await page.getByRole('textbox',{name:'Message Moyai'}).waitFor();
+test('Home offers enabled security policies, sends only an explicit choice and follows its model and repository limits',async t=>{
+  reset({connections:CONNECTIONS});const page=await pageFor(t,'');await page.getByRole('textbox',{name:'Message Moyai'}).waitFor();
   const trigger=page.getByRole('combobox',{name:'Security policy'});await trigger.waitFor();assert.match(await trigger.innerText(),/Organization default · Standard engineering/);
+  await waitFor(()=>last('/api/security-policy/new-session'),'the default policy read');assert.equal(last('/api/security-policy/new-session').query,'','the default needs no profile');
+  await page.getByRole('combobox',{name:'Model'}).click();
+  assert.deepEqual(await page.getByRole('option').allTextContents(),['test-model','gpt-6-astra','gpt-6-astra-ultrafast'],'an unrestricted policy offers every model');
+  await page.keyboard.press('Escape');
   await page.getByRole('textbox',{name:'Message Moyai'}).fill('Default policy task');await page.getByRole('button',{name:'Send message'}).click();
   await waitFor(()=>last('/api/sessions','POST'));assert.deepEqual(last('/api/sessions','POST').body,{model:'test-model',visibility:'shared'});
+  await waitFor(()=>last(`/api/sessions/${SID}/messages`,'POST'));
+  assert.deepEqual(last(`/api/sessions/${SID}/messages`,'POST').body.connections,['gh-101','gh-102','linear'],'an unrestricted policy keeps every connection');
   await page.goto(base+'/');
   await page.getByRole('combobox',{name:'Security policy'}).click();
   assert.deepEqual(await page.getByRole('option').allTextContents(),['Organization default · Standard engineering','Standard engineering','Restricted review'],'disabled policies are not offered');
   await page.getByRole('option',{name:'Restricted review',exact:true}).click();
   assert.equal(await page.getByRole('combobox',{name:'Security policy'}).innerText(),'Restricted review');
+  await waitFor(()=>last('/api/security-policy/new-session')?.query===`?profile_id=${P2}`,'the chosen policy read');
+  // Restricted review allows one model and repositories 101 and 9001 (not in the catalog) through GitHub only.
+  const model=page.getByRole('combobox',{name:'Model'});
+  await page.getByText('2 connections are not allowed by this security policy').waitFor();
+  assert.equal(await model.innerText(),'gpt-6-astra','a refused choice falls back to the policy default');
+  await model.click();assert.deepEqual(await page.getByRole('option').allTextContents(),['gpt-6-astra']);await page.keyboard.press('Escape');
+  if(screens)await page.screenshot({path:path.join(screens,'home-policy-1440.png')});
   await page.getByRole('textbox',{name:'Message Moyai'}).fill('Restricted task');await page.getByRole('button',{name:'Send message'}).click();
   await waitFor(()=>state.requests.filter(req=>req.path==='/api/sessions'&&req.method==='POST').length===2);
-  assert.deepEqual(last('/api/sessions','POST').body,{model:'test-model',visibility:'shared',security_profile_id:P2});
+  assert.deepEqual(last('/api/sessions','POST').body,{model:'openai/gpt-6-astra',visibility:'shared',security_profile_id:P2});
+  await waitFor(()=>state.requests.filter(req=>req.path===`/api/sessions/${SID}/messages`&&req.method==='POST').length===2);
+  const message=last(`/api/sessions/${SID}/messages`,'POST').body;
+  assert.equal(message.model,'openai/gpt-6-astra');assert.deepEqual(message.connections,['gh-101'],'only the listed repository is selected');
+});
+
+test('Home blocks sending when its policy allows no model, and a member reads only the default policy',async t=>{
+  reset({role:'member',permissions:[...MEMBER]});state.profiles[0].policy.models=[];
+  const page=await pageFor(t,'');await page.getByRole('textbox',{name:'Message Moyai'}).waitFor();
+  await page.getByText('This security policy allows no models. Choose another policy or ask an administrator.').waitFor();
+  assert.equal(await page.getByRole('combobox',{name:'Security policy'}).count(),0,'only security.manage holders choose a profile');
+  assert.ok(state.requests.filter(req=>req.path==='/api/security-policy/new-session').every(req=>req.query===''));
+  assert.equal(await page.getByRole('combobox',{name:'Model'}).isDisabled(),true);
+  await page.getByRole('textbox',{name:'Message Moyai'}).fill('Nothing allowed');
+  assert.equal(await page.getByRole('button',{name:'Send message'}).isDisabled(),true);
+  await page.keyboard.press('Enter');await page.waitForTimeout(100);
+  assert.equal(last('/api/sessions','POST'),undefined,'nothing is admitted');
+  for(const width of [768,320]){await page.setViewportSize({width,height:900});await noOverflow(page,width);}
+  if(screens)await page.screenshot({path:path.join(screens,'home-no-model-320.png')});
+});
+
+test('Home reads its policy again after a refused send and retries with an allowed model',async t=>{
+  reset();const page=await pageFor(t,'');await page.getByRole('textbox',{name:'Message Moyai'}).waitFor();
+  await waitFor(()=>last('/api/security-policy/new-session'),'the default policy read');
+  const reads=()=>state.requests.filter(req=>req.path==='/api/security-policy/new-session').length, before=reads();
+  state.profiles[0].policy.models=['openai/gpt-6-astra'];  // An administrator narrows the default after Home read it.
+  await page.getByRole('textbox',{name:'Message Moyai'}).fill('Narrowed task');await page.getByRole('button',{name:'Send message'}).click();
+  await page.getByText('This model is not allowed by the session security policy.').waitFor();
+  await waitFor(()=>reads()>before,'the policy read again');
+  await page.waitForFunction(()=>document.querySelector('[aria-label="Model"]')?.textContent==='gpt-6-astra');
+  await page.getByRole('button',{name:'Send message'}).click();
+  await waitFor(()=>last('/api/sessions','POST')?.body.model==='openai/gpt-6-astra','the retry uses the allowed model');
+  await waitFor(()=>last(`/api/sessions/${SID}/messages`,'POST'));
+});
+
+test('the composer waits for its session policy before sending',async t=>{
+  let release;const gate=new Promise(resolve=>{release=resolve;});t.after(()=>release());
+  reset({session:true,sessionPolicy:{...profile('','',{}).policy,models:['openai/gpt-6-astra']},policyGate:gate});
+  const page=await pageFor(t,'#'+SID);await page.getByRole('heading',{name:'Governed work'}).first().waitFor();
+  const input=page.getByRole('textbox',{name:/Message/}).last();await input.click();await page.keyboard.type('Too early');
+  await page.getByText('Loading security policy…').waitFor();
+  assert.equal(await page.getByRole('button',{name:'Send message'}).isDisabled(),true,'no send before the policy read');
+  await page.keyboard.press('Enter');await page.waitForTimeout(100);
+  assert.equal(last(`/api/sessions/${SID}/messages`,'POST'),undefined,'the stored model is not sent before the read');
+  release();
+  await page.waitForFunction(()=>[...document.querySelectorAll('[aria-label="Model"]')].some(el=>el.textContent==='openai/gpt-6-astra'));
+  await page.getByRole('button',{name:'Send message'}).click();
+  await waitFor(()=>last(`/api/sessions/${SID}/messages`,'POST'));
+  assert.equal(last(`/api/sessions/${SID}/messages`,'POST').body.model,'openai/gpt-6-astra','the refused session model is never sent');
+});
+
+test('the composer follows the session policy, including a mandatory narrowing of its own model',async t=>{
+  const limited={...profile('','',{}).policy,connected_apps:['github'],repositories:[101],models:['openai/gpt-6-astra-ultrafast','openai/gpt-6-astra']};
+  reset({session:true,sessionPolicy:limited,connections:CONNECTIONS,preferences:{delivery_mode:'when_idle',connection_ids:['gh-101','gh-102','linear']}});
+  const page=await pageFor(t,'#'+SID);await page.getByRole('heading',{name:'Governed work'}).first().waitFor();
+  await waitFor(()=>last(`/api/sessions/${SID}/security-policy`),'the session policy read');
+  const model=page.getByRole('combobox',{name:'Model'});
+  await page.waitForFunction(()=>[...document.querySelectorAll('[aria-label="Model"]')].some(el=>el.textContent==='openai/gpt-6-astra'));
+  await model.click();assert.deepEqual(await page.getByRole('option').allTextContents(),['openai/gpt-6-astra','openai/gpt-6-astra-ultrafast'],'workspace order');
+  if(screens)await page.screenshot({path:path.join(screens,'composer-policy-1440.png')});
+  await page.getByRole('option',{name:'openai/gpt-6-astra-ultrafast',exact:true}).click();
+  const input=page.getByRole('textbox',{name:/Message/}).last();await input.click();await page.keyboard.type('Governed follow-up');
+  await page.getByRole('button',{name:'Send message'}).click();
+  await waitFor(()=>last(`/api/sessions/${SID}/messages`,'POST'));
+  const body=last(`/api/sessions/${SID}/messages`,'POST').body;
+  assert.equal(body.model,'openai/gpt-6-astra-ultrafast');assert.deepEqual(body.connections,['gh-101'],'preferred connections outside the policy are left out');
+  assert.equal(await page.locator('.global-error').count(),0);
 });
 
 for(const width of [1440,320])test(`role and policy editors stay labelled, contained and scrollable at ${width}px`,async t=>{

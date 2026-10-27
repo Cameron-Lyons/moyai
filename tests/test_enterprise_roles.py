@@ -258,6 +258,8 @@ def test_connector_tools_follow_the_canonical_read_write_catalog():
     ('PUT', '/api/admin/spend-limits', 'spend.manage'),
     ('DELETE', '/api/admin/spend-limits/user:person@example.com', 'spend.manage'),
     ('GET', '/api/admin/spend', 'spend.read'),
+    # A new session's policy previews admission; choosing a profile also needs security.manage.
+    ('GET', '/api/security-policy/new-session', 'sessions.create'),
 ])
 def test_route_permissions_follow_the_resource(method, path, permission):
     assert route_permission(SimpleNamespace(scope={'path': path}, method=method)) == permission

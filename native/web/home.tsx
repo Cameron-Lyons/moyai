@@ -6,13 +6,14 @@ import { GoalChip, goalCommandAction } from "./goal"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { SpaceBackdrop } from "./space-backdrop"
 import "./home.css"
-import { csrfToken } from "./api"
+import { ApiError, csrfToken } from "./api"
 import { AttachButton, AttachmentPreviews, useAttachments, useFileDrop, FileDropOverlay } from "./attachments"
 import type { GeneralPreferences } from "./general-preferences"
 import type { NewConversation, Session } from "./conversation-state"
-import { createSession, createSessionMessage, listConnections, listSecurityProfileOptions, type ConnectionView, type NewSession, type SessionProfileCatalog } from "./generated/api"
+import { createSession, createSessionMessage, getNewSessionSecurityPolicy, listConnections, listSecurityProfileOptions, type ConnectionView, type NewSession, type NewSessionSecurityPolicy, type SessionProfileCatalog } from "./generated/api"
+import { policyAdmitsConnection, policyModel, policyModels } from "./security-policy"
 
-type HomeConnection = Pick<ConnectionView, "id" | "name" | "enabled" | "shared" | "read_only">
+type HomeConnection = Pick<ConnectionView, "id" | "name" | "kind" | "enabled" | "shared" | "read_only" | "policy">
 const starters = [
   { label: "Review code", detail: "Find the edge cases", prompt: "Review my changes for bugs and improvements.", Icon: Code2 },
   { label: "Fix a bug", detail: "Trace it to the source", prompt: "Help me investigate and fix this bug: ", Icon: Bug },
@@ -49,11 +50,24 @@ export function Home({ models, defaultModel, initiallyPrivate = false, individua
   const [policies, setPolicies] = useState<SessionProfileCatalog | null>(null), [policyId, setPolicyId] = useState("")
   const policyNow = useRef(policyId)
   policyNow.current = policyId
+  // The policy a new session would bind. A failed read leaves every choice to admission.
+  // A refused send reads it again (policyRevision); the previous answer stays on screen meanwhile.
+  const governed = productMode === "existing"
+  const [policyRevision, setPolicyRevision] = useState(0)
+  const [bound, setBound] = useState<{ profile: string; value: NewSessionSecurityPolicy | null; loading: boolean }>({ profile: "", value: null, loading: true })
+  const boundPolicy = bound.profile === policyId ? bound.value : null
+  const policyReady = !governed || (bound.profile === policyId && !bound.loading)
+  const modelChoices = policyModels(models, boundPolicy?.policy)
+  const sendModel = policyModel(models, boundPolicy?.policy, model, boundPolicy?.default_model)
+  const noModel = policyReady && !sendModel
   const accountScope = `${isPrivate ? "private" : "shared"}:${connectionVersion}:${accountsVersion}`
-  const accounts = catalog.scope === accountScope ? catalog.rows : []
+  const catalogRows = catalog.scope === accountScope ? catalog.rows : []
+  const accounts = catalogRows.filter(row => policyAdmitsConnection(boundPolicy?.policy, row))
   const skipAccounts = skippedScope === accountScope
   const needsAccounts = preferences?.connection_ids != null ? preferences.connection_ids.length > 0 : productMode === "existing"
-  const selectedAccounts = skipAccounts || !needsAccounts ? [] : accounts.filter(row => preferences?.connection_ids == null || preferences.connection_ids.includes(row.id)).map(row => row.id)
+  const preferred = (row: HomeConnection) => preferences?.connection_ids == null || preferences.connection_ids.includes(row.id)
+  const selectedAccounts = skipAccounts || !needsAccounts ? [] : accounts.filter(preferred).map(row => row.id)
+  const excludedAccounts = skipAccounts || !needsAccounts ? 0 : catalogRows.filter(preferred).length - accounts.filter(preferred).length
   const accountsReady = !needsAccounts || skipAccounts || (catalog.scope === accountScope && !catalog.loading && !catalog.error)
   const [composerFocus, setComposerFocus] = useState(0)
   const admission = useRef<{ signature: string; session?: Session; request: string } | null>(null)
@@ -79,6 +93,7 @@ export function Home({ models, defaultModel, initiallyPrivate = false, individua
   async function send(prompt = draft) {
     if (prompt.trim() === "/goal") { setGoalMode(true); setDraft(""); setComposerFocus(value => value + 1); return }
     if (goalMode && !prompt.trim()) return
+    if (noModel) return  // The alert above already explains why nothing is sent.
     const auth = csrfToken()
     try { await submit(goalMode ? `/goal --budget none ${prompt}` : prompt) }
     catch (reason) { if (mounted.current && csrfToken() === auth) setError(String(reason)) }
@@ -100,6 +115,16 @@ export function Home({ models, defaultModel, initiallyPrivate = false, individua
     return () => controller.abort()
   }, [securityPolicies])
 
+  useEffect(() => {
+    if (!governed) return
+    const controller = new AbortController(), profile = policyId
+    setBound(previous => ({ profile, value: previous.profile === profile ? previous.value : null, loading: true }))
+    void getNewSessionSecurityPolicy({ query: profile ? { profile_id: profile } : {}, signal: controller.signal }).then(({ data: value }) => {
+      if (!controller.signal.aborted) setBound({ profile, value, loading: false })
+    }, () => { if (!controller.signal.aborted) setBound({ profile, value: null, loading: false }) })
+    return () => controller.abort()
+  }, [governed, policyId, policyRevision])
+
   async function submit(prompt: string): Promise<void> {
     const action = goalCommandAction(prompt)
     if (action && action !== "set") throw new Error("Open an existing conversation to change its goal.")
@@ -109,6 +134,7 @@ export function Home({ models, defaultModel, initiallyPrivate = false, individua
     if (!accountsReady) throw new Error(catalog.error
       ? "Connections could not be loaded. Cancel to retry connections or continue without them."
       : "Connections are still loading. Retry when they are ready.")
+    if (!policyReady) throw new Error("The security policy is still loading. Retry when it is ready.")
     if (!prompt.trim() && !pictures.files.length) throw new Error("Enter a message or attach a file.")
     submitting.current = true
     setBusy(true); setError("")
@@ -117,7 +143,7 @@ export function Home({ models, defaultModel, initiallyPrivate = false, individua
       if (!mounted.current || csrfToken() !== auth) throw new Error("Your sign-in changed. Retry from the current workspace.")
     }
     try {
-      const submission = homeSubmission(prompt, model, isPrivate, attachments.map(file => file.id), selectedAccounts, accounts, policyId, policies?.profiles.map(profile => profile.id))
+      const submission = homeSubmission(prompt, sendModel, isPrivate, attachments.map(file => file.id), selectedAccounts, accounts, policyId, policies?.profiles.map(profile => profile.id))
       const signature = JSON.stringify([auth, submission.signature])
       if (admission.current?.signature !== signature) admission.current = { signature, request: crypto.randomUUID() }
       const attempt = admission.current
@@ -135,6 +161,11 @@ export function Home({ models, defaultModel, initiallyPrivate = false, individua
       try { await onCreated() }
       catch { if (mounted.current && csrfToken() === auth) setError("Your message was sent, but the session list could not be refreshed.") }
     }
+    catch (reason) {
+      // An administrator may have narrowed the policy since it was read; offer its current choices before a retry.
+      if (reason instanceof ApiError && reason.status === 403 && mounted.current) setPolicyRevision(value => value + 1)
+      throw reason
+    }
     finally { submitting.current = false; if (mounted.current) setBusy(false) }
   }
 
@@ -148,6 +179,7 @@ export function Home({ models, defaultModel, initiallyPrivate = false, individua
       </header>
       <form className="home-form" onSubmit={event => { event.preventDefault(); void send() }}>
         {error && <p className="error" role="alert">{error}</p>}
+        {noModel && <p className="error" role="alert">This security policy allows no models. Choose another policy or ask an administrator.</p>}
         {needsAccounts && catalog.scope === accountScope && catalog.error && !skipAccounts && <div className="home-connection-error" role="alert">
           <span className="error">{catalog.error}</span>
           <Button type="button" variant="outline" size="sm" disabled={busy} onClick={() => setAccountsVersion(value => value + 1)}>Retry connections</Button>
@@ -166,8 +198,8 @@ export function Home({ models, defaultModel, initiallyPrivate = false, individua
               </Button>
               {goalMode && <GoalChip disabled={busy} onRemove={() => { setGoalMode(false); setComposerFocus(value => value + 1) }} />}
             </div>
-            <div className="send-actions"><Select value={model} onValueChange={setModel}><SelectTrigger aria-label="Model"><SelectValue /></SelectTrigger><SelectContent>{models.map(value => <SelectItem value={value} key={value}>{value.replace(/^openai\//, "")}</SelectItem>)}</SelectContent></Select>
-              <Button type="submit" size="icon" aria-label="Send message" disabled={busy || pictures.uploading || pictures.hasErrors || !accountsReady || (!draft.trim() && (goalMode || !pictures.files.length))}><Send /></Button>
+            <div className="send-actions"><Select value={sendModel} onValueChange={setModel} disabled={noModel}><SelectTrigger aria-label="Model"><SelectValue placeholder="No allowed models" /></SelectTrigger><SelectContent>{modelChoices.map(value => <SelectItem value={value} key={value}>{value.replace(/^openai\//, "")}</SelectItem>)}</SelectContent></Select>
+              <Button type="submit" size="icon" aria-label="Send message" disabled={busy || pictures.uploading || pictures.hasErrors || !accountsReady || !policyReady || noModel || (!draft.trim() && (goalMode || !pictures.files.length))}><Send /></Button>
             </div>
           </div>
         </div>
@@ -175,6 +207,8 @@ export function Home({ models, defaultModel, initiallyPrivate = false, individua
           {busy && <span role="status">Sending…</span>}
           {pictures.uploading && <span role="status">Uploading files…</span>}
           {needsAccounts && !accountsReady && !catalog.error && <span role="status">Loading connections…</span>}
+          {!policyReady && <span role="status">Loading security policy…</span>}
+          {accountsReady && excludedAccounts > 0 && <span role="status">{excludedAccounts === 1 ? "1 connection is" : `${excludedAccounts} connections are`} not allowed by this security policy</span>}
           <span>Drop files or paste images · Enter to send</span>
         </div>
 

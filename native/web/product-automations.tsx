@@ -11,18 +11,19 @@ import { automationDefaultSchedule, automationEventFields, automationSetupNotes,
 import { automationHistoryMerge, automationRunStatus, automationTiming } from "./automation-helpers.js"
 import { ApiError, csrfToken } from "./api"
 import {
-  configureProductAutomationWebhook, createProductAutomation, getMe, getProductAutomationPreview, getProductAutomationWebhook,
+  configureProductAutomationWebhook, createProductAutomation, getMe, getNewSessionSecurityPolicy, getProductAutomationPreview, getProductAutomationWebhook,
   listProductAutomationHistory, listProductAutomations, migrateProductAutomation, runProductAutomation, setProductAutomationState,
-  testProductAutomationEvent, updateProductAutomation, listSessions, type SessionListItem,
+  testProductAutomationEvent, updateProductAutomation, listSessions, type PolicyView, type SessionListItem,
 } from "./generated/api"
 import {
-  AutomationRequestKeys, automationActions, automationBlocker, automationMetadata, automationSamplePayload, automationStatus, calendarFrequencies, changeAutomationEvent, changeAutomationEventField, changeAutomationRepository, eventFieldVisible, historySessionHash, isAutomationProvider,
+  AutomationRequestKeys, automationActions, automationBlocker, automationMetadata, automationPolicyRefusal, automationSamplePayload, automationStatus, calendarFrequencies, changeAutomationEvent, changeAutomationEventField, changeAutomationRepository, eventFieldVisible, historySessionHash, isAutomationProvider,
   onceUtcInput, onceUtcInstant, validateAutomation,
   type AutomationDefinition, type AutomationHistoryPage, type AutomationInventory, type AutomationPreview,
   type AutomationTiming, type AutomationTrigger, type AutomationEvent, type ProductAutomation, type AutomationRunResult,
   type AutomationWebhookResult, type AutomationEnvironment, type AutomationConnection,
 } from "./product-automation-data"
 import { listOrganizationConnections, listProductEnvironments } from "./generated/api"
+import { githubRepositoryName, policyAdmitsApp, policyModel, policyModels, policyRefusesRepository } from "./security-policy"
 import "./product-automations.css"
 
 const base = "/product/automations"
@@ -260,6 +261,10 @@ function AutomationDialog({ id, mode, canCreate, eventChoices, onMode, onSaved, 
   const chats = useRead(mode !== "review" ? "/sessions" : null, signal => listSessions({ signal }).then(({ data }) => data))
   const environments = useRead(mode !== "review" ? "/product/environments" : null, signal => listProductEnvironments({ signal }).then(({ data }) => data))
   const connections = useRead<AutomationConnection[]>(mode !== "review" ? "/product/connections" : null, signal => listOrganizationConnections({ signal }).then(({ data }) => data))
+  // Pickers follow the workflow's profile ("" is the organization default); saving checks it again.
+  const profileId = mode === "new" ? "" : preview.data?.definition.security_profile_id
+  const policy = useRead(mode !== "review" && profileId != null ? `/security-policy/new-session?profile_id=${profileId}` : null,
+    signal => getNewSessionSecurityPolicy({ query: profileId ? { profile_id: profileId } : {}, signal }).then(({ data }) => data))
   const [busy, setBusy] = useState(false), [error, setError] = useState(""), [historyVersion, setHistoryVersion] = useState(0)
   const [confirm, setConfirm] = useState<"migrate" | "enable" | "pause" | "run" | "retire" | null>(null)
   const [runResult, setRunResult] = useState<AutomationRunResult | null>(null)
@@ -282,12 +287,14 @@ function AutomationDialog({ id, mode, canCreate, eventChoices, onMode, onSaved, 
       else { setConfirm(null); preview.refresh(); setHistoryVersion(value => value + 1) }
     } catch (reason) {
       if (!alive.current || csrfToken() !== requestAuth) return
-      if (reason instanceof ApiError && [401, 403, 404].includes(reason.status)) {
+      // A security policy refusal keeps the dialog and the user's edits, with its reason.
+      const policyRefused = reason instanceof ApiError && automationPolicyRefusal(reason.status, reason.message)
+      if (reason instanceof ApiError && [401, 403, 404].includes(reason.status) && !policyRefused) {
         onClose(); onSaved()
         if (reason.status === 403) window.dispatchEvent(new Event("moyai:access-changed"))
         return
       }
-      setError(`${errorLabel(reason)}${reason instanceof ApiError && reason.status === 409 ? " Refresh the saved definition and review its current revision before retrying." : " A retry of the same change keeps its request identity."}`)
+      setError(`${errorLabel(reason)}${policyRefused ? "" : reason instanceof ApiError && reason.status === 409 ? " Refresh the saved definition and review its current revision before retrying." : " A retry of the same change keeps its request identity."}`)
     } finally { pending.current = false; if (alive.current && csrfToken() === requestAuth) setBusy(false) }
   }
   const ready = preview.data, actions = ready ? automationActions(ready) : null
@@ -335,8 +342,9 @@ function AutomationDialog({ id, mode, canCreate, eventChoices, onMode, onSaved, 
         onSetup={(provider, secret, done) => write(`${base}/${encodeURIComponent(id!)}/webhook`, { revision: ready.revision, provider, secret }, body => configureProductAutomationWebhook({ path: { identity: id! }, body }), false, done)} />}
       <HistoryRows id={id!} version={historyVersion} />
     </>}
-    {mode !== "review" && models.data && (mode === "new" ? canCreate : ready && caps?.update) && <DefinitionEditor
+    {mode !== "review" && models.data && !policy.loading && (mode === "new" ? canCreate : ready && caps?.update) && <DefinitionEditor
       key={mode === "new" ? "new" : `${ready!.id}:${ready!.revision}`} existing={mode === "new" ? undefined : ready!.definition} models={models.data.models} defaultModel={models.data.default_model} eventChoices={eventChoices}
+      policy={policy.data?.policy ?? null} policyError={Boolean(policy.error)}
       chats={(chats.data ?? []).filter(chat => chat.owner_id === models.data!.user.id && chat.visibility === "shared" && chat.surface === "web" && !chat.archived && !chat.deleted)} chatError={chats.error} chatLoading={chats.loading} onRefreshChats={chats.refresh}
       environments={environments.data ?? []} environmentError={environments.error} environmentLoading={environments.loading} onRefreshEnvironments={environments.refresh} busy={busy}
       connections={connections.data ?? []} connectionError={connections.error} connectionLoading={connections.loading} onRefreshConnections={connections.refresh}
@@ -344,7 +352,7 @@ function AutomationDialog({ id, mode, canCreate, eventChoices, onMode, onSaved, 
       onSave={definition => id
         ? write(`${base}/${encodeURIComponent(id)}`, { revision: ready?.revision ?? 0, definition }, body => updateProductAutomation({ path: { identity: id }, body }), true)
         : write(base, { revision: 0, definition }, body => createProductAutomation({ body }), true)} />}
-    {mode !== "review" && !models.data && models.loading && <p role="status">Loading available models…</p>}
+    {mode !== "review" && (!models.data && models.loading || policy.loading) && <p role="status">Loading available models…</p>}
   </DialogContent></Dialog>
 }
 
@@ -389,8 +397,8 @@ const eventFieldLimits: Record<string, number> = {
   text_contains: 200, text_starts_with: 200, reaction: 100, action: 80, status: 100, conclusion: 60,
   branch: 200, project: 100, epic: 100, service_id: 100, urgency: 30, payload_pattern: 500,
 }
-export function EventFields({ event, choices, disabled, onChange }: {
-  event: AutomationEvent; choices: [string, string][]; disabled: boolean; onChange: (event: AutomationEvent) => void
+export function EventFields({ event, choices, disabled, onChange, repositoryRefused = false }: {
+  event: AutomationEvent; choices: [string, string][]; disabled: boolean; onChange: (event: AutomationEvent) => void; repositoryRefused?: boolean
 }) {
   const id = useId()
   const options = choices.map(([value, label]) => ({ value, label }))
@@ -410,11 +418,14 @@ export function EventFields({ event, choices, disabled, onChange }: {
     {event.provider === "session" && <p className="ns-field-hint">Watches new human messages in shared sessions after activation. Leave the session ID blank for all eligible sessions, or use the exact original 32-character ID or native UUID. Existing messages are not replayed.</p>}
     {event.provider === "slack" && <p className="ns-field-hint">Uses the installed organization Slack app and allowed users. Add the bot to watched channels and configure the required event subscriptions and scopes.</p>}
     {event.provider === "github" && typeof event.repository_id === "number" && <p className="ns-field-hint">Saved repository ID: {event.repository_id}. Changing the repository name requires the service to resolve it again.</p>}
+    {repositoryRefused && <p className="pa-warning" role="status">This repository is not allowed by the workflow’s security policy.</p>}
   </div>
 }
 
-export function DefinitionEditor({ existing, models, defaultModel, chats = [], chatError = "", chatLoading = false, onRefreshChats, eventChoices = {}, environments = [], environmentError = "", environmentLoading = false, onRefreshEnvironments, connections = [], connectionError = "", connectionLoading = false, onRefreshConnections, busy, onCancel, onSave }: {
+export function DefinitionEditor({ existing, models, defaultModel, policy = null, policyError = false, chats = [], chatError = "", chatLoading = false, onRefreshChats, eventChoices = {}, environments = [], environmentError = "", environmentLoading = false, onRefreshEnvironments, connections = [], connectionError = "", connectionLoading = false, onRefreshConnections, busy, onCancel, onSave }: {
   existing?: AutomationDefinition; models: string[]; defaultModel: string; busy: boolean
+  /** The workflow profile's effective policy; null when unknown. Saving checks it again. */
+  policy?: PolicyView | null; policyError?: boolean
   chats?: SessionListItem[]; chatError?: string; chatLoading?: boolean; onRefreshChats?: () => void
   eventChoices?: Record<string, [string, string][]>
   environments?: AutomationEnvironment[]; environmentError?: string; environmentLoading?: boolean; onRefreshEnvironments?: () => void
@@ -422,7 +433,7 @@ export function DefinitionEditor({ existing, models, defaultModel, chats = [], c
   onCancel: () => void; onSave: (definition: AutomationDefinition) => Promise<void>
 }) {
   const [definition, setDefinition] = useState<AutomationDefinition>(() => existing ? structuredClone(existing) : {
-    name: "", prompt: "", session_id: null, security_profile_id: "", model: defaultModel, mode: "modal", harness: "pydantic-v1", repo_url: "", github_repository_id: null,
+    name: "", prompt: "", session_id: null, security_profile_id: "", model: policyModel(models, policy, defaultModel, defaultModel) || defaultModel, mode: "modal", harness: "pydantic-v1", repo_url: "", github_repository_id: null,
     environment_id: "auto", plugins: [], metadata: {}, queue_events: false, max_runs_per_hour: 50,
     self_management: { instructions: false, schedule: false },
     triggers: [{ id: crypto.randomUUID(), schedule: { ...automationDefaultSchedule(), cron: "", run_at: null } }],
@@ -436,7 +447,13 @@ export function DefinitionEditor({ existing, models, defaultModel, chats = [], c
   const changeTriggers = (triggers: AutomationTrigger[]) => change({ triggers, ...(!capEdited.current ? { max_runs_per_hour: triggers.some(trigger => trigger.event?.provider === "slack" && trigger.event.event === "message.posted") ? 150 : 50 } : {}) })
   const changeTrigger = (id: string, trigger: AutomationTrigger) => changeTriggers(definition.triggers.map(item => item.id === id ? trigger : item))
   const sourceOptions = [{ value: "schedule", label: "Schedule" }, ...Object.keys(eventChoices).filter(provider => automationEventFields[provider]).map(value => ({ value, label: automationSources[value] || value }))]
-  const availableModels = [...new Set([definition.model, ...models])].map(value => ({ value: value || "__default__", label: value ? `${value}${models.includes(value) ? "" : " (not currently enabled)"}` : "Workspace default" }))
+  const allowedModels = policyModels(models, policy)
+  const refusedModel = (value: string) => policy?.models != null && !policy.models.includes(value || defaultModel)
+  const availableModels = [...new Set([definition.model, ...allowedModels])].map(value => ({ value: value || "__default__", label: `${value || "Workspace default"}${value && !models.includes(value) ? " (not currently enabled)" : refusedModel(value) ? " (not allowed by its security policy)" : ""}` }))
+  const repositories = connections.find(connection => connection.id === "github")?.repositories ?? []
+  const allowedRepositories = policy?.repositories?.map(identity => repositories.find(repository => repository.id === identity)?.full_name ?? `Repository ${identity}`)
+  const repositoryRefused = !definition.session_id && Boolean(definition.repo_url || definition.github_repository_id)
+    && policyRefusesRepository(policy, definition.github_repository_id, githubRepositoryName(definition.repo_url), repositories)
   const chatOptions = [
     { value: "__new__", label: "New chat each run" },
     ...chats.map(chat => ({ value: chat.id, label: chat.title })),
@@ -456,6 +473,7 @@ export function DefinitionEditor({ existing, models, defaultModel, chats = [], c
     catch (reason) { setError(errorLabel(reason)) }
   }}>
     <p className="ns-help">Instructions and resulting chats are shared with your workspace.</p>
+    {policyError && <p className="ns-field-hint" role="status">Its security policy could not be read, so every model and repository is offered. Saving still checks the policy.</p>}
     <div className="ns-fields">
       <div className="ns-field"><label htmlFor={`${id}-name`}>Automation name</label><Input id={`${id}-name`} ref={nameRef} value={definition.name} required minLength={2} maxLength={100} disabled={busy} onChange={event => change({ name: event.target.value })} /></div>
       <div className="ns-field"><label htmlFor={`${id}-prompt`}>Instructions</label><Textarea id={`${id}-prompt`} rows={6} required minLength={3} maxLength={500000} disabled={busy} value={definition.prompt} onChange={event => change({ prompt: event.target.value })} /></div>
@@ -465,7 +483,9 @@ export function DefinitionEditor({ existing, models, defaultModel, chats = [], c
         {chatError && <p className="ns-error" role="alert">{chatError}{onRefreshChats && <Button type="button" variant="outline" onClick={onRefreshChats}>Retry chats</Button>}</p>}
       </div>
       <div className="ns-field"><label htmlFor={`${id}-model`}>Model</label><Choice id={`${id}-model`} label="Automation model" value={definition.model || "__default__"} options={availableModels} disabled={busy} onChange={value => change({ model: value === "__default__" ? "" : value })} /></div>
-      {!definition.session_id && <><div className="ns-field"><label htmlFor={`${id}-repository`}>Repository</label><Input id={`${id}-repository`} type="url" maxLength={500} placeholder="https://github.com/owner/repository" value={definition.repo_url} disabled={busy} onChange={event => setDefinition(previous => changeAutomationRepository(previous, event.target.value))} /><p className="ns-field-hint">Public repositories use a credential-free checkout. Private repositories require their selected GitHub connection. Choose a validated environment below when the workflow needs prepared dependencies.</p></div>
+      {!definition.session_id && <><div className="ns-field"><label htmlFor={`${id}-repository`}>Repository</label><Input id={`${id}-repository`} type="url" maxLength={500} placeholder="https://github.com/owner/repository" value={definition.repo_url} disabled={busy} onChange={event => setDefinition(previous => changeAutomationRepository(previous, event.target.value))} /><p className="ns-field-hint">Public repositories use a credential-free checkout. Private repositories require their selected GitHub connection. Choose a validated environment below when the workflow needs prepared dependencies.</p>
+        {allowedRepositories && <p className="ns-field-hint">{allowedRepositories.length ? `Its security policy allows only ${allowedRepositories.join(", ")}.` : "Its security policy allows no repositories."}</p>}
+        {repositoryRefused && <p className="pa-warning" role="status">This repository is not allowed by the workflow’s security policy.</p>}</div>
       <div className="ns-field"><label htmlFor={`${id}-environment`}>Execution environment</label><Choice id={`${id}-environment`} label="Execution environment" value={definition.environment_id} options={environmentOptions} disabled={busy || environmentLoading} onChange={value => change({ environment_id: value })} />
         {environmentLoading && <p className="ns-field-hint" role="status">Loading saved environments…</p>}
         {environmentError && <p className="ns-error" role="alert">{environmentError}{onRefreshEnvironments && <Button type="button" variant="outline" onClick={onRefreshEnvironments}>Retry environments</Button>}</p>}
@@ -482,7 +502,8 @@ export function DefinitionEditor({ existing, models, defaultModel, chats = [], c
               : isAutomationProvider(value, eventChoices) ? { id: trigger.id, event: { provider: value, event: eventChoices[value]?.[0]?.[0] || "*" } } : trigger)
           }} /></div>
           {trigger.schedule ? <TimingFields label={`Trigger ${index + 1}`} disabled={busy} timing={trigger.schedule} onChange={schedule => changeTrigger(trigger.id, { ...trigger, schedule })} />
-            : trigger.event && known ? <EventFields event={trigger.event} choices={eventChoices[source] || []} disabled={busy} onChange={event => changeTrigger(trigger.id, { ...trigger, event })} />
+            : trigger.event && known ? <EventFields event={trigger.event} choices={eventChoices[source] || []} disabled={busy} onChange={event => changeTrigger(trigger.id, { ...trigger, event })}
+              repositoryRefused={trigger.event.provider === "github" && policyRefusesRepository(policy, trigger.event.repository_id, typeof trigger.event.repository === "string" ? trigger.event.repository : "", repositories)} />
               : <><p className="pa-warning">The server did not provide an editor contract for this saved source. Its original settings are retained.</p><pre>{JSON.stringify(trigger.event, null, 2)}</pre></>}
         </section>
       })}
@@ -492,9 +513,9 @@ export function DefinitionEditor({ existing, models, defaultModel, chats = [], c
       {connectionLoading && <p role="status" className="ns-muted">Loading connected apps…</p>}
       {connectionError && <p className="ns-error" role="alert">{connectionError}{onRefreshConnections && <Button type="button" variant="outline" onClick={onRefreshConnections}>Retry connections</Button>}</p>}
       {(["linear", "github", "slack", "notion"] as const).map(provider => {
-        const account = connections.find(connection => connection.id === provider), selected = definition.plugins.includes(provider)
-        return <div className="pa-connection" key={provider}><CheckField label={`${automationSources[provider] || (provider === "notion" ? "Notion" : provider)} · ${account ? !account.connected ? "Not connected" : !account.enabled ? "Disabled" : account.read_only ? "Read only" : "Connected" : "Availability unavailable"}`}
-          checked={selected} disabled={busy || (!selected && (connectionLoading || !account?.connected || !account.enabled))} onChange={checked => change({ plugins: checked ? [...definition.plugins, provider] : definition.plugins.filter(value => value !== provider) })} />
+        const account = connections.find(connection => connection.id === provider), selected = definition.plugins.includes(provider), allowed = policyAdmitsApp(policy, provider)
+        return <div className="pa-connection" key={provider}><CheckField label={`${automationSources[provider] || (provider === "notion" ? "Notion" : provider)} · ${!allowed ? "Not allowed by its security policy" : account ? !account.connected ? "Not connected" : !account.enabled ? "Disabled" : account.read_only ? "Read only" : "Connected" : "Availability unavailable"}`}
+          checked={selected} disabled={busy || (!selected && (!allowed || connectionLoading || !account?.connected || !account.enabled))} onChange={checked => change({ plugins: checked ? [...definition.plugins, provider] : definition.plugins.filter(value => value !== provider) })} />
           {Boolean(account?.tools?.length) && <details><summary>{account!.tools!.length} tools</summary><ul>{account!.tools!.map((tool, index) => <li key={`${tool.name}:${index}`}>{tool.name && <code>{tool.name} </code>}{tool.description}</li>)}</ul></details>}
         </div>
       })}
@@ -517,7 +538,8 @@ export function DefinitionEditor({ existing, models, defaultModel, chats = [], c
     </section>
     {definition.mode !== "modal" && <p className="pa-warning">This saved execution mode ({definition.mode}) is unsupported by the native service. Its value is retained; migration remains blocked.</p>}
     {!models.length && <p className="pa-warning">No models are currently available. Activation remains unavailable until model access is configured.</p>}
+    {models.length > 0 && !allowedModels.length && <p className="pa-warning">Its security policy allows none of the workspace’s models. Activation remains unavailable until the policy allows one.</p>}
     {error && <p className="ns-error" role="alert">{error}</p>}
-    <div className="ns-dialog-actions"><Button type="button" variant="outline" disabled={busy} onClick={onCancel}>{existing ? <><ChevronLeft size={16} />Back to review</> : "Cancel"}</Button><Button type="submit" disabled={busy || (!existing && !models.length)}>{busy ? "Saving…" : "Save paused"}</Button></div>
+    <div className="ns-dialog-actions"><Button type="button" variant="outline" disabled={busy} onClick={onCancel}>{existing ? <><ChevronLeft size={16} />Back to review</> : "Cancel"}</Button><Button type="submit" disabled={busy || (!existing && !allowedModels.length)}>{busy ? "Saving…" : "Save paused"}</Button></div>
   </form>
 }

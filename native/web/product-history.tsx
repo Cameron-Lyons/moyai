@@ -12,10 +12,11 @@ import { Textarea } from "@/components/ui/textarea"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { ApiError } from "./api"
 import {
-  continueProductSession, getHistorySession, getMe, listConnections, getProductSessionFileContent, listProductContinuationFiles,
+  continueProductSession, getHistorySession, getMe, getNewSessionSecurityPolicy, listConnections, getProductSessionFileContent, listProductContinuationFiles,
   listProductSessionChildren, listProductSessionFiles, listProductSessionMessages, previewProductContinuation,
   type ContinuationRecoveryFile, type HistoryAttachment, type ProductContinuationResult, type ProductFile,
 } from "./generated/api"
+import { policyAdmitsConnection, policyModel, policyModels } from "./security-policy"
 import "./product-history.css"
 import slackLogo from "./assets/slack-logo.svg"
 import { SlackMessage } from "./slack-content"
@@ -346,6 +347,14 @@ function ContinuationComposer({ sessionId, active, revision, onContinued, onDeni
   const connectionsPath = review.data ? `/connections?shared=${shared}` : null
   const connections = useJson(connectionsPath, active && open, revision + attempt,
     async signal => (await listConnections({ query: { shared }, signal })).data)
+  // The continuation binds the organization default under its saved policy; admission still decides.
+  const bound = useJson("/security-policy/new-session", active && open, revision + attempt,
+    async signal => (await getNewSessionSecurityPolicy({ signal })).data)
+  const policy = bound.data?.policy
+  const models = policyModels(me.data?.models ?? [], policy)
+  const fallback = bound.data ? bound.data.default_model : me.data?.default_model
+  const chosen = policyModel(me.data?.models ?? [], policy, model || fallback || "", fallback)
+  const available = connections.data?.filter(item => item.enabled && policyAdmitsConnection(policy, item)) ?? []
   const data = review.data
   useEffect(() => {
     mounted.current = true
@@ -364,7 +373,8 @@ function ContinuationComposer({ sessionId, active, revision, onContinued, onDeni
     pending.current = true; setBusy(true); setError("")
     try {
       const { data: result } = await continueProductSession({ path: { run_id: sessionId }, body: {
-        prompt, model: model || me.data?.default_model, connections: selected, request_key: requestKey.current,
+        prompt, model: chosen || undefined, connections: selected.filter(id => available.some(item => item.id === id)),
+        request_key: requestKey.current,
         expected_source_fingerprint: data.source_fingerprint, accept_recent_history: recent,
         accept_workspace_omissions: omissions, drain_idle_workspace: drain,
       } })
@@ -400,13 +410,14 @@ function ContinuationComposer({ sessionId, active, revision, onContinued, onDeni
         {data.requires_workspace_drain && <Label className="ph-check"><Checkbox checked={drain} disabled={busy}
           onCheckedChange={value => setDrain(value === true)} />Save and close the idle earlier computer before starting native work.</Label>}
         <Label htmlFor={`continuation-model-${sessionId}`}>Model</Label>
-        <Select value={model || me.data?.default_model || ""} onValueChange={setModel} disabled={busy || !active}>
-          <SelectTrigger id={`continuation-model-${sessionId}`}><SelectValue placeholder="Select a model" /></SelectTrigger>
-          <SelectContent>{me.data?.models.map(value => <SelectItem key={value} value={value}>{value}</SelectItem>)}</SelectContent>
+        <Select value={chosen} onValueChange={setModel} disabled={busy || !active || bound.loading || !models.length}>
+          <SelectTrigger id={`continuation-model-${sessionId}`}><SelectValue placeholder={policy?.models != null && !models.length ? "No allowed models" : "Select a model"} /></SelectTrigger>
+          <SelectContent>{models.map(value => <SelectItem key={value} value={value}>{value}</SelectItem>)}</SelectContent>
         </Select>
+        {policy?.models != null && !models.length && <Notice error>The security policy for new conversations allows no models. Ask an administrator to review it.</Notice>}
         {connections.error && <Notice error>{connections.error.message}</Notice>}
-        {!!connections.data?.length && <details><summary>Connections</summary>
-          {connections.data.filter(item => item.enabled).map(item => <Label className="ph-check" key={item.id}>
+        {!!available.length && <details><summary>Connections</summary>
+          {available.map(item => <Label className="ph-check" key={item.id}>
             <Checkbox checked={selected.includes(item.id)} disabled={busy || !active}
               onCheckedChange={value => setSelected(rows => value === true ? [...rows, item.id] : rows.filter(id => id !== item.id))} />
             {item.name}
@@ -416,7 +427,7 @@ function ContinuationComposer({ sessionId, active, revision, onContinued, onDeni
         <Textarea id={`continuation-prompt-${sessionId}`} value={prompt} onChange={event => setPrompt(event.target.value)}
           placeholder="What should Moyai do next?" maxLength={500000} disabled={busy || !active} rows={4} />
         {error && <Notice error>{error}</Notice>}
-        <Button type="submit" disabled={busy || !active || !prompt.trim() || !me.data ||
+        <Button type="submit" disabled={busy || !active || !prompt.trim() || !me.data || bound.loading || !chosen ||
           (data.requires_recent_history && !recent) || (data.requires_workspace_ack && !omissions) ||
           (data.requires_workspace_drain && !drain)}>
           {busy ? "Continuing…" : "Continue and send"}<ArrowRight size={16} />

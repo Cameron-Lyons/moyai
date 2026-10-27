@@ -100,6 +100,8 @@ def route_permission(request):
         return 'sessions.create'
     if path == '/api/sessions':
         return 'sessions.read' if read else 'sessions.create'
+    if path == '/api/security-policy/new-session':
+        return 'sessions.create'  # Choosing a profile also needs security.manage, checked by the handler.
     if path.startswith(('/api/sessions/', '/api/turns/', '/api/folders', '/api/artifacts', '/api/computer', '/api/goals', '/api/swarms')):
         return 'sessions.read' if read else 'sessions.manage'
     if path.startswith('/api/connections/slack/personal'):

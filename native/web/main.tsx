@@ -16,7 +16,7 @@ import "./style.css"
 import "./product-shell.css"
 import { ApiError, csrfToken, setCsrf } from "./api"
 import { getMe, listPullRequestStatuses, startGoogleSignIn, startOidcSignIn, listSessionFolders, markSessionRead, type Me, type PullRequestStatus, type SignInRedirect } from "./generated/api"
-import { cancelQueuedTurn, createSession, createSessionAnswer, createSessionMessage, getAuthConfig, getSession, getSessionActivity, getSessionPlan, listConnections, listSessionMessages, listSessions, loginWithPassword, logout, retrySlackDelivery, steerQueuedTurn, stopSession, updateQueuedTurn, type AuthConfig, type ConnectionView, type PendingRequests as Pending, type PlanStep, type SessionDetail } from "./generated/api"
+import { cancelQueuedTurn, createSession, createSessionAnswer, createSessionMessage, getAuthConfig, getSession, getSessionActivity, getSessionPlan, getSessionSecurityPolicy, listConnections, listSessionMessages, listSessions, loginWithPassword, logout, retrySlackDelivery, steerQueuedTurn, stopSession, updateQueuedTurn, type AuthConfig, type ConnectionView, type PendingRequests as Pending, type PlanStep, type PolicyView, type SessionDetail } from "./generated/api"
 import { listHistorySessions, searchHistory, type HistorySessionList, type SourcedHistorySession } from "./generated/api"
 import { downloadDebugTrace } from "./debug-trace"
 import { FailureBanner } from "./failure-banner"
@@ -54,6 +54,7 @@ import { ProductCredentialRequest } from "./product-credentials"
 import { QuestionChoices } from "./question-choices"
 import { BrowserLoginCard, type BrowserLoginMetadata, type LoginOutcome } from "./browser-login"
 import { can, canOpenPage, permissionKey } from "./permissions"
+import { policyAdmitsConnection, policyModel, policyModels } from "./security-policy"
 
 const ComputerPanel = React.lazy(() => import("./computer").then(module => ({ default: module.ComputerPanel })))
 const SettingsPage = React.lazy(() => import("./settings").then(module => ({ default: module.SettingsPage })))
@@ -500,6 +501,9 @@ function Conversation({ id, me, connections, connectionVersion, refreshList, wor
   const [accountRevision, setAccountRevision] = useState(0)
   const [accountNotice, setAccountNotice] = useState("")
   const [accountCatalog, setAccountCatalog] = useState<{ scope: string; rows: Connection[]; loading: boolean; error: string }>({ scope: "", rows: [], loading: false, error: "" })
+  // The session's effective policy, read with its connections; null leaves every choice to admission.
+  // Sending waits for the first read, so a narrower policy's model is chosen before anything is sent.
+  const [sessionPolicy, setSessionPolicy] = useState<PolicyView | null>(null), [policyRead, setPolicyRead] = useState(false)
   const mode = me.preferences?.delivery_mode ?? "when_idle"
   const [skippedAccountScope, setSkippedAccountScope] = useState("")
   const [error, setError] = useState("")
@@ -575,7 +579,7 @@ function Conversation({ id, me, connections, connectionVersion, refreshList, wor
     liveNow.current = emptyLiveTranscript()
     setLiveText(liveNow.current); setView(null); setMessages([]); setPlan([]); setActivity([]); setPanelError("")
     setDraft(""); setAnsweredRequest(null); setEditing(null); setEditText(""); pictures.clear(); setSendingNow(new Set()); setModel(me.default_model); setSelectedAccounts([]); setWorkspaceOpen(false)
-    setError(""); setLoadError(message); setBusy(false)
+    setError(""); setLoadError(message); setBusy(false); setSessionPolicy(null)
     setAccountCatalog({ scope: "", rows: [], loading: false, error: "" }); setAccountNotice(""); setSkippedAccountScope("")
     dispatchPanel({ type: "reset" })
     openedBrowserLogin.current = ""
@@ -746,29 +750,41 @@ function Conversation({ id, me, connections, connectionVersion, refreshList, wor
     })
   }, [id, auxiliaryPanel, Boolean(view)])
   const accountScope = view ? `${id}:${view.session.visibility}:${view.session.surface}:${connectionVersion}:${accountRevision}` : ""
-  const effectiveConnections = accountCatalog.scope === accountScope ? accountCatalog.rows.filter(row => row.enabled && (view?.session.visibility === "private" || row.shared)) : []
+  const effectiveConnections = accountCatalog.scope === accountScope ? accountCatalog.rows.filter(row => row.enabled && (view?.session.visibility === "private" || row.shared) && policyAdmitsConnection(sessionPolicy, row)) : []
   const preferredAccounts = me.preferences?.connection_ids ?? selectedAccounts
   const skipAccounts = skippedAccountScope === accountScope
   const sendAccounts = skipAccounts ? [] : preferredAccounts.filter(id => effectiveConnections.some(row => row.id === id))
   const accountBlocked = !skipAccounts && (Boolean(accountNotice) || preferredAccounts.length > 0 && (accountCatalog.scope !== accountScope || accountCatalog.loading || Boolean(accountCatalog.error)))
+  const modelChoices = policyModels(me.models, sessionPolicy)
+  // A narrower mandatory policy can exclude the session's own model; "" when none is allowed.
+  const composerModel = policyModel(me.models, sessionPolicy, model, me.default_model)
+  const policyReady = me.product_mode !== "existing" || policyRead
   useEffect(() => {
     if (!view || !visible) return
     const controller = new AbortController(), scope = accountScope
     setAccountCatalog({ scope, rows: [], loading: true, error: "" })
-    void listConnections({ query: { session_id: id }, signal: controller.signal }).then(({ data: rows }) => {
-      if (!controller.signal.aborted) setAccountCatalog({ scope, rows, loading: false, error: "" })
-    }, reason => { if (!controller.signal.aborted) setAccountCatalog({ scope, rows: [], loading: false, error: String(reason) }) })
+    const policy = me.product_mode === "existing"
+      ? getSessionSecurityPolicy({ path: { identity: id }, signal: controller.signal }).then(({ data }) => data.policy, () => null)
+      : Promise.resolve(null)
+    // A failed connection read still applies the policy, so it never blocks sending without connections.
+    const catalog = listConnections({ query: { session_id: id }, signal: controller.signal })
+      .then(({ data: rows }) => ({ rows, error: "" }), reason => ({ rows: [], error: String(reason) }))
+    void Promise.all([catalog, policy]).then(([{ rows, error }, value]) => {
+      if (controller.signal.aborted) return
+      setSessionPolicy(value); setPolicyRead(true)
+      setAccountCatalog({ scope, rows, loading: false, error })
+    })
     return () => controller.abort()
   }, [accountScope, visible])
   useEffect(() => {
     if (me.preferences?.connection_ids != null || accountCatalog.scope !== accountScope || accountCatalog.loading || accountCatalog.error) return
-    const available = new Set(accountCatalog.rows.filter(row => row.enabled).map(row => row.id))
+    const available = new Set(accountCatalog.rows.filter(row => row.enabled && policyAdmitsConnection(sessionPolicy, row)).map(row => row.id))
     const retained = selectedAccounts.filter(account => available.has(account))
     if (retained.length !== selectedAccounts.length) {
       setSelectedAccounts(retained)
       setAccountNotice("Some connections are no longer available for this chat.")
     }
-  }, [accountScope, accountCatalog, selectedAccounts, me.preferences?.connection_ids])
+  }, [accountScope, accountCatalog, sessionPolicy, selectedAccounts, me.preferences?.connection_ids])
   useEffect(() => {
     if (!workspaceRequest || sideMode) return
     setWorkspaceOpen(false)
@@ -880,10 +896,12 @@ function Conversation({ id, me, connections, connectionVersion, refreshList, wor
       throw new Error("Finish uploading or retry the attached files before starting a goal.")
     }
     if (startingGoal && accountBlocked) throw new Error("Resolve the connection error before starting a goal.")
+    if (startingGoal && !policyReady) throw new Error("The security policy is still loading. Retry when it is ready.")
+    if (startingGoal && !composerModel) throw new Error("This conversation's security policy allows no models.")
     const auth = csrfToken(), version = sensitiveVersion.current
     const current = () => auth === csrfToken() && version === sensitiveVersion.current
     const body = { prompt: command, ...(startingGoal ? {
-      model, connections: [...sendAccounts].sort(), attachments: pictures.readyFiles.map(file => file.id),
+      model: composerModel, connections: [...sendAccounts].sort(), attachments: pictures.readyFiles.map(file => file.id),
     } : {}) }
     const payload = JSON.stringify([id, auth, body])
     if (lastGoalRequest.current?.payload !== payload) lastGoalRequest.current = { payload, key: crypto.randomUUID() }
@@ -947,12 +965,12 @@ function Conversation({ id, me, connections, connectionVersion, refreshList, wor
       }
       return
     }
-    if ((!prompt.trim() && !pictures.files.length) || busy || pictures.uploading || pictures.hasErrors || accountBlocked) return
+    if ((!prompt.trim() && !pictures.files.length) || busy || pictures.uploading || pictures.hasErrors || accountBlocked || !policyReady || !composerModel) return
     submitting.current = true
     setBusy(true); setSending(true); setError("")
     const attachments = pictures.readyFiles
     const body = {
-      prompt, model: answeringQuestion ? active?.model ?? model : model, mode,
+      prompt, model: answeringQuestion ? active?.model ?? composerModel : composerModel, mode,
       connections: answeringQuestion ? active?.connections ?? sendAccounts : sendAccounts,
       attachments: attachments.map(file => file.id),
       ...(answeringQuestion ? { reply_to: active?.id } : {}),
@@ -1162,16 +1180,17 @@ function Conversation({ id, me, connections, connectionVersion, refreshList, wor
               <AttachmentPreviews files={editing ? editing.attachments ?? [] : pictures.files} remove={editing || busy ? undefined : pictures.remove} retry={editing || busy ? undefined : pictures.retry} draft />
               <SkillComposer ref={composerInput} focusRequest={composerFocus} onGoalSelect={editing ? undefined : () => { setGoalMode(true); setDraft("") }} value={editing ? editText : draft} onChange={editing ? setEditText : setDraft} onSend={prompt => void send(prompt)} shared={session.visibility !== "private"} sessionId={id} disabled={busy} placeholder={goalMode && !editing ? view.goal ? "Describe a goal to replace the current one…" : "Describe a goal to keep pursuing…" : answeringQuestion ? "Type your answer to the pending question…" : "Ask Moyai to help with your work…"} onPaste={editing ? undefined : pictures.paste} />
               <div className="send-actions">
-                <Button type="submit" size={editing ? "sm" : "icon"} aria-label={editing ? "Save queued message" : answeringQuestion ? "Answer question" : "Send message"} disabled={(editing ? !editText.trim() : !draft.trim() && (goalMode || !pictures.files.length)) || busy || (!editing && (pictures.uploading || pictures.hasErrors || accountBlocked))}>{editing ? <><Check className="composer-save-icon" /><span className="composer-optional-label">Save message</span></> : <Send size={16} />}</Button>
+                <Button type="submit" size={editing ? "sm" : "icon"} aria-label={editing ? "Save queued message" : answeringQuestion ? "Answer question" : "Send message"} disabled={(editing ? !editText.trim() : !draft.trim() && (goalMode || !pictures.files.length)) || busy || (!editing && (pictures.uploading || pictures.hasErrors || accountBlocked || !policyReady || !composerModel))}>{editing ? <><Check className="composer-save-icon" /><span className="composer-optional-label">Save message</span></> : <Send size={16} />}</Button>
               </div>
             </div>
             <div className="composer-actions">
               <AttachButton add={pictures.add} disabled={Boolean(editing) || busy} compact />
               {!editing && goalMode && <GoalChip disabled={busy} replacing={Boolean(view.goal)} onRemove={() => { setGoalMode(false); setComposerFocus(value => value + 1) }} />}
               {(session.active_turn || view.goal?.status === "active") && <Button type="button" variant="outline" aria-label="Stop task" onClick={() => void runConversationAction(() => stopSession({ path: { session_id: id } }))}><Square size={13} /><span className="composer-optional-label">Stop</span></Button>}
-              <Choice value={model} onChange={setModel} label="Model" options={me.models.map(item => ({ value: item, label: item }))} />
+              <Choice value={composerModel} onChange={setModel} label="Model" options={modelChoices.map(item => ({ value: item, label: item }))} />
             </div>
           </div>
+          {!composerModel && <p className="error" role="alert">This conversation's security policy allows no models. Ask an administrator to review it.</p>}
           {accountNotice && !skipAccounts && <p className="notice" role="status">{accountNotice}<Button type="button" variant="ghost" size="sm" onClick={() => setAccountNotice("")}>Continue</Button><a href="#settings/general">Preferences</a></p>}
           {session.surface === "slack" && view.slack_delivery && <div className="composer-hint" role="status">
             {view.slack_delivery.rejected > 0 ? <><span>{view.slack_delivery.rejected_files > 0 && <>Slack could not upload {view.slack_delivery.rejected_files} file(s). {view.slack_delivery.file_error_codes.length > 0 && <>Reason: {view.slack_delivery.file_error_codes.join(", ")}. </>}</>}{view.slack_delivery.rejected > view.slack_delivery.rejected_files && <>Slack could not deliver {view.slack_delivery.rejected - view.slack_delivery.rejected_files} message(s). </>}{view.slack_delivery.file_error_codes.includes("missing_scope") && <>Check file upload permissions for the Slack connection in Settings. </>}</span>{session.can_manage && <Button variant="ghost" size="sm" onClick={async () => { try { await retrySlackDelivery({ path: { session_id: id } }); await load() } catch (reason) { setError(String(reason)) } }}>Retry delivery</Button>}</>
@@ -1179,6 +1198,7 @@ function Conversation({ id, me, connections, connectionVersion, refreshList, wor
               : view.slack_delivery.pending > 0 ? "Waiting to deliver to Slack…" : null}
           </div>}
           {accountBlocked && !accountNotice && !accountCatalog.error && <p className="composer-hint" role="status">Loading connections…</p>}
+          {!policyReady && <p className="composer-hint" role="status">Loading security policy…</p>}
           {accountBlocked && accountCatalog.error && <p className="error" role="alert">{accountCatalog.error}<Button type="button" variant="outline" size="sm" onClick={() => setAccountRevision(value => value + 1)}>Retry connections</Button><Button type="button" variant="ghost" size="sm" onClick={() => { setSkippedAccountScope(accountScope); setAccountNotice("") }}>Continue without connections</Button></p>}
           {pictures.uploading && <p className="composer-hint" role="status">Uploading files…</p>}
         </form>
@@ -1265,7 +1285,7 @@ function Conversation({ id, me, connections, connectionVersion, refreshList, wor
         if (tab.kind === "plan") return <>{panelError && <p className="error" role="alert">{panelError}</p>}{!plan.length && <div className="panel-empty"><Check /><p>{panelLoading ? "Loading plan…" : "Moyai’s task plan will appear here."}</p></div>}{plan.map(task => <div className="plan-row" key={task.id}><span className={`plan-mark ${task.status}`}>{task.status === "completed" ? "✓" : "○"}</span><div>{task.content}<small>{task.status.replaceAll("_", " ")}</small></div></div>)}</>
         if (tab.kind === "side-chat") return tab.sessionId
           ? <Conversation key={`${me.user.id}:${tab.sessionId}`} id={tab.sessionId} me={me} connections={connections} connectionVersion={connectionVersion} refreshList={refreshList} workspaceRequest={null} pullRequests={[]} onPRUpdated={onPRUpdated} sideMode visible={activeTab} onOpenFile={openOutput} onOpenAction={openAction} onTitle={title => dispatchPanel({ type: "rename", id: tab.id, title })} />
-          : <SideChatPicker parentId={id} defaultModel={me.default_model} individual={me.user.individual !== false} onCreated={refreshList} onSelect={selected => dispatchPanel({ type: "replace", id: tab.id, tab: { id: `side-chat:${selected.id}`, kind: "side-chat", sessionId: selected.id, title: selected.title } })} />
+          : <SideChatPicker parentId={id} individual={me.user.individual !== false} onCreated={refreshList} onSelect={selected => dispatchPanel({ type: "replace", id: tab.id, tab: { id: `side-chat:${selected.id}`, kind: "side-chat", sessionId: selected.id, title: selected.title } })} />
         return null
       }}</PanelTabs>
     </div>
@@ -1274,7 +1294,7 @@ function Conversation({ id, me, connections, connectionVersion, refreshList, wor
   </div>
 }
 
-function SideChatPicker({ parentId, defaultModel, individual, onCreated, onSelect }: { parentId: string; defaultModel: string; individual: boolean; onCreated: () => Promise<void>; onSelect: (session: Session) => void }) {
+function SideChatPicker({ parentId, individual, onCreated, onSelect }: { parentId: string; individual: boolean; onCreated: () => Promise<void>; onSelect: (session: Session) => void }) {
   const [sessions, setSessions] = useState<Session[]>([])
   const [query, setQuery] = useState("")
   const [error, setError] = useState("")
@@ -1296,7 +1316,8 @@ function SideChatPicker({ parentId, defaultModel, individual, onCreated, onSelec
     <Button className="side-chat-new" disabled={busy} onClick={async () => {
       setBusy(true); setError("")
       try {
-        const { data: next } = await createSession({ body: { visibility: "shared", model: defaultModel } })
+        // No model: the new session's security policy chooses its default.
+        const { data: next } = await createSession({ body: { visibility: "shared" } })
         if (alive.current) onSelect(next)
         // The session already exists; a sidebar refresh failure must not turn
         // a confirmed creation into an invitation to create it again.

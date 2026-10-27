@@ -63,6 +63,34 @@ test('saved event and execution settings remain intact while the expanded editor
   assert.doesNotMatch(html,/Run now|Enable schedule|cannot be converted|awaiting migration support/);
 });
 
+test('the editor follows its workflow policy for models, connected apps and repositories',()=>{
+  const policy={connected_apps:['github'],tools:null,git_access:'write',network_domains:null,repositories:[7,9001],models:['allowed-model']};
+  const connections=[{id:'github',connected:true,enabled:true,read_only:false,repositories:[{id:7,full_name:'acme/app'},{id:8,full_name:'acme/other'}]},{id:'linear',connected:true,enabled:true,read_only:false}];
+  const existing=definition({repo_url:'https://github.com/acme/other',triggers:[{id:'push',event:{provider:'github',event:'push',repository:'acme/other',repository_id:8}}]});
+  const html=render(ui.DefinitionEditor,{existing,models:['enabled-model','allowed-model'],defaultModel:'enabled-model',policy,connections,eventChoices:{github:[['push','Push']]},busy:false,onCancel(){},async onSave(){}});
+  assert.match(html,/Its security policy allows only acme\/app, Repository 9001\./,'allowed repositories by their last known names');
+  assert.equal(html.match(/This repository is not allowed by the workflow’s security policy\./g)?.length,2,'the workflow and trigger repositories');
+  assert.match(html,/Linear · Not allowed by its security policy/);assert.match(html,/GitHub · Connected/);
+  assert.doesNotMatch(render(ui.DefinitionEditor,{existing:definition({repo_url:'https://github.com/Acme/App'}),models:['allowed-model'],defaultModel:'allowed-model',policy,connections,busy:false,onCancel(){},async onSave(){}}),/is not allowed by the workflow/);
+  const none=render(ui.DefinitionEditor,{models:['enabled-model'],defaultModel:'enabled-model',policy:{...policy,models:[],repositories:[]},connections,busy:false,onCancel(){},async onSave(){}});
+  assert.match(none,/Its security policy allows none of the workspace’s models/);assert.match(none,/Its security policy allows no repositories\./);
+  assert.match(none,/GitHub · Not allowed by its security policy/,'GitHub with no repositories cannot be selected');
+  assert.match(none,/<button[^>]*disabled=""[^>]*>Save paused<\/button>/,'a new workflow cannot be saved without an allowed model');
+  assert.match(render(ui.DefinitionEditor,{models:['enabled-model'],defaultModel:'enabled-model',policyError:true,busy:false,onCancel(){},async onSave(){}}),/could not be read, so every model and repository is offered/);
+  for(const code of ['model_not_allowed_by_security_policy','repository_not_allowed_by_security_policy'])assert.match(data.automationBlocker(code),/security policy does not allow/);
+});
+
+test('a security policy refusal is not lost access, so the editor keeps the definition',()=>{
+  // ProductGovernance.workflow() and continuation() refusals.
+  for(const detail of ['The workflow model exceeds its security policy.','The workflow repository exceeds its security policy.',
+    'A workflow trigger repository exceeds its security policy.','The workflow connections exceed its security policy.',
+    'A workflow cannot exceed the security policy of its creating session.','This chat allows more than the workflow security policy. Choose a chat started under that policy, or a new chat for each run.'])
+    assert.equal(data.automationPolicyRefusal(403,detail),true,detail);
+  assert.equal(data.automationPolicyRefusal(403,'Your workspace role does not allow this action.'),false);
+  assert.equal(data.automationPolicyRefusal(403,'Only the owner may manage this automation. Administrators may pause it.'),false);
+  assert.equal(data.automationPolicyRefusal(409,'Lambda computers cannot enforce a network allowlist. Select a policy without network restrictions or use a Modal computer.'),false);
+});
+
 test('server capabilities, readiness, revision and generation all gate activation',()=>{
   assert.equal(data.automationActions(preview()).enable,true);
   for(const changed of [

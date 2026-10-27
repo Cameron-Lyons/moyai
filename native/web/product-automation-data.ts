@@ -19,7 +19,7 @@ export type ProductAutomation = ProductAutomationSummary
 export type AutomationPreview = ProductAutomationPreview
 export type AutomationHistory = ProductAutomationHistoryEntry
 export type { ProductEnvironment as AutomationEnvironment } from "./generated/api"
-export type AutomationConnection = Pick<OrganizationConnection, "id" | "connected" | "enabled" | "read_only"> & { tools?: OrganizationConnection["tools"] }
+export type AutomationConnection = Pick<OrganizationConnection, "id" | "connected" | "enabled" | "read_only"> & { tools?: OrganizationConnection["tools"]; repositories?: OrganizationConnection["repositories"] }
 
 export const calendarFrequencies: { value: AutomationTiming["frequency"]; label: string }[] = [
   { value: "hourly", label: "Hourly" }, { value: "daily", label: "Daily" }, { value: "weekdays", label: "Weekdays" },
@@ -105,6 +105,8 @@ const blockerMessages: Record<string, string> = {
   prompt_exceeds_native_limit: "Instructions exceed the new runtime’s 500,000-character limit.",
   model_not_enabled_in_native_core: "This model is not enabled in the new runtime.",
   model_not_enabled: "This model is not enabled.",
+  model_not_allowed_by_security_policy: "This workflow’s security policy does not allow its model. Choose an allowed model.",
+  repository_not_allowed_by_security_policy: "This workflow’s security policy does not allow its repository or a GitHub trigger repository.",
   legacy_occurrences_must_finish: "Earlier executions must finish before migration.",
   owner_action_required: "Only the owner can edit or migrate this definition.",
   slack_event_source_requires_installation_scopes_and_shared_authority: "The Slack source needs an installed app, the required scopes, and shared account access.",
@@ -117,6 +119,14 @@ export function automationBlocker(code: string): string {
   if (code.startsWith("once_already_consumed:")) return `One-time trigger ${code.split(":")[1]} has already run.`
   if (code.startsWith("once_requires_future_time:")) return `Choose a future date for one-time trigger ${code.split(":")[1]}.`
   return blockerMessages[code] ?? code.replaceAll("_", " ")
+}
+/**
+ * Whether a refused write came from the workflow's security policy (its model,
+ * repositories, connections or chat) rather than lost access, so the definition
+ * can be changed and saved again. The service names the policy in these refusals.
+ */
+export function automationPolicyRefusal(status: number, message: string): boolean {
+  return status === 403 && message.includes("security policy")
 }
 export function historySessionHash(row: AutomationHistory): string | undefined {
   if (!row.session_id) return undefined

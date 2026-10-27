@@ -9,7 +9,7 @@ from app.enterprise_roles import GovernanceActor, GroupRoleChange, RoleAssignmen
 from app.governance_audit import parse_filters
 from app.permissions import BUILTIN_PERMISSIONS, catalog
 from app.scim import TokenCreate
-from app.security_profiles import ProfileDefaults, SaveProfile
+from app.security_profiles import PROFILE_ID_PATTERN, ProfileDefaults, SaveProfile
 from app.spend_limits import SpendLimitChanges
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from fastapi.responses import StreamingResponse
@@ -20,6 +20,7 @@ from .product_governance_views import (
     GovernanceGroupRole,
     GovernanceRole,
     GovernanceRoleAssignment,
+    NewSessionSecurityPolicy,
     PermissionCatalog,
     RolesAdmin,
     ScimAdmin,
@@ -153,6 +154,15 @@ def routes(runtime):
             await runtime.database.allowed_session(db, identity, native)
             policy = await runtime.database.governance.policy(db, identity)
             return SessionSecurityPolicy.model_validate({'policy': policy.model_dump(mode='json')})
+
+    @router.get('/api/security-policy/new-session', operation_id='getNewSessionSecurityPolicy')
+    async def new_session_policy(profile_id: str = Query('', pattern=PROFILE_ID_PATTERN),
+                                 user=Depends(principal)) -> NewSessionSecurityPolicy:
+        """The policy and default model a new session would get; '' is the organization default."""
+        async with runtime.database.sessions() as db:
+            policy, model = await runtime.database.governance.new_session_policy(db, user, profile_id)
+        return NewSessionSecurityPolicy.model_validate({'policy': policy.model_dump(mode='json'),
+                                                        'default_model': model})
 
     async def spend_view(user) -> SpendLimitsAdmin:
         """The limit listing; usage totals only for a caller holding spend.read."""

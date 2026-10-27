@@ -344,8 +344,16 @@ class ProductAutomationService:
     ) -> list[str]:
         result = []
         project_grants = []
+        governance = getattr(self.database, "governance", None)
+        # Read the workflow's profile once. When it is unavailable, policy stays
+        # None and each check below reads it again, so it reports the refusal.
+        policy = None
+        if governance is not None:
+            try:
+                policy = await governance.profile_policy(db, definition.security_profile_id)
+            except HTTPException:
+                policy = None
         if definition.session_id:
-            governance = getattr(self.database, "governance", None)
             try:
                 await self.database.automation_session(db, row["owner_id"], definition.session_id)
             except HTTPException:
@@ -353,7 +361,9 @@ class ProductAutomationService:
             else:
                 if governance is not None:
                     try:
-                        await governance.continuation(db, definition.session_id, definition.security_profile_id)
+                        await governance.continuation(
+                            db, definition.session_id, definition.security_profile_id, policy=policy,
+                        )
                     except HTTPException:
                         result.append("scheduled_chat_exceeds_security_policy")
         if definition.mode != "modal":
@@ -372,7 +382,7 @@ class ProductAutomationService:
                 try:
                     project_grants = await self._admitted(db, definition, await self.connections.resolve_grants(
                         row["owner_id"], definition.plugins, shared_session=True, surface="automation", db=db,
-                    ))
+                    ), policy)
                 except (HTTPException, ValueError):
                     result.append("selected_connections_require_onboarding_or_authorization")
         if definition.session_id:
@@ -399,12 +409,15 @@ class ProductAutomationService:
                     result.append("selected_environment_requires_its_current_repository_connection")
         if len(definition.prompt) > 500_000:
             result.append("prompt_exceeds_native_limit")
+        model = None
         try:
             model = self.settings.resolve_model(definition.model or None)
             if model not in self.database.settings.models:
                 result.append("model_not_enabled_in_native_core")
         except ValueError:
             result.append("model_not_enabled")
+        if policy is not None:  # governance.workflow() refuses an unavailable profile.
+            result.extend(self._policy_blockers(governance, policy, definition, model))
         if await self._old_active(db, row["id"]):
             result.append("legacy_occurrences_must_finish")
         for trigger in definition.triggers:
@@ -446,16 +459,34 @@ class ProductAutomationService:
             "authority_version": authority, "connection_ids": connections, "workspace_context": workspace,
         })
 
-    async def _admitted(self, db: AsyncSession, definition: Definition, grants: list[Grant]) -> list[Grant]:
+    @staticmethod
+    def _policy_blockers(governance: Any, policy: Any, definition: Definition, model: str | None) -> list[str]:
+        """Repository and model limits the workflow's profile now refuses, with governance.workflow()'s checks.
+
+        A profile narrowed after the workflow was saved would otherwise only
+        refuse the next enable or migration.
+        """
+        result = []
+        if governance.workflow_repository_denial(policy, definition):
+            result.append("repository_not_allowed_by_security_policy")
+        if model is not None and not governance.admits_model(policy, model):
+            result.append("model_not_allowed_by_security_policy")
+        return result
+
+    async def _admitted(
+        self, db: AsyncSession, definition: Definition, grants: list[Grant], policy: Any = None,
+    ) -> list[Grant]:
         """Keep the plugin grants the workflow's security policy admits.
 
         A plugin selects every installation repository; a repository limit would
-        otherwise refuse each run at admission.
+        otherwise refuse each run at admission. policy is the workflow profile's
+        policy when the caller already resolved it.
         """
         governance = getattr(self.database, "governance", None)
         if governance is None:
             return grants
-        policy = await governance.profile_policy(db, definition.security_profile_id)
+        if policy is None:
+            policy = await governance.profile_policy(db, definition.security_profile_id)
         return [grant for grant in grants
                 if governance.admits_grant(policy, grant.kind, governance.repository_of(grant))]
 

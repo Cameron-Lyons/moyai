@@ -5360,6 +5360,19 @@ export type NewSession = {
 };
 
 /**
+ * NewSessionSecurityPolicy
+ *
+ * What a new session would bind under a profile, with the mandatory policy applied.
+ */
+export type NewSessionSecurityPolicy = {
+    /**
+     * Default Model
+     */
+    default_model: string | null;
+    policy: PolicyView;
+};
+
+/**
  * NewSwarm
  */
 export type NewSwarm = {
@@ -15071,6 +15084,36 @@ export type OriginalArchiveApiRunsRunIdArtifactGetResponses = {
      */
     200: unknown;
 };
+
+export type GetNewSessionSecurityPolicyData = {
+    body?: never;
+    path?: never;
+    query?: {
+        /**
+         * Profile Id
+         */
+        profile_id?: string;
+    };
+    url: '/api/security-policy/new-session';
+};
+
+export type GetNewSessionSecurityPolicyErrors = {
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+};
+
+export type GetNewSessionSecurityPolicyError = GetNewSessionSecurityPolicyErrors[keyof GetNewSessionSecurityPolicyErrors];
+
+export type GetNewSessionSecurityPolicyResponses = {
+    /**
+     * Successful Response
+     */
+    200: NewSessionSecurityPolicy;
+};
+
+export type GetNewSessionSecurityPolicyResponse = GetNewSessionSecurityPolicyResponses[keyof GetNewSessionSecurityPolicyResponses];
 
 export type ListSecurityProfileOptionsData = {
     body?: never;

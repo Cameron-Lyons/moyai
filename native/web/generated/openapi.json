@@ -9534,6 +9534,31 @@
         "title": "NewSession",
         "type": "object"
       },
+      "NewSessionSecurityPolicy": {
+        "description": "What a new session would bind under a profile, with the mandatory policy applied.",
+        "properties": {
+          "default_model": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Default Model"
+          },
+          "policy": {
+            "$ref": "#/components/schemas/PolicyView"
+          }
+        },
+        "required": [
+          "policy",
+          "default_model"
+        ],
+        "title": "NewSessionSecurityPolicy",
+        "type": "object"
+      },
       "NewSwarm": {
         "properties": {
           "attachments": {
@@ -25545,6 +25570,48 @@
           }
         },
         "summary": "Original Archive"
+      }
+    },
+    "/api/security-policy/new-session": {
+      "get": {
+        "description": "The policy and default model a new session would get; '' is the organization default.",
+        "operationId": "getNewSessionSecurityPolicy",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "profile_id",
+            "required": false,
+            "schema": {
+              "default": "",
+              "pattern": "^([0-9a-f]{32})?$",
+              "title": "Profile Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NewSessionSecurityPolicy"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "New Session Policy"
       }
     },
     "/api/security-profiles": {

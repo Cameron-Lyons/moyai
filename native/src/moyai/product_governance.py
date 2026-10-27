@@ -247,8 +247,28 @@ class ProductGovernance:
             kind != 'github' or ProductGovernance.admits_repository(policy, repository_id))
 
     @staticmethod
+    def workflow_repository_denial(policy, definition):
+        """Why this policy refuses a workflow's saved repository or a GitHub trigger repository, or None.
+
+        workflow() refuses with it and the automation readiness review reports
+        it, so both check the same repositories.
+        """
+        if (definition.repo_url or definition.github_repository_id) and not ProductGovernance.admits_repository(
+                policy, definition.github_repository_id):
+            return 'The workflow repository exceeds its security policy.'
+        if not all(ProductGovernance.admits_repository(policy, trigger.event.repository_id)
+                   for trigger in definition.triggers if trigger.event is not None and trigger.event.provider == 'github'):
+            return 'A workflow trigger repository exceeds its security policy.'
+        return None
+
+    @staticmethod
+    def admits_model(policy, model):
+        """Whether the policy allows this model."""
+        return policy.models is None or model in policy.models
+
+    @staticmethod
     def require_model(policy, model, message='This model is not allowed by the session security policy.'):
-        if policy.models is not None and model not in policy.models:
+        if not ProductGovernance.admits_model(policy, model):
             raise HTTPException(403, message)
 
     @staticmethod
@@ -261,7 +281,7 @@ class ProductGovernance:
         if requested:
             ProductGovernance.require_model(policy, requested)
             return requested
-        if policy.models is None or default in policy.models:
+        if ProductGovernance.admits_model(policy, default):
             return default
         allowed = next((model for model in available if model in policy.models), None)
         if allowed is None:
@@ -396,6 +416,24 @@ class ProductGovernance:
             CanonicalRead(sync, self.identity), requested))
         return binding.policy
 
+    async def new_session_policy(self, db, principal, requested=''):
+        """The policy and implicit model of a new session under this profile, for model and connection pickers.
+
+        Selecting a profile needs security.manage, as in bind(). The model is the
+        one session_model gives a session that does not ask for one; None when
+        the policy allows no enabled model. Admission still decides.
+        """
+        principal.require('sessions.create')
+        if requested:
+            principal.require('security.manage')
+        policy = await self.profile_policy(db, requested)
+        settings = self.database.settings
+        try:
+            model = self.session_model(policy, '', settings.default_model, settings.models)
+        except HTTPException:
+            model = None
+        return policy, model
+
     async def workflow(self, db, principal, definition, *, previous='', scope=None, model):
         """Check a workflow definition against its profile; model is its resolved model choice."""
         from app.security_profiles import intersect
@@ -410,23 +448,21 @@ class ProductGovernance:
             raise HTTPException(403, 'The workflow connections exceed its security policy.')
         if definition.repo_url and not self.admits(policy, 'github'):
             raise HTTPException(403, 'The workflow repository exceeds its security policy.')
-        if (definition.repo_url or definition.github_repository_id) and not self.admits_repository(
-                policy, definition.github_repository_id):
-            raise HTTPException(403, 'The workflow repository exceeds its security policy.')
-        if not all(self.admits_repository(policy, trigger.event.repository_id) for trigger in definition.triggers
-                   if trigger.event is not None and trigger.event.provider == 'github'):
-            raise HTTPException(403, 'A workflow trigger repository exceeds its security policy.')
+        if denial := self.workflow_repository_denial(policy, definition):
+            raise HTTPException(403, denial)
         self.require_model(policy, model, 'The workflow model exceeds its security policy.')
         if scope is not None and intersect(await self.policy(db, scope.session_id), policy) != policy:
             raise HTTPException(403, 'A workflow cannot exceed the security policy of its creating session.')
 
-    async def continuation(self, db, session_id, requested=''):
+    async def continuation(self, db, session_id, requested='', *, policy=None):
         """Admit a run in an existing chat only while the chat is no wider than its workflow.
 
         A chat's binding is immutable, so it cannot adopt the workflow's profile.
+        policy is the requested profile's policy when the caller already resolved it.
         """
         from app.security_profiles import intersect
-        policy = await self.profile_policy(db, requested)
+        if policy is None:
+            policy = await self.profile_policy(db, requested)
         current = await self.policy(db, session_id)
         if intersect(current, policy) != current:
             raise HTTPException(403, 'This chat allows more than the workflow security policy. '

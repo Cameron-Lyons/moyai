@@ -1266,3 +1266,62 @@ async def test_slack_auto_selection_drops_repositories_the_policy_excludes(autom
     async with product.database.sessions.begin() as db:
         narrowed = await events._automatic(db, session.id, product.principal, submission)
     assert narrowed.connections == [grant.id for grant in grants if ProductGovernance.repository_of(grant) == 7]
+
+
+async def test_new_session_policy_previews_the_bound_policy_and_the_implicit_model(governed, monkeypatch):
+    """Home and the composers filter their pickers with this; admission still decides."""
+    product = governed
+    monkeypatch.setattr(product.database.settings, 'model_catalog', 'other,third')
+    open_policy = ProfilePolicy().model_dump(mode='json')
+    route = '/api/security-policy/new-session'
+    selected = await profile(product, {'models': ['third', 'other'], 'repositories': [7, 8]})
+    async with governance_client(product) as client:
+        async def read(**params):
+            response = await client.get(route, params=params)
+            assert response.status_code == 200, response.text
+            return response.json()
+        assert await read() == {'policy': open_policy, 'default_model': 'test'}
+        await defaults(product, selected, mandatory=await profile(product, {'models': ['other'], 'repositories': [8]}))
+        # The mandatory policy narrows the default profile, which excludes the workspace default model.
+        narrowed = {'policy': {**open_policy, 'repositories': [8], 'models': ['other']}, 'default_model': 'other'}
+        assert await read() == await read(profile_id=selected) == narrowed
+        assert (await product.database.create_session(product.actor, NewSession())).model == 'other'
+        nothing = await profile(product, {'models': []})
+        assert await read(profile_id=nothing) == {'policy': {**open_policy, 'repositories': [8], 'models': []},
+                                                  'default_model': None}
+        assert (await client.get(route, params={'profile_id': '../x'})).status_code == 422
+        assert (await client.get(route, params={'profile_id': uuid4().hex})).status_code == 409
+    # As in bind(), the default needs only sessions.create; choosing a profile needs security.manage.
+    await member_role(product, ['sessions.create', 'sessions.read'])
+    async with governance_client(product) as client:
+        assert (await client.get(route)).json() == narrowed
+        assert (await client.get(route, params={'profile_id': selected})).status_code == 403
+        await source_write(product, "UPDATE moyai.enterprise_roles SET permissions='[\"sessions.read\"]' WHERE id='restricted'")
+        assert (await client.get(route)).status_code == 403
+
+
+async def test_preview_reports_repository_and_model_limits_the_profile_gained_after_saving(automations):
+    ctx = automations
+    product = ctx.product
+    attach(product)
+    repository, model = 'repository_not_allowed_by_security_policy', 'model_not_allowed_by_security_policy'
+
+    async def codes(row):
+        return {repository, model} & set((await ctx.service.preview(ctx.grant, row['id']))['blockers'])
+    row = await automation_fixtures.create(ctx, repo_url='https://github.com/acme/app')
+    watched = await automation_fixtures.create(ctx, triggers=[
+        {'id': 'push', 'event': {'provider': 'github', 'event': 'pull_request', 'repository_id': 8}}])
+    assert not await codes(row) and not await codes(watched)
+    await defaults(product, await profile(product, {'repositories': [7], 'models': ['other']}))
+    preview = await ctx.service.preview(ctx.grant, row['id'])
+    assert {repository, model} <= set(preview['blockers']) and not preview['capabilities']['migrate']
+    # Each limit reports only its own code.
+    await defaults(product, await profile(product, {'repositories': [7]}))
+    assert await codes(row) == {repository}
+    assert await codes(watched) == {repository}, 'a GitHub trigger repository outside the list'
+    await defaults(product, await profile(product, {'models': ['other']}))
+    assert await codes(row) == await codes(watched) == {model}
+    await defaults(product, await profile(product, {'repositories': [8], 'models': ['test']}))
+    assert not await codes(watched)
+    await defaults(product, await profile(product, {'models': ['test']}))
+    assert not await codes(row)

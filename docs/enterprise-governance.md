@@ -141,6 +141,23 @@ the workspace default when the policy allows it, otherwise on the first allowed
 model; an explicitly requested model must be allowed. A policy that allows no
 model stops all sessions under it.
 
+Model and connection pickers follow the effective policy, but admission still
+decides. Home reads the policy a new session would bind (with the chosen profile
+and the mandatory policy) and offers only its models and the connections it
+allows, starting on the model that session would get (a new side chat leaves
+the model to that default as well); the conversation composer
+does the same with its session's policy, so a narrower mandatory limit moves it
+to an allowed model. Both wait for that read before sending, and Home reads the
+policy again after a refused send. Continuing a historical conversation offers the
+organization default's choices, which its saved policy can narrow further at
+admission. The workflow editor checks its workflow's profile, and its readiness
+review reports `repository_not_allowed_by_security_policy` or
+`model_not_allowed_by_security_policy` when that profile no longer allows the
+saved repository, a GitHub trigger repository, or the model; a save the
+policy refuses keeps the editor open with the reason. Someone without
+`security.manage` editing a workflow that keeps another profile sees every
+choice; saving still checks it.
+
 These limits govern Moyai-managed access only. They do not stop a session's shell
 from cloning a public repository, using credentials a person supplies, or calling
 another model provider with its own key. Exclude the credential tools in the same
@@ -394,6 +411,7 @@ configuration history, not a transcript of every agent action.
 | `/scim/v2/*` | Bearer-authenticated directory protocol |
 | `/api/security-profiles` | Enabled profile selection catalog |
 | `/api/admin/security-profiles`, `/api/admin/security-profiles/defaults` | Revision-checked policy configuration, with the editor's app, tool, repository and model choices and the deployment's network enforcement |
+| `/api/security-policy/new-session` | Policy and default model a new session would get; `sessions.create`, and `security.manage` to name a `profile_id` |
 | `/api/sessions/{id}/security-policy` | Accessible session's effective policy |
 | `/api/admin/spend-limits` | Spend configuration and reported usage |
 | `/api/admin/governance/audit`, `/api/admin/governance/audit/export` | Audit feed and export |

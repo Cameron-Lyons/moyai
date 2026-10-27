@@ -250,6 +250,14 @@ class SessionSecurityPolicy(GovernanceView):
     policy: PolicyView
 
 
+class NewSessionSecurityPolicy(GovernanceView):
+    """What a new session would bind under a profile, with the mandatory policy applied."""
+
+    policy: PolicyView
+    # The model a session that does not ask for one starts on; None when the policy allows no enabled model.
+    default_model: str | None
+
+
 class SpendLimitView(GovernanceView):
     id: str
     kind: Literal["organization", "user-default", "session-default", "user"]
