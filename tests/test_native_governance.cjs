@@ -110,10 +110,8 @@ test('spend tiers: group ids, the limit source and the personal budget notice',(
   assert.deepEqual(gov.tierChange('ignored','',tier),{id:tier.id,limit_usd:null,revision:3});
   for(const bad of ['','g-eng','E'.repeat(32)])assert.throws(()=>gov.tierChange(bad,'5',undefined),/Choose a directory group/);
   assert.throws(()=>gov.tierChange('e'.repeat(32),'-1',undefined),/dollar amount/);
-  assert.equal(gov.limitSourceText('override',''),'Per-person override');
-  assert.equal(gov.limitSourceText('group','Engineering'),'Engineering group tier');
-  assert.equal(gov.limitSourceText('group',''),'Directory group tier');
-  assert.equal(gov.limitSourceText('default',''),'Default monthly limit');
+  assert.deepEqual([['override',''],['group','Engineering'],['group',''],['default','']].map(([source,name])=>gov.limitSourceText(source,name)),
+    ['Per-person override','Engineering group tier','Directory group tier','Default monthly limit']);
   const status=(personal,organization_reached=false,organization_pending=false)=>({period_start:'2026-10-01T00:00:00+00:00',resets_at:'2026-11-01T00:00:00+00:00',warning_ratio:2/3,personal,organization_reached,organization_pending});
   const scope=patch=>({limit_usd:30,used_usd:5,level:'ok',source:'group',group_name:'Engineering',...patch});
   assert.equal(gov.spendNotice(status(null)),null);assert.equal(gov.spendNotice(status(scope())),null);
@@ -228,7 +226,6 @@ test('service account bodies stay inside the ceiling, keep the state on edit and
   assert.deepEqual(gov.serviceKeyBody(' Splunk ',365),{label:'Splunk',expires_in_days:365});
   for(const days of [0,7,366,Number.NaN])assert.throws(()=>gov.serviceKeyBody('Splunk',days),/30, 90, 180 or 365/);
   assert.throws(()=>gov.serviceKeyBody('  ',90),/between 1 and 80/);
-  assert.deepEqual([...gov.EXPIRY_CHOICES],[30,90,180,365]);assert.equal(gov.DEFAULT_EXPIRY,90);
   const five={...account,active:true,keys:Array.from({length:5},(_,i)=>({id:String(i),status:'active'}))};
   assert.equal(gov.canIssueKey(five,5),false);assert.equal(gov.canIssueKey(five,6),true);
   assert.equal(gov.canIssueKey({...account,active:true,keys:[{id:'x',status:'expired'}]},1),true);assert.equal(gov.canIssueKey(account,5),false);

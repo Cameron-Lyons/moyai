@@ -278,16 +278,6 @@ class OidcSignIn:
             return conn.execute('DELETE FROM login_states WHERE state_hash=? AND browser_hash=? AND expires>? RETURNING *',
                                 (state_digest(provider_id, state), digest(browser), time.time())).fetchone()
 
-    def refuse(self, provider_id, reason, email='', client=''):
-        """Audit a refusal after a state was consumed.
-
-        A verified person is named; an anonymous refusal is kept once per
-        provider, client network, reason and minute (sign_in_audit.anonymous_key).
-        """
-        key = None if email else sign_in_audit.anonymous_key('oidc', client, reason, provider_id)
-        sign_in_audit.record(self.store, 'sign_in.refused', email or 'anonymous', 'oidc',
-                             resource_id=provider_id, reason=reason, key=key)
-
     async def verified(self, provider_id, client, row, code, error, iss):
         """The provider's verified identity for a consumed state, else IdentityRefused or OidcUnavailable."""
         if error:
@@ -400,8 +390,9 @@ class OidcSignIn:
             # Only a fully verified identity names the actor (any refusal after
             # verification); claims alone do not.
             try:
-                await asyncio.to_thread(self.refuse, provider, reason, identity['email'] if identity else '',
-                                        row['client'])
+                await asyncio.to_thread(sign_in_audit.refused, self.store, 'oidc', reason,
+                                        email=identity['email'] if identity else '', client=row['client'],
+                                        resource_id=provider)
             except Exception as failure:
                 log.warning('Organization sign-in refusal was not recorded: %s', type(failure).__name__)
             return response

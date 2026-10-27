@@ -16,7 +16,7 @@ failed write as non-fatal; a sign-in issues no session without its event.
 
 Every event a client can repeat without a new verified sign-in is keyed, so a
 repeat inserts nothing: an Access sign-in or refusal per subject and minute, an
-anonymous refusal per client network, reason and minute (anonymous_key), and a
+anonymous refusal per client network, reason and minute (refused), and a
 sign-out once per session.
 """
 from contextlib import contextmanager
@@ -47,15 +47,17 @@ def succeeded(store, method, actor, *, enrolled, key):
         return succeeded_in(conn, method, actor, enrolled=enrolled, key=key)
 
 
-def anonymous_key(method, client, reason, resource_id=''):
-    """One anonymous refusal per method (and provider), client network, reason and UTC minute.
+def refused(store, method, reason, *, email='', client='', resource_id=''):
+    """sign_in.refused after a consumed sign-in state, in its own transaction.
 
-    A refusal before anyone is verified is bounded only by its start throttle,
-    which is per client and per process, so many clients could otherwise each
-    add a permanent row per attempt.
+    A verified email names the actor. An anonymous refusal is bounded only by its
+    start throttle (per client and process), so it is kept once per method (and
+    provider), client network, reason and UTC minute.
     """
     from .governance_activity import minute_bucket
-    return f'{method}\x1f{resource_id}\x1f{client}\x1f{reason}\x1f{minute_bucket()}'
+    key = None if email else f'{method}\x1f{resource_id}\x1f{client}\x1f{reason}\x1f{minute_bucket()}'
+    return record(store, 'sign_in.refused', email or 'anonymous', method,
+                  resource_id=resource_id, reason=reason, key=key)
 
 
 def record(store, action, actor, method, *, resource_id=None, key=None, **details):

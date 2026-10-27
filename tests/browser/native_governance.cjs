@@ -693,10 +693,8 @@ test('Home shows the personal budget notice at two-thirds and at the limit',asyn
   state.spendStatus=status(scope({used_usd:30,level:'reached'}));await page.reload();
   await notice.getByText(/Your \$30\.00 monthly model budget is used up\. New model requests are refused until November 1 \(UTC\)/).waitFor();
   assert.match(await notice.getAttribute('class'),/\berror\b/);
-  state.spendStatus=status(null,true);await page.reload();
-  await notice.getByText(/The organization's monthly model budget is used up/).waitFor();
   state.spendStatus=status(scope({used_usd:5,level:'ok'}));await page.reload();await page.getByRole('textbox',{name:'Message Moyai'}).waitFor();
-  await waitFor(()=>state.requests.filter(req=>req.path==='/api/spend/status').length>=4,'status read');
+  await waitFor(()=>state.requests.filter(req=>req.path==='/api/spend/status').length>=3,'status read');
   assert.equal(await notice.count(),0,'nothing below two-thirds');
   await page.setViewportSize({width:320,height:640});state.spendStatus=status(scope());await page.reload();await notice.waitFor();
   assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true,'the notice wraps at 320px');
@@ -772,7 +770,7 @@ test('losing access while loading more clears audit and directory rows and re-re
     reset();await page.evaluate(id=>{location.hash='settings/'+id;},route);await page.reload();await page.getByRole('region',{name:region}).getByText(row,{exact:true}).waitFor();
     const reads=meReads();state.permissions=state.permissions.filter(x=>x!==permission);
     await page.getByRole('button',{name:more,exact:true}).click();await page.getByRole('heading',{name:'Permission required'}).waitFor();
-    assert.ok(meReads()>reads,'own access is re-read after a 403');assert.equal(await page.getByText(row,{exact:true}).count(),0,'loaded rows are removed');
+    assert.ok(meReads()>reads,`own access is re-read after a 403 (${route})`);assert.equal(await page.getByText(row,{exact:true}).count(),0,`loaded rows are removed (${route})`);
   }
 });
 

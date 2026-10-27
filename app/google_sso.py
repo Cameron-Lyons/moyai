@@ -128,15 +128,6 @@ class GoogleSignIn:
         self.store.identity({'method': 'google', 'identity': identity, 'role': person['role']}, sign_in=True)
         return person['role']
 
-    def refuse(self, reason, email='', client=''):
-        """Audit a refusal after a state was consumed.
-
-        A verified person is named; an anonymous refusal is kept once per
-        client network, reason and minute (sign_in_audit.anonymous_key).
-        """
-        key = None if email else sign_in_audit.anonymous_key('google', client, reason)
-        sign_in_audit.record(self.store, 'sign_in.refused', email or 'anonymous', 'google', reason=reason, key=key)
-
     async def verified(self, row, code, error):
         """The provider's verified identity for a consumed state, else IdentityRefused."""
         if error:
@@ -226,7 +217,8 @@ class GoogleSignIn:
                 return response
             # Only a verified identity names the actor: any refusal after the exchange.
             try:
-                await asyncio.to_thread(self.refuse, reason, identity['email'] if identity else '', row["client"])
+                await asyncio.to_thread(sign_in_audit.refused, self.store, 'google', reason,
+                                        email=identity['email'] if identity else '', client=row["client"])
             except Exception as failure:
                 log.warning('Google sign-in refusal was not recorded: %s', type(failure).__name__)
             return response

@@ -595,9 +595,6 @@ async def test_a_changed_email_is_reviewed_and_recovered_without_a_second_accoun
     product.idp.claims = {'sub': 'okta-subject', 'email': 'third@example.test'}
     assert_failed(product, await sign_in(product), 'mapping_review')
     assert product.store.rows('SELECT id FROM users') == [{'id': user_id}]
-    with pytest.raises(IdentityRefused):
-        product.store.external_identity({'issuer': ISSUER, 'sub': 'okta-subject', 'email': 'third@example.test'},
-                                        kind='oidc', provider='okta')
 
 
 async def test_ascii_emails_only(product, tmp_path):
@@ -629,7 +626,7 @@ async def test_unexpected_failures_redirect_and_log_only_their_type(product, mon
         assert_failed(product, await sign_in(product), 'unavailable')
         monkeypatch.setattr(product.store, 'external_identity_in', failing)
         assert_failed(product, await sign_in(product), 'unavailable')
-        monkeypatch.setattr(product.oidc, 'refuse', failing)
+        monkeypatch.setattr(sign_in_audit, 'refused', failing)
         response = await sign_in(product)
     assert response.status_code == 303 and response.headers['location'] == '/?signin=failed#connections'
     assert 'RuntimeError' in caplog.text and 'ValueError' in caplog.text and 'person@example.test' not in caplog.text

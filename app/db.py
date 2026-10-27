@@ -1032,13 +1032,9 @@ class Store:
 
     def access_identity(self, identity):
         """Pin a verified Access subject to a person without changing ownership."""
-        return self.external_identity(identity, kind='cloudflare')
-
-    def external_identity(self, identity, *, kind, provider='', require_scim=False):
-        """external_identity_in, in its own writer transaction."""
         with self.connect() as conn:
             conn.begin_write()
-            return self.external_identity_in(conn, identity, kind=kind, provider=provider, require_scim=require_scim)
+            return self.external_identity_in(conn, identity, kind='cloudflare')
 
     def external_identity_in(self, conn, identity, *, kind, provider='', require_scim=False):
         """Pin a verified (issuer, subject) to a person without changing ownership.
