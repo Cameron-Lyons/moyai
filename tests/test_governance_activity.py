@@ -16,6 +16,8 @@ from app.governance_activity import (
 from app.governance_audit import RESOURCE_TYPES
 
 SECRET = 'sk-live-TOPSECRET prompt text'
+MESSAGE = {'origin': 'user', 'mode': 'asap', 'reply': False, 'steering': False, 'model': 'test', 'attachments': 0,
+           'connection_kinds': []}
 
 
 def event(action='policy.tool_denied', **change):
@@ -53,10 +55,8 @@ def test_events_hold_only_validated_metadata():
     ('policy.tool_denied', {'details': {'reason': 'tool_disabled', 'permission': 'a\x00b'}}),
     ('policy.model_denied', {'details': {'reason': 'spend_limit', 'scopes': ['organization', SECRET]}}),
     ('policy.model_denied', {'details': {'reason': 'spend_limit', 'awaiting_cost': 'yes'}}),
-    ('message.submitted', {'details': {'origin': 'user', 'mode': 'asap', 'reply': False, 'steering': False,
-                                       'model': 'test', 'attachments': True, 'connection_kinds': []}}),
-    ('message.submitted', {'details': {'origin': 'user', 'mode': 'asap', 'reply': False, 'steering': False,
-                                       'model': 'test', 'attachments': 0, 'connection_kinds': ['github'] * 51}}),
+    ('message.submitted', {'details': {**MESSAGE, 'attachments': True}}),
+    ('message.submitted', {'details': {**MESSAGE, 'connection_kinds': ['github'] * 51}}),
     ('session.created', {'details': {'origin': 'user', 'visibility': 'shared', 'profile_revision': 1,
                                      'inherited': False, 'title': SECRET}}),
     ('session.deleted', {'details': {'note': SECRET}}),
@@ -83,8 +83,7 @@ def test_identifiers_are_bounded_text():
 
 def test_details_are_limited_to_2048_bytes():
     kinds = ['k' * 40 + str(index) for index in range(50)]
-    details = {'origin': 'user', 'mode': 'asap', 'reply': False, 'steering': False, 'model': 'test',
-               'attachments': 0, 'connection_kinds': kinds}
+    details = {**MESSAGE, 'connection_kinds': kinds}
     with pytest.raises(ValueError, match=f'exceed {MAX_ACTIVITY_DETAILS} bytes'):
         event('message.submitted', details=details)
     assert event('message.submitted', details={**details, 'connection_kinds': kinds[:30]})
@@ -114,8 +113,7 @@ def test_model_ids_outside_the_identifier_pattern_are_digests():
     assert model_fields('openai/gpt-6-astra') == {'model': 'openai/gpt-6-astra'}
     hidden = model_fields('team model ' + SECRET)
     assert set(hidden) == {'model_digest'} and len(hidden['model_digest']) == 16
-    details = {'origin': 'user', 'mode': 'asap', 'reply': False, 'steering': False, 'attachments': 0,
-               'connection_kinds': []}
+    details = {key: value for key, value in MESSAGE.items() if key != 'model'}
     built = event('message.submitted', details={**details, **hidden})
     assert json.loads(built.details)['model_digest'] == hidden['model_digest'] and SECRET not in built.details
     assert json.loads(event('policy.model_denied', details={'reason': 'model_policy', **hidden}).details) == {

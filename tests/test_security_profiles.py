@@ -400,9 +400,10 @@ def test_stale_unknown_and_unchanged_saves_write_nothing(store, profiles):
         profiles.save(body(revision=1), ADMIN, profile_id='f' * 32)
     assert missing.value.status_code == 404
     assert read(store, SecurityProfiles._row_in, 'not-a-profile-id') is None
-    # The same values in another spelling are unchanged: no revision, no event.
-    same = profiles.save(body(revision=1, tools=['read_file', 'read_file']), ADMIN, profile_id=created['id'])
-    assert same == created
+    # The same values in another spelling, or with explicit null limits, are unchanged: no revision, no event.
+    for policy in ({'tools': ['read_file', 'read_file']},
+                   {'tools': ['read_file'], 'repositories': None, 'models': None}):
+        assert profiles.save(body(revision=1, **policy), ADMIN, profile_id=created['id']) == created
     assert len(events(store)) == 1
     assert store.rows('SELECT COUNT(*) AS total FROM security_profile_revisions')[0]['total'] == 1
 
@@ -428,16 +429,6 @@ def test_updates_that_omit_saved_repository_or_model_limits_are_refused(store, p
     # Without saved limits, an older body (four fields) still saves.
     renamed = profiles.save(body('Renamed', revision=2), ADMIN, profile_id=created['id'])
     assert renamed['revision'] == 3
-
-
-def test_legacy_profiles_save_unchanged_with_explicit_nulls(store, profiles):
-    created = profiles.save(body(tools=['read_file']), ADMIN)
-    assert store.rows('SELECT policy FROM security_profiles')[0]['policy'] == (
-        '{"connected_apps":null,"git_access":"write","network_domains":null,"tools":["read_file"]}')
-    same = profiles.save(body(revision=1, tools=['read_file'], repositories=None, models=None), ADMIN,
-                         profile_id=created['id'])
-    assert same == created and len(events(store)) == 1
-    assert store.rows('SELECT COUNT(*) AS total FROM security_profile_revisions')[0]['total'] == 1
 
 
 def test_only_newly_added_repositories_and_models_must_be_in_the_catalog(store, profiles):

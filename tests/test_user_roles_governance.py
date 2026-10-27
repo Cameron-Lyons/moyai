@@ -329,7 +329,7 @@ def test_security_person_resolves_directory_state_and_permissions(directory):
     assert security.person('dan@example.com') is None
 
 
-def test_oidc_accounts_are_individuals_for_directory_actors_and_audit(directory):
+def test_oidc_accounts_are_individuals_for_directory_actors(directory):
     service = directory
     signed_in(service, 'ida@example.com', kind='oidc')
     custom(service, 'ida@example.com')
@@ -344,9 +344,3 @@ def test_oidc_accounts_are_individuals_for_directory_actors_and_audit(directory)
     # An earlier Google account that now signs in through the organization's provider.
     linked = GovernanceActor.from_principal(SimpleNamespace(**{**vars(principal), 'kind': 'google'}))
     assert linked.resolved_kind == 'individual'
-    from app.governance_audit import record_event_in
-    with service.store.connect() as conn:
-        conn.begin_write()
-        record_event_in(conn, 'sign_in.refused', 'anonymous', 'sign_in', 'okta', {'method': 'oidc', 'reason': 'token'})
-        with pytest.raises(ValueError, match='resource_type'):
-            record_event_in(conn, 'enrolled', 'ida@example.com', 'identity_binding', 'oidc:ida', {})

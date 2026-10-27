@@ -85,6 +85,10 @@ def oidc_settings(tmp_path, providers=(OKTA,), secrets=None, **overrides):
     (({**OKTA, 'issuer': 'https://login.microsoftonline.com/{tenantid}/v2.0'},), None, {}),
     (({**OKTA, 'issuer': 'https://accounts.google.com'},), None, {}),
     (({**OKTA, 'issuer': 'https://Accounts.Google.com/'},), None, {}),
+    (({**OKTA, 'issuer': 'https://example.okta.com/?tenant=x'},), None, {}),
+    (({**OKTA, 'algorithms': ['HS256']},), None, {}),
+    (({**OKTA, 'scopes': ['email']},), None, {}),
+    (({**OKTA, 'domains': []},), None, {}),
     (({**OKTA, 'label': 'Okta\r\nSet-Cookie: x'},), None, {}),
     ((OKTA,), None, {'google_admin_emails': 'admin@elsewhere.test'}),
     ((OKTA,), None, {'google_admin_emails': ''}),
@@ -112,7 +116,7 @@ def test_oidc_owns_its_domains_and_counts_as_person_sign_in(tmp_path, monkeypatc
     assert tenant.oidc_secret('okta') == 'synthetic-secret'
 
     monkeypatch.setenv('MOYAI_OIDC_PROVIDERS', '[{"id":"okta","label":"Okta","issuer":"https://example.okta.com",'
-                                               '"client_id":"c","domains":["Example.TEST"]}]')
+                                               '"client_id":"c","domains":[" Example.TEST "]}]')
     monkeypatch.setenv('MOYAI_OIDC_CLIENT_SECRETS', '{"okta":"synthetic-secret"}')
     monkeypatch.setenv('GOOGLE_ALLOWED_DOMAINS', 'example.test')
     monkeypatch.setenv('GOOGLE_ADMIN_EMAILS', 'admin@example.test')

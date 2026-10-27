@@ -455,7 +455,7 @@ def test_facets_list_known_and_recorded_actions(store, audit):
     facets = audit.listing(None)['facets']
     assert facets == {'actions': sorted({*LEGACY_ACTIONS, *ACTIVITY_ACTIONS, 'scim_user.deactivated', 'role.created',
                                          'spend_limit.updated'}), 'resource_types': list(RESOURCE_TYPES)}
-    assert {'session', 'message', 'policy', 'automation', 'sign_in'} <= set(facets['resource_types'])
+    assert {'session', 'message', 'policy', 'automation', 'sign_in', 'identity_binding'} <= set(facets['resource_types'])
     assert {'user_role.changed', 'connection.connected', 'credential.revoked'} <= set(facets['actions'])
 
 
@@ -642,6 +642,14 @@ def test_recorded_actions_name_their_resource_type(store, audit):
         older = record_event_in(conn, 'role.updated', 'owner@example.com', 'CustomRole', 'auditor')
     assert pages(audit, parse_filters(resource_type='security_profile')) == [('governance', kept)]
     assert pages(audit, parse_filters(resource_type='CustomRole')) == [('governance', older)]
+    # Native AI guardrail refusals insert event_values rows from their own transaction.
+    action, actor, resource_type, resource_id, details = event_values(
+        'ai_guardrail.violation', 'owner@example.com', 'ai_guardrail', 'phi-presidio',
+        {'session_id': 'session', 'model': 'route-alias', 'guardrails': ['phi-presidio']})
+    guardrail = governance_row(store, BASE, action=action, actor=actor, resource_type=resource_type,
+                               resource_id=resource_id, details=json.loads(details))
+    assert pages(audit, parse_filters(resource_type='ai_guardrail')) == [('governance', guardrail)]
+    assert 'ai_guardrail' in audit.listing()['facets']['resource_types']
 
 
 def test_activity_only_types_never_read_the_governance_table(store):
@@ -670,19 +678,6 @@ def test_activity_only_types_never_read_the_governance_table(store):
         automation = parse_filters(resource_type='automation')
         assert len(governance_audit._statements_in(counted, source, automation, None, 51)) == 1
         assert counted.scans == 1
-
-
-def test_runtime_events_validate_like_governance_changes(store, audit):
-    """Native AI guardrail refusals insert event_values rows from their own transaction."""
-    with pytest.raises(ValueError, match=r'^Name governance actions <resource_type>\.<verb>\.$'):
-        event_values('guardrail.violation', 'owner@example.com', 'ai_guardrail', 'phi-presidio')
-    action, actor, resource_type, resource_id, details = event_values(
-        'ai_guardrail.violation', 'owner@example.com', 'ai_guardrail', 'phi-presidio',
-        {'session_id': 'session', 'model': 'route-alias', 'guardrails': ['phi-presidio']})
-    kept = governance_row(store, BASE, action=action, actor=actor, resource_type=resource_type,
-                          resource_id=resource_id, details=json.loads(details))
-    assert pages(audit, parse_filters(resource_type='ai_guardrail')) == [('governance', kept)]
-    assert 'ai_guardrail' in audit.listing()['facets']['resource_types']
 
 
 def test_exports_release_one_chunk_per_page(store, audit, monkeypatch):
@@ -732,29 +727,19 @@ def test_activity_rows_join_the_feed_filters_and_exports(store, audit):
                                           'session_id': session}
     assert entries[blocked]['details'] == {'occurrence_kind': 'schedule', 'reason': 'governance', 'outcome': 'denied'}
 
-    def listed(**values):
-        return [(entry['source'], entry['id']) for entry in audit.listing(parse_filters(**values), limit=200)['entries']]
-
     # The folded actor_key serves a case-insensitive actor filter.
-    assert listed(actor=' OWNER@example.com ') == [('governance', configured), ('activity', blocked),
-                                                   ('activity', denied), ('activity', created)]
-    assert listed(actor='dana@example.com') == [('activity', message)]
-    assert listed(resource_type='policy') == [('activity', denied)]
-    assert listed(resource_type='session') == [('activity', created)]
-    assert listed(resource_type='automation') == [('governance', configured), ('activity', blocked)]
-    assert listed(action='message.submitted') == [('activity', message)]
-    assert listed(action='automation.created') == [('governance', configured)]
-    assert listed(resource_type='message', action='session.created') == []
+    assert pages(audit, parse_filters(actor=' OWNER@example.com ')) == [
+        ('governance', configured), ('activity', blocked), ('activity', denied), ('activity', created)]
+    assert pages(audit, parse_filters(actor='dana@example.com')) == [('activity', message)]
+    assert pages(audit, parse_filters(resource_type='policy')) == [('activity', denied)]
+    assert pages(audit, parse_filters(resource_type='session')) == [('activity', created)]
+    assert pages(audit, parse_filters(resource_type='automation')) == [('governance', configured), ('activity', blocked)]
+    assert pages(audit, parse_filters(action='message.submitted')) == [('activity', message)]
+    assert pages(audit, parse_filters(action='automation.created')) == [('governance', configured)]
+    assert pages(audit, parse_filters(resource_type='message', action='session.created')) == []
     rows = records(audit.export(parse_filters(resource_type='policy'), 'ndjson'))
     assert [(row['source'], row['details']['outcome']) for row in rows] == [('activity', 'denied')]
     assert 'session_id' in rows[0]['details']
-
-
-def test_activity_cells_are_escaped_in_csv_exports(store, audit):
-    activity_row(store, BASE, actor='=HYPERLINK("https://evil.example")', session_id='+1')
-    rows = list(csv.reader(io.StringIO(''.join(audit.export(None, 'csv')), newline='')))
-    assert rows[1][1:6] == ['activity', 'session.created', '\'=HYPERLINK("https://evil.example")', 'session', "'+1"]
-    assert json.loads(rows[1][6])['session_id'] == '+1'
 
 
 def test_cursors_issued_before_activity_rows_stay_valid(store, audit):

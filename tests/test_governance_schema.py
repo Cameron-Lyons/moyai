@@ -183,7 +183,7 @@ def test_spend_group_limits_bound_each_tier(store):
     insert = 'INSERT INTO spend_group_limits VALUES(?,?,?,?,?)'
     for group, limit in (('unlimited', None), ('blocked', 0), ('ceiling', 1_000_000), ('cents', 12.34)):
         store.execute(insert, (group, limit, 1, 'owner@example.com', STAMP))
-    for limit, revision in ((-0.01, 1), (1_000_000.01, 1), (5, 0), (5, None)):
+    for limit, revision in ((-0.01, 1), (1_000_000.01, 1), (5, 0), (5, None), (float('inf'), 1), (float('-inf'), 1)):
         with pytest.raises(INTEGRITY_ERRORS):
             store.execute(insert, ('rejected', limit, revision, 'owner@example.com', STAMP))
     with pytest.raises(INTEGRITY_ERRORS):  # One tier per group.
@@ -191,9 +191,6 @@ def test_spend_group_limits_bound_each_tier(store):
     assert store.rows('SELECT group_id,limit_usd FROM spend_group_limits ORDER BY group_id') == [
         {'group_id': 'blocked', 'limit_usd': 0}, {'group_id': 'ceiling', 'limit_usd': 1_000_000},
         {'group_id': 'cents', 'limit_usd': 12.34}, {'group_id': 'unlimited', 'limit_usd': None}]
-    for limit in (float('inf'), float('-inf')):
-        with pytest.raises(INTEGRITY_ERRORS):
-            store.execute(insert, ('infinite', limit, 1, 'owner@example.com', STAMP))
     if store.database:
         with pytest.raises(INTEGRITY_ERRORS):
             store.execute(insert, ('nan', float('nan'), 1, 'owner@example.com', STAMP))

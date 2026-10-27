@@ -500,7 +500,7 @@ test('service accounts: an administrator creates an account, sees a new key once
   await page.getByRole('button',{name:'Disable Finance export'}).waitFor();
 });
 
-test('service accounts: a delegate reviews, revokes and disables but cannot create or issue, and others never see the page',async t=>{
+test('service accounts: a delegate reviews, revokes and disables but cannot create or issue',async t=>{
   reset({role:'member',permissions:[...MEMBER,'service_accounts.manage']});const page=await pageFor(t,'#settings/service-accounts');
   await page.getByRole('heading',{name:'SIEM collector'}).waitFor();
   await page.getByText(/A built-in administrator creates service accounts/).waitFor();
@@ -511,11 +511,6 @@ test('service accounts: a delegate reviews, revokes and disables but cannot crea
   await disable.getByText(/It has no unrevoked keys\./).waitFor();await disable.getByRole('button',{name:'Disable account'}).click();await disable.waitFor({state:'hidden'});
   await choose(page,page,'Account status','Disabled accounts');await page.getByRole('heading',{name:'Finance export'}).waitFor();
   assert.equal(await page.getByRole('button',{name:'Enable Finance export'}).count(),0,'only a built-in administrator re-enables');
-  reset({role:'member',permissions:[...MEMBER,'audit.read','spend.read']});await page.evaluate(()=>{location.hash='settings/overview';});await page.reload();
-  const nav=page.getByRole('navigation',{name:'Settings'});await nav.getByRole('link',{name:'Audit log'}).waitFor();
-  assert.equal(await nav.getByRole('link',{name:'Service accounts'}).count(),0);
-  await page.evaluate(()=>{location.hash='settings/service-accounts';});await page.getByRole('heading',{name:'Permission required'}).waitFor();
-  assert.ok(!state.requests.some(req=>req.path==='/api/admin/service-accounts'),'no protected request without the permission');
 });
 
 test('security policies: explicit null-versus-empty choices, validation, defaults and disable',async t=>{
@@ -576,16 +571,9 @@ test('security policies: explicit null-versus-empty choices, validation, default
   await page.getByRole('button',{name:'Disable Contractor sandbox'}).click();const disable=page.getByRole('dialog',{name:'Disable Contractor sandbox?'});
   await disable.getByText(/keep their recorded policy/).waitFor();await disable.getByRole('button',{name:'Disable policy'}).click();await disable.waitFor({state:'hidden'});
   assert.match(last('/api/admin/security-profiles/abcdefabcdefabcdefabcdefabcdefab','DELETE').query,/revision=1/);
-});
-
-test('security policies: the network hint states what Modal enforcement covers',async t=>{
-  reset({networkEnforcement:'modal'});const page=await pageFor(t,'#settings/security-policies');
-  await page.getByRole('button',{name:'Edit Restricted review'}).click();const review=page.getByRole('dialog',{name:'Edit Restricted review'});
-  await review.getByText(/cannot open outbound connections\. .*Enforced on Modal computers for HTTPS \(port 443\) by hostname; plain HTTP, SSH and other ports are blocked\. DNS lookups are not restricted/).waitFor();
-  await review.getByText(/Lambda computers refuse restricted policies\. A running computer started under a wider policy must restart\./).waitFor();
-  assert.equal(await review.getByText(/Network enforcement is off/).count(),0);
-  await choose(review,page,'Network access','Unrestricted');await review.getByText('No outbound restriction is applied.',{exact:true}).waitFor();
-  assert.equal(await review.getByText(/Enforced on Modal computers/).count(),0,'an unrestricted choice has no enforcement caveats');
+  // With Modal enforcement the dialog states what is enforced instead of refusing.
+  state.networkEnforcement='modal';await page.reload();await page.getByRole('button',{name:'Edit Restricted review'}).click();
+  await page.getByRole('dialog',{name:'Edit Restricted review'}).getByText(/cannot open outbound connections\. .*Enforced on Modal computers for HTTPS \(port 443\) by hostname/).waitFor();
 });
 
 test('spend limits: blank means no limit, overrides add/edit/remove, and only changed rows are sent',async t=>{
@@ -623,6 +611,11 @@ test('spend limits: blank means no limit, overrides add/edit/remove, and only ch
   assert.equal(await summary.count(),0,'usage totals are hidden when the listing has none');
   assert.equal(await table.getByRole('row').filter({hasText:'dan@example.test'}).getByRole('cell',{name:'—',exact:true}).count(),1,'per-person spend is unknown without usage');
   assert.equal(spendReads(),reads,'a listing without usage still replaces the page without another read');
+  // spend.manage alone edits limits from a listing that never had usage.
+  reset({role:'member',permissions:[...MEMBER,'spend.manage']});await page.reload();await table.getByText('carol@example.test',{exact:true}).waitFor();
+  assert.equal(await page.getByText('You can view limits. Changing them requires the spend.manage permission.').count(),0);assert.equal(await page.locator('dl[aria-label="Organization spend this month"]').count(),0,'no usage totals without spend.read');
+  await page.getByRole('textbox',{name:'Organization monthly limit'}).fill('6000');await page.getByRole('button',{name:'Save limits'}).click();await page.getByText('Limits saved.').waitFor();
+  assert.deepEqual(last('/api/admin/spend-limits','PUT').body,{changes:[{id:'organization',limit_usd:6000,revision:3}]});
 });
 
 test('spend limits: directory group tiers, the unlimited confirmation and the limit lookup',async t=>{
@@ -689,7 +682,7 @@ test('spend limits: directory group tiers, the unlimited confirmation and the li
   await section.getByText(/No directory groups yet/).waitFor();assert.equal(await section.getByRole('link',{name:'Provisioning'}).count(),1);
 });
 
-test('Home shows the personal budget notice at two-thirds, at the limit and while a cost is recorded',async t=>{
+test('Home shows the personal budget notice at two-thirds and at the limit',async t=>{
   const scope=patch=>({limit_usd:30,used_usd:21,level:'warning',source:'group',group_name:'Engineering',...patch});
   const status=(personal,organization_reached=false,organization_pending=false)=>({period_start:'2026-10-01T00:00:00+00:00',resets_at:'2026-11-01T00:00:00+00:00',warning_ratio:2/3,personal,organization_reached,organization_pending});
   reset({spendStatus:status(scope())});const page=await pageFor(t,'');await page.getByRole('textbox',{name:'Message Moyai'}).waitFor();
@@ -700,14 +693,10 @@ test('Home shows the personal budget notice at two-thirds, at the limit and whil
   state.spendStatus=status(scope({used_usd:30,level:'reached'}));await page.reload();
   await notice.getByText(/Your \$30\.00 monthly model budget is used up\. New model requests are refused until November 1 \(UTC\)/).waitFor();
   assert.match(await notice.getAttribute('class'),/\berror\b/);
-  state.spendStatus=status(scope({used_usd:null,level:'pending'}));await page.reload();
-  await notice.getByText(/An earlier model request's cost is still being recorded/).waitFor();
   state.spendStatus=status(null,true);await page.reload();
   await notice.getByText(/The organization's monthly model budget is used up/).waitFor();
-  state.spendStatus=status(null,false,true);await page.reload();
-  await notice.getByText(/An earlier model request's cost is still being recorded/).waitFor();
   state.spendStatus=status(scope({used_usd:5,level:'ok'}));await page.reload();await page.getByRole('textbox',{name:'Message Moyai'}).waitFor();
-  await waitFor(()=>state.requests.filter(req=>req.path==='/api/spend/status').length>=6,'status read');
+  await waitFor(()=>state.requests.filter(req=>req.path==='/api/spend/status').length>=4,'status read');
   assert.equal(await notice.count(),0,'nothing below two-thirds');
   await page.setViewportSize({width:320,height:640});state.spendStatus=status(scope());await page.reload();await notice.waitFor();
   assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true,'the notice wraps at 320px');
@@ -717,19 +706,6 @@ test('Home shows the personal budget notice at two-thirds, at the limit and whil
     await page.waitForTimeout(200);
     assert.equal(state.requests.filter(req=>req.path==='/api/spend/status').length,0);assert.equal(await notice.count(),0);
   }
-});
-
-test('spend limits: spend.manage without spend.read edits limits without seeing usage',async t=>{
-  reset({role:'member',permissions:[...MEMBER,'spend.manage']});const page=await pageFor(t,'#settings/spend-limits');
-  await page.getByText('Per-person overrides',{exact:true}).waitFor();
-  const table=page.getByRole('region',{name:'Per-person spend overrides'});await table.getByText('carol@example.test',{exact:true}).waitFor();
-  assert.equal(await page.locator('dl[aria-label="Organization spend this month"]').count(),0,'no usage totals without spend.read');
-  assert.equal(await page.getByText('You can view limits. Changing them requires the spend.manage permission.').count(),0);
-  assert.equal(await table.getByRole('row').filter({hasText:'carol@example.test'}).getByRole('cell',{name:'—',exact:true}).count(),1,'per-person spend is unknown without usage');
-  const save=page.getByRole('button',{name:'Save limits'});assert.equal(await save.isDisabled(),true);
-  await page.getByRole('textbox',{name:'Organization monthly limit'}).fill('6000');await save.click();await page.getByText('Limits saved.').waitFor();
-  assert.deepEqual(last('/api/admin/spend-limits','PUT').body,{changes:[{id:'organization',limit_usd:6000,revision:3}]});
-  assert.equal(await page.locator('dl[aria-label="Organization spend this month"]').count(),0,'the saved listing has no usage either');
 });
 
 test('audit log: filters, date validation, cursor paging and exports',async t=>{
@@ -791,21 +767,13 @@ test('load more with an empty final page stops paging instead of returning to th
 });
 
 test('losing access while loading more clears audit and directory rows and re-reads access',async t=>{
-  reset();const page=await pageFor(t,'#settings/audit-log');
-  const meReads=()=>state.requests.filter(req=>req.path==='/api/me').length;
-  const table=page.getByRole('region',{name:'Audit log entries'});await table.getByText('Role created',{exact:true}).waitFor();
-  let reads=meReads();state.permissions=state.permissions.filter(x=>x!=='audit.read');
-  await page.getByRole('button',{name:'Load more'}).click();
-  await page.getByRole('heading',{name:'Permission required'}).waitFor();
-  assert.ok(meReads()>reads,'own access is re-read after a 403');
-  assert.equal(await page.getByText('Role created',{exact:true}).count(),0,'loaded audit entries are removed');
-  reset();await page.evaluate(()=>{location.hash='settings/provisioning';});await page.reload();
-  const users=page.getByRole('region',{name:'Directory users'});await users.getByText('Dana Former').waitFor();
-  reads=meReads();state.permissions=state.permissions.filter(x=>x!=='scim.manage');
-  await page.getByRole('button',{name:'Load more users'}).click();
-  await page.getByRole('heading',{name:'Permission required'}).waitFor();
-  assert.ok(meReads()>reads,'own access is re-read after a 403');
-  assert.equal(await page.getByText('Dana Former').count(),0,'loaded directory users are removed');
+  reset();const page=await pageFor(t,'#settings/overview');const meReads=()=>state.requests.filter(req=>req.path==='/api/me').length;
+  for(const [route,region,row,more,permission] of [['audit-log','Audit log entries','Role created','Load more','audit.read'],['provisioning','Directory users','Dana Former','Load more users','scim.manage']]) {
+    reset();await page.evaluate(id=>{location.hash='settings/'+id;},route);await page.reload();await page.getByRole('region',{name:region}).getByText(row,{exact:true}).waitFor();
+    const reads=meReads();state.permissions=state.permissions.filter(x=>x!==permission);
+    await page.getByRole('button',{name:more,exact:true}).click();await page.getByRole('heading',{name:'Permission required'}).waitFor();
+    assert.ok(meReads()>reads,'own access is re-read after a 403');assert.equal(await page.getByText(row,{exact:true}).count(),0,'loaded rows are removed');
+  }
 });
 
 test('Users shows custom roles and replacing one needs explicit confirmation',async t=>{

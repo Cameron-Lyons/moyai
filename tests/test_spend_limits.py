@@ -38,6 +38,7 @@ class Actor:
 
 
 ADMIN = Actor('google:1', 'Finance@Example.com')
+ENG, FIN, OPS, GONE = '0e' * 16, 'f1' * 16, '0a' * 16, 'de' * 16
 
 
 @pytest.fixture
@@ -77,6 +78,8 @@ def rows(listing):
     (' session-default ', ('session-default', 'session-default', '')),
     ('user:Bob@Example.COM', ('user:bob@example.com', 'user', 'bob@example.com')),
     ('user: bob@example.com ', ('user:bob@example.com', 'user', 'bob@example.com')),
+    ('group:' + ENG, ('group:' + ENG, 'group', ENG)),
+    (' group:' + ENG.upper() + ' ', ('group:' + ENG, 'group', ENG)),
 ])
 def test_ids_are_normalized(value, expected):
     assert parse_id(value) == expected
@@ -383,8 +386,6 @@ def test_evaluate_rejects_malformed_arguments(limit_set, usage):
 
 # Directory group tiers
 
-ENG, FIN, OPS, GONE = '0e' * 16, 'f1' * 16, '0a' * 16, 'de' * 16
-
 
 def directory(store, groups=(), users=()):
     """groups: (id, name, deleted); users: (id, email, active, deleted, group ids)."""
@@ -415,14 +416,6 @@ def groups(store, limits):
 
 def tier(group, limit_usd, revision=0):
     return change('group:' + group, limit_usd, revision)
-
-
-@pytest.mark.parametrize(('value', 'expected'), [
-    ('group:' + ENG, ('group:' + ENG, 'group', ENG)),
-    (' group:' + ENG.upper() + ' ', ('group:' + ENG, 'group', ENG)),
-])
-def test_group_ids_are_normalized(value, expected):
-    assert parse_id(value) == expected
 
 
 @pytest.mark.parametrize('value', ['group:', 'group', 'Group:' + ENG, 'group:' + ENG[:-1], 'group:' + ENG + '0',

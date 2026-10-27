@@ -281,33 +281,9 @@ def canonical_read_engine(service):
         _table=lambda name: f'"main"."{name}"')
 
 
-def test_resolution_is_pure_and_matches_named_queries(governance):
-    from moyai.product_governance import CanonicalRead
-    service = governance
-    role(service)
-    role(service, 'operator', ['connections.manage', 'workspace.read'])
-    assign(service, 'bob@example.com', 'reader')
-    team = directory_group(service, 'Ops', [provision(service, 'bob@example.com')])
-    service.enterprise.set_group_role(team, GroupRoleChange(role_id='operator'), OWNER)
-    with service.store.connect() as conn:
-        canonical = resolve_access(canonical_fetch(conn), 'bob@example.com', 'member')
-    assert canonical.permissions == {'sessions.read', 'workspace.read', 'connections.manage'}
-    assert canonical.groups == ((team, 1, 'operator'),) and canonical.role_id == 'reader' and not canonical.default
-    # The native adapter's form: CanonicalRead binds SQLAlchemy text() and qualified quoted tables.
-    engine, identity = canonical_read_engine(service)
-    try:
-        with engine.connect() as session:
-            read = CanonicalRead(session, identity)
-            assert resolve_access(canonical_fetch(read), 'bob@example.com', 'member') == canonical
-            assert resolve_access(snapshot_fetch(read, 'bob@example.com'), 'bob@example.com', 'member') == canonical
-            assert resolve_access(snapshot_fetch(read, 'nobody@example.com'), 'nobody@example.com', 'member').default
-    finally:
-        engine.dispose()
-    assert all('{' not in sql and ':' in sql for sql in ACCESS_QUERIES.values())
-
-
 def test_snapshot_and_directory_reads_match_per_query_resolution(governance, monkeypatch):
-    """One statement per person (native checks) and one batch (users page) keep resolve_access's results."""
+    """One statement per person (native checks) and one batch (users page) keep resolve_access's results,
+    through both the store connection and the native CanonicalRead adapter."""
     from moyai.product_governance import CanonicalRead
     service = governance
     role(service)
@@ -345,7 +321,7 @@ def test_snapshot_and_directory_reads_match_per_query_resolution(governance, mon
             for email in emails:
                 builtin = service.roles.role_in(conn, email)
                 expected = resolve_access(canonical_fetch(conn), email, builtin)
-                for fetch in (snapshot_fetch(conn, email), snapshot_fetch(read, email), directory):
+                for fetch in (snapshot_fetch(conn, email), snapshot_fetch(read, email), canonical_fetch(read), directory):
                     assert resolve_access(fetch, email, builtin) == expected, email
             executed = statements(monkeypatch)
             fetch = snapshot_fetch(conn, 'ann@example.com')
@@ -359,10 +335,12 @@ def test_snapshot_and_directory_reads_match_per_query_resolution(governance, mon
     finally:
         engine.dispose()
     assert ann_state.groups == tuple(sorted(((audit, 1, 'auditor'), (ops, 1, 'operator'))))
+    assert ann_state.role_id == 'reader' and not ann_state.default
     assert ann_state.permissions == {'sessions.read', 'workspace.read', 'connections.manage', 'spend.read'}
     assert ann_state.directory is not None and ann_state.directory[0] == ann
     assert access(service, 'idle@example.com').permissions == frozenset()
     assert access(service, 'owner@example.com').groups == () and access(service, 'ghost@example.com').permissions == frozenset()
+    assert all('{' not in sql and ':' in sql for sql in ACCESS_QUERIES.values())
 
 
 def test_default_state_and_member_rows_never_change_governance(governance):

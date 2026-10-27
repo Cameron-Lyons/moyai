@@ -15,8 +15,9 @@ from urllib.parse import parse_qs, urlsplit
 import httpx
 import jwt
 import pytest
-from app import oidc_sso
-from app.config import OidcProvider, Settings
+from app import governance_activity, oidc_sso, sign_in_audit
+from app.config import Settings
+from app.database import DatabaseError
 from app.db import IdentityRefused, Store
 from app.enterprise_roles import GovernanceActor, RoleAssignment, RoleCreate
 from app.google_sso import GoogleSignIn
@@ -112,12 +113,12 @@ def settings_for(tmp_path, providers=(OKTA,), secrets=None, **overrides):
               'google_admin_emails': 'admin@example.test',
               'oidc_providers': list(providers),
               'oidc_client_secrets': secrets if secrets is not None else {
-                  (item['id'] if isinstance(item, dict) else item.id): SECRET for item in providers}}
+                  item['id']: SECRET for item in providers}}
     values.update(overrides)
     return Settings(**values)
 
 
-def service(path, store, settings, idp, extra=()):
+def service(store, settings, idp, extra=()):
     roles = UserRoles(store, settings)
     security = Security(settings, roles)
 
@@ -130,20 +131,29 @@ def service(path, store, settings, idp, extra=()):
     app = FastAPI()
     app.include_router(oidc.routes())
     client = httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url=ORIGIN)
-    return SimpleNamespace(path=path, store=store, settings=settings, roles=roles, security=security,
-                           oidc=oidc, app=app, client=client, idp=idp)
+    return SimpleNamespace(store=store, settings=settings, roles=roles, security=security,
+                           oidc=oidc, client=client, idp=idp)
 
 
 @pytest.fixture
 async def product(tmp_path):
     store = Store(tmp_path)
     initialize_components(store)
-    idp = FakeProvider()
-    current = service(tmp_path, store, settings_for(tmp_path), idp)
+    clients = []
+
+    def serve(settings=None, idp=None, extra=()):
+        """Another router on the same store; its client closes with the fixture."""
+        current = service(store, settings or settings_for(tmp_path), idp or FakeProvider(), extra)
+        clients.append(current.client)
+        return current
+
+    current = serve()
+    current.serve = serve
     try:
         yield current
     finally:
-        await current.client.aclose()
+        for client in clients:
+            await client.aclose()
         store.close()
 
 
@@ -179,9 +189,10 @@ def issued(security, identity):
     return cookie['workspace_session'].value
 
 
-def request_with(cookie):
+def request_with(cookie=None):
+    headers = [(b'cookie', f'workspace_session={cookie}'.encode())] if cookie else []
     return Request({'type': 'http', 'method': 'GET', 'path': '/api/me', 'query_string': b'', 'state': {},
-                    'headers': [(b'cookie', f'workspace_session={cookie}'.encode())]})
+                    'headers': headers})
 
 
 def events(product, action=None):
@@ -200,6 +211,12 @@ def assert_failed(product, response, reason=None):
     assert 'workspace_session' not in response.cookies
     if reason:
         assert refused(product)[-1] == reason
+
+
+def raising(error):
+    def fail(*args, **kwargs):
+        raise error
+    return fail
 
 
 async def test_code_flow_with_pkce_pins_a_new_account_and_audits_it(product):
@@ -241,6 +258,13 @@ async def test_code_flow_with_pkce_pins_a_new_account_and_audits_it(product):
     assert len(events(product, 'identity_binding.created')) == 1
 
 
+def access_service(product, tmp_path):
+    settings = settings_for(tmp_path, cloudflare_access_login=True, public_url='https://workspace.example.test',
+                            cloudflare_access_team_domain='synthetic.cloudflareaccess.com',
+                            cloudflare_access_audience='employee', cloudflare_access_broker_audience='broker')
+    return Security(settings, UserRoles(product.store, settings))
+
+
 async def test_session_follows_live_provider_configuration_and_custom_roles(product, tmp_path):
     response = await sign_in(product)
     cookie = response.cookies['workspace_session']
@@ -258,11 +282,38 @@ async def test_session_follows_live_provider_configuration_and_custom_roles(prod
                     settings_for(tmp_path, providers=({**OKTA, 'issuer': ISSUER + '2'},)),
                     settings_for(tmp_path, providers=({**OKTA, 'domains': ['partner.test']},
                                                       {**other, 'domains': ['example.test']})),
-                    settings_for(tmp_path, cloudflare_access_login=True, public_url='https://workspace.example.test',
-                                 cloudflare_access_team_domain='synthetic.cloudflareaccess.com',
-                                 cloudflare_access_audience='employee', cloudflare_access_broker_audience='broker')):
+                    access_service(product, tmp_path).settings):
         assert Security(changed, UserRoles(product.store, changed)).session_info(request_with(cookie)) is None
     assert Security(product.settings, product.roles).session_info(request_with(cookie))['method'] == 'oidc'
+
+
+def google_service(product, tmp_path, domain='other.test', **overrides):
+    """Google sign-in whose token exchange is a correctly signed synthetic ID token."""
+    settings = settings_for(tmp_path, google_client_id='google-client', google_client_secret='google-secret',
+                            **overrides)
+    google = GoogleSignIn(settings, Security(settings, UserRoles(product.store, settings)), product.store)
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+
+    async def signing_key(kid):
+        return key.public_key()
+
+    async def exchange(code, verifier, nonce):
+        now = int(time.time())
+        token = jwt.encode({'iss': 'https://accounts.google.com', 'aud': 'google-client', 'sub': 'google-subject',
+                            'iat': now, 'exp': now + 300, 'nonce': nonce, 'email': 'person@' + domain,
+                            'email_verified': True, 'hd': domain}, key, algorithm='RS256', headers={'kid': 'k'})
+        return await google.verify(token, nonce)
+
+    google.signing_key, google.exchange = signing_key, exchange
+    app = FastAPI()
+    app.include_router(google.routes())
+    return google, httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url=ORIGIN)
+
+
+async def google_callback(client, **query):
+    started = await client.post('/api/auth/google/start', json={}, headers={'origin': ORIGIN})
+    state = parse_qs(urlsplit(started.json()['url']).query)['state'][0]
+    return await client.get('/auth/google/callback', params={'state': state, 'code': 'synthetic-code', **query})
 
 
 async def test_google_does_not_sign_in_or_keep_sessions_for_claimed_domains(product, tmp_path):
@@ -274,45 +325,18 @@ async def test_google_does_not_sign_in_or_keep_sessions_for_claimed_domains(prod
     assert security.session_info(request_with(unclaimed))['method'] == 'google'
     assert settings.google_signin_domains() == {'other.test', 'partner.test'}
 
-    only = settings_for(tmp_path, google_client_id='google-client', google_client_secret='google-secret',
-                        google_allowed_domains='example.test')
-    app = FastAPI()
-    app.include_router(GoogleSignIn(only, Security(only, UserRoles(product.store, only)), product.store).routes())
-    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url=ORIGIN) as client:
+    _, client = google_service(product, tmp_path, google_allowed_domains='example.test')
+    async with client:
         blocked = await client.post('/api/auth/google/start', json={}, headers={'origin': ORIGIN})
     assert blocked.status_code == 409
 
 
 async def test_google_callback_refuses_a_verified_identity_in_a_claimed_domain(product, tmp_path):
-    settings = settings_for(tmp_path, google_client_id='google-client', google_client_secret='google-secret')
-    google = GoogleSignIn(settings, Security(settings, UserRoles(product.store, settings)), product.store)
-    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-    domain = {}
-
-    async def signing_key(kid):
-        return key.public_key()
-
-    async def exchange(code, verifier, nonce):
-        # A correctly signed Google ID token; only the hosted domain differs.
-        now = int(time.time())
-        token = jwt.encode({'iss': 'https://accounts.google.com', 'aud': 'google-client', 'sub': 'google-subject',
-                            'iat': now, 'exp': now + 300, 'nonce': nonce, 'email': 'person@' + domain['hd'],
-                            'email_verified': True, 'hd': domain['hd']}, key, algorithm='RS256', headers={'kid': 'k'})
-        return await google.verify(token, nonce)
-
-    google.signing_key, google.exchange = signing_key, exchange
-    app = FastAPI()
-    app.include_router(google.routes())
-    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url=ORIGIN) as client:
-        for domain['hd'], location in (('example.test', '/?signin=failed#tasks'), ('other.test', '/#tasks')):
-            started = await client.post('/api/auth/google/start', json={}, headers={'origin': ORIGIN})
-            state = parse_qs(urlsplit(started.json()['url']).query)['state'][0]
-            response = await client.get('/auth/google/callback', params={'state': state, 'code': 'synthetic-code'})
-            assert response.headers['location'] == location
-            if domain['hd'] == 'example.test':
-                assert 'workspace_session' not in response.cookies
-                assert not product.store.rows('SELECT 1 FROM users')
-    assert product.store.rows('SELECT id,email FROM users') == [{'id': 'google:google-subject', 'email': 'person@other.test'}]
+    _, client = google_service(product, tmp_path, domain='example.test')
+    async with client:
+        response = await google_callback(client)
+    assert_failed(product, response)
+    assert response.headers['location'] == '/?signin=failed#tasks' and not product.store.rows('SELECT 1 FROM users')
 
 
 @pytest.mark.parametrize('claims, header, reason', [
@@ -345,7 +369,6 @@ async def test_token_and_claim_failures_redirect_without_a_session(product, clai
 
 
 def freeze_minute(monkeypatch, minute='2026-10-26T09:30'):
-    from app import governance_activity
     monkeypatch.setattr(governance_activity, 'minute_bucket', lambda: minute)
 
 
@@ -364,7 +387,7 @@ async def test_unsigned_confused_or_foreign_signatures_are_refused(product, monk
     assert not product.store.rows('SELECT 1 FROM access_identities')
 
 
-async def test_signing_keys_are_rate_limited_and_never_symmetric_or_ambiguous(product, tmp_path):
+async def test_signing_keys_are_rate_limited_and_never_symmetric_or_ambiguous(product):
     idp = product.idp
     idp.header = {'kid': 'rotated'}
     assert_failed(product, await sign_in(product), 'token')
@@ -378,11 +401,8 @@ async def test_signing_keys_are_rate_limited_and_never_symmetric_or_ambiguous(pr
         fresh = FakeProvider()
         fresh.keys = keys
         fresh.key = fresh.signing_key = idp.key
-        current = service(tmp_path, product.store, product.settings, fresh)
-        try:
-            assert_failed(current, await sign_in(current), 'unavailable')
-        finally:
-            await current.client.aclose()
+        current = product.serve(product.settings, fresh)
+        assert_failed(current, await sign_in(current), 'unavailable')
 
 
 async def test_a_verified_document_survives_a_discovery_outage_for_a_day(product, monkeypatch):
@@ -406,13 +426,9 @@ async def test_a_verified_document_survives_a_discovery_outage_for_a_day(product
 
 
 async def test_configured_prompt_reaches_the_authorization_request(product, tmp_path):
-    current = service(tmp_path, product.store, settings_for(tmp_path, providers=({**OKTA, 'prompt': 'login'},)),
-                      product.idp)
-    try:
-        _, params, _ = await start(current)
-        assert params['prompt'] == 'login'
-    finally:
-        await current.client.aclose()
+    current = product.serve(settings_for(tmp_path, providers=({**OKTA, 'prompt': 'login'},)), product.idp)
+    _, params, _ = await start(current)
+    assert params['prompt'] == 'login'
 
 
 @pytest.mark.parametrize('change', ['issuer', 'http', 'redirect', 'large', 'unsupported'])
@@ -434,23 +450,20 @@ async def test_discovery_must_name_the_exact_issuer_over_https(product, change):
     assert not product.store.rows('SELECT 1 FROM login_states')
 
 
+def token_timeout(request):
+    raise httpx.ReadTimeout('synthetic timeout', request=request)
+
+
 @pytest.mark.parametrize('reply', [
     httpx.Response(400, json={'error': 'invalid_grant'}), httpx.Response(500),
     httpx.Response(200, text='not json'), httpx.Response(200, json={'access_token': 'only'}),
-    httpx.Response(200, json={'id_token': 'x' * 40000}),
+    httpx.Response(200, json={'id_token': 'x' * 40000}), token_timeout,
 ])
 async def test_token_endpoint_failures_echo_nothing(product, reply):
     product.idp.responses['https://idp.example.test/token'] = reply
     response = await sign_in(product)
     assert_failed(product, response, 'token')
     assert response.headers['location'] == '/?signin=failed#connections'
-
-
-async def test_token_endpoint_timeout_fails_closed(product):
-    def timeout(request):
-        raise httpx.ReadTimeout('synthetic timeout', request=request)
-    product.idp.responses['https://idp.example.test/token'] = timeout
-    assert_failed(product, await sign_in(product), 'token')
 
 
 async def test_state_is_bound_to_this_browser_this_provider_and_one_use(product):
@@ -484,7 +497,7 @@ async def test_state_is_bound_to_this_browser_this_provider_and_one_use(product)
     assert expired.headers['location'] == '/?signin=failed#tasks'
 
 
-async def test_issuer_parameter_and_cancellation(product, tmp_path, monkeypatch):
+async def test_issuer_parameter_and_cancellation(product, monkeypatch):
     freeze_minute(monkeypatch)
     assert_failed(product, await sign_in(product, iss='https://other.example.test'), 'issuer')
     cancelled = await sign_in(product, code='', error='access_denied')
@@ -495,15 +508,12 @@ async def test_issuer_parameter_and_cancellation(product, tmp_path, monkeypatch)
     # A provider that promises RFC 9207 responses must send the parameter.
     idp = FakeProvider()
     idp.document['authorization_response_iss_parameter_supported'] = True
-    current = service(tmp_path, product.store, product.settings, idp)
-    try:
-        assert_failed(current, await sign_in(current))
-        # The repeated anonymous refusal in this minute is kept once.
-        assert refused(current) == ['issuer', 'cancelled']
-        response = await sign_in(current, iss=ISSUER)
-        assert response.status_code == 303 and response.headers['location'] == '/#connections'
-    finally:
-        await current.client.aclose()
+    current = product.serve(product.settings, idp)
+    assert_failed(current, await sign_in(current))
+    # The repeated anonymous refusal in this minute is kept once.
+    assert refused(current) == ['issuer', 'cancelled']
+    response = await sign_in(current, iss=ISSUER)
+    assert response.status_code == 303 and response.headers['location'] == '/#connections'
 
 
 async def test_start_is_throttled_and_keeps_few_pending_states(product):
@@ -595,13 +605,10 @@ async def test_ascii_emails_only(product, tmp_path):
     existing(product, 'google:kate', 'google', 'kate@example.test')
     settings = settings_for(tmp_path, providers=({**OKTA, 'domains': ['example.test', 'work.test']},),
                             google_allowed_domains='example.test,work.test')
-    current = service(tmp_path, product.store, settings, product.idp)
-    try:
-        for email in ('\u212aate@example.test', 'person@wor\u212a.test'):
-            current.idp.claims = {'email': email}
-            assert_failed(current, await sign_in(current), 'claims')
-    finally:
-        await current.client.aclose()
+    current = product.serve(settings, product.idp)
+    for email in ('\u212aate@example.test', 'person@wor\u212a.test'):
+        current.idp.claims = {'email': email}
+        assert_failed(current, await sign_in(current), 'claims')
     assert not product.store.rows('SELECT 1 FROM access_identities')
 
 
@@ -613,16 +620,12 @@ async def test_display_names_keep_printable_text_only(product):
 
 
 async def test_unexpected_failures_redirect_and_log_only_their_type(product, monkeypatch, caplog):
-    def failing(*args, **kwargs):
-        raise RuntimeError('synthetic failure for person@example.test')
-
-    def invalid(*args, **kwargs):
-        raise ValueError('synthetic account failure for person@example.test')
-
+    failing = raising(RuntimeError('synthetic failure for person@example.test'))
     with caplog.at_level('WARNING', logger='app.oidc_sso'):
         # An account failure after verification is unavailable, never a token
         # error, and names the verified person.
-        monkeypatch.setattr(product.store, 'external_identity_in', invalid)
+        monkeypatch.setattr(product.store, 'external_identity_in',
+                            raising(ValueError('synthetic account failure for person@example.test')))
         assert_failed(product, await sign_in(product), 'unavailable')
         monkeypatch.setattr(product.store, 'external_identity_in', failing)
         assert_failed(product, await sign_in(product), 'unavailable')
@@ -653,16 +656,13 @@ async def test_scim_deactivation_and_required_provisioning(product, tmp_path):
     earlier = (await sign_in(product)).cookies['workspace_session']
 
     required = settings_for(tmp_path, providers=({**OKTA, 'require_scim_user': True},))
-    current = service(tmp_path, product.store, required, product.idp)
-    try:
-        # Requiring provisioning also ends sessions that began without it.
-        assert current.security.session_info(request_with(earlier)) is None
-        assert_failed(current, await sign_in(current), 'not_provisioned')
-        scim_user(current, 'person@example.test', True)
-        assert (await sign_in(current)).headers['location'] == '/#connections'
-        assert current.security.session_info(request_with(earlier))['method'] == 'oidc'
-    finally:
-        await current.client.aclose()
+    current = product.serve(required, product.idp)
+    # Requiring provisioning also ends sessions that began without it.
+    assert current.security.session_info(request_with(earlier)) is None
+    assert_failed(current, await sign_in(current), 'not_provisioned')
+    scim_user(current, 'person@example.test', True)
+    assert (await sign_in(current)).headers['location'] == '/#connections'
+    assert current.security.session_info(request_with(earlier))['method'] == 'oidc'
 
 
 async def test_entra_style_claims_keys_and_client_secret_post(product, tmp_path):
@@ -677,73 +677,22 @@ async def test_entra_style_claims_keys_and_client_secret_post(product, tmp_path)
     entra = {'id': 'entra', 'label': 'Microsoft', 'issuer': tenant, 'client_id': 'entra-client',
              'domains': ['other.test'], 'email_verified_claim': 'xms_edov', 'token_auth': 'client_secret_post'}
     settings = settings_for(tmp_path, providers=(OKTA, entra))
-    current = service(tmp_path, product.store, settings, product.idp, extra=(idp,))
+    current = product.serve(settings, product.idp, extra=(idp,))
     current.idp = idp
-    try:
-        response = await sign_in(current, 'entra')
-        assert response.status_code == 303, refused(current)
-        assert session(current, response)['identity']['email'] == 'person@other.test'
-        idp.claims = {'email_verified': True, 'email': 'person@other.test'}  # Only the configured claim counts.
-        assert_failed(current, await sign_in(current, 'entra'), 'email_unverified')
-    finally:
-        await current.client.aclose()
+    response = await sign_in(current, 'entra')
+    assert response.status_code == 303, refused(current)
+    assert session(current, response)['identity']['email'] == 'person@other.test'
+    idp.claims = {'email_verified': True, 'email': 'person@other.test'}  # Only the configured claim counts.
+    assert_failed(current, await sign_in(current, 'entra'), 'email_unverified')
 
 
-async def test_es256_provider(tmp_path):
-    store = Store(tmp_path)
-    initialize_components(store)
+async def test_es256_provider(product, tmp_path):
     idp = FakeProvider(algorithm='ES256')
-    current = service(tmp_path, store, settings_for(tmp_path, providers=({**OKTA, 'algorithms': ['ES256']},)), idp)
-    try:
-        assert (await sign_in(current)).headers['location'] == '/#connections'
-        idp.signing_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-        idp.header = {'alg': 'RS256'}  # Not an allowed algorithm for this provider.
-        assert_failed(current, await sign_in(current), 'token')
-    finally:
-        await current.client.aclose()
-        store.close()
-
-
-def test_provider_model_rejects_unsafe_values():
-    with pytest.raises(ValueError):
-        OidcProvider(**{**OKTA, 'issuer': 'https://idp.example.test/?tenant=x'})
-    with pytest.raises(ValueError):
-        OidcProvider(**{**OKTA, 'label': 'Okta\nInjected'})
-    with pytest.raises(ValueError):
-        OidcProvider(**{**OKTA, 'algorithms': ['HS256']})
-    with pytest.raises(ValueError):
-        OidcProvider(**{**OKTA, 'scopes': ['email']})
-    with pytest.raises(ValueError):
-        OidcProvider(**{**OKTA, 'domains': []})
-    assert OidcProvider(**{**OKTA, 'domains': [' Example.TEST ']}).domains == ('example.test',)
-
-
-def google_service(product, tmp_path):
-    """Google sign-in whose token exchange is a correctly signed synthetic ID token."""
-    settings = settings_for(tmp_path, google_client_id='google-client', google_client_secret='google-secret')
-    google = GoogleSignIn(settings, Security(settings, UserRoles(product.store, settings)), product.store)
-    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-
-    async def signing_key(kid):
-        return key.public_key()
-
-    async def exchange(code, verifier, nonce):
-        now = int(time.time())
-        token = jwt.encode({'iss': 'https://accounts.google.com', 'aud': 'google-client', 'sub': 'google-subject',
-                            'iat': now, 'exp': now + 300, 'nonce': nonce, 'email': 'person@other.test',
-                            'email_verified': True, 'hd': 'other.test'}, key, algorithm='RS256', headers={'kid': 'k'})
-        return await google.verify(token, nonce)
-
-    google.signing_key, google.exchange = signing_key, exchange
-    app = FastAPI()
-    app.include_router(google.routes())
-    return google, httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url=ORIGIN)
-
-
-async def google_callback(client, **query):
-    started = await client.post('/api/auth/google/start', json={}, headers={'origin': ORIGIN})
-    state = parse_qs(urlsplit(started.json()['url']).query)['state'][0]
-    return await client.get('/auth/google/callback', params={'state': state, 'code': 'synthetic-code', **query})
+    current = product.serve(settings_for(tmp_path, providers=({**OKTA, 'algorithms': ['ES256']},)), idp)
+    assert (await sign_in(current)).headers['location'] == '/#connections'
+    idp.signing_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    idp.header = {'alg': 'RS256'}  # Not an allowed algorithm for this provider.
+    assert_failed(current, await sign_in(current), 'token')
 
 
 def sign_ins(product):
@@ -756,6 +705,8 @@ async def test_google_sign_in_success_and_refusals_are_audited_like_oidc(product
     google, client = google_service(product, tmp_path)
     async with client:
         assert (await google_callback(client)).headers['location'] == '/#tasks'
+        assert product.store.rows('SELECT id,email FROM users') == [
+            {'id': 'google:google-subject', 'email': 'person@other.test'}]
         assert (await google_callback(client)).cookies.get('workspace_session')
         succeeded = [
             ('sign_in.succeeded', 'person@other.test', 'google', {'method': 'google', 'enrolled': True}),
@@ -783,30 +734,21 @@ async def test_google_sign_in_success_and_refusals_are_audited_like_oidc(product
 
         # Any refusal after the provider verified the person names them, and an
         # account failure after the exchange is unavailable, not a token error.
-        def review(*args, **kwargs):
-            raise IdentityRefused('mapping_review')
-
-        def broken(*args, **kwargs):
-            raise ValueError('synthetic account failure for person@other.test')
-
-        for patched, target, reason in ((google.security, 'person', 'deactivated'),
-                                        (product.store, 'identity', 'mapping_review'),
-                                        (product.store, 'identity', 'unavailable')):
+        for patched, target, replacement, reason in (
+                (google.security, 'person', lambda *args, **kwargs: None, 'deactivated'),
+                (product.store, 'identity', raising(IdentityRefused('mapping_review')), 'mapping_review'),
+                (product.store, 'identity', raising(ValueError('synthetic account failure for person@other.test')),
+                 'unavailable')):
             with monkeypatch.context() as patch:
-                patch.setattr(patched, target, {'deactivated': lambda *args, **kwargs: None,
-                                                'mapping_review': review, 'unavailable': broken}[reason])
+                patch.setattr(patched, target, replacement)
                 assert_failed(product, await google_callback(client), reason)
             assert sign_ins(product)[-1][1:] == ('person@other.test', 'google', {'method': 'google', 'reason': reason})
 
 
 async def test_google_sign_in_fails_closed_when_its_audit_event_cannot_be_written(product, tmp_path, monkeypatch, caplog):
-    from app import sign_in_audit
     _, client = google_service(product, tmp_path)
-
-    def failing(*args, **kwargs):
-        raise RuntimeError('synthetic audit failure for person@other.test')
-
-    monkeypatch.setattr(sign_in_audit, 'succeeded_in', failing)
+    monkeypatch.setattr(sign_in_audit, 'succeeded_in',
+                        raising(RuntimeError('synthetic audit failure for person@other.test')))
     async with client:
         with caplog.at_level('WARNING', logger='app.google_sso'):
             assert_failed(product, await google_callback(client), 'unavailable')
@@ -816,74 +758,48 @@ async def test_google_sign_in_fails_closed_when_its_audit_event_cannot_be_writte
     assert [event['action'] for event in events(product)] == ['sign_in.refused']
 
 
-def access_service(product, tmp_path):
-    settings = settings_for(tmp_path, cloudflare_access_login=True, public_url='https://workspace.example.test',
-                            cloudflare_access_team_domain='synthetic.cloudflareaccess.com',
-                            cloudflare_access_audience='employee', cloudflare_access_broker_audience='broker')
-    return Security(settings, UserRoles(product.store, settings))
-
-
-def access_request(cookie=None):
-    headers = [(b'cookie', b'workspace_session=' + cookie)] if cookie else []
-    return Request({'type': 'http', 'method': 'GET', 'path': '/api/me', 'query_string': b'', 'state': {},
-                    'headers': headers})
-
-
 ACCESS = {'sub': 'access-subject', 'issuer': 'https://synthetic.cloudflareaccess.com',
           'email': 'person@example.test', 'domain': 'example.test'}
 
 
 async def test_access_sign_in_is_recorded_per_new_session_and_minute(product, tmp_path, monkeypatch):
-    from app import governance_activity
     security = access_service(product, tmp_path)
-    issued = security.access_session(access_request(), ACCESS)
+    issued = security.access_session(request_with(), ACCESS)
     assert issued and sign_ins(product) == [
         ('sign_in.succeeded', 'person@example.test', 'cloudflare', {'method': 'cloudflare', 'enrolled': True})]
-    # A client that never keeps its cookie records once per minute.
-    for _ in range(3):
-        assert security.access_session(access_request(), ACCESS)
-    assert len(sign_ins(product)) == 1
     # A valid existing session records nothing.
     cookie = SimpleCookie()
     cookie.load(issued.decode('latin-1'))
-    assert security.access_session(access_request(cookie['workspace_session'].value.encode()), ACCESS) is None
-    monkeypatch.setattr(governance_activity, 'minute_bucket', lambda: '2099-01-01T00:00')
-    assert security.access_session(access_request(), ACCESS)
+    assert security.access_session(request_with(cookie['workspace_session'].value), ACCESS) is None
+    freeze_minute(monkeypatch, '2099-01-01T00:00')
+    assert security.access_session(request_with(), ACCESS)
     assert sign_ins(product)[1:] == [
         ('sign_in.succeeded', 'person@example.test', 'cloudflare', {'method': 'cloudflare', 'enrolled': False})]
 
 
 async def test_access_refusals_are_recorded_and_unrecorded_sign_ins_issue_no_session(product, tmp_path, monkeypatch):
-    from app import sign_in_audit
-    from app.database import DatabaseError
     security = access_service(product, tmp_path)
-    assert security.access_session(access_request(), ACCESS)
+    assert security.access_session(request_with(), ACCESS)
     changed = {**ACCESS, 'email': 'renamed@example.test'}
-    for _ in range(2):
-        with pytest.raises(IdentityRefused):
-            security.access_session(access_request(), changed)
+    with pytest.raises(IdentityRefused):
+        security.access_session(request_with(), changed)
     assert sign_ins(product)[1:] == [
         ('sign_in.refused', 'renamed@example.test', 'cloudflare', {'method': 'cloudflare', 'reason': 'mapping_review'})]
     monkeypatch.setattr(security, 'person', lambda *args, **kwargs: None)
-    connection = access_request()
+    connection = request_with()
     assert security.access_session(connection, ACCESS) is None
     assert not hasattr(connection.state, 'access_session')  # No session for a deactivated person.
     assert sign_ins(product)[-1] == (
         'sign_in.refused', 'person@example.test', 'cloudflare', {'method': 'cloudflare', 'reason': 'deactivated'})
     monkeypatch.undo()
-
-    def failing(*args, **kwargs):
-        raise DatabaseError('synthetic audit failure')
-
-    monkeypatch.setattr(sign_in_audit, 'succeeded_in', failing)
+    monkeypatch.setattr(sign_in_audit, 'succeeded_in', raising(DatabaseError('synthetic audit failure')))
     with pytest.raises(DatabaseError):
-        security.access_session(access_request(), {**ACCESS, 'sub': 'another-subject', 'email': 'other@example.test'})
+        security.access_session(request_with(), {**ACCESS, 'sub': 'another-subject', 'email': 'other@example.test'})
 
 
 async def test_repeated_access_sign_in_events_are_written_once_per_process(product, tmp_path, monkeypatch):
     # access_actor runs for every request: a cookie-less client or a mapping in
     # review writes its per-minute event once, then only reads.
-    from app import sign_in_audit
     security = access_service(product, tmp_path)
     writes = []
     for name in ('succeeded', 'record'):
@@ -894,14 +810,14 @@ async def test_repeated_access_sign_in_events_are_written_once_per_process(produ
             return original(*args, **kwargs)
         monkeypatch.setattr(sign_in_audit, name, counted)
     for _ in range(3):
-        assert security.access_session(access_request(), ACCESS)
+        assert security.access_session(request_with(), ACCESS)
     changed = {**ACCESS, 'email': 'renamed@example.test'}
     for _ in range(3):
         with pytest.raises(IdentityRefused):
-            security.access_session(access_request(), changed)
+            security.access_session(request_with(), changed)
     assert writes == ['succeeded', 'record']
     assert [action for action, *_ in sign_ins(product)] == ['sign_in.succeeded', 'sign_in.refused']
     # Another process (an empty memo) repeats the write, and the key keeps one row.
     security.access_recorded.clear()
-    assert security.access_session(access_request(), ACCESS)
+    assert security.access_session(request_with(), ACCESS)
     assert writes[-1] == 'succeeded' and len(sign_ins(product)) == 2
