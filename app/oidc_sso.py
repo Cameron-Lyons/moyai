@@ -394,8 +394,8 @@ class OidcSignIn:
             else:
                 response = RedirectResponse(row['return_path'], status_code=303)
                 response.delete_cookie(COOKIE, path=cookie_path)
-                self.security.new_identity_session(response, person['role'], method='oidc', identity=identity,
-                                                   client_id=client.provider.client_id)
+                self.security.new_session(response, person['role'], identity=identity, method='oidc',
+                                          client_id=client.provider.client_id)
                 return response
             # Only a fully verified identity names the actor (any refusal after
             # verification); claims alone do not.

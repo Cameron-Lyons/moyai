@@ -182,10 +182,9 @@ class Security:
     def access_session(self, request: HTTPConnection, identity: dict) -> bytes | None:
         """Establish a browser session from a verified employee assertion only.
 
-        Each new session records sign_in.succeeded before its cookie is issued
-        (a failed write raises, so no cookie is issued), once per subject and
-        minute, which bounds clients that never keep cookies. A mapping that
-        needs review, or a deactivated person, records sign_in.refused instead.
+        It records sign_in.succeeded before issuing a cookie (a failed write
+        raises, so no cookie is issued), or sign_in.refused, once per subject and
+        minute (app.sign_in_audit).
         """
         from .db import IdentityRefused
 
@@ -350,21 +349,15 @@ class Security:
         if request.headers.get("origin") != self.origin:
             raise HTTPException(403, "This request must come from the workspace.")
 
-    def new_session(self, response, role: str = "admin", *, identity: dict | None = None, local: bool = False) -> str:
+    def new_session(self, response, role: str = "admin", *, identity: dict | None = None, local: bool = False,
+                    method: str = "google", client_id: str = "") -> str:
         sid = secrets.token_urlsafe(32)
-        info = {"sid": sid, "role": role, "method": "google" if identity else "local" if local else "password"}
+        info = {"sid": sid, "role": role, "method": method if identity else "local" if local else "password"}
         if identity:
-            info.update(identity=identity, client_id=self.settings.google_client_id)
+            info.update(identity=identity, client_id=client_id or self.settings.google_client_id)
         elif role == "member":
             info["password_tag"] = digest(self.settings.workspace_member_password)
         self.set_session_cookie(response, info)
-        return sid
-
-    def new_identity_session(self, response, role: str, *, method: str, identity: dict, client_id: str) -> str:
-        """A session for a verified individual from an organization identity provider."""
-        sid = secrets.token_urlsafe(32)
-        self.set_session_cookie(response, {"sid": sid, "role": role, "method": method,
-                                           "identity": identity, "client_id": client_id})
         return sid
 
     def set_session_cookie(self, response, info):

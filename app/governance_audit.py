@@ -2,16 +2,12 @@
 
 Every successful governance change records exactly one event through
 record_event_in on the same canonical connection, after its writer lock is held,
-so a rolled-back change leaves no event. A native workflow (automation)
-configuration change is such a change: mutate() inserts its event_values row
-under the canonical writer lock it already holds. Native runtime outcomes, such
-as a gateway AI guardrail refusal, insert event_values rows in the native
-transaction that records the outcome instead. Sign-in events
-(app.sign_in_audit) commit with the account write they describe, or take a
-scoped write lock of their own; an event a client could repeat is keyed (an
-Access sign-in or anonymous refusal per minute, a sign-out per session). Events
-carry identifiers, actions, authenticated actors and bounded metadata; never
-tokens, secrets, policy bodies or user content.
+so a rolled-back change leaves no event. Native automation changes (under the
+writer lock mutate() already holds) and runtime outcomes such as a gateway AI
+guardrail refusal (in their own native transaction) insert event_values rows;
+sign-in events follow app.sign_in_audit. Events carry identifiers, actions,
+authenticated actors and bounded metadata; never tokens, secrets, policy bodies
+or user content.
 Schema lives in the canonical initializers; keep the import alias below instead
 of defining initialize_schema here.
 
@@ -19,15 +15,13 @@ GovernanceAudit merges governance_audit_events with the activity audit
 (governance_activity_events: sessions, messages, policy refusals and blocked
 runs, see app.governance_activity) and the existing user_role_audit,
 connection_audit and credential_audit tables into one feed ordered by
-(created_at DESC, source, id DESC). Activity rows are append-only and written
-without the writer lock: a trigger rejects UPDATE, so never add one. Reads never
-take the writer lock: a page is one read-only snapshot (REPEATABLE READ READ
-ONLY on PostgreSQL) in which each source is read through its (created_at, id)
-index with the filters and a LIMIT in SQL. No index covers the governance
-resource_type, but record_event_in requires '<resource_type>.<verb>' actions for
-RESOURCE_TYPES, so a filter on one of them reads one governance keyset statement
-per matching action through the action index. The activity table indexes
-action, the folded actor (actor_key) and resource_type.
+(created_at DESC, source, id DESC). Reads never take the writer lock: a page is
+one read-only snapshot (REPEATABLE READ READ ONLY on PostgreSQL) in which each
+source is read through its (created_at, id) index with the filters and a LIMIT
+in SQL. No index covers the governance resource_type, but record_event_in
+requires '<resource_type>.<verb>' actions for RESOURCE_TYPES, so a filter on one
+of them reads one governance keyset statement per matching action through the
+action index.
 Legacy rows are normalized to fixed actions and identifiers; their free-text
 action column is classified and never returned, and their details hold only
 enumerated values.

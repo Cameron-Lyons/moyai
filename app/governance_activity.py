@@ -2,10 +2,9 @@
 
 Configuration changes, AI guardrail events and sign-in, refusal and sign-out
 (sign_in.*) stay in governance_audit_events (app.governance_audit). Activity is
-higher volume, so it has its own append-only table, governance_activity_events,
-indexed by time, action, actor_key, resource_type and session. Native writes it
-(moyai.product_activity_audit) by qualified name in the shared database, and
-GovernanceAudit reads it as the 'activity' feed source.
+higher volume, so it has its own append-only table, governance_activity_events.
+Native writes it (moyai.product_activity_audit) by qualified name in the shared
+database, and GovernanceAudit reads it as the 'activity' feed source.
 
 ACTIVITY_ACTIONS is the static catalog: every action has one resource type, one
 outcome and one details model. Details models forbid extra keys and hold only

@@ -311,9 +311,6 @@ class Settings(BaseSettings):
             raise ValueError('OpenID Connect sign-in requires GOOGLE_ADMIN_EMAILS in the allowed domains.')
         return self
 
-    def oidc_provider(self, provider_id: str) -> OidcProvider | None:
-        return next((provider for provider in self.oidc_providers if provider.id == provider_id), None)
-
     def oidc_provider_for_domain(self, domain: str) -> OidcProvider | None:
         """The one provider that owns sign-in for this email domain, if any."""
         return next((provider for provider in self.oidc_providers if domain in provider.domains), None)

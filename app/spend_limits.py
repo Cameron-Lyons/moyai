@@ -323,9 +323,17 @@ def group_name_in(conn, group_id: str) -> str:
     return row['display_name'] if row else ''
 
 
+def _limit_usd(row) -> float | None:
+    return None if row is None or row['limit_usd'] is None else float(row['limit_usd'])
+
+
+def _location(identity: str, kind: str, subject: str) -> tuple[str, str, str]:
+    """(table, key column, key) of a limit's row: tiers live in spend_group_limits by group id."""
+    return ('spend_group_limits', 'group_id', subject) if kind == 'group' else ('spend_limits', 'id', identity)
+
+
 def _view(row):
-    return {'id': row['id'], 'kind': row['kind'], 'subject': row['subject'],
-            'limit_usd': None if row['limit_usd'] is None else float(row['limit_usd']),
+    return {'id': row['id'], 'kind': row['kind'], 'subject': row['subject'], 'limit_usd': _limit_usd(row),
             'revision': row['revision'], 'updated_at': row['updated_at'], 'updated_by': row['updated_by']}
 
 
@@ -336,8 +344,8 @@ def _absent(identity):
 
 def _tier_view(row, group_name: str):
     return {'id': 'group:' + row['group_id'], 'group_id': row['group_id'], 'group_name': group_name,
-            'limit_usd': None if row['limit_usd'] is None else float(row['limit_usd']),
-            'revision': row['revision'], 'updated_at': row['updated_at'], 'updated_by': row['updated_by']}
+            'limit_usd': _limit_usd(row), 'revision': row['revision'], 'updated_at': row['updated_at'],
+            'updated_by': row['updated_by']}
 
 
 _COLUMNS = 'id,kind,subject,limit_usd,revision,updated_by,updated_at'
@@ -454,6 +462,18 @@ class SpendLimits:
                 highest = max(highest, value)
         return highest + 1
 
+    def _new_row_in(self, conn, identity: str, kind: str, counts: dict[str, int]) -> int:
+        """Count one new override or tier against its capacity and return its first revision."""
+        if kind not in counts:
+            source = "spend_limits WHERE kind='user'" if kind == 'user' else 'spend_group_limits'
+            counts[kind] = conn.execute(f'SELECT COUNT(*) AS total FROM {source}').fetchone()['total']
+        if kind == 'user' and counts[kind] >= MAX_USER_LIMITS:
+            raise SpendLimitCapacity()
+        if kind == 'group' and counts[kind] >= MAX_GROUP_LIMITS:
+            raise SpendLimitCapacity(f'At most {MAX_GROUP_LIMITS} directory group spend tiers are supported.')
+        counts[kind] += 1
+        return self._first_revision_in(conn, identity)
+
     def save(self, changes: SpendLimitChanges | Mapping | Sequence, actor) -> dict:
         """Apply 1-50 revisioned changes all-or-nothing and return the new listing.
 
@@ -470,81 +490,47 @@ class SpendLimits:
         with self.store.connect() as conn:
             conn.begin_write()
             label, authority = self._authorized_in(conn, actor, label)
-            stamp, users, groups = timestamp(), None, None
+            stamp, counts = timestamp(), {}
             for change in body.changes:
                 identity, kind, subject = parse_id(change.id)
+                details = {'kind': kind}
                 if kind == 'group':
-                    groups = self._save_tier_in(conn, change, subject, authority, label, stamp, groups)
-                    continue
-                row = conn.execute(f'SELECT {_COLUMNS} FROM spend_limits WHERE id=?', (identity,)).fetchone()
+                    group = conn.execute("SELECT display_name FROM scim_groups WHERE id=? AND deleted_at=''",
+                                         (subject,)).fetchone()
+                    if group is None:
+                        raise SpendLimitNotFound('Directory group not found.')
+                    self._refuse_own_group_in(conn, authority, subject)
+                    details['group_name'] = group['display_name']
+                table, key, value = _location(identity, kind, subject)
+                row = conn.execute(f'SELECT limit_usd,revision FROM {table} WHERE {key}=?', (value,)).fetchone()
                 if (row['revision'] if row else 0) != change.revision:
                     raise StaleRevision()
-                previous = None if row is None or row['limit_usd'] is None else float(row['limit_usd'])
-                if previous == change.limit_usd and (row is not None or kind != 'user'):
+                previous = _limit_usd(row)
+                # Overrides and tiers are created even without a limit: NULL means unlimited for them.
+                if previous == change.limit_usd and (row is not None or kind in SINGLETONS):
                     continue
                 if row is None:
-                    if kind == 'user':
-                        if users is None:
-                            users = conn.execute("SELECT COUNT(*) AS total FROM spend_limits WHERE kind='user'"
-                                                 ).fetchone()['total']
-                        if users >= MAX_USER_LIMITS:
-                            raise SpendLimitCapacity()
-                        users += 1
-                    revision = self._first_revision_in(conn, identity) if kind == 'user' else 1
-                    conn.execute(f'INSERT INTO spend_limits({_COLUMNS}) VALUES(?,?,?,?,?,?,?)',
-                                 (identity, kind, subject, change.limit_usd, revision, label, stamp))
+                    revision = 1 if kind in SINGLETONS else self._new_row_in(conn, identity, kind, counts)
+                    if kind == 'group':
+                        conn.execute(f'INSERT INTO spend_group_limits({_TIER_COLUMNS}) VALUES(?,?,?,?,?)',
+                                     (subject, change.limit_usd, revision, label, stamp))
+                    else:
+                        conn.execute(f'INSERT INTO spend_limits({_COLUMNS}) VALUES(?,?,?,?,?,?,?)',
+                                     (identity, kind, subject, change.limit_usd, revision, label, stamp))
                     action = 'spend_limit.created'
                 else:
                     revision = row['revision'] + 1
-                    if conn.execute('''UPDATE spend_limits SET limit_usd=?,revision=?,updated_by=?,updated_at=?
-                            WHERE id=? AND revision=?''', (change.limit_usd, revision, label, stamp, identity,
-                                                           row['revision'])).rowcount != 1:
+                    if conn.execute(f'''UPDATE {table} SET limit_usd=?,revision=?,updated_by=?,updated_at=?
+                            WHERE {key}=? AND revision=?''', (change.limit_usd, revision, label, stamp, value,
+                                                             row['revision'])).rowcount != 1:
                         raise StaleRevision()
                     action = 'spend_limit.updated'
                 record_event_in(conn, action, label, 'spend_limit', identity, {
-                    'kind': kind, 'limit_usd': change.limit_usd, 'previous_usd': previous, 'revision': revision})
+                    **details, 'limit_usd': change.limit_usd, 'previous_usd': previous, 'revision': revision})
             return self.listing_in(conn)
 
-    def _save_tier_in(self, conn, change: SpendLimitChange, group_id: str, authority, label: str, stamp: str,
-                      count: int | None) -> int | None:
-        """Create or update one group's tier; returns the running tier count for the capacity check."""
-        identity = 'group:' + group_id
-        group = conn.execute("SELECT id,display_name FROM scim_groups WHERE id=? AND deleted_at=''",
-                             (group_id,)).fetchone()
-        if group is None:
-            raise SpendLimitNotFound('Directory group not found.')
-        self._refuse_own_group_in(conn, authority, group_id)
-        row = conn.execute(f'SELECT {_TIER_COLUMNS} FROM spend_group_limits WHERE group_id=?', (group_id,)).fetchone()
-        if (row['revision'] if row else 0) != change.revision:
-            raise StaleRevision()
-        previous = None if row is None or row['limit_usd'] is None else float(row['limit_usd'])
-        # A NULL tier is meaningful (its members have no limit), so it is created.
-        if row is not None and previous == change.limit_usd:
-            return count
-        if row is None:
-            if count is None:
-                count = conn.execute('SELECT COUNT(*) AS total FROM spend_group_limits').fetchone()['total']
-            if count >= MAX_GROUP_LIMITS:
-                raise SpendLimitCapacity(f'At most {MAX_GROUP_LIMITS} directory group spend tiers are supported.')
-            count += 1
-            revision = self._first_revision_in(conn, identity)
-            conn.execute(f'INSERT INTO spend_group_limits({_TIER_COLUMNS}) VALUES(?,?,?,?,?)',
-                         (group_id, change.limit_usd, revision, label, stamp))
-            action = 'spend_limit.created'
-        else:
-            revision = row['revision'] + 1
-            if conn.execute('''UPDATE spend_group_limits SET limit_usd=?,revision=?,updated_by=?,updated_at=?
-                    WHERE group_id=? AND revision=?''', (change.limit_usd, revision, label, stamp, group_id,
-                                                      row['revision'])).rowcount != 1:
-                raise StaleRevision()
-            action = 'spend_limit.updated'
-        record_event_in(conn, action, label, 'spend_limit', identity, {
-            'kind': 'group', 'group_name': group['display_name'], 'limit_usd': change.limit_usd,
-            'previous_usd': previous, 'revision': revision})
-        return count
-
     def delete(self, limit_id: str, revision: int, actor) -> dict:
-        """Remove one person's override or one group's tier, so the default applies again."""
+        """Remove one person's override or one group's tier (live or deleted), so the default applies again."""
         if type(revision) is not int:
             raise TypeError('Spend limit revisions are integers.')
         identity, kind, subject = parse_id(limit_id)
@@ -555,30 +541,16 @@ class SpendLimits:
         with self.store.connect() as conn:
             conn.begin_write()
             label, authority = self._authorized_in(conn, actor, label)
-            if kind == 'group':
-                self._delete_tier_in(conn, subject, revision, authority, label)
-                return {'id': identity, 'deleted': True}
-            row = conn.execute(f'SELECT {_COLUMNS} FROM spend_limits WHERE id=?', (identity,)).fetchone()
+            table, key, value = _location(identity, kind, subject)
+            row = conn.execute(f'SELECT limit_usd,revision FROM {table} WHERE {key}=?', (value,)).fetchone()
             if row is None:
                 raise SpendLimitNotFound()
+            details = {'kind': kind, 'limit_usd': None, 'previous_usd': _limit_usd(row), 'revision': revision}
+            if kind == 'group':
+                self._refuse_own_group_in(conn, authority, subject)
+                details['group_name'] = group_name_in(conn, subject)
             if row['revision'] != revision or conn.execute(
-                    'DELETE FROM spend_limits WHERE id=? AND revision=?', (identity, revision)).rowcount != 1:
+                    f'DELETE FROM {table} WHERE {key}=? AND revision=?', (value, revision)).rowcount != 1:
                 raise StaleRevision()
-            record_event_in(conn, 'spend_limit.deleted', label, 'spend_limit', identity, {
-                'kind': kind, 'limit_usd': None,
-                'previous_usd': None if row['limit_usd'] is None else float(row['limit_usd']),
-                'revision': revision})
+            record_event_in(conn, 'spend_limit.deleted', label, 'spend_limit', identity, details)
         return {'id': identity, 'deleted': True}
-
-    def _delete_tier_in(self, conn, group_id: str, revision: int, authority, label: str) -> None:
-        """Delete a tier, including one whose group was deleted (it no longer applies)."""
-        row = conn.execute(f'SELECT {_TIER_COLUMNS} FROM spend_group_limits WHERE group_id=?', (group_id,)).fetchone()
-        if row is None:
-            raise SpendLimitNotFound()
-        self._refuse_own_group_in(conn, authority, group_id)
-        if row['revision'] != revision or conn.execute(
-                'DELETE FROM spend_group_limits WHERE group_id=? AND revision=?', (group_id, revision)).rowcount != 1:
-            raise StaleRevision()
-        record_event_in(conn, 'spend_limit.deleted', label, 'spend_limit', 'group:' + group_id, {
-            'kind': 'group', 'group_name': group_name_in(conn, group_id), 'limit_usd': None,
-            'previous_usd': None if row['limit_usd'] is None else float(row['limit_usd']), 'revision': revision})

@@ -1,8 +1,7 @@
 """Google OpenID Connect for organization sign-in; no Google API access is retained.
 
-A successful callback records sign_in.succeeded with the account refresh, so a
-failed audit write issues no session. A refusal after a consumed state records
-only a fixed reason (app.sign_in_audit); unknown or expired states record nothing.
+Refusals after a consumed state are audited (app.sign_in_audit); unknown or
+expired states record nothing.
 """
 import asyncio
 import base64

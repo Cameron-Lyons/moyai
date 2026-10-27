@@ -9,24 +9,20 @@ never widens: lists meet by intersection, git access takes the minimum and null
 is the identity.
 
 Repository limits name permanent IDs, never owner/name text, and apply to public
-repositories too. Stored documents have two shapes: a policy without repository
-or model limits keeps the four-key document earlier releases wrote and read,
-byte for byte, and any such limit writes all six keys. Earlier releases therefore
-refuse (fail closed on) exactly the documents that use the new limits.
+repositories too; dump_policy keeps policies without repository or model limits
+in the four-key document earlier releases read.
 
 network_domains is enforced on Modal computers at creation (moyai.modal_network)
 when MOYAI_NETWORK_POLICY_ENFORCEMENT=modal; otherwise, and on Lambda,
 ProductGovernance.require_provider refuses any non-null value. Modal matches TLS
-SNI on port 443 only: other ports and plain HTTP are blocked, DNS lookups are not
-restricted, and a shared CDN domain admits the other sites it serves. Domains are
-exact hostnames or '*.' plus a hostname: '*.example.com' covers example.com and
-every subdomain depth, and an exact entry covers only itself. Intersection and
-redundancy removal follow those semantics exactly. Hostnames are lowercase
-A-labels. Unicode input is converted with UTS #46 non-transitional (IDNA2008)
-mapping, the form clients send in SNI, never the stdlib IDNA 2003 codec, which
-rewrites 'straße.de' to 'strasse.de'. IP literals in any spelling, ports,
-schemes, paths, user names, single-label names and single-label wildcards such
-as '*.com' are rejected.
+SNI, so domains are exact hostnames or '*.' plus a hostname: '*.example.com'
+covers example.com and every subdomain depth, and an exact entry covers only
+itself. Intersection and redundancy removal follow those semantics exactly.
+Hostnames are lowercase A-labels. Unicode input is converted with UTS #46
+non-transitional (IDNA2008) mapping, the form clients send in SNI, never the
+stdlib IDNA 2003 codec, which rewrites 'straße.de' to 'strasse.de'. IP literals
+in any spelling, ports, schemes, paths, user names, single-label names and
+single-label wildcards such as '*.com' are rejected.
 
 Profiles are revisioned and never deleted. Disabling one keeps its revisions,
 so native session bindings (moyai_product_session_policies) stay auditable. This
@@ -655,25 +651,16 @@ class SecurityProfiles:
             return {'default_profile_id': body.default_profile_id, 'mandatory_profile_id': body.mandatory_profile_id,
                     'revision': revision, 'updated_at': stamp, 'updated_by': label}
 
-    def mandatory_in(self, conn, defaults: dict | None = None) -> MandatoryProfile | None:
-        """The current mandatory profile, or None. A dangling selection fails closed."""
-        if defaults is None:
-            # One round trip for governed transactions that only need the floor.
-            row = conn.execute('''SELECT d.mandatory_profile_id AS mandatory_id, p.id AS profile_id,
-                    p.revision AS revision, p.policy AS policy
-                FROM security_profile_defaults d LEFT JOIN security_profiles p ON p.id = d.mandatory_profile_id
-                WHERE d.id=1''').fetchone()
-            if row is None or not row['mandatory_id']:
-                return None
-            identity = row['mandatory_id']
-            if row['profile_id'] is None or not PROFILE_ID.fullmatch(identity):
-                raise OrganizationPolicyUnavailable()
-            return MandatoryProfile(identity, row['revision'], _stored(row['policy']))
-        identity = defaults['mandatory_profile_id']
-        if not identity:
+    def mandatory_in(self, conn) -> MandatoryProfile | None:
+        """The current mandatory profile in one round trip, or None. A dangling selection fails closed."""
+        row = conn.execute('''SELECT d.mandatory_profile_id AS mandatory_id, p.id AS profile_id,
+                p.revision AS revision, p.policy AS policy
+            FROM security_profile_defaults d LEFT JOIN security_profiles p ON p.id = d.mandatory_profile_id
+            WHERE d.id=1''').fetchone()
+        if row is None or not row['mandatory_id']:
             return None
-        row = self._row_in(conn, identity)
-        if row is None:
+        identity = row['mandatory_id']
+        if row['profile_id'] is None or not PROFILE_ID.fullmatch(identity):
             raise OrganizationPolicyUnavailable()
         # Applied even if disabled out of band: the selection still restricts.
         return MandatoryProfile(identity, row['revision'], _stored(row['policy']))
@@ -696,6 +683,6 @@ class SecurityProfiles:
             selected = self._row_in(conn, identity)
             if selected is None or not selected['enabled']:
                 raise ProfileUnavailable() if requested_id else OrganizationPolicyUnavailable()
-        mandatory = self.mandatory_in(conn, defaults)
+        mandatory = self.mandatory_in(conn)
         policy = intersect(_stored(selected['policy']) if selected else None, mandatory.policy if mandatory else None)
         return SessionBinding(identity if selected else '', selected['revision'] if selected else 0, policy)
